@@ -3,6 +3,7 @@
 
 use super::undo::EditKind;
 use super::*;
+use crate::editor::motions::char_class;
 use crate::editor::syntax::indent_width;
 use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
@@ -98,7 +99,12 @@ impl Editor {
         }
         // Auto-indent the new line (treesitter, else smart/auto-indent, else 0)
         // and park the cursor past the indent — vim's `Enter` behavior.
-        let width = self.indent_for(self.cursor.line);
+        // With no indent rule at all the text carried onto the new line keeps its
+        // leading blanks, as in vim with `'noautoindent'`.
+        let Some(width) = self.indent_rule_for(self.cursor.line) else {
+            self.ai_open_line = None;
+            return;
+        };
         self.cursor.col = self.set_line_indent(self.cursor.line, width);
         // The line just left behind is blank when you press `<CR>` without
         // typing on it (two `<CR>`s in a row, or `<CR>` on a fresh auto-indent):
@@ -242,9 +248,30 @@ impl Editor {
             }
             return;
         }
+        // `<C-g>{key}`: `i_CTRL-G_u` closes the undo step here, so what is typed
+        // next undoes on its own. The other `i_CTRL-G_*` commands are not built.
+        if self.awaiting_ctrl_g {
+            self.awaiting_ctrl_g = false;
+            if key.as_char() == Some('u') {
+                self.end_typing_step();
+                self.owe_typing_step();
+            } else if key.code != KeyCode::Esc {
+                self.echo_err(format!(
+                    "E: i_CTRL-G_{} is not implemented",
+                    key.as_char()
+                        .map(String::from)
+                        .unwrap_or_else(|| "<key>".into())
+                ));
+            }
+            return;
+        }
         // A modeless session navigates with caret semantics (`<Right>` crosses to
         // the next line, `<C-Right>` jumps a word) and selects with `<S-…>`.
         if !self.paste_active && self.modeless_nav(key) {
+            // A caret move starts a new insert where it lands, as an arrow key
+            // does below.
+            self.insert_repeat = 1;
+            self.insert_start = (self.cursor.line, self.cursor.col);
             return;
         }
         // …and `<S-Tab>` outdents the caret's line.
@@ -286,6 +313,9 @@ impl Editor {
                 self.mode = Mode::Insert;
             }
             KeyCode::Esc => {
+                // `{count}i…<Esc>`: the session's text lands `count - 1` more times
+                // before Insert is left (overtyping in Replace mode).
+                self.replay_insert_count();
                 // Leaving Insert ends any snippet session (its tabstops are dropped).
                 self.end_snippet();
                 // In a Helix session (an Insert opened by `c`/`i`/…) return to
@@ -336,27 +366,48 @@ impl Editor {
             // so no `edit_each_cursor` wrap). The `".` last-insert register records
             // the keystroke once, not once per cursor.
             KeyCode::Enter => {
+                let stack_valid = self.replace_stack_valid();
                 self.for_each_cursor(|ed| ed.insert_newline());
                 self.insert_text.push('\n'); // `".` last-insert register
+                if self.mode == Mode::Replace {
+                    self.replace_push(stack_valid, None);
+                }
+            }
+            KeyCode::Backspace if self.mode == Mode::Replace && !self.cursors_active() => {
+                self.replace_backspace();
             }
             KeyCode::Backspace => self.for_each_cursor(|ed| ed.insert_backspace()),
             KeyCode::Tab => self.insert_tab(),
-            KeyCode::Left => {
-                let s = self.buffer().line(self.cursor.line);
-                self.cursor.col = unicode::prev_grapheme(&s, self.cursor.col);
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Home
+            | KeyCode::End => {
+                match key.code {
+                    KeyCode::Left => {
+                        let s = self.buffer().line(self.cursor.line);
+                        self.cursor.col = unicode::prev_grapheme(&s, self.cursor.col);
+                    }
+                    KeyCode::Right => {
+                        let s = self.buffer().line(self.cursor.line);
+                        self.cursor.col = unicode::next_grapheme(&s, self.cursor.col).min(s.len());
+                    }
+                    KeyCode::Up => self.move_vertical(-1, true),
+                    KeyCode::Down => self.move_vertical(1, true),
+                    // `i_<Home>` / `i_<End>`: jump to the first / last column of the
+                    // cursor's own line without leaving Insert. `<Home>` is column
+                    // zero (vim's `0`, not `^` — it does not stop at the first
+                    // non-blank), and `<End>` is the past-the-last-character append
+                    // column Insert allows.
+                    KeyCode::Home => self.cursor.col = 0,
+                    _ => self.cursor.col = self.line_len(),
+                }
+                // A cursor key starts a new insert where it lands, as in vim: the
+                // count of `3i` no longer repeats, and `<C-w>`/`<C-u>` stop here.
+                self.insert_repeat = 1;
+                self.insert_start = (self.cursor.line, self.cursor.col);
             }
-            KeyCode::Right => {
-                let s = self.buffer().line(self.cursor.line);
-                self.cursor.col = unicode::next_grapheme(&s, self.cursor.col).min(s.len());
-            }
-            KeyCode::Up => self.move_vertical(-1, true),
-            KeyCode::Down => self.move_vertical(1, true),
-            // `i_<Home>` / `i_<End>`: jump to the first / last column of the
-            // cursor's own line without leaving Insert. `<Home>` is column zero
-            // (vim's `0`, not `^` — it does not stop at the first non-blank), and
-            // `<End>` is the past-the-last-character append column Insert allows.
-            KeyCode::Home => self.cursor.col = 0,
-            KeyCode::End => self.cursor.col = self.line_len(),
             KeyCode::Delete => {
                 let len = self.line_len();
                 if self.cursor.col < len {
@@ -380,6 +431,7 @@ impl Editor {
             // `<C-r>` arms register insertion: the next keystroke (handled at the
             // top of this fn) names the register to pull in.
             KeyCode::Char('r') if key.ctrl => self.awaiting_register = true,
+            KeyCode::Char('g') if key.ctrl && !key.alt => self.awaiting_ctrl_g = true,
             // `i_CTRL-O`: drop to Normal for exactly one command, then resume Insert
             // here. Remember the insert flavour (Insert / Replace) to return to; the
             // resume happens in [`Editor::input`] once the one-shot command settles.
@@ -396,6 +448,17 @@ impl Editor {
                 self.insert_normal = Some(self.mode);
                 self.mode = Mode::Normal;
             }
+            // `i_CTRL-W` / `i_CTRL-U`: rub out the word / everything before the
+            // cursor on its line (at column 0, the line break, like `<BS>`).
+            KeyCode::Char('w') if key.ctrl && !key.alt => {
+                self.for_each_cursor(|ed| ed.insert_delete_before(false));
+            }
+            KeyCode::Char('u') if key.ctrl && !key.alt => {
+                self.for_each_cursor(|ed| ed.insert_delete_before(true));
+            }
+            // Any other unbound Ctrl chord is a command key, never text: typing it
+            // must not drop its bare letter into the buffer.
+            KeyCode::Char(_) if key.ctrl => {}
             // A typed character lands at every cursor (the primary and any
             // secondary multi-cursors); with none, `for_each_cursor` is just the
             // single-cursor insert. The `".` last-insert register records the
@@ -473,15 +536,21 @@ impl Editor {
             return;
         }
         let at = self.cursor_char();
+        let stack_valid = self.replace_stack_valid();
+        let mut overtyped = None;
         if self.mode == Mode::Replace && self.cursor.col < self.line_len() {
             let s = self.buffer().line(self.cursor.line);
-            let end = self.buffer().line_start(self.cursor.line)
-                + unicode::next_grapheme(&s, self.cursor.col);
+            let next = unicode::next_grapheme(&s, self.cursor.col);
+            overtyped = Some(s[self.cursor.col..next].to_string());
+            let end = self.buffer().line_start(self.cursor.line) + next;
             self.buffer_mut().remove(at..end);
         }
         self.buffer_mut().insert_char(at, c);
         self.cursor.col += c.len_utf8();
         self.buffer_mut().modified = true;
+        if self.mode == Mode::Replace {
+            self.replace_push(stack_valid, overtyped);
+        }
         // smartindent electric dedent: a closing bracket typed as the first
         // non-blank char of a line re-indents that line to its opener's level.
         if self.mode == Mode::Insert
@@ -710,6 +779,7 @@ impl Editor {
         // arriving is real content, not an indent nobody typed into.
         self.close_completion();
         self.awaiting_register = false;
+        self.awaiting_ctrl_g = false;
         self.ai_open_line = None;
 
         // Record the payload for dot-repeat, bracketed exactly as the client sent it.
@@ -838,6 +908,163 @@ impl Editor {
         self.insert_text.push_str(&ws);
     }
 
+    /// Replay the insert session's typed text [`Editor::insert_repeat`] `- 1` more
+    /// times at the cursor, through the same per-character path typing takes (so a
+    /// Replace session overtypes). A repeat whose text would exceed 64 MiB is refused
+    /// loudly (`E1240`) rather than freezing the editor. Single-cursor only.
+    fn replay_insert_count(&mut self) {
+        let extra = std::mem::replace(&mut self.insert_repeat, 1).saturating_sub(1);
+        if extra == 0
+            || (self.insert_text.is_empty() && !self.insert_repeat_lines)
+            || self.cursors_active()
+        {
+            self.insert_repeat_lines = false;
+            return;
+        }
+        const MAX_REPEAT_BYTES: usize = 64 << 20;
+        if self
+            .insert_text
+            .len()
+            .checked_mul(extra)
+            .is_none_or(|n| n > MAX_REPEAT_BYTES)
+        {
+            self.echo("E1240: Resulting text too long");
+            return;
+        }
+        let text = self.insert_text.clone();
+        let was_paste = std::mem::replace(&mut self.paste_active, true);
+        let lines = std::mem::take(&mut self.insert_repeat_lines);
+        for _ in 0..extra {
+            if lines {
+                self.insert_newline();
+            }
+            for c in text.chars() {
+                if c == '\n' {
+                    self.insert_newline();
+                } else {
+                    self.insert_char_at_cursor(c);
+                }
+            }
+        }
+        self.paste_active = was_paste;
+    }
+
+    /// Record one Replace-mode keystroke on the replace stack: the grapheme it
+    /// overtyped, or `None` when it added text (past the line's end, a line break).
+    /// `valid` is [`Editor::replace_stack_valid`] sampled *before* the keystroke's
+    /// edit moved the cursor.
+    fn replace_push(&mut self, valid: bool, overtyped: Option<String>) {
+        if !valid {
+            self.replace_stack.clear();
+        }
+        self.replace_stack.push(overtyped);
+        self.replace_stack_tick = (self.cur_buffer(), self.cursor.line, self.cursor.col);
+    }
+
+    /// Whether the replace stack still describes the text before the cursor: the
+    /// cursor has not left the spot the last push/pop put it on.
+    fn replace_stack_valid(&self) -> bool {
+        self.replace_stack_tick == (self.cur_buffer(), self.cursor.line, self.cursor.col)
+    }
+
+    /// `<BS>` in Replace mode (vim's `replace_do_bs`): a character that overtyped
+    /// text gets the original back, one that was appended is deleted, and before
+    /// the start of the session's typing the cursor only moves left.
+    fn replace_backspace(&mut self) {
+        if !self.replace_stack_valid() {
+            self.replace_stack.clear();
+        }
+        match self.replace_stack.pop() {
+            Some(Some(orig)) if self.cursor.col > 0 => {
+                let start = self.buffer().line_start(self.cursor.line);
+                let s = self.buffer().line(self.cursor.line);
+                let prev_col = unicode::prev_grapheme(&s, self.cursor.col);
+                let col = self.cursor.col;
+                let removed = s[prev_col..col].chars().count();
+                self.buffer_mut().remove(start + prev_col..start + col);
+                self.buffer_mut().insert(start + prev_col, &orig);
+                self.cursor.col = prev_col;
+                self.buffer_mut().modified = true;
+                self.trim_insert_text(removed);
+            }
+            Some(_) => self.insert_backspace(),
+            None => {
+                if self.cursor.col > 0 {
+                    let s = self.buffer().line(self.cursor.line);
+                    self.cursor.col = unicode::prev_grapheme(&s, self.cursor.col);
+                } else if self.cursor.line > 0 {
+                    self.cursor.line -= 1;
+                    self.cursor.col = self.line_len();
+                }
+                if (self.cursor.line, self.cursor.col) < self.insert_start {
+                    self.insert_start = (self.cursor.line, self.cursor.col);
+                }
+                return;
+            }
+        }
+        self.replace_stack_tick = (self.cur_buffer(), self.cursor.line, self.cursor.col);
+    }
+
+    /// The per-cursor body of `i_CTRL-W` (`line == false`: the word before the
+    /// cursor, after any blanks) and `i_CTRL-U` (`line == true`: all text before
+    /// the cursor, keeping the indent under `'autoindent'` when there is text past
+    /// it). At column 0 both delete the line break, as `<BS>` does.
+    fn insert_delete_before(&mut self, line: bool) {
+        if self.cursor.col == 0 {
+            self.insert_backspace();
+            return;
+        }
+        let s = self.buffer().line(self.cursor.line);
+        let col = self.cursor.col;
+        let to = if line {
+            let fnb = self.first_non_blank(self.cursor.line);
+            if self.buffer().options.autoindent && fnb < col {
+                fnb
+            } else {
+                0
+            }
+        } else {
+            let head = &s[..col];
+            let mut it = head.char_indices().rev().peekable();
+            while it.next_if(|&(_, c)| c == ' ' || c == '\t').is_some() {}
+            let mut to = it.peek().map_or(0, |&(i, c)| i + c.len_utf8());
+            if let Some(&(_, c)) = it.peek() {
+                let class = char_class(c);
+                for (i, c) in it {
+                    if char_class(c) != class {
+                        break;
+                    }
+                    to = i;
+                }
+            }
+            to
+        };
+        // vim stops once at the start of the insert: text typed in this session
+        // goes first, and only a further `<C-w>`/`<C-u>` reaches what was there.
+        let (start_line, start_col) = self.insert_start;
+        let to = if start_line == self.cursor.line
+            && to < start_col
+            && start_col < col
+            && s.is_char_boundary(start_col)
+        {
+            start_col
+        } else {
+            to
+        };
+        if to == col {
+            return;
+        }
+        let start = self.buffer().line_start(self.cursor.line);
+        let removed = s[to..col].chars().count();
+        self.buffer_mut().remove(start + to..start + col);
+        self.cursor.col = to;
+        self.buffer_mut().modified = true;
+        self.trim_insert_text(removed);
+        if start_line == self.cursor.line && to < start_col {
+            self.insert_start.1 = to;
+        }
+    }
+
     fn insert_backspace(&mut self) {
         if self.cursor.col > 0 {
             if self.buffer().options.autopairs && self.autopair_backspace() {
@@ -863,6 +1090,10 @@ impl Editor {
             self.cursor.col = prev_len;
             self.buffer_mut().modified = true;
             self.trim_insert_text(1); // the joined newline
+        }
+        // Backspacing past the start of the insert moves that start with it.
+        if (self.cursor.line, self.cursor.col) < self.insert_start {
+            self.insert_start = (self.cursor.line, self.cursor.col);
         }
     }
 

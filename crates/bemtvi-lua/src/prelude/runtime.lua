@@ -273,11 +273,20 @@ function btv.notify(msg, level, _opts)
 end
 vim.notify = btv.notify
 
--- `btv.notify_once` [alias `vim.notify_once`]: in neovim this dedups by message; we have
--- no message history to dedup against during a one-shot colorscheme load, so route
--- to notify.
+btv._notified_once = btv._notified_once or {}
+
+-- `btv.notify_once(msg[, level[, opts]])` [alias `vim.notify_once`]: `btv.notify`, but a
+-- given message is shown only the FIRST time it is sent this session (as neovim's), so a
+-- deprecation warning raised from a hot path does not flood the message line. Returns
+-- `true` when the message was shown, `false` when it was suppressed as a repeat.
 function btv.notify_once(msg, level, opts)
-  return btv.notify(msg, level, opts)
+  local key = type(msg) == "table" and table.concat(msg, "\n") or tostring(msg)
+  if btv._notified_once[key] then
+    return false
+  end
+  btv._notified_once[key] = true
+  btv.notify(msg, level, opts)
+  return true
 end
 vim.notify_once = btv.notify_once
 

@@ -1018,6 +1018,24 @@ async fn setloclist_getloclist_round_trip_is_window_scoped() {
     assert_eq!(got.as_str(), Some("1|1|2|A|B1"));
 }
 
+/// A huge `:cnewer` count clamps to the newest list rather than overflowing the
+/// stack-pointer arithmetic (a debug-build panic).
+#[tokio::test]
+async fn cnewer_with_a_huge_count_clamps_to_the_newest_list() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"vim.fn.setqflist({ { filename = "a", lnum = 1, text = "list1" } }, " ")
+           vim.fn.setqflist({ { filename = "b", lnum = 2, text = "list2" } }, " ")"#,
+    )
+    .await;
+    // Already on the newest (second) list: the step overflowed `cur + count`.
+    let msg = message_after(&rpc, &mut incoming, ":cnewer 18446744073709551615<CR>").await;
+    assert!(msg.contains("E381"), "expected E381, got {msg:?}");
+    let cur = exec_lua(&rpc, "return vim.fn.getqflist()[1].text").await;
+    assert_eq!(cur.as_str(), Some("list2"));
+}
+
 #[tokio::test]
 async fn colder_and_cnewer_walk_the_quickfix_stack() {
     let (rpc, mut incoming) = start().await;
@@ -1143,7 +1161,9 @@ async fn lmake_populates_the_loclist_not_the_quickfix_list() {
         src,
         ":lmake jumped into the error's file"
     );
-    assert_eq!(cursor(&rpc).await, (2, 2), "landed on the first error");
+    // Column 3 is past the end of `l2`; a Normal-mode landing clamps onto its last
+    // char, as vim's does.
+    assert_eq!(cursor(&rpc).await, (2, 1), "landed on the first error");
 }
 
 #[tokio::test]
@@ -1295,6 +1315,14 @@ fn row_has_group(map: &[(Value, Value)], needle: &str, group: &str) -> bool {
 #[tokio::test]
 async fn lspdiagnostics_colors_loclist_rows_by_severity() {
     let (rpc, mut incoming) = start().await;
+    // Wide enough that a row's message survives past the absolute temp path: the
+    // redraw ships a `nowrap` row only as far as the window can show it.
+    rpc.request(
+        "btv_ui_try_resize",
+        vec![Value::from(400u64), Value::from(24u64)],
+    )
+    .await
+    .expect("resize");
     let path = write_temp("diag_color", "txt", "aa\nbb\ncc\ndd\n");
     message_after(&rpc, &mut incoming, &format!(":e {path}<CR>")).await;
     // One diagnostic of each severity, on ascending lines so the loclist (sorted by
@@ -1627,4 +1655,19 @@ async fn a_list_write_precedes_the_command_that_opens_it() {
     assert_eq!(owned, Some(1), "the owner window kept its location list");
     exec_lua(&rpc, r#"vim.cmd("ll 1")"#).await;
     assert_eq!(cursor(&rpc).await.0, 2, ":ll 1 jumped to the entry");
+}
+
+/// An out-of-range `bufnr` / `nr` (beyond i32) is a caller error that fails loud —
+/// never silently wrapped onto some other buffer (2^32 + 1 used to land on buffer 1).
+#[tokio::test]
+async fn an_out_of_range_bufnr_or_nr_fails_loud() {
+    let (rpc, _incoming) = start().await;
+    let got = exec_lua(
+        &rpc,
+        "local ok1, e1 = pcall(vim.fn.setqflist, { { bufnr = 4294967297, lnum = 1, text = 'x' } })\n\
+         local ok2, e2 = pcall(vim.fn.setqflist, { { filename = 'a', lnum = 1, nr = 4294967297 } })\n\
+         return tostring(ok1) .. '|' .. tostring(tostring(e1):match('bufnr')) .. '|' .. tostring(ok2) .. '|' .. tostring(tostring(e2):match('nr'))",
+    )
+    .await;
+    assert_eq!(got.as_str(), Some("false|bufnr|false|nr"), "got {got:?}");
 }

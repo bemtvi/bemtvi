@@ -538,6 +538,56 @@ async fn ts_install_fetches_inherited_query_sets() {
     );
 }
 
+/// The `; inherits:` names come from downloaded query text and are joined into
+/// `<data>/queries/<lang>/`: a `../..` there must not write query files outside the
+/// data dir. Only a plain grammar identifier is followed.
+#[tokio::test]
+async fn ts_install_ignores_an_inherited_name_that_escapes_the_query_dir() {
+    let _guard = test_lock().lock().await;
+    let root = bemtvi_test_harness::temp_root().join("bemtvi-tsinstall-inherit-escape");
+    let _ = std::fs::remove_dir_all(&root);
+    let data_dir = root.join("data");
+    let mirror = root.join("mirror");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let nt = mirror
+        .join("raw.githubusercontent.com/nvim-treesitter/nvim-treesitter")
+        .join(REF);
+    write_under(
+        &nt.join("lua/nvim-treesitter/parsers.lua"),
+        parsers_lua(REV).as_bytes(),
+    );
+    write_under(
+        &nt.join("runtime/queries/rust/highlights.scm"),
+        b"; inherits: ../../escaped\n(identifier) @variable\n",
+    );
+    // Where the mirror resolves `runtime/queries/../../escaped/highlights.scm`.
+    write_under(
+        &nt.join("escaped/highlights.scm"),
+        b"(line_comment) @comment\n",
+    );
+    build_source_tarball(
+        &mirror
+            .join("github.com/tree-sitter/tree-sitter-rust/archive")
+            .join(format!("{REV}.tar.gz")),
+        &format!("tree-sitter-rust-{REV}"),
+    );
+    std::env::set_var("BEMTVI_DATA_DIR", &data_dir);
+    std::env::set_var("BEMTVI_TS_MIRROR", &mirror);
+    std::env::set_var("BEMTVI_TS_REF", REF);
+    std::env::set_var(
+        "BEMTVI_CC",
+        std::env::var("CC").unwrap_or_else(|_| "cc".into()),
+    );
+
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, ":TSInstall rust<CR>");
+    let msg = wait_for_message(&rpc, &mut incoming, "TSInstall: installed").await;
+    assert!(
+        !root.join("escaped").exists(),
+        "an inherited `../..` name wrote outside the data dir ({msg:?})"
+    );
+}
+
 #[tokio::test]
 async fn ts_install_unknown_language_fails_loud() {
     let _guard = test_lock().lock().await;
@@ -843,4 +893,34 @@ async fn ts_install_repo_generates_parser_from_grammar_js_via_cli() {
         spans > 0,
         "the CLI-generated grammar produced no highlights"
     );
+}
+
+/// A repo's `tree-sitter.json` `path` names the grammar's subdir *inside* the repo. An
+/// absolute or `..` path would point the build (and a `tree-sitter generate`, which
+/// writes) at a directory outside the unpacked source, so it fails loud instead.
+#[tokio::test]
+async fn ts_install_repo_rejects_a_grammar_path_outside_the_repo() {
+    let _guard = test_lock().lock().await;
+    let outside = grammar_src_dir();
+    for (tag, path) in [
+        ("abs", outside.to_string_lossy().into_owned()),
+        ("dotdot", "../../..".to_string()),
+    ] {
+        let json = format!(
+            r#"{{ "grammars": [ {{ "name": "rust", "path": {} }} ] }}"#,
+            serde_json::Value::String(path.clone())
+        );
+        let data_dir = repo_fixture(&format!("badpath-{tag}"), "HEAD", &json);
+        let (rpc, mut incoming) = start(None).await;
+        feed(&rpc, ":TSInstall acme/tree-sitter-demo<CR>");
+        let msg = wait_for_message(&rpc, &mut incoming, "TSInstall: acme/tree-sitter-demo").await;
+        assert!(
+            msg.contains("failed") && msg.contains("path"),
+            "a grammar path of {path:?} must fail loud: {msg:?}"
+        );
+        assert!(
+            !data_dir.join("parser/rust.so").exists(),
+            "nothing was built"
+        );
+    }
 }

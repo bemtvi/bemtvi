@@ -195,6 +195,14 @@ impl Editor {
             .filter_map(|slot| slot.tree.as_mut())
     }
 
+    /// Read-only [`Editor::parked_trees_mut`].
+    pub(crate) fn parked_trees(&self) -> impl Iterator<Item = &WindowTree> {
+        std::iter::once(&self.main_tabs)
+            .chain(self.dock_tabs.iter().flatten())
+            .flat_map(|stack| stack.tabs.iter())
+            .filter_map(|slot| slot.tree.as_ref())
+    }
+
     /// The layer (and its tree) that owns window `id`, scanning every open layer.
     /// `None` if no open window across the main tree and all docks has that id.
     pub(crate) fn tree_of_window(&self, id: WindowId) -> Option<(Layer, &WindowTree)> {

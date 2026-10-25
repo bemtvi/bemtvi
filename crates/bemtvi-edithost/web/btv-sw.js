@@ -20,6 +20,13 @@
 //                                                                       └─► wasm ─► Lua
 //                        ◄────────── port.postMessage(reply) ◄────────────┘
 //
+// ISOLATION. Mounts are served on the EDITOR's own origin, so the editor (Lua, shared with
+// the native listener) adds a `sandbox` CSP to every reply unless the mount opted into
+// `same_origin`; the headers below pass it through untouched. That CSP is what keeps a
+// mount's document out of this origin's OPFS, the wasm and the daemon link. There is no
+// session token on this path, unlike the native listener: this worker only answers fetches
+// from this origin's own pages, which no other local process can make.
+//
 // See docs/plans/2026-07-14-btv-http-mount.md.
 
 // Everything under here is the editor's; everything else on the origin is the site's own and

@@ -2184,3 +2184,58 @@ async fn accepting_a_row_whose_command_opens_a_tab_leaves_no_orphan_docs_float()
         "no orphaned docs float survives in the tab the wildmenu was open in"
     );
 }
+
+// The server hands `btv._cmdline_complete_run` a CHAR offset; the completer must see
+// every word up to the cursor even when an earlier argument holds multibyte text
+// (treating the char offset as a byte offset dropped one trailing byte per extra
+// UTF-8 byte, so the partial word lost its last character).
+#[tokio::test]
+async fn user_command_complete_fn_args_survive_multibyte_text() {
+    let dir = temp_dir("cmdcomplete_fn_utf8");
+    let init = "btv.cmdline_complete.setup {}\n\
+        btv.user_command.create('Sub', function() end, { complete = function(args) \
+          _G.seen = table.concat(args, '|') return { 'tea', 'toast' } end })";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    feed(&rpc, ":Sub café ñandú t<Tab>");
+    let _ = poll_menu(&rpc, &mut incoming).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.seen").await.as_str(),
+        Some("café|ñandú|t"),
+        "the completer must receive the whole args typed before the cursor"
+    );
+}
+
+/// A user command's completer that throws used to yield no candidates with no word
+/// about why — `<Tab>` just did nothing, and the plugin author had nothing to go on.
+/// The error is now reported (once per distinct error, since the completer re-runs
+/// on every keystroke while the menu is open), still yielding no candidates.
+#[tokio::test]
+async fn a_throwing_user_command_completer_is_reported() {
+    let dir = temp_dir("cmdcomplete_fn_throws");
+    let init = "btv.cmdline_complete.setup {}\n\
+        btv.user_command.create('Sub', function() end, { complete = function(_args) \
+          error('completer exploded') end })";
+    let (rpc, _incoming) = start(&dir, init).await;
+    let got = exec_lua(
+        &rpc,
+        "local notes = {}\n\
+         btv.notify = function(m) notes[#notes + 1] = tostring(m) end\n\
+         local a = btv._cmdline_complete_run('Sub ', 4)\n\
+         local b = btv._cmdline_complete_run('Sub x', 5)\n\
+         return { #a + #b, #notes, notes[1] or '' }",
+    )
+    .await;
+    let arr = got.as_array().expect("an array");
+    assert_eq!(
+        arr[0].as_i64(),
+        Some(0),
+        "no candidates from a throwing completer"
+    );
+    assert_eq!(arr[1].as_i64(), Some(1), "reported once, not per keystroke");
+    let note = arr[2].as_str().unwrap_or_default();
+    assert!(
+        note.contains("Sub") && note.contains("completer exploded"),
+        "the report names the command and the error: {note:?}"
+    );
+}

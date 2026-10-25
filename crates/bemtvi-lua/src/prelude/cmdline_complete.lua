@@ -1075,6 +1075,18 @@ local function user_command_complete(cmd)
   return rec and rec.complete or nil
 end
 
+-- Report a user-command completer that threw. The completer re-runs on every
+-- keystroke while the menu is open, so a repeat of the last report is skipped.
+local last_completer_error
+local function report_completer_error(cmd, err)
+  local msg = ":" .. tostring(cmd) .. " completion failed: " .. tostring(err)
+  if msg == last_completer_error then
+    return
+  end
+  last_completer_error = msg
+  btv.notify(msg, btv.log.levels.ERROR)
+end
+
 -- Whether `v` is a thenable (a promise) — what an *async* completer returns.
 local function is_promise(v)
   return type(v) == "table" and type(v.next) == "function"
@@ -1092,9 +1104,9 @@ end
 
 function btv._cmdline_complete_run(line, col)
   -- Argument region iff a complete word is followed by whitespace before the cursor.
-  -- The command word and its trailing space are ASCII, so this byte scan of the
-  -- char-offset-truncated prefix is exact for the only structure we test.
-  local before = line:sub(1, col)
+  -- `col` is a CHAR offset (the server counts codepoints), so convert it to the byte
+  -- offset `string.sub` needs before cutting the prefix.
+  local before = line:sub(1, btv.str.byteindex(line, col))
   -- A command modifier (`:vertical`/`:tab`/`:silent`, optional `!`) wraps a nested
   -- command: once past the modifier word, strip it (and its trailing whitespace) and
   -- complete the REMAINDER, so the nested command completes as if typed bare. The
@@ -1157,14 +1169,15 @@ function btv._cmdline_complete_run(line, col)
       return launch_path_picker(before, uc == "dir")
     end
     if type(uc) == "function" then
-      -- Call the completer with the args so far. A throw yields no candidates rather
-      -- than breaking the command line. A SYNC completer returns its list straight to
+      -- Call the completer with the args so far. A throw is reported and yields no
+      -- candidates rather than breaking the command line. A SYNC completer returns its list straight to
       -- the inline wildmenu (core fuzzy-ranks it against the partial word, and re-runs
       -- this per keystroke so it tracks the growing args); an ASYNC one returns a
       -- promise, which can't be awaited synchronously here, so it routes through the
       -- picker instead.
       local ok, result = pcall(uc, arg_list(before))
       if not ok then
+        report_completer_error(cmd, result)
         return {}
       end
       if is_promise(result) then

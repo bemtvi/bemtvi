@@ -143,6 +143,33 @@ impl LuaSandbox {
             .ok_or_else(|| SandboxError::Runtime(format!("{what} handle released")))
     }
 
+    /// Load `wrapped` (a chunk returning the callable) and run it once to obtain
+    /// the function, storing it under a fresh handle.
+    ///
+    /// That one run is user code too: the source is spliced into the wrapper, so it
+    /// can close the wrapper early and put arbitrary statements in the chunk's own
+    /// body. It therefore runs under the same deadline as a call.
+    fn compile_wrapped(&mut self, wrapped: &str) -> Result<SandboxFn, SandboxError> {
+        let outer = self
+            .lua
+            .load(wrapped)
+            .set_name("=btv-sandbox")
+            .set_environment(self.env.clone())
+            .into_function()
+            .map_err(|e| SandboxError::Compile(tidy(&e.to_string())))?;
+        self.deadline.set(Some(Instant::now() + CALL_DEADLINE));
+        let result: Result<mlua::Function, mlua::Error> = outer.call(());
+        self.deadline.set(None);
+        let f = result.map_err(|e| match Self::runtime_err(e) {
+            SandboxError::Runtime(msg) => SandboxError::Compile(msg),
+            other => other,
+        })?;
+        let id = self.next_id;
+        self.next_id += 1;
+        self.fns.insert(id, f);
+        Ok(SandboxFn(id))
+    }
+
     /// Map an mlua error onto the seam's typed error, recovering a deadline abort
     /// from its marker.
     fn runtime_err(err: mlua::Error) -> SandboxError {
@@ -174,21 +201,7 @@ impl SandboxEngine for LuaSandbox {
         // fresh arguments; the inner function inherits the sandbox environment as
         // its `_ENV` upvalue, so the closure is sandboxed too.
         let wrapped = format!("return function({}) return ({src}) end", params.join(", "));
-        let outer = self
-            .lua
-            .load(&wrapped)
-            .set_name("=btv-sandbox")
-            .set_environment(self.env.clone())
-            .into_function()
-            .map_err(|e| SandboxError::Compile(tidy(&e.to_string())))?;
-        let f: mlua::Function = outer
-            .call(())
-            .map_err(|e| SandboxError::Compile(tidy(&e.to_string())))?;
-
-        let id = self.next_id;
-        self.next_id += 1;
-        self.fns.insert(id, f);
-        Ok(SandboxFn(id))
+        self.compile_wrapped(&wrapped)
     }
 
     fn call_subst(
@@ -318,20 +331,7 @@ impl SandboxEngine for LuaSandbox {
         // The only difference from `compile_expr`: the body is spliced in as
         // statements, so the source supplies its own `return`.
         let wrapped = format!("return function({}) {src} end", params.join(", "));
-        let outer = self
-            .lua
-            .load(&wrapped)
-            .set_name("=btv-sandbox")
-            .set_environment(self.env.clone())
-            .into_function()
-            .map_err(|e| SandboxError::Compile(tidy(&e.to_string())))?;
-        let f: mlua::Function = outer
-            .call(())
-            .map_err(|e| SandboxError::Compile(tidy(&e.to_string())))?;
-        let id = self.next_id;
-        self.next_id += 1;
-        self.fns.insert(id, f);
-        Ok(SandboxFn(id))
+        self.compile_wrapped(&wrapped)
     }
 
     fn call_paint(
@@ -758,9 +758,10 @@ fn paint_span(span: Table, nth: usize) -> Result<PaintSpan, SandboxError> {
     // empty span, which paints nothing rather than erroring: `line:find` on a
     // zero-width match legitimately produces one, and a decoration-only span has no
     // range by design.
+    let start = first.max(1) - 1;
     Ok(PaintSpan {
-        start: (first.max(1) - 1) as usize,
-        end: last.max(first - 1) as usize,
+        start: start as usize,
+        end: last.max(start) as usize,
         group,
         decor,
         priority,
@@ -836,6 +837,11 @@ fn named_key<T: Copy>(
 fn number_result(v: Value) -> Result<f64, SandboxError> {
     match v {
         Value::Integer(n) => Ok(n as f64),
+        // NaN orders neither above nor below anything, so it cannot be a key in
+        // the total order the rows are sorted by.
+        Value::Number(n) if n.is_nan() => Err(SandboxError::BadReturn(
+            "NaN (not an orderable sort key)".to_string(),
+        )),
         Value::Number(n) => Ok(n),
         other => Err(SandboxError::BadReturn(other.type_name().to_string())),
     }

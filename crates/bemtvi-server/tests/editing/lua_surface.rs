@@ -327,6 +327,21 @@ async fn ex_command_expands_q_args_in_the_replacement() {
 }
 
 #[tokio::test]
+async fn ex_command_does_not_re_expand_escapes_inside_the_arguments() {
+    // The escapes expand in ONE pass over the template: argument text that happens to
+    // spell an escape (`<bang>`) is data, not template, and must reach the command
+    // verbatim rather than being expanded a second time.
+    let (rpc, mut incoming) = start(None).await;
+    command(&rpc, "command! -nargs=1 Say echo <q-args>").await;
+    let map = redraw_after(&rpc, &mut incoming, ":Say <lt>bang><CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("<bang>"),
+        "an escape spelled in the arguments must not be expanded"
+    );
+}
+
+#[tokio::test]
 async fn ex_command_without_bang_refuses_to_clobber() {
     // Re-defining an existing command without `!` is E174, matching vim — the
     // bang is the opt-in to replace. (Plugins always use `command!` for exactly

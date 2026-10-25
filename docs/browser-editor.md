@@ -58,8 +58,13 @@ native edit-host split uses, so only the transport differs:
   `:connect bemtvi://…`, and `:e` / `:w` operate on the **daemon's** filesystem over
   **WebTransport** (HTTP/3 / QUIC). Editing still happens entirely in the tab — only
   fs crosses the wire. Having no local disk, the browser is **always remote-config**:
-  it runs the **daemon's** config + plugins (fetched over the wire) and keeps shada on
-  the daemon, where a native client would default to local. Daemon mode also brings
+  it runs the **daemon's** config + plugins (fetched over the wire), where a native
+  client would default to local. Because a link can name any daemon, a `?daemon=` from
+  the page URL connects only after you approve it in a prompt that shows `HOST:PORT` and
+  the cert hash; the page remembers the approval for that address and cert, and
+  declining keeps the tab local. A daemon session's shada (registers, history, marks,
+  plugin state) is its own OPFS blob, one per daemon address, so a daemon's config never
+  sees the local session's state or another daemon's. Daemon mode also brings
   **async processes** (`btv.run` / `btv.process`), **`:terminal`**, and **LSP** over
   the wire — the daemon's real language servers, driven from the tab. A dropped
   WebTransport link **auto-reconnects** (the tab's editor is local, so your buffers

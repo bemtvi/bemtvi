@@ -226,3 +226,56 @@ fn a_checkout_still_deletes_a_file_the_target_tree_drops() {
     assert!(repo.join("keep.txt").exists());
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A file deleted from the worktree diffs as all-removals even when the editor
+/// reached it through a symlinked directory. The path no longer exists, so it can't
+/// be canonicalized as a whole; it must still be resolved against the canonical
+/// worktree root through its nearest existing ancestor, or the deleted file reads
+/// as "not inside the repository".
+#[cfg(unix)]
+#[test]
+fn a_deleted_file_reached_through_a_symlink_diffs_as_removals() {
+    let Some((base, repo, _target)) = fixture("symlinked-deleted") else {
+        return;
+    };
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&repo, &link).expect("symlink the repo");
+    std::fs::remove_file(repo.join("keep.txt")).unwrap();
+
+    let outcome = bemtvi_git::run_git_job(&GitJob::DiffFile {
+        path: link.to_string_lossy().into_owned(),
+        file: link.join("keep.txt").to_string_lossy().into_owned(),
+    });
+    match outcome {
+        Ok(bemtvi_lua::GitValue::Diff {
+            added,
+            changed,
+            removed,
+            ..
+        }) => assert_eq!((added, changed, removed), (0, 0, 1)),
+        other => panic!("a deleted tracked file should diff as one removal, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// `discover`'s `prefix` for a not-yet-written file reached through a symlinked
+/// directory names the directory it will live in, like it does for an existing one.
+#[cfg(unix)]
+#[test]
+fn discover_prefix_of_a_new_file_through_a_symlink() {
+    let Some((base, repo, _target)) = fixture("symlinked-new") else {
+        return;
+    };
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&repo, &link).expect("symlink the repo");
+    std::fs::create_dir_all(repo.join("sub")).unwrap();
+
+    let outcome = bemtvi_git::run_git_job(&GitJob::Discover {
+        path: link.join("sub/new.txt").to_string_lossy().into_owned(),
+    });
+    match outcome {
+        Ok(bemtvi_lua::GitValue::Discover { prefix, .. }) => assert_eq!(prefix, "sub"),
+        other => panic!("discover should name the file's directory, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}

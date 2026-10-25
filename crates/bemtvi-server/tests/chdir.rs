@@ -417,3 +417,29 @@ fn getcwd_raw() -> String {
         .to_string_lossy()
         .into_owned()
 }
+
+/// Ex-commands typed in one input batch run in order, even when one is the server's
+/// (`:lcd`) and the next the core's (`:close`): the `:lcd` lands on the window it was
+/// typed in, and closing that window takes its local dir with it — the window left
+/// keeps the global cwd. (The server's command used to wait for the end of the batch,
+/// after `:close` had already run, and so landed on the surviving window.)
+#[tokio::test]
+async fn a_server_ex_command_runs_before_the_next_one_in_the_same_batch() {
+    let _lock = serial_lock().lock().await;
+    let _guard = CwdGuard::capture();
+    let (rpc, _incoming) = start().await;
+    let global = getcwd(&rpc).await;
+    let dir = temp_dir("chdir_batch_order");
+    command(&rpc, "split").await;
+    feed(&rpc, &format!(":lcd {}<CR>:close<CR>", dir.display()));
+    barrier(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return #btv.win.list()").await.as_i64(),
+        Some(1)
+    );
+    assert_eq!(
+        getcwd(&rpc).await,
+        global,
+        "the `:lcd` belonged to the closed window, not the survivor"
+    );
+}

@@ -98,6 +98,46 @@ try {
   check("diag: the virtual-text message ('boom') rendered in the DOM",
     texts.some((t) => t && t.includes("boom")), `row spans=${JSON.stringify(texts)}`);
 
+  // (d2) The message line shows the diagnostic under the cursor, as natively.
+  const underMsg = await page.evaluate(async () => {
+    const r = await window.__bemtvi.feed("gg0");
+    return r.frame?.message ?? null;
+  });
+  check("diag: the message line shows the diagnostic under the cursor ('boom')",
+    String(underMsg).includes("boom"), `message=${JSON.stringify(underMsg)}`);
+
+  // (e) A scroll slide's band carries the same overlays as the settled window, so the
+  //     squiggle and the message slide with the text instead of blanking for the slide.
+  await page.evaluate(() => window.__bemtvi.execLua(`
+    local lines = { "hello world" }
+    for i = 2, 200 do lines[i] = "line " .. i end
+    btv.buf.set_lines(0, 0, -1, false, lines)
+  `));
+  await sleep(200);
+  await page.evaluate(() => window.__bemtvi.execLua(`
+    local ns = btv.ns.create("diag-deco-test")
+    btv.diagnostic.set(ns, 0, { { lnum = 0, col = 0, end_col = 5, severity = 1, message = "boom" } })
+  `));
+  await page.evaluate(() => window.__bemtvi.feed(":set scrollanim<CR>gg0"));
+  await sleep(200);
+  const band = await page.evaluate(async () => {
+    const r = await window.__bemtvi.feed("<C-d>");
+    const w = (r.frame?.windows || []).find((x) => x.focused) || {};
+    const s = w.scroll;
+    if (!s) return null;
+    return {
+      diag: (s.diagnostics || []).flat(),
+      virt: (s.diagnostics_virt || []).filter(Boolean),
+    };
+  });
+  check("band: the <C-d> frame carries a scroll band", band !== null, "no `scroll` on the frame");
+  check("band: the diagnostic underline rides the scroll band",
+    !!band && band.diag.some((s) => Array.isArray(s) && s[0] === 0 && s[1] === 5 && s[2] === 1),
+    `band.diagnostics=${JSON.stringify(band?.diag)}`);
+  check("band: the diagnostic virtual text rides the scroll band",
+    !!band && band.virt.some((v) => Array.isArray(v) && String(v[0]).includes("boom")),
+    `band.diagnostics_virt=${JSON.stringify(band?.virt)}`);
+
   await browser.close();
 } finally {
   cleanup();

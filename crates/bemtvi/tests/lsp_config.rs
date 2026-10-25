@@ -1005,6 +1005,79 @@ async fn a_request_routes_to_the_named_server() {
     );
 }
 
+/// With several clients attached, `btv.lsp.clients` and the single-client sugar
+/// (`btv.lsp.request` / `notify`) follow the documented routing order — `priority`
+/// descending, then config name — never the registry's hash order. `beta` outranks
+/// `alpha` here, so the default request goes to beta although alpha sorts first.
+#[tokio::test]
+async fn lsp_request_default_client_follows_priority_order() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-request-order");
+    arm_mock_named(
+        dir.as_path(),
+        "alpha",
+        r#"{ "hover": { "contents": "FROM-ALPHA" } }"#,
+    );
+    arm_mock_named(
+        dir.as_path(),
+        "beta",
+        r#"{ "hover": { "contents": "FROM-BETA" } }"#,
+    );
+    let (rpc, _incoming) = open_rust(dir.as_path()).await;
+    exec_lua(
+        &rpc,
+        "btv.lsp.config('alpha', { cmd = { 'unused' }, filetypes = { 'rust' }, priority = 1 })\n\
+         btv.lsp.config('beta',  { cmd = { 'unused' }, filetypes = { 'rust' }, priority = 9 })\n\
+         btv.lsp.enable('alpha')",
+    )
+    .await;
+    // alpha attaches FIRST (the lower client id), so registry order alone would put it
+    // ahead of the higher-priority beta.
+    assert!(
+        await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await,
+        "alpha attached"
+    );
+    exec_lua(&rpc, "btv.lsp.enable('beta')").await;
+    assert!(
+        await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "2").await,
+        "both servers attached"
+    );
+    let order = exec_lua(
+        &rpc,
+        "local n = {}\n\
+         for _, c in ipairs(btv.lsp.clients({ bufnr = 0 })) do n[#n + 1] = c.name end\n\
+         return table.concat(n, ',')",
+    )
+    .await;
+    exec_lua(
+        &rpc,
+        "_G.R = nil\n\
+         btv.lsp.request('textDocument/hover', btv.lsp.position_params(), function(err, res)\n\
+         \x20 _G.R = err and ('ERR ' .. tostring(err)) or btv.json.encode(res)\n\
+         end)",
+    )
+    .await;
+    let answered = await_lua_eq(
+        &rpc,
+        "tostring(_G.R ~= nil and _G.R:find('FROM%-') ~= nil)",
+        "true",
+    )
+    .await;
+    let reply = exec_lua(&rpc, "return tostring(_G.R)").await;
+    std::env::remove_var("BEMTVI_LSP_CMD_ALPHA");
+    std::env::remove_var("BEMTVI_LSP_CMD_BETA");
+    assert_eq!(
+        order.as_str(),
+        Some("beta,alpha"),
+        "clients() in priority order"
+    );
+    assert!(answered, "the request was answered, got {reply:?}");
+    assert!(
+        reply.as_str().unwrap_or_default().contains("FROM-BETA"),
+        "the default request goes to the highest-priority client, got {reply:?}"
+    );
+}
+
 #[tokio::test]
 async fn hover_merges_every_capable_server_in_priority_order() {
     // neovim's `vim.lsp.buf.hover` asks every client and composes one float; bemtvi
@@ -2606,5 +2679,66 @@ async fn a_rootless_server_pulling_workspace_folders_gets_none() {
     assert!(
         matches!(folders, None | Some(serde_json::Value::Null)),
         "a rootless client has no folders to hand back, got {folders:?}"
+    );
+}
+
+/// The `rootUri` a `before_init` hook receives is a real `file://` URI: a root holding
+/// a space or a `#` is percent-encoded (as every other URI the client sends is), not
+/// pasted in raw where a hook parsing it would truncate at the `#`.
+#[tokio::test]
+async fn before_init_root_uri_is_percent_encoded() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_cfg_rooturi");
+    let (rpc, _incoming) = open_rust(&dir).await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.uri = nil
+        btv.lsp.config("rooturi", {
+          cmd = { "placeholder" },
+          filetypes = { "rust" },
+          root_dir = "/tmp/a b#c",
+          before_init = function(params) _G.uri = params.rootUri end,
+        })
+        btv.lsp.enable("rooturi")
+        "#,
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "_G.uri", "file:///tmp/a%20b%23c").await,
+        "rootUri was {:?}",
+        exec_lua(&rpc, "return tostring(_G.uri)").await
+    );
+}
+
+/// A config that renames its server (`name = "bar"` under the registry key `"foo"`) is
+/// addressed by the name the server reports: `btv.lsp.stop("bar", { disable = true })`
+/// must close `"foo"`'s gate, or the very next matching buffer respawns what was just
+/// stopped.
+#[tokio::test]
+async fn stop_disable_closes_the_gate_of_a_renamed_config() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_cfg_renamed_stop");
+    let (rpc, _incoming) = open_rust(&dir).await;
+    exec_lua(
+        &rpc,
+        r#"
+        btv.lsp.config("foo", { name = "bar", cmd = { "placeholder" }, filetypes = { "rust" },
+          root_dir = "/tmp" })
+        btv.lsp.enable("foo")
+        "#,
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "btv.lsp._config_key.bar", "foo").await,
+        "the renamed server was started under its reported name"
+    );
+    exec_lua(&rpc, "btv.lsp.stop('bar', { disable = true })").await;
+    assert_eq!(
+        exec_lua(&rpc, "return tostring(btv.lsp._enabled.foo)")
+            .await
+            .as_str(),
+        Some("nil"),
+        "stopping by the reported name disabled the config it came from"
     );
 }

@@ -81,13 +81,6 @@ impl EditHost {
                 self.redraw();
             }
         }
-
-        // A `:sleep` parks the editor for the requested span. Awaiting (not
-        // blocking) keeps the RPC reader/writer tasks alive, so input typed
-        // during the sleep is buffered and applied once we wake.
-        if let Some(ms) = self.editor.take_sleep() {
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-        }
     }
 
     /// Dispatch an API method. This is the (small, growing) `nvim_*` surface.
@@ -373,7 +366,8 @@ impl EditHost {
             )),
             "nvim_get_current_win" => Ok(Value::from(self.editor.current_window_id().0)),
             "nvim_set_current_win" => {
-                let id = WindowId(uint(params.first(), 0) as u64);
+                let id = self.resolve_win(params.first());
+                self.check_win(id, "nvim_set_current_win")?;
                 self.editor.set_current_window(id);
                 self.emit_lifecycle_events();
                 self.run_pending();
@@ -388,7 +382,9 @@ impl EditHost {
             }
             "nvim_win_set_buf" => {
                 let win = self.resolve_win(params.first());
-                let buf = BufferId(uint(params.get(1), 0) as u64);
+                let buf = self.resolve_buf(params.get(1));
+                self.check_win(win, "nvim_win_set_buf")?;
+                self.check_buf(buf, "nvim_win_set_buf")?;
                 self.editor.set_window_buffer(win, buf);
                 self.emit_lifecycle_events();
                 self.run_pending();
@@ -481,6 +477,9 @@ impl EditHost {
                                 Some("left" | "right")
                             )
                         });
+                    if buf.0 != 0 {
+                        self.check_buf(buf, "nvim_open_win")?;
+                    }
                     let prev = self.editor.current_window_id();
                     let new = self.editor.open_split_window(buf, vertical);
                     if !enter {
@@ -547,6 +546,12 @@ impl EditHost {
             "nvim_get_current_tabpage" => Ok(Value::from(self.editor.current_tab_id().0)),
             "nvim_set_current_tabpage" => {
                 let tab = self.resolve_tabpage(params.first());
+                if !self.editor.tab_is_valid(tab) {
+                    return Err(format!(
+                        "nvim_set_current_tabpage: Invalid tabpage id: {}",
+                        tab.0
+                    ));
+                }
                 self.editor.set_current_tabpage(tab);
                 self.emit_lifecycle_events();
                 self.run_pending();
@@ -597,7 +602,8 @@ impl EditHost {
             )),
             "nvim_get_current_buf" => Ok(Value::from(self.editor.current_buffer_id().0)),
             "nvim_set_current_buf" => {
-                let id = BufferId(uint(params.first(), 0) as u64);
+                let id = self.resolve_buf(params.first());
+                self.check_buf(id, "nvim_set_current_buf")?;
                 self.editor.set_current_buffer(id);
                 self.emit_lifecycle_events();
                 self.run_pending();
@@ -645,6 +651,25 @@ impl EditHost {
                 Ok(Value::Array(vec![Value::from(1u64), Value::Map(vec![])]))
             }
             other => Err(format!("Unknown method: {other}")),
+        }
+    }
+
+    /// Reject a window handle that names no window (in any tab) with neovim's
+    /// "Invalid window id", rather than letting the setter silently do nothing.
+    fn check_win(&self, win: WindowId, method: &str) -> Result<(), String> {
+        match self.editor.window_buffer(win) {
+            Some(_) => Ok(()),
+            None => Err(format!("{method}: Invalid window id: {}", win.0)),
+        }
+    }
+
+    /// Reject a buffer handle that names no buffer with neovim's "Invalid buffer
+    /// id", rather than letting the setter silently do nothing.
+    fn check_buf(&self, buf: BufferId, method: &str) -> Result<(), String> {
+        if self.editor.buffer_is_valid(buf) {
+            Ok(())
+        } else {
+            Err(format!("{method}: Invalid buffer id: {}", buf.0))
         }
     }
 

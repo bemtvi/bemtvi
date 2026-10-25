@@ -65,7 +65,14 @@ btv.test.describe("examples/decor-invalidate", function()
     local spans = flagged(t, 5)
     btv.test.expect(#spans).to_be(1)
     btv.test.expect(spans[1][1]).to_be(48)
-    btv.test.expect(spans[1][2]).to_be(#t:line(5))
+    -- A highlight is only sent as far as the window can show it, so the flag
+    -- covers every painted cell from the limit on (the line's own end when it
+    -- fits the window, past the right edge when it doesn't) and never runs past
+    -- the line.
+    local painted = t:screen()[5]
+    btv.test.expect(t:line(5):sub(1, #painted)).to_equal(painted)
+    btv.test.expect(spans[1][2] >= #painted).to_be(true)
+    btv.test.expect(spans[1][2] <= #t:line(5)).to_be(true)
   end)
 
   btv.test.it("§1 — a short line carries nothing", function(t)

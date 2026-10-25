@@ -75,8 +75,8 @@ pub use render::{shape_with_fonts, TestGlyph};
 // The pure per-row syntax-coloring layer (run splitting + the no-colorscheme group
 // fallback), exported so the Tier-1 `syntax` test can exercise it without a GPU.
 pub use render::{
-    apply_search_fg, clear_bg_under, col_to_screen, group_fallback, rect_subtract, row_segments,
-    text_run_origin,
+    apply_search_fg, clear_bg_under, col_to_screen, expand_tabs, group_fallback, rect_subtract,
+    row_segments, text_run_origin,
 };
 // The wide-glyph mask (replace an off-grid emoji cluster with cell-width spaces) and
 // the shrink-to-fit sizing of the cluster that mask reserved room for, so the Tier-1

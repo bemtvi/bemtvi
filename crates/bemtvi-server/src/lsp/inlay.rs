@@ -22,7 +22,7 @@ use bemtvi_lsp::{InlayHintData, ServerKey};
 use bemtvi_lua::InlayHintMirrorData;
 use rmpv::Value;
 
-use super::{byte_col, InlayHintSpan, InlayHintsCache, InlayResolveTarget, LspReqKind};
+use super::{InlayHintSpan, InlayHintsCache, InlayResolveTarget, LspReqKind};
 use crate::redraw::StyleTable;
 use crate::EditHost;
 
@@ -127,6 +127,11 @@ impl EditHost {
         let server_key = key.clone();
 
         let mut by_line: BTreeMap<usize, Vec<InlayHintSpan>> = BTreeMap::new();
+        // One column converter per hinted line, shared by every hint on it: converting
+        // each hint by re-reading and re-walking its line was O(hints x line length),
+        // which froze the tick on a minified file's one long line.
+        let mut cols: std::collections::HashMap<usize, super::semantic::LineCols> =
+            std::collections::HashMap::new();
         for hint in hints {
             let line_idx = hint.line as usize;
             if line_idx >= buf.line_count() {
@@ -138,8 +143,10 @@ impl EditHost {
             if hint.label.is_empty() && hint.resolve_data.is_none() {
                 continue;
             }
-            let text = buf.line(line_idx);
-            let byte = byte_col(encoding, &text, hint.character as usize);
+            let byte = cols
+                .entry(line_idx)
+                .or_insert_with(|| super::semantic::LineCols::new(buf.line(line_idx)))
+                .byte(encoding, hint.character as usize);
             by_line.entry(line_idx).or_default().push(InlayHintSpan {
                 byte_col: byte,
                 text: sanitize_label(&hint.label),
@@ -332,9 +339,15 @@ impl EditHost {
                     return Value::Array(Vec::new());
                 }
                 spans.sort_by_key(|s| s.byte_col);
-                let Some(text) = buf.map(|b| b.line(line_idx)) else {
+                // Only the head of the line this row can show (see `RowSeg::text`);
+                // a hint anchored past a cut head is off screen.
+                let Some(row_text) = buf.and_then(|b| seg.text(b, tabstop)) else {
                     return Value::Array(Vec::new());
                 };
+                let clipped = row_text.clipped();
+                let text = &row_text.text;
+                // Sorted by anchor, so one forward walk maps them all.
+                let mut vc = unicode::LineVirtcol::new(text, tabstop);
                 let hints = spans
                     .iter()
                     // Skip an unresolved lazy placeholder (empty `text`): it has no
@@ -344,7 +357,10 @@ impl EditHost {
                     // rebased to row-local columns (so it rides the right continuation
                     // row); a hint outside this row's segment is skipped.
                     .filter_map(|s| {
-                        let col = unicode::virtcol(&text, s.byte_col.min(text.len()), tabstop);
+                        if clipped && s.byte_col > text.len() {
+                            return None;
+                        }
+                        let col = vc.at(s.byte_col.min(text.len()));
                         let col = seg.clip_col(col)?;
                         Some(Value::Array(vec![
                             Value::from(col as u64),

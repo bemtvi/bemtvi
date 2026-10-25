@@ -123,3 +123,23 @@ async fn tabnew_lists_a_remote_directory_in_a_new_tab() {
         "`:tabnew <remote-dir>` lists the directory as the explorer in a new tab"
     );
 }
+
+/// A remote directory holding a name with a newline (legal on Unix, unrepresentable as
+/// one listing row) lists the other entries — no bogus split rows — and says so.
+#[tokio::test]
+async fn a_remote_newline_filename_is_skipped_and_reported() {
+    let fs = DaemonFs::default();
+    fs.dir("/virtual/nl", &[(false, "alpha.txt"), (false, "bad\nname")]);
+    let (rpc, _incoming) = spawn_with_daemon_fs(fs, "/virtual/nl").await;
+    assert_eq!(
+        await_lines(&rpc, &["../", "alpha.txt"]).await,
+        vec!["../", "alpha.txt"],
+        "the newline name is left out rather than split across rows"
+    );
+    feed(&rpc, ":messages<CR>");
+    let history = bemtvi_test_harness::lines(&rpc).await;
+    assert!(
+        history.iter().any(|l| l.contains("newline")),
+        "the skip is reported: {history:?}"
+    );
+}

@@ -214,12 +214,14 @@ impl EditHost {
     /// a token whose candidates all fail to resolve is **omitted**, so it never
     /// overrides the treesitter span beneath. `base_order` offsets the per-token
     /// `order` so these sort deterministically among themselves (priority already
-    /// separates them from the other sources).
+    /// separates them from the other sources). Tokens starting at or past byte
+    /// `limit` (the end of the row's on-screen head) are skipped.
     pub(crate) fn semantic_intervals(
         &self,
         buffer: BufferId,
         line_idx: usize,
         base_order: u32,
+        limit: usize,
     ) -> Vec<HlInterval<'_>> {
         // The editor-wide gate (`vim.lsp.semantic_tokens.enable(false)`) hides the
         // paint everywhere without dropping any cache.
@@ -242,6 +244,7 @@ impl EditHost {
             .servers()
             .filter_map(|(_, d)| d.semantic.spans.get(&line_idx))
             .flatten()
+            .filter(|s| s.start < limit)
             .collect();
         if spans.is_empty() {
             return Vec::new();
@@ -351,6 +354,8 @@ fn decode_tokens(
     let mut spans: BTreeMap<usize, Vec<SemanticSpan>> = BTreeMap::new();
     let mut line: u32 = 0;
     let mut start_char: u32 = 0;
+    // The current line's column converter, reused by every token on it.
+    let mut cols: Option<(usize, LineCols)> = None;
     for tok in tokens {
         // Absolute position: a non-zero deltaLine moves down and resets the
         // column to deltaStart; a zero deltaLine advances the column on the line.
@@ -372,13 +377,16 @@ fn decode_tokens(
         if line_idx >= buffer.line_count() {
             continue;
         }
-        let text = buffer.line(line_idx);
-        let start = byte_col(encoding, &text, start_char as usize);
-        let end = byte_col(
-            encoding,
-            &text,
-            start_char.saturating_add(tok.length) as usize,
-        );
+        let cols = match &mut cols {
+            Some((at, cols)) if *at == line_idx => cols,
+            slot => {
+                &mut slot
+                    .insert((line_idx, LineCols::new(buffer.line(line_idx))))
+                    .1
+            }
+        };
+        let start = cols.byte(encoding, start_char as usize);
+        let end = cols.byte(encoding, start_char.saturating_add(tok.length) as usize);
         if end <= start {
             continue;
         }
@@ -394,6 +402,56 @@ fn decode_tokens(
         });
     }
     spans
+}
+
+/// LSP column → line-local byte conversion for one line, shared by every token on
+/// it. [`byte_col`] walks the line from column 0, so converting each of a long line's
+/// tokens that way is O(tokens × line length) — a minified file's one line with tens
+/// of thousands of tokens froze the tick. An ASCII line converts in O(1); otherwise
+/// a per-character `(units before it, its byte)` table is built once (on first use)
+/// and binary-searched, with the same rounding as [`byte_col`]: the first character
+/// boundary at or past the requested column, clamped to the line's end.
+pub(super) struct LineCols {
+    text: String,
+    ascii: bool,
+    /// `(utf-16 units, chars, byte)` at each character start, then at the line end.
+    bounds: Vec<(usize, usize, usize)>,
+}
+
+impl LineCols {
+    pub(super) fn new(text: String) -> Self {
+        let ascii = text.is_ascii();
+        Self {
+            text,
+            ascii,
+            bounds: Vec::new(),
+        }
+    }
+
+    pub(super) fn byte(&mut self, encoding: PositionEncoding, character: usize) -> usize {
+        // Every encoding counts an ASCII character as one unit, so the column is
+        // the byte (`byte_col` itself walks the line for UTF-16/32).
+        if self.ascii {
+            return character.min(self.text.len());
+        }
+        if encoding == PositionEncoding::Utf8 {
+            return byte_col(encoding, &self.text, character);
+        }
+        if self.bounds.is_empty() {
+            let (mut units, mut chars) = (0usize, 0usize);
+            for (byte, c) in self.text.char_indices() {
+                self.bounds.push((units, chars, byte));
+                units += c.len_utf16();
+                chars += 1;
+            }
+            self.bounds.push((units, chars, self.text.len()));
+        }
+        let idx = match encoding {
+            PositionEncoding::Utf16 => self.bounds.partition_point(|b| b.0 < character),
+            _ => self.bounds.partition_point(|b| b.1 < character),
+        };
+        self.bounds.get(idx).map_or(self.text.len(), |b| b.2)
+    }
 }
 
 /// Classify a token against the legend into its `(type, modifiers, groups)`: the

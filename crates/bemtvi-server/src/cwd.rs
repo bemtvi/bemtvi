@@ -30,6 +30,17 @@ pub(crate) struct PendingChdir {
     pub win: WindowId,
     pub tab: TabId,
     pub undo: Option<CdUndo>,
+    /// The slots a `""`/`~` target's install would touch, as they stood when it was
+    /// issued — so its ack ([`DirState::set_deferred`]) leaves any slot a newer `:cd`
+    /// changed meanwhile alone.
+    pub before: CdSlots,
+}
+
+/// A snapshot of the three slots [`DirState::set`] may touch for one `(win, tab)`.
+pub(crate) struct CdSlots {
+    win: Option<Entry>,
+    tab: Option<Entry>,
+    global: Entry,
 }
 
 /// The reply leg of a deferred `:cd`: the `pending_chdirs` token it was issued under, plus
@@ -63,7 +74,7 @@ impl CdScope {
 }
 
 /// A scope's current dir plus the previous one (for the `:cd -` toggle).
-#[derive(Default, Clone)]
+#[derive(Default, Clone, PartialEq)]
 struct Entry {
     dir: PathBuf,
     prev: Option<PathBuf>,
@@ -83,6 +94,9 @@ pub(crate) struct CdUndo {
     win_slot: Option<Entry>,
     tab_slot: Option<Entry>,
     global_slot: Entry,
+    after_win: Option<Entry>,
+    after_tab: Option<Entry>,
+    after_global: Entry,
 }
 
 /// The three-scope directory state. The current window's effective dir is mirrored
@@ -162,17 +176,98 @@ impl DirState {
         tab: TabId,
         new_dir: PathBuf,
     ) -> CdUndo {
-        let undo = CdUndo {
+        let win_slot = self.win.get(&win).cloned();
+        let tab_slot = self.tab.get(&tab).cloned();
+        let global_slot = self.global.clone();
+        self.set(scope, win, tab, new_dir.clone());
+        CdUndo {
             scope,
             win,
             tab,
-            optimistic: new_dir.clone(),
-            win_slot: self.win.get(&win).cloned(),
-            tab_slot: self.tab.get(&tab).cloned(),
-            global_slot: self.global.clone(),
+            optimistic: new_dir,
+            win_slot,
+            tab_slot,
+            global_slot,
+            after_win: self.win.get(&win).cloned(),
+            after_tab: self.tab.get(&tab).cloned(),
+            after_global: self.global.clone(),
+        }
+    }
+
+    /// Snapshot the slots a [`Self::set`] for `(win, tab)` may touch.
+    pub(crate) fn slots(&self, win: WindowId, tab: TabId) -> CdSlots {
+        CdSlots {
+            win: self.win.get(&win).cloned(),
+            tab: self.tab.get(&tab).cloned(),
+            global: self.global.clone(),
+        }
+    }
+
+    /// Install a deferred (non-optimistic) `:cd` once the daemon resolved it — the
+    /// [`Self::set`] it would have been, applied only to the slots still as they were
+    /// when it was issued (`before`), so a newer `:cd` / `:lcd` that landed meanwhile
+    /// keeps its state, and never to a window or tab that has closed since (`alive`:
+    /// whether the window, then the tab, still exists). Returns
+    /// whether the target scope itself was installed (the caller announces only then).
+    pub(crate) fn set_deferred(
+        &mut self,
+        scope: CdScope,
+        win: WindowId,
+        tab: TabId,
+        new_dir: PathBuf,
+        before: &CdSlots,
+        (win_alive, tab_alive): (bool, bool),
+    ) -> bool {
+        let win_same = win_alive && self.win.get(&win) == before.win.as_ref();
+        let tab_same = tab_alive && self.tab.get(&tab) == before.tab.as_ref();
+        match scope {
+            CdScope::Window => {
+                if !win_same {
+                    return false;
+                }
+                set_local(self.win.entry(win).or_default(), new_dir);
+            }
+            CdScope::Tabpage => {
+                if !tab_same {
+                    return false;
+                }
+                if win_same {
+                    self.win.remove(&win);
+                }
+                set_local(self.tab.entry(tab).or_default(), new_dir);
+            }
+            CdScope::Global => {
+                if self.global != before.global {
+                    return false;
+                }
+                if win_same {
+                    self.win.remove(&win);
+                }
+                if tab_same {
+                    self.tab.remove(&tab);
+                }
+                self.global.prev = Some(std::mem::replace(&mut self.global.dir, new_dir));
+            }
+        }
+        true
+    }
+
+    /// Confirm an optimistic `:cd` with the daemon's canonical dir, rewriting only the dir
+    /// it installed at its scope (the `prev` and the clears it made stay as they are).
+    /// Returns `false` when a later `:cd` already superseded it.
+    pub(crate) fn confirm_optimistic(&mut self, undo: CdUndo, canon: PathBuf) -> bool {
+        let entry = match undo.scope {
+            CdScope::Global => Some(&mut self.global),
+            CdScope::Tabpage => self.tab.get_mut(&undo.tab),
+            CdScope::Window => self.win.get_mut(&undo.win),
         };
-        self.set(scope, win, tab, new_dir);
-        undo
+        match entry {
+            Some(e) if e.dir == undo.optimistic => {
+                e.dir = canon;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The dir installed *at* `scope` (its own entry, not the effective override), or
@@ -187,7 +282,8 @@ impl DirState {
     }
 
     /// Reverse an optimistic `:cd` ([`Self::set_optimistic`]) — restoring the snapshotted
-    /// slots — **iff** its dir is still installed at the scope. Returns `true` when it
+    /// slots — **iff** its dir is still installed at the scope; a slot a later `:cd` has
+    /// changed since (a newer `:lcd` after this `:cd`) is left alone. Returns `true` when it
     /// rolled back, `false` when a later `:cd` already superseded this one (in which case
     /// the newer state, and its own announce, are left untouched). The caller uses the
     /// result to decide whether to finalize (ack-ok) or stop (superseded).
@@ -195,23 +291,29 @@ impl DirState {
         if self.dir_at(undo.scope, undo.win, undo.tab) != Some(undo.optimistic.as_path()) {
             return false; // a newer :cd won — leave it
         }
-        match undo.win_slot {
-            Some(e) => {
-                self.win.insert(undo.win, e);
-            }
-            None => {
-                self.win.remove(&undo.win);
-            }
-        }
-        match undo.tab_slot {
-            Some(e) => {
-                self.tab.insert(undo.tab, e);
-            }
-            None => {
-                self.tab.remove(&undo.tab);
+        if self.win.get(&undo.win) == undo.after_win.as_ref() {
+            match undo.win_slot {
+                Some(e) => {
+                    self.win.insert(undo.win, e);
+                }
+                None => {
+                    self.win.remove(&undo.win);
+                }
             }
         }
-        self.global = undo.global_slot;
+        if self.tab.get(&undo.tab) == undo.after_tab.as_ref() {
+            match undo.tab_slot {
+                Some(e) => {
+                    self.tab.insert(undo.tab, e);
+                }
+                None => {
+                    self.tab.remove(&undo.tab);
+                }
+            }
+        }
+        if self.global == undo.after_global {
+            self.global = undo.global_slot;
+        }
         true
     }
 

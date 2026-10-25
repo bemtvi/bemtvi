@@ -109,6 +109,20 @@ impl ImageStore {
         }
     }
 
+    /// Drop every cached entry no window of `view` shows, so a preview that closed
+    /// (or a picker that moved on to the next file) frees its decoded image and its
+    /// fetched remote bytes instead of holding them for the rest of the session.
+    pub(crate) fn retain_live(&mut self, view: &bemtvi_view::View) {
+        let keep: std::collections::HashSet<&str> = view
+            .windows
+            .iter()
+            .filter_map(|w| w.image.as_ref().map(|im| im.path.as_str()))
+            .collect();
+        self.cache.retain(|k, _| keep.contains(k.as_str()));
+        self.remote.retain_paths(|k| keep.contains(k));
+        self.pending.retain(|k, _| keep.contains(k.as_str()));
+    }
+
     /// Paint `image` **centered** within `area`, decoding (and caching) it on first
     /// use and re-decoding when the file changed on disk (its `size`/`mtime_ms`
     /// version moved — e.g. an external edit the watch reloaded). The picture is fit

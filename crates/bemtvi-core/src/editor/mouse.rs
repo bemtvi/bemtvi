@@ -1719,7 +1719,10 @@ impl Editor {
     /// ([`window_max_leftcol`](Self::window_max_leftcol)). A no-op at the clamp.
     fn drag_pan(&mut self, win: WindowId, right: bool) {
         self.leftcol = if right {
-            (self.leftcol + 1).min(self.window_max_leftcol(win).max(self.leftcol))
+            (self.leftcol + 1).min(
+                self.window_max_leftcol(win, self.leftcol + 1)
+                    .max(self.leftcol),
+            )
         } else {
             self.leftcol.saturating_sub(1)
         };
@@ -2329,7 +2332,14 @@ impl Editor {
     /// per-redraw `ensure_visible_horizontal` doesn't immediately undo the scroll.
     /// Only meaningful under `nowrap`.
     fn wheel_scroll_horizontal(&mut self, win: WindowId, delta: i64) {
-        let max = self.window_max_leftcol(win) as i64;
+        let from = if win == self.current_window_id() {
+            self.leftcol
+        } else {
+            self.tree_of_window(win)
+                .map_or(0, |(_, t)| t.get(win).saved_leftcol)
+        };
+        let reach = (from as i64).saturating_add(delta.max(0)) as usize;
+        let max = self.window_max_leftcol(win, reach) as i64;
         if win == self.current_window_id() {
             let old = self.leftcol;
             let new = (old as i64 + delta).clamp(0, max) as usize;
@@ -2370,7 +2380,12 @@ impl Editor {
     /// its current viewport minus the text width, floored at 0. At this offset the
     /// widest visible line's last column sits at the right edge, so a window whose
     /// lines all fit (`widest <= text width`) has a max of 0 — no horizontal scroll.
-    pub(crate) fn window_max_leftcol(&self, win: WindowId) -> usize {
+    ///
+    /// `reach` is the furthest `leftcol` the caller could ask for: the answer is exact
+    /// up to it and saturates there, so each visible line is measured only as far as
+    /// `reach` plus the text width — a wheel notch over a multi-megabyte line costs the
+    /// columns it can scroll into, not the whole line.
+    pub(crate) fn window_max_leftcol(&self, win: WindowId, reach: usize) -> usize {
         let (Some((top, _)), Some((content_w, text_h)), Some(buf_id), Some(opts)) = (
             self.window_scroll(win),
             self.window_text_area(win),
@@ -2398,14 +2413,12 @@ impl Editor {
                 .unwrap_or_else(|| self.number_width_for(&opts, line_count)),
         );
         let ts = buf.options.effective_tabstop();
+        let cap = reach.saturating_add(text_w);
         let widest = (top..top.saturating_add(text_h).min(line_count))
-            .map(|l| {
-                let s = buf.line(l);
-                crate::unicode::virtcol(&s, s.len(), ts)
-            })
+            .map(|l| line_width_capped(buf, l, ts, cap))
             .max()
             .unwrap_or(0);
-        widest.saturating_sub(text_w)
+        widest.min(cap).saturating_sub(text_w)
     }
 
     /// Pull every laid-out window's `leftcol` back to what its content justifies
@@ -2454,7 +2467,13 @@ impl Editor {
                 }
                 continue;
             }
-            let max = self.window_max_leftcol(id);
+            let reach = if id == current {
+                self.leftcol
+            } else {
+                self.tree_of_window(id)
+                    .map_or(0, |(_, t)| t.get(id).saved_leftcol)
+            };
+            let max = self.window_max_leftcol(id, reach);
             if id == current {
                 self.leftcol = self.leftcol.min(max);
             } else if let Some(tree) = self.tree_of_window_mut(id) {
@@ -2498,7 +2517,12 @@ impl Editor {
             if self.window_text_area(id).is_none() {
                 continue; // still unmeasurable (a float mid-placement): keep the flag.
             }
-            let max = self.window_max_leftcol(id);
+            let reach = self.windows.get(id).saved_leftcol.max(if id == current {
+                self.leftcol
+            } else {
+                0
+            });
+            let max = self.window_max_leftcol(id, reach);
             if id == current {
                 self.leftcol = self.leftcol.min(max);
             }
@@ -2924,4 +2948,25 @@ fn tab_cell_width(label: &TabLabel) -> usize {
     };
     let modified = if label.modified { "+" } else { "" };
     crate::unicode::display_width(&format!(" {count}{}{modified} ", label.name))
+}
+
+/// Display width of line `l`, measured only until it reaches `cap` columns: a prefix
+/// of the line is measured first and grown (doubling) only while it still falls short,
+/// so the cost follows the columns asked about rather than the line's length. Exact
+/// whenever the line is narrower than `cap`; otherwise some width `>= cap`.
+fn line_width_capped(buf: &crate::buffer::Buffer, l: usize, ts: usize, cap: usize) -> usize {
+    let len = buf.line_len(l);
+    let mut budget = cap.saturating_mul(4).max(256);
+    loop {
+        if budget >= len {
+            let s = buf.line_cow(l);
+            return crate::unicode::virtcol(&s, s.len(), ts);
+        }
+        let head = buf.line_head(l, budget);
+        let w = crate::unicode::virtcol(&head, head.len(), ts);
+        if w >= cap {
+            return w;
+        }
+        budget = budget.saturating_mul(2);
+    }
 }

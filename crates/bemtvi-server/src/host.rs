@@ -363,15 +363,16 @@ async fn stream_local_process(
     let mut killed = false;
     if let Some(out) = child.stdout.take() {
         let mut reader = BufReader::new(out);
-        let mut line = String::new();
+        let mut line: Vec<u8> = Vec::new();
         let mut batch: Vec<String> = Vec::new();
         loop {
             line.clear();
             tokio::select! {
-                read = reader.read_line(&mut line) => match read {
+                read = reader.read_until(b'\n', &mut line) => match read {
                     Ok(0) => break, // EOF — the child closed stdout
                     Ok(_) => {
-                        batch.push(line.trim_end_matches(['\n', '\r']).to_string());
+                        let text = String::from_utf8_lossy(&line);
+                        batch.push(text.trim_end_matches(['\n', '\r']).to_string());
                         if batch.len() >= 512 {
                             events.stdout(std::mem::take(&mut batch));
                         }

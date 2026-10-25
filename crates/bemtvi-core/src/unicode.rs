@@ -5,19 +5,31 @@
 //! accounts for wide characters and tabs. These pure helpers convert between
 //! byte offset, grapheme boundary, and virtual (screen) column over a line
 //! `&str`. ASCII is handled correctly either way (each ASCII char is its own
-//! single-byte grapheme); [`floor_grapheme`] additionally takes an all-ASCII
+//! single-byte grapheme); [`floor_grapheme`] additionally takes an ASCII-neighbour
 //! fast path to skip grapheme segmentation on the cursor hot path.
 
 use std::borrow::Cow;
 use std::iter::Peekable;
 
-use unicode_segmentation::{GraphemeIndices, UnicodeSegmentation};
+use unicode_segmentation::{GraphemeCursor, GraphemeIndices, UnicodeSegmentation};
 use unicode_width::UnicodeWidthStr;
 
 /// Default tab-stop width in cells — the fallback used where no buffer-local
 /// `tabstop` is in scope (e.g. panel rendering, some LSP column math). Buffer
 /// text uses [`crate::options::BufferOptions::effective_tabstop`] instead.
 pub const TABSTOP: usize = 8;
+
+/// Whether every byte is printable ASCII (`0x20..0x7f`): one single-cell grapheme each.
+fn all_printable_ascii(bytes: &[u8]) -> bool {
+    bytes.iter().all(|&b| (0x20..0x7f).contains(&b))
+}
+
+/// [`all_printable_ascii`], also admitting tabs — nothing [`control_width`] substitutes.
+fn all_printable_ascii_or_tab(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|&b| (0x20..0x7f).contains(&b) || b == b'\t')
+}
 
 /// Byte offset of the grapheme boundary immediately after `byte` (clamped to
 /// the end of `line`). Returns `line.len()` when there is no following grapheme.
@@ -44,20 +56,27 @@ pub fn floor_grapheme(line: &str, byte: usize) -> usize {
     if byte >= line.len() {
         return line.len();
     }
-    // Fast path for an all-ASCII line (the common case, and this is on the cursor
-    // hot path): every byte is its own single-byte grapheme, so `byte` is already
-    // a boundary. The `is_ascii` scan is far cheaper than grapheme segmentation.
-    if line.is_ascii() {
+    // Fast path (the common case, and this is on the cursor hot path): between two
+    // ASCII characters there is always a grapheme boundary except inside a CRLF, so
+    // `byte` is one. Looking at the two neighbours keeps this O(1) — a scan of the
+    // whole line here made every cursor step on a huge line cost the line.
+    let b = line.as_bytes();
+    if b[byte].is_ascii()
+        && (byte == 0 || (b[byte - 1].is_ascii() && !(b[byte - 1] == b'\r' && b[byte] == b'\n')))
+    {
         return byte;
     }
-    let mut last = 0;
-    for (i, _) in line.grapheme_indices(true) {
-        if i > byte {
-            break;
-        }
-        last = i;
+    let mut byte = byte;
+    while !line.is_char_boundary(byte) {
+        byte -= 1;
     }
-    last
+    // Otherwise ask the segmenter about this one spot; it reads only the context
+    // the boundary rules need, not the line from its start.
+    let mut cursor = GraphemeCursor::new(byte, line.len(), true);
+    if cursor.is_boundary(line, 0).unwrap_or(false) {
+        return byte;
+    }
+    cursor.prev_boundary(line, 0).ok().flatten().unwrap_or(0)
 }
 
 /// Display width of `s` in screen cells — wide characters count as two (via
@@ -97,6 +116,13 @@ pub fn wrapped_row_count(
 /// wide characters counting as two (via `unicode-width`). If `byte` is not on a
 /// grapheme boundary it is first snapped down to the nearest one.
 pub fn virtcol(line: &str, byte: usize, tabstop: usize) -> usize {
+    // Printable ASCII through `byte` (inclusive, so no combining mark follows it) is
+    // one cell per byte: skip the grapheme walk, which dominated a frame scrolled far
+    // into a huge line.
+    let byte = byte.min(line.len());
+    if all_printable_ascii(&line.as_bytes()[..(byte + 1).min(line.len())]) {
+        return byte;
+    }
     let byte = floor_grapheme(line, byte);
     let mut col = 0;
     for g in line[..byte].graphemes(true) {
@@ -420,6 +446,11 @@ impl<'a> LineVirtcol<'a> {
 /// (or `line.len()` when `target` is at or past the end). Used to land vertical
 /// motion on the column nearest the remembered one.
 pub fn byte_at_virtcol(line: &str, target: usize, tabstop: usize) -> usize {
+    // One cell per byte over a printable-ASCII head (see `virtcol`).
+    let n = target.saturating_add(1).min(line.len());
+    if all_printable_ascii(&line.as_bytes()[..n]) {
+        return target.min(line.len());
+    }
     let mut col = 0;
     for (i, g) in line.grapheme_indices(true) {
         let w = grapheme_width(g, col, tabstop);
@@ -495,7 +526,9 @@ pub fn control_repr(c: char) -> Option<String> {
 /// client that measures the returned string lands every cell where the server's
 /// column math expects it.
 pub fn display_line(line: &str) -> Cow<'_, str> {
-    if !line.chars().any(|c| control_width(c).is_some()) {
+    if all_printable_ascii_or_tab(line.as_bytes())
+        || !line.chars().any(|c| control_width(c).is_some())
+    {
         return Cow::Borrowed(line);
     }
     let mut out = String::with_capacity(line.len() + 8);
@@ -532,6 +565,9 @@ pub fn display_char_offset(line: &str, char_idx: usize) -> usize {
 /// chars [`display_line`] substitutes), in order. Used to overlay a `SpecialKey`
 /// highlight on the `^X` / `<xx>` tokens. Empty for the common all-printable line.
 pub fn unprintable_positions(line: &str) -> Vec<(usize, usize)> {
+    if all_printable_ascii_or_tab(line.as_bytes()) {
+        return Vec::new();
+    }
     line.char_indices()
         .filter(|&(_, c)| control_width(c).is_some())
         .map(|(i, c)| (i, i + c.len_utf8()))
@@ -573,4 +609,27 @@ pub fn utf16_to_byte(line: &str, u16_units: usize) -> usize {
         units += ch.len_utf16();
     }
     line.len()
+}
+
+/// Upper-case one character the way vim's `utf_toupper` does: a one-to-one
+/// mapping, so a case operator never changes the text's length. `ß` becomes
+/// `ẞ`, and a character whose full uppercase is several (`ﬁ` → `FI`) stays as is.
+pub fn simple_upper(c: char) -> char {
+    let mut up = c.to_uppercase();
+    match (up.next(), up.next()) {
+        (Some(u), None) => u,
+        _ if c == 'ß' => 'ẞ',
+        _ => c,
+    }
+}
+
+/// Lower-case one character one-to-one, as vim's `utf_tolower`: `İ` becomes a
+/// plain `i` rather than `i` plus a combining dot.
+pub fn simple_lower(c: char) -> char {
+    let mut low = c.to_lowercase();
+    match (low.next(), low.next()) {
+        (Some(l), None) => l,
+        _ if c == 'İ' => 'i',
+        _ => c,
+    }
 }

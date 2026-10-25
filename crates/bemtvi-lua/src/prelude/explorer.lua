@@ -75,11 +75,15 @@ end
 
 -- Render a `btv.fs.readdir` result into listing lines — the Lua twin of the server's
 -- `bemtvi_core::dir_listing` (off-tick): `../` first, then sub-directories (suffixed
--- `/`), then files, each group sorted case-insensitively (netrw's default).
+-- `/`), then files, each group sorted case-insensitively (netrw's default). A name
+-- holding a line break cannot be one row (nor be opened from its row text), so it is
+-- left out and counted — the second return — for the caller to report.
 local function render(entries)
-  local dirs, files = {}, {}
+  local dirs, files, skipped = {}, {}, 0
   for _, e in ipairs(entries) do
-    if e.type == "directory" then
+    if e.name:find("[\r\n]") then
+      skipped = skipped + 1
+    elseif e.type == "directory" then
       dirs[#dirs + 1] = e.name
     else
       files[#files + 1] = e.name
@@ -97,7 +101,7 @@ local function render(entries)
   for _, name in ipairs(files) do
     lines[#lines + 1] = name
   end
-  return lines
+  return lines, skipped
 end
 
 -- Read `dir`'s entries (async) and render them into listing buffer `buf`: fill the
@@ -116,10 +120,24 @@ local function list_into(buf, dir)
     -- Fill, then lock. `nvim_buf_set_lines` refuses a `nomodifiable` buffer, so make it
     -- writable for the fill and lock it right after; clear `modified` since this fill is
     -- the file *read*, not an unsaved change.
+    local lines, skipped = render(entries)
+    if skipped > 0 then
+      btv.notify(
+        ("explorer: %d entr%s in %s not listed (a newline in the name)"):format(
+          skipped,
+          skipped == 1 and "y" or "ies",
+          dir
+        ),
+        3
+      )
+    end
     btv.bo[buf].modifiable = true
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, render(entries))
+    local filled, err = pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, lines)
     btv.bo[buf].modifiable = false
     btv.bo[buf].modified = false
+    if not filled then
+      return btv.notify("explorer: can't list " .. dir .. ": " .. tostring(err), 4)
+    end
     btv.bo[buf].filetype = "btvdir"
   end)()
 end

@@ -424,3 +424,36 @@ async fn update_in_insert_false_debounces_in_a_modeless_session() {
         "applied once typing went quiet, without leaving Insert"
     );
 }
+
+/// `vim.diagnostic.config` stores every key it is given, but only `underline`,
+/// `virtual_text`, `signs` and `update_in_insert` reach a rendering surface. A key
+/// with nothing behind it (`severity_sort`, `virtual_lines`, a typo) used to be
+/// stored and echoed back as if it took effect; it now warns once naming the key,
+/// while still being stored (and the honored keys stay silent).
+#[tokio::test]
+async fn unhonored_diagnostic_config_keys_warn_once() {
+    let (rpc, _incoming) = start().await;
+    let got = exec_lua(
+        &rpc,
+        "local notes = {}\n\
+         btv.notify = function(m) notes[#notes + 1] = tostring(m) end\n\
+         vim.diagnostic.config({ underline = true, virtual_text = true, signs = true, update_in_insert = false })\n\
+         local clean = #notes\n\
+         vim.diagnostic.config({ severity_sort = true })\n\
+         vim.diagnostic.config({ severity_sort = true })\n\
+         return { clean, #notes, notes[1] or '', vim.diagnostic.config().severity_sort }",
+    )
+    .await;
+    let arr = got.as_array().expect("an array");
+    assert_eq!(arr[0].as_i64(), Some(0), "honored keys stay silent");
+    assert_eq!(arr[1].as_i64(), Some(1), "one warning, deduped per key");
+    assert!(
+        arr[2]
+            .as_str()
+            .unwrap_or_default()
+            .contains("severity_sort"),
+        "the warning names the key: {:?}",
+        arr[2]
+    );
+    assert_eq!(arr[3].as_bool(), Some(true), "the key is still stored");
+}

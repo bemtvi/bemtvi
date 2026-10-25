@@ -377,9 +377,9 @@ pub enum LspOp {
     DiagnosticGoto {
         /// `true` for `goto_next`, `false` for `goto_prev`.
         forward: bool,
-        /// Restrict to a single severity (`vim.diagnostic.severity.*`, 1=ERROR…
-        /// 4=HINT); `None` considers all severities.
-        severity: Option<u8>,
+        /// The wanted severities as a bitmask — bit `s - 1` for severity `s`
+        /// (1=ERROR…4=HINT); `None` considers all severities.
+        severities: Option<u8>,
     },
     /// `vim.diagnostic.setloclist()` — open the current buffer's diagnostics as
     /// the navigable panel location list (the `:LspDiagnostics` surface).
@@ -829,10 +829,14 @@ pub enum GitValue {
     },
     /// `btv.git.status` — `dirty` (any tracked change; untracked-only is still dirty
     /// here since an entry is emitted) and the per-path porcelain entries: exactly one
-    /// [`GitStatusEntry`] per changed path, both columns filled.
+    /// [`GitStatusEntry`] per changed path, both columns filled. `notice` is set when
+    /// the repository is not trusted (not owned by the current user and not listed in
+    /// `safe.directory`) and its own config defines filter drivers, which were
+    /// therefore not run: the human message naming the repository and the drivers.
     Status {
         dirty: bool,
         entries: Vec<GitStatusEntry>,
+        notice: Option<String>,
     },
 }
 
@@ -2071,6 +2075,7 @@ pub struct LspServerCapabilities {
     pub signature_help: bool,
     pub completion: bool,
     pub document_formatting: bool,
+    pub document_range_formatting: bool,
     pub rename: bool,
     pub code_action: bool,
     pub semantic_tokens: bool,

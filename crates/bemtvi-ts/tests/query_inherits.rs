@@ -172,3 +172,34 @@ fn the_resolved_chain_is_reported_for_the_runtimepath_bridge() {
         "a language that inherits nothing reports an empty chain"
     );
 }
+
+/// An inherited name is joined into `queries/<lang>/`, so a `../` in it would pull a
+/// query file from outside the query root. Only a plain grammar identifier is
+/// followed; the file's own patterns still load.
+#[test]
+fn an_inherited_name_that_escapes_the_query_root_is_not_followed() {
+    let data = data_dir("inherit_escape");
+    write_query(
+        &data.0,
+        "rust",
+        "highlights",
+        "; inherits: ../outside\n(integer_literal) @number\n",
+    );
+    // `queries/../outside/highlights.scm` — a sibling of the query root.
+    let outside = data.0.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("highlights.scm"), "\"fn\" @keyword\n").unwrap();
+    let mut engine = Engine::new(data.0.clone());
+
+    let spans = engine.highlight_text("rust", SRC, 0, 3);
+    let groups: Vec<&str> = spans.iter().map(|s| s.group.as_str()).collect();
+
+    assert!(
+        !groups.contains(&"keyword"),
+        "a query outside the query root was merged in: {groups:?}"
+    );
+    assert!(
+        groups.contains(&"number"),
+        "the file's own patterns must still load: {groups:?}"
+    );
+}

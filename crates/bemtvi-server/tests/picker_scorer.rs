@@ -166,3 +166,23 @@ async fn the_scorer_is_rejected_at_the_lua_boundary_if_it_is_not_source() {
         "passing a closure must fail loud, got {s:?}"
     );
 }
+
+/// NaN is a number but not a sort key: it compares neither above nor below
+/// anything, which breaks the total order the reorder sorts by. Refused like any
+/// other non-key.
+#[tokio::test]
+async fn a_nan_sort_key_is_refused() {
+    let dir = temp_dir("scorer_nan");
+    let init = format!("{SRC}\nbtv.picker.scorer([[ 0/0 ]])\n");
+    let (rpc, mut incoming) = start(&dir, &init).await;
+    exec_lua(&rpc, "btv.picker.open('rows')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+    feed(&rpc, "aa");
+    let map = poll_menu(&rpc, &mut incoming).await.expect("filtered menu");
+    let msg = message(&map);
+    assert!(
+        msg.contains("btv.picker.scorer") && msg.contains("NaN"),
+        "a NaN sort key must be refused, got {msg:?}"
+    );
+    assert_eq!(menu_items(&menu_of(&map)), vec!["aa1", "aa2", "aa3"]);
+}

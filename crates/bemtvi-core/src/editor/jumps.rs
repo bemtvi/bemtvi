@@ -183,31 +183,40 @@ impl Editor {
     /// edits and buffers that aren't the focused one.
     pub fn adjust_jumplists_for_edits(&mut self) {
         for id in self.buffer_ids() {
-            let Some(ob) = self.buffers.map.get_mut(&id) else {
-                continue;
-            };
-            let edits = ob.buffer.take_jump_edits();
-            if edits.is_empty() {
-                continue;
+            self.adjust_jumplists_for_buffer(id);
+        }
+    }
+
+    /// [`adjust_jumplists_for_edits`](Self::adjust_jumplists_for_edits) for the one
+    /// buffer `id`, handing back the edits it drained so a caller that also tracks
+    /// lines across them (`:global`'s target marks) reads the same journal without
+    /// stealing it from the jumplists.
+    pub(crate) fn adjust_jumplists_for_buffer(
+        &mut self,
+        id: BufferId,
+    ) -> Vec<crate::buffer::BufferEdit> {
+        let Some(ob) = self.buffers.map.get_mut(&id) else {
+            return Vec::new();
+        };
+        let edits = ob.buffer.take_jump_edits();
+        for edit in &edits {
+            let (s, oe, ne) = (edit.start_point, edit.old_end_point, edit.new_end_point);
+            for win in self.windows.all_windows_mut() {
+                shift_window_jumps(win, id, s, oe, ne);
             }
-            for edit in &edits {
-                let (s, oe, ne) = (edit.start_point, edit.old_end_point, edit.new_end_point);
-                for win in self.windows.all_windows_mut() {
+            // Every *parked* tree — inactive tabs of any layer, plus a
+            // non-focused layer's active tab (the main tree while a dock is
+            // focused, or a dock's tree while main is) — stashes its own window
+            // tree; their jumplists must ride the same edit so a `<C-o>` stays
+            // correct after a tab/layer switch. (The live tree on `self.windows`
+            // was handled above.)
+            for tree in self.parked_trees_mut() {
+                for win in tree.all_windows_mut() {
                     shift_window_jumps(win, id, s, oe, ne);
-                }
-                // Every *parked* tree — inactive tabs of any layer, plus a
-                // non-focused layer's active tab (the main tree while a dock is
-                // focused, or a dock's tree while main is) — stashes its own window
-                // tree; their jumplists must ride the same edit so a `<C-o>` stays
-                // correct after a tab/layer switch. (The live tree on `self.windows`
-                // was handled above.)
-                for tree in self.parked_trees_mut() {
-                    for win in tree.all_windows_mut() {
-                        shift_window_jumps(win, id, s, oe, ne);
-                    }
                 }
             }
         }
+        edits
     }
 
     /// Window `id`'s jumplist for `vim.fn.getjumplist`, oldest-first: each entry as

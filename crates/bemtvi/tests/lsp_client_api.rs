@@ -241,6 +241,56 @@ async fn supports_method_reads_the_advertised_capabilities() {
     );
 }
 
+/// `textDocument/rangeFormatting` is answered by `documentRangeFormattingProvider`, a
+/// separate capability from whole-document formatting: a server that formats whole
+/// files only must not claim range formatting (and vice versa).
+#[tokio::test]
+async fn supports_method_range_formatting_reads_its_own_capability() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-client-supports-range");
+    arm_mock(
+        dir.as_path(),
+        r#"{ "capabilities": { "documentFormattingProvider": true } }"#,
+    );
+    let (rpc, _incoming) = open_rust(dir.as_path(), "let x = 1\n").await;
+    enable_demo(&rpc).await;
+    let whole_only = exec_lua(
+        &rpc,
+        "local c = btv.lsp.clients({ bufnr = 0 })[1]\n\
+         return tostring(c:supports_method('textDocument/formatting')) .. ',' ..\n\
+         \x20 tostring(c:supports_method('textDocument/rangeFormatting')) .. ',' ..\n\
+         \x20 tostring(c.server_capabilities.documentRangeFormattingProvider)",
+    )
+    .await;
+    std::env::remove_var("BEMTVI_LSP_CMD");
+    assert_eq!(
+        whole_only.as_str(),
+        Some("true,false,false"),
+        "a whole-document-only formatter must not claim range formatting"
+    );
+
+    let dir = temp_dir("lsp-client-supports-range-2");
+    arm_mock(
+        dir.as_path(),
+        r#"{ "capabilities": { "documentFormattingProvider": false, "documentRangeFormattingProvider": true } }"#,
+    );
+    let (rpc, _incoming2) = open_rust(dir.as_path(), "let x = 1\n").await;
+    enable_demo(&rpc).await;
+    let range_only = exec_lua(
+        &rpc,
+        "local c = btv.lsp.clients({ bufnr = 0 })[1]\n\
+         return tostring(c:supports_method('textDocument/formatting')) .. ',' ..\n\
+         \x20 tostring(c:supports_method('textDocument/rangeFormatting'))",
+    )
+    .await;
+    std::env::remove_var("BEMTVI_LSP_CMD");
+    assert_eq!(
+        range_only.as_str(),
+        Some("false,true"),
+        "a range-only formatter must claim range formatting"
+    );
+}
+
 // ----- exec_cmd --------------------------------------------------------------
 
 #[tokio::test]

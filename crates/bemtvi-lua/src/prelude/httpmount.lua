@@ -15,7 +15,7 @@
 --     respond({ status = 200, headers = { ["content-type"] = "text/html" }, body = "<h1>hi</h1>" })
 --   end,
 -- }):next(function(mount)
---   btv.print(mount:url())        -- http://127.0.0.1:53124/plugin/example/
+--   btv.print(mount:url())        -- http://127.0.0.1:53124/<token>/plugin/example/
 -- end)
 -- ```
 --
@@ -33,11 +33,25 @@
 -- their firewall, their bookmark; a plugin must not decide it by loading. `'httphost'`
 -- defaults to `127.0.0.1` (loopback only).
 --
--- SECURITY: mounts share ONE origin, so the same-origin policy does NOT isolate mount A
--- from mount B — script served by one can fetch the other and read the reply. Mounts are
--- a trust boundary between the EDITOR and the NETWORK, not between plugins. A mount that
--- renders untrusted content (markdown from a repo under review) should set a restrictive
--- `content-security-policy` on its own responses.
+-- SECURITY, three layers:
+--
+--   * Natively every mounted path sits under a per-session secret segment
+--     (`http://127.0.0.1:<port>/<token>/plugin/<name>/`), so another local process or user
+--     cannot call a mount without being handed the URL. Always build URLs from
+--     `mount:url()` / `mount:path()` (or relative to the page) — never hard-code
+--     `/plugin/<name>`, which natively 404s. (The web build has no token: its Service Worker
+--     only answers the editor's own origin, which no other process can reach.)
+--   * The listener refuses foreign `Origin`s and DNS-rebound `Host`s, so other websites
+--     cannot drive a mount either.
+--   * Every mount response gets a `content-security-policy: sandbox …` (no
+--     `allow-same-origin`), so a mount's documents run in an OPAQUE origin. That matters
+--     most on the web build, where mounts share the editor's own origin: an unsandboxed
+--     page could read the editor's OPFS, drive the wasm, and use its daemon link. The cost:
+--     a sandboxed page cannot `fetch()` back to its own mount (on the web its requests
+--     bypass the Service Worker; natively they carry `Origin: null` and are refused), has
+--     no cookies or `localStorage`, and cannot touch `window.opener`/`parent`. A plugin
+--     whose OWN page needs that opts out with `same_origin = true` — and then must not put
+--     untrusted HTML in that document (render it in a nested `<iframe sandbox>` instead).
 --
 -- Two shapes in one API, deliberately (`btv` is promise-only for ONE-SHOT async; a
 -- persistent stream of events stays handler-based — same as `btv.process.open` /
@@ -64,23 +78,43 @@ btv._http_mounts = btv._http_mounts or {}
 -- The VALUE being the timer is what lets `opts.timeout` live here rather than in each
 -- transport — see `btv._http_request`.
 btv._http_open = btv._http_open or {}
+-- `req_id -> mount id` for every slot in `btv._http_open`, so closing a mount can retire
+-- its own in-flight requests.
+btv._http_open_mount = btv._http_open_mount or {}
 
 -- ----- Mount handle ----------------------------------------------------------
 
 local Mount = {}
 Mount.__index = Mount
 
+-- The policy appended to every response of a mount without `same_origin = true`: script,
+-- forms, popups, dialogs and downloads still work, but the document runs in an opaque
+-- origin. Appended as its own header, never merged into (or replacing) the plugin's CSP —
+-- both policies are enforced.
+local SANDBOX_CSP =
+  "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads"
+
+-- Record the base URL a transport reported (`http://127.0.0.1:53124/<token>` natively,
+-- the page's bare origin on the web) as its origin and the path prefix mounts sit under.
+local function set_base(base)
+  local origin, prefix = tostring(base):match("^(%a[%w+.-]*://[^/]*)(.*)$")
+  btv._http_origin = origin or base
+  btv._http_prefix = (prefix or ""):gsub("/+$", "")
+end
+
 -- `mount:url()` — the mount's base URL, trailing-slashed
--- (`http://127.0.0.1:53124/plugin/example/`). Hand this to a browser, an `<iframe>`, or
--- `btv.ui.open`. Absorbs the difference between worlds: natively it is the editor's bound
--- port, on the web build the page's own origin.
+-- (`http://127.0.0.1:53124/<token>/plugin/example/`). Hand this to a browser, an
+-- `<iframe>`, or `btv.ui.open`. Absorbs the difference between worlds: natively it is the
+-- editor's bound port plus the session token, on the web build the page's own origin.
+-- It is the only way to address a mount — build every URL from it.
 function Mount:url()
   return self:origin() .. self:path() .. "/"
 end
 
--- `mount:path()` — the mount's path on the origin (`/plugin/example`), no trailing slash.
+-- `mount:path()` — the mount's path on the origin (`/<token>/plugin/example` natively,
+-- `/plugin/example` on the web build), no trailing slash.
 function Mount:path()
-  return "/plugin/" .. self._name
+  return (btv._http_prefix or "") .. "/plugin/" .. self._name
 end
 
 -- `mount:origin()` — the origin serving this mount (`http://127.0.0.1:53124`).
@@ -101,6 +135,18 @@ function Mount:close()
   end
   self._alive = false
   btv._http_mounts[self._id] = nil
+  -- Its in-flight requests go with it (the transport answers them 503): stop their
+  -- deadlines so none fires later with a 504 and a false timeout report.
+  for req_id, owner in pairs(btv._http_open_mount) do
+    if owner == self._id then
+      local deadline = btv._http_open[req_id]
+      if deadline then
+        deadline:stop()
+      end
+      btv._http_open[req_id] = nil
+      btv._http_open_mount[req_id] = nil
+    end
+  end
   btv._http_unmount(self._id)
 end
 
@@ -135,11 +181,13 @@ function btv._http_request(id, req_id, req)
   end
 
   -- The deadline. Fires only if nothing answered first — `btv._http_reply` stops it.
+  btv._http_open_mount[req_id] = id
   btv._http_open[req_id] = btv.timer(function()
     if not btv._http_open[req_id] then
       return
     end
     btv._http_open[req_id] = nil
+    btv._http_open_mount[req_id] = nil
     btv._http_respond(req_id, 504, { { "content-type", "text/plain; charset=utf-8" } }, "")
     btv.notify(
       ("btv.http.mount(%q): on_request did not respond within %dms; the client got a 504. "):format(
@@ -160,6 +208,7 @@ function btv._http_request(id, req_id, req)
     if deadline then
       deadline:stop()
       btv._http_open[req_id] = nil
+      btv._http_open_mount[req_id] = nil
       btv._http_respond(req_id, 500, {}, "")
     end
     btv.notify(
@@ -182,49 +231,74 @@ function btv._http_reply(req_id, res)
     )
     return
   end
+  -- Retire the request: stop its deadline so a live timer per in-flight request cannot
+  -- pile up (or fire a false timeout for a request already answered).
+  local function close()
+    deadline:stop()
+    btv._http_open[req_id] = nil
+    btv._http_open_mount[req_id] = nil
+  end
+  -- A reply that fails validation still answers the client — a 500 now, not a 504
+  -- from the deadline later — before the error reaches the caller.
+  local function refuse(msg)
+    close()
+    btv._http_respond(req_id, 500, {}, "")
+    error(msg, 3)
+  end
   res = res or {}
   if type(res) ~= "table" then
-    error("btv.http.mount: respond expects a table { status, headers, body }", 2)
+    refuse("btv.http.mount: respond expects a table { status, headers, body }")
   end
 
   local status = res.status or 200
   if type(status) ~= "number" or status < 100 or status > 599 then
-    error(("btv.http.mount: respond status must be 100-599, got %s"):format(tostring(status)), 2)
+    refuse(("btv.http.mount: respond status must be 100-599, got %s"):format(tostring(status)))
   end
 
   local body = res.body or ""
   if type(body) ~= "string" then
-    error(("btv.http.mount: respond body must be a string, got %s"):format(type(body)), 2)
+    refuse(("btv.http.mount: respond body must be a string, got %s"):format(type(body)))
   end
 
   -- Headers as ordered `{ name, value }` pairs for the bridge (a map at the surface, so a
   -- plugin writes `{ ["content-type"] = "text/html" }`).
   local headers = {}
+  -- Refused LOUD here, not dropped: the transport cannot put a header with CR/LF or an
+  -- invalid name on the wire, and silently losing one (a `content-security-policy`)
+  -- serves the page without it.
   for name, value in pairs(res.headers or {}) do
-    if type(name) ~= "string" then
-      error("btv.http.mount: respond header names must be strings", 2)
+    if type(name) ~= "string" or not name:match("^[%w!#$%%&'*+%-.^_`|~]+$") then
+      refuse("btv.http.mount: invalid response header name " .. tostring(name))
     end
-    headers[#headers + 1] = { name, tostring(value) }
+    value = tostring(value)
+    if value:find("[\r\n%z]") then
+      refuse("btv.http.mount: response header " .. name .. " contains CR, LF or NUL")
+    end
+    headers[#headers + 1] = { name, value }
   end
 
-  -- Answered: stop the deadline so a live timer per in-flight request cannot pile up.
-  deadline:stop()
-  btv._http_open[req_id] = nil
+  local mount = btv._http_mounts[btv._http_open_mount[req_id]]
+  if not (mount and mount.same_origin) then
+    headers[#headers + 1] = { "content-security-policy", SANDBOX_CSP }
+  end
+
+  close()
   btv._http_respond(req_id, status, headers, body)
 end
 
 -- Native callback: the listener rebound onto a new address after an `'httphost'` /
 -- `'httpport'` write. Every live mount stays mounted — only the origin moved — so this
 -- updates the one place `Mount:origin()` reads.
-function btv._http_rebound(origin)
-  btv._http_origin = origin
+function btv._http_rebound(base)
+  set_base(base)
 end
 
 -- ----- Public API ------------------------------------------------------------
 
 -- `btv.http.mount(opts)` -> a promise of a `Mount`.
 --
--- Publishes `opts.on_request` at `/plugin/<opts.name>/*` on the editor's one origin,
+-- Publishes `opts.on_request` at `/plugin/<opts.name>/*` on the editor's one origin
+-- (natively under the session-token segment — address it only through `mount:url()`),
 -- binding the listener if this is the first mount. The promise RESOLVES with the handle
 -- once the route is live, and REJECTS (a `{ message }` table) when the listener cannot
 -- bind (`'httpport'` is taken) or the name is already mounted — never a silent fallback to
@@ -235,8 +309,15 @@ end
 --   name = "example",              -- required; [%w_-]+. Mounts at /plugin/example
 --   on_request = function(req, respond) end,  -- required
 --   timeout = 30000,               -- ms before an unanswered request gets a 504
+--   same_origin = false,           -- DANGEROUS when true: serve WITHOUT the sandbox CSP
 -- }
 -- ```
+--
+-- Every response is sandboxed into an opaque origin by default (a `content-security-policy`
+-- of `sandbox allow-scripts …` is added beside any CSP the plugin sets). `same_origin = true`
+-- turns that off so the page can `fetch()` its own mount and use storage — on the web build
+-- it then runs with the EDITOR's privileges (its OPFS, the wasm, the daemon link), so only
+-- use it for a page made entirely of the plugin's own code, never for untrusted HTML.
 --
 -- The handler is called `on_request(req, respond)`:
 --
@@ -244,7 +325,7 @@ end
 -- req = {
 --   method = "GET",                -- upper-cased
 --   path = "/style.css",           -- MOUNT-RELATIVE; a bare /plugin/example is "/"
---   raw_path = "/plugin/example/style.css",
+--   raw_path = "/plugin/example/style.css",  -- below the session token, in every world
 --   query = { v = "2" },           -- decoded
 --   headers = { ["accept"] = "*/*" },  -- lowercased names
 --   body = "",                     -- raw bytes, binary-safe
@@ -297,9 +378,14 @@ function btv.http.mount(opts)
     )
   end
 
+  local same_origin = opts.same_origin
+  if same_origin ~= nil and type(same_origin) ~= "boolean" then
+    error(("btv.http.mount: `same_origin` must be a boolean, got %s"):format(type(same_origin)), 2)
+  end
+
   return btv.promise.new(function(resolve, reject)
     local id = btv._next_cb_id()
-    btv._cb_fns[id] = function(err, origin)
+    btv._cb_fns[id] = function(err, base)
       if err ~= nil then
         -- The mount never published: drop the registry entry so a stale handler cannot
         -- be reached by a route that does not exist.
@@ -309,12 +395,17 @@ function btv.http.mount(opts)
       end
       -- One listener, so one origin for every mount — recorded centrally and read back
       -- through `Mount:origin()`, which is what lets a later rebind move them all.
-      btv._http_origin = origin
+      set_base(base)
       resolve(setmetatable({ _id = id, _name = name, _alive = true }, Mount))
     end
     -- Register BEFORE the bridge: the actor can route a request to this mount as soon as
     -- the listener is up, and the reply arrives on a later tick either way.
-    btv._http_mounts[id] = { on_request = opts.on_request, name = name, timeout = timeout }
+    btv._http_mounts[id] = {
+      on_request = opts.on_request,
+      name = name,
+      timeout = timeout,
+      same_origin = same_origin == true,
+    }
     -- If the bridge throws (a conversion error), drop BOTH registrations: the
     -- callback could never fire, and the mount table describes a listener that
     -- does not exist. Rethrow so the promise executor rejects.
@@ -328,7 +419,8 @@ function btv.http.mount(opts)
 end
 
 -- `btv.http.origin()` -> the origin serving plugin mounts (`http://127.0.0.1:53124`), or
--- `nil` when nothing has mounted yet. Nil rather than a guess: until the first
+-- `nil` when nothing has mounted yet. Only the origin: natively a mount also needs the
+-- session-token path segment, so address mounts with `mount:url()`, not this. Nil rather than a guess: until the first
 -- `btv.http.mount` there is no listener, so there is no origin to report and inventing one
 -- from `'httpport'` would describe a port nothing is listening on.
 function btv.http.origin()

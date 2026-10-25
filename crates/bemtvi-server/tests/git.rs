@@ -1709,3 +1709,153 @@ async fn status_with_ignored_keeps_modified_and_untracked_intact() {
         exec_lua(&rpc, "return _G.sterr").await
     );
 }
+
+/// Run `args` as root of a fresh user namespace mapping the caller's subordinate uids,
+/// so a `chown` inside lands on a uid outside that is not ours. `false` if unavailable.
+#[cfg(unix)]
+fn in_userns(args: &[&str]) -> bool {
+    Command::new("unshare")
+        .args(["--map-auto", "--map-root-user"])
+        .args(args)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Hand `dir` (recursively) to another uid, making the repository in it untrusted.
+/// `false` when the platform can't (no `unshare --map-auto` / subordinate uid range).
+#[cfg(unix)]
+fn disown(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let ours = std::fs::metadata(dir).map(|m| m.uid()).ok();
+    in_userns(&["chown", "-R", "1:1", &dir.to_string_lossy()])
+        && std::fs::metadata(dir).map(|m| m.uid()).ok() != ours
+}
+
+/// Remove a tree [`disown`] may have handed to another uid.
+#[cfg(unix)]
+fn remove_tree(dir: &Path) {
+    if std::fs::remove_dir_all(dir).is_err() && dir.exists() {
+        in_userns(&["rm", "-rf", &dir.to_string_lossy()]);
+    }
+}
+
+/// A repo whose `.gitattributes` puts `file.txt` through the `evil` filter, and whose
+/// `.git/config` (written after the commit, so the fixture's own git never runs it)
+/// makes that filter's `clean` command touch the returned marker, outside the repo.
+/// `file.txt` is then edited at the same size, so status must hash it — through the
+/// filter, when the filter runs.
+fn make_filter_repo(tag: &str) -> (PathBuf, PathBuf) {
+    let repo = temp_dir(tag).join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join(".gitattributes"), "*.txt filter=evil\n").unwrap();
+    std::fs::write(repo.join("file.txt"), "a\nb\nc\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+    let marker = repo.parent().unwrap().join("FILTER-RAN");
+    let _ = std::fs::remove_file(&marker);
+    let mut config = std::fs::read_to_string(repo.join(".git/config")).unwrap();
+    config.push_str(&format!(
+        "[filter \"evil\"]\n\tclean = \"touch '{}'; cat\"\n",
+        marker.display()
+    ));
+    std::fs::write(repo.join(".git/config"), config).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(repo.join("file.txt"), "a\nB\nc\n").unwrap();
+    (repo, marker)
+}
+
+/// Lua that runs `btv.git.status` on `repo` twice, in sequence, recording every
+/// `btv.notify` message in `_G.__notes` and the second result as `<path>=<XY>` pairs
+/// in `_G.__st` (or `err:<code>`).
+fn status_twice_lua(repo: &Path) -> String {
+    let repo = repo.to_string_lossy().replace('\\', "\\\\");
+    format!(
+        r#"_G.__st = nil
+           _G.__notes = {{}}
+           local orig = btv.notify
+           btv.notify = function(m, ...)
+             table.insert(_G.__notes, m)
+             return orig(m, ...)
+           end
+           local function fmt(r)
+             local out = {{}}
+             for _, e in ipairs(r.entries) do
+               out[#out + 1] = e.path .. "=" .. e.index .. e.worktree
+             end
+             table.sort(out)
+             return table.concat(out, ",")
+           end
+           btv.git.status("{repo}"):next(function()
+             return btv.git.status("{repo}")
+           end):next(
+             function(r) _G.__st = fmt(r) end,
+             function(e) _G.__st = "err:" .. tostring(e.code) end)
+           return 1"#,
+    )
+}
+
+/// git parity: a repository you own is trusted, so the filter its own config defines
+/// runs when status compares an edited file — as `git status` would run it.
+#[tokio::test]
+async fn status_runs_a_trusted_repos_clean_filter() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (repo, marker) = make_filter_repo("git_filter_trusted");
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, &status_twice_lua(&repo)).await;
+    settle(&rpc, &["_G.__st"]).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.__st").await.as_str(),
+        Some("file.txt= M")
+    );
+    assert!(
+        marker.exists(),
+        "a trusted repository's clean filter must run"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return #_G.__notes").await.as_i64(),
+        Some(0),
+        "nothing was skipped, so nothing is reported"
+    );
+}
+
+/// A repository owned by another user is untrusted (git's `safe.directory` rule):
+/// statusing it must not run the filter its `.git/config` defines — opening a file in
+/// someone else's checkout must not execute their commands — yet status still reports
+/// the edit, compared unfiltered, and the user is told ONCE that the filter was skipped.
+#[cfg(unix)]
+#[tokio::test]
+async fn status_of_an_untrusted_repo_skips_its_filter_and_says_so_once() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (repo, marker) = make_filter_repo("git_filter_untrusted");
+    if !disown(&repo) {
+        eprintln!("skip: cannot hand the fixture to another uid (no `unshare --map-auto`)");
+        remove_tree(&repo);
+        return;
+    }
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, &status_twice_lua(&repo)).await;
+    settle(&rpc, &["_G.__st"]).await;
+    let st = exec_lua(&rpc, "return _G.__st").await;
+    let notes = exec_lua(&rpc, "return table.concat(_G.__notes, '\\n')").await;
+    let count = exec_lua(&rpc, "return #_G.__notes").await.as_i64();
+    remove_tree(&repo);
+    assert!(
+        !marker.exists(),
+        "an untrusted repository's filter driver ran"
+    );
+    assert_eq!(st.as_str(), Some("file.txt= M"));
+    assert_eq!(count, Some(1), "told once across two statuses: {notes:?}");
+    let notes = notes.as_str().unwrap_or_default().to_string();
+    assert!(
+        notes.contains("evil") && notes.contains("not trusted"),
+        "the notice names the skipped filter: {notes}"
+    );
+}

@@ -169,7 +169,7 @@ local aslist, aslist_triggers
 -- Exported as `M._source_name` so the dashboard (plugins_ui.lua) labels raw specs
 -- with exactly the name normalize() would install them under.
 local function basename(s)
-  return btv.utils.basename((s:gsub("%.git$", "")))
+  return btv.utils.basename((s:gsub("[/\\]+$", ""):gsub("%.git$", "")))
 end
 M._source_name = basename
 
@@ -281,6 +281,16 @@ local function normalize(spec)
   local dir = spec.dir and btv.utils.expanduser(spec.dir) or nil
 
   local name = spec.name or (src and basename(src)) or basename(dir)
+  -- The name is the install directory under the root (`<root>/<name>`) that install
+  -- clones into, update pulls in and clean deletes, so it must be one path segment.
+  if type(name) ~= "string" or name == "" or name == "." or name == ".." or name:find("[/\\]") then
+    error(
+      "btv.plugins: '"
+        .. tostring(name)
+        .. "' is not a plugin name — it must be a single directory name, with no path separators",
+      0
+    )
+  end
   local url = src and (is_full_url(src) and src or M._opts.github:format(src)) or nil
 
   report_unknown_keys(spec, name)
@@ -624,9 +634,22 @@ local function arm_lazy(spec)
     -- is invisible in a config). `btv.command` rejects it; report which plugin and which
     -- trigger, and keep arming the rest. Raising here would abort `M.add`'s loop and
     -- silently drop every spec AFTER this one.
-    local armed, arm_err = pcall(btv.command, c, function(o)
+    local stub
+    stub = function(o)
       M.load(name)
         :next(function()
+          -- A plugin that never defined `c` left this stub in place, and re-dispatching
+          -- would re-enter it again and again.
+          if btv._resolve_user_command(c, 0) == stub then
+            error(
+              "btv.plugins["
+                .. name
+                .. "]: loaded, but it defines no :"
+                .. c
+                .. " command — fix the spec's `cmd` trigger",
+              0
+            )
+          end
           -- Re-dispatch the original invocation against the real command the
           -- plugin just defined (it replaced this stub).
           btv.cmd(c .. (o.bang and "!" or "") .. (o.args ~= "" and (" " .. o.args) or ""))
@@ -634,7 +657,13 @@ local function arm_lazy(spec)
         :catch(function(err)
           btv.notify(tostring(err and err.message or err), 4)
         end)
-    end, { nargs = "*", desc = "Lazy-load " .. name .. ", then run :" .. c })
+    end
+    local armed, arm_err = pcall(
+      btv.command,
+      c,
+      stub,
+      { nargs = "*", desc = "Lazy-load " .. name .. ", then run :" .. c }
+    )
     if not armed then
       btv.notify(
         "btv.plugins["
@@ -1660,7 +1689,16 @@ function M.lock(opts)
     -- emptied lockfile would be written as `[]` — not the name-keyed object this file is
     -- documented as and re-read as. Spell the empty object out.
     local body = next(resolved) == nil and "{}" or btv.json.encode(resolved, { pretty = true })
-    btv.await(lfs.write(path, body .. "\n"))
+    -- Written beside the target and renamed over it, so an interrupted write (a crash,
+    -- a full disk) leaves the previous lockfile intact rather than a truncated one. A
+    -- symlinked lockfile (a dotfiles checkout) is replaced at its target, so the link
+    -- survives.
+    if btv.await(lfs.exists(path)) then
+      path = btv.await(lfs.realpath(path))
+    end
+    local tmp = path .. ".tmp"
+    btv.await(lfs.write(tmp, body .. "\n"))
+    btv.await(lfs.rename(tmp, path))
     M._lock = resolved
     notify_change()
     return resolved

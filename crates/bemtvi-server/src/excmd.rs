@@ -302,7 +302,11 @@ impl EditHost {
             // `name` would send `:PluginSync!` to E492 even though the command
             // exists.
             _ if self.lua.has_user_command(base, cur_buf) => {
-                if let Err(e) = self.lua.run_user_command_bang(base, args, cur_buf, bang) {
+                let cursor_line = self.editor.cursor.line;
+                if let Err(e) =
+                    self.lua
+                        .run_user_command_bang(base, args, cur_buf, bang, range, cursor_line)
+                {
                     self.editor
                         .echo(format!("E5108: Error executing command {base}: {e}"));
                 }
@@ -363,6 +367,7 @@ impl EditHost {
                     (abs.clone(), Some(PathBuf::from(abs)))
                 }
             };
+            let before = self.dirs.slots(win, tab);
             let undo = optimistic.map(|dir| self.dirs.set_optimistic(scope, win, tab, dir));
             if undo.is_some() {
                 self.publish_cwd_mirror();
@@ -376,6 +381,7 @@ impl EditHost {
                     win,
                     tab,
                     undo,
+                    before,
                 },
             );
             self.fx.fs_chdir(wire, token);
@@ -803,7 +809,7 @@ impl EditHost {
             return;
         }
         let path = PathBuf::from(arg);
-        let src = match std::fs::read_to_string(&path) {
+        let src = match std::fs::read(&path) {
             Ok(s) => s,
             Err(_) => {
                 self.editor.echo(format!("E484: Can't open file {arg}"));

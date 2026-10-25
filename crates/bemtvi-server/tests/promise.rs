@@ -114,6 +114,37 @@ async fn finally_runs_and_passes_the_value_through() {
 }
 
 #[tokio::test]
+async fn finally_waits_for_a_returned_promise() {
+    let (rpc, _incoming) = start().await;
+    // A `finally` handler that returns a promise (an async cleanup) holds the chain
+    // until that promise settles, then passes the ORIGINAL outcome through; a
+    // rejecting cleanup replaces it with its own reason. Same as the browser.
+    exec_lua(
+        &rpc,
+        "_G.got = nil\n_G.err = nil\n\
+         local gate = btv.promise.new(function(r) _G.release = r end)\n\
+         btv.promise.resolve(7)\n\
+           :finally(function() return gate end)\n\
+           :next(function(v) _G.got = v end)\n\
+         btv.promise.reject('orig')\n\
+           :finally(function() return btv.promise.reject('cleanup') end)\n\
+           :catch(function(e) _G.err = e end)",
+    )
+    .await;
+    assert_eq!(
+        lua_bool(&rpc, "return _G.got == nil").await,
+        Some(true),
+        "the chain must wait for the cleanup promise"
+    );
+    assert_eq!(
+        lua_string(&rpc, "return _G.err").await.as_deref(),
+        Some("cleanup")
+    );
+    exec_lua(&rpc, "_G.release('ignored')").await;
+    assert_eq!(lua_u64(&rpc, "return _G.got").await, Some(7));
+}
+
+#[tokio::test]
 async fn reactions_are_async_never_inline() {
     let (rpc, _incoming) = start().await;
     // Even an already-resolved promise runs its :next on a later microtask, so

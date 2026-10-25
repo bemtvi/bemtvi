@@ -746,3 +746,80 @@ async fn pos_set_rejects_what_it_cannot_store() {
         vec![0, 0, 0, 0]
     );
 }
+
+#[tokio::test]
+async fn an_insert_brackets_its_text_with_the_change_marks() {
+    let (rpc, _incoming) = start(None).await;
+    edit_probe(&rpc, &["  alpha beta", "gamma"], (1, 4), "Aend<Esc>").await;
+    let marks = "local o = {} for _, m in ipairs(btv.mark.list({ names = '[]' })) do \
+                 o[#o + 1] = m.name .. m.line .. ',' .. m.col end return table.concat(o, ' ')";
+    assert_eq!(exec_lua(&rpc, marks).await, Value::from("[0,12 ]0,15"));
+    edit_probe(&rpc, &["  alpha beta", "gamma"], (2, 1), "ixy<Esc>").await;
+    assert_eq!(exec_lua(&rpc, marks).await, Value::from("[1,1 ]1,3"));
+}
+
+#[tokio::test]
+async fn every_visual_operator_sets_the_selection_marks() {
+    let (rpc, _incoming) = start(None).await;
+    let marks = "local o = {} for _, m in ipairs(btv.mark.list({ names = '<>' })) do \
+                 o[#o + 1] = m.name .. m.line .. ',' .. m.col end return table.concat(o, ' ')";
+    for keys in ["vlU", "vl~", "Vj>", "Vj=", "vlgu"] {
+        edit_probe(&rpc, &["alpha beta", "gamma"], (1, 2), keys).await;
+        let got = exec_lua(&rpc, marks).await;
+        let got = got.as_str().unwrap_or_default().to_string();
+        assert!(got.starts_with("<0,"), "{keys}: no `< mark ({got})");
+        assert!(got.contains(">"), "{keys}: no `> mark ({got})");
+    }
+}
+
+/// `` `[ `` / `` `] `` after `keys`, as `"[l,c ]l,c"` (0-based lines).
+async fn change_marks_after(rpc: &Rpc, text: &[&str], at: (usize, usize), keys: &str) -> String {
+    edit_probe(rpc, text, at, keys).await;
+    let marks = "local o = {} for _, m in ipairs(btv.mark.list({ names = '[]' })) do \
+                 o[#o + 1] = m.name .. m.line .. ',' .. m.col end return table.concat(o, ' ')";
+    exec_lua(rpc, marks)
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Every change brackets what it touched with `` `[ `` / `` `] ``, as vim's do —
+/// not only the operators: `x`, `r`, `~`, `D`, `p`, `J`, the shifts, `dd`, `:s`
+/// and undo/redo too (expected values from `nvim --headless --clean`).
+#[tokio::test]
+async fn every_change_sets_the_change_marks() {
+    let (rpc, _incoming) = start(None).await;
+    let text = [
+        "alpha beta gamma delta",
+        "  indented line here",
+        "third line x y z",
+    ];
+    for (at, keys, want) in [
+        ((1, 6), "x", "[0,6 ]0,6"),
+        ((1, 6), "3x", "[0,6 ]0,6"),
+        ((1, 6), "2X", "[0,4 ]0,4"),
+        ((1, 6), "3rZ", "[0,6 ]0,8"),
+        ((1, 6), "~", "[0,6 ]0,6"),
+        ((1, 6), "D", "[0,6 ]0,6"),
+        ((1, 6), "ylp", "[0,7 ]0,7"),
+        ((1, 6), "J", "[0,22 ]0,41"),
+        ((1, 6), "gJ", "[0,22 ]0,42"),
+        ((1, 6), "3J", "[0,22 ]0,58"),
+        ((1, 6), "<<", "[0,6 ]0,21"),
+        ((2, 4), "<<", "[1,4 ]1,17"),
+        ((1, 6), "dd", "[0,6 ]0,6"),
+        ((1, 6), "2dd", "[0,6 ]0,6"),
+        ((1, 0), ":2,3s/i/I/g<CR>", "[1,0 ]2,0"),
+        ((2, 4), "xu", "[1,0 ]1,0"),
+        ((1, 6), "jJu", "[1,0 ]2,0"),
+        ((1, 6), "xjxu", "[1,0 ]1,0"),
+        ((1, 6), "xu<C-r>", "[0,0 ]0,0"),
+    ] {
+        assert_eq!(
+            change_marks_after(&rpc, &text, at, keys).await,
+            want,
+            "keys {keys:?}"
+        );
+    }
+}

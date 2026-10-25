@@ -589,6 +589,13 @@ impl Keymaps {
         }
     }
 
+    /// Whether any map in `scope` starts with `key` (a complete map or a prefix of one).
+    pub fn binds(&self, scope: MatchScope, key: Key) -> bool {
+        self.tries
+            .get(&scope.bucket())
+            .is_some_and(|t| !matches!(t.classify(&[key]), Classify::None))
+    }
+
     /// Look up a single key that completes a **default** map in `scope` — the built-in
     /// behavior bemtvi encodes as `default` keymaps (the `cmdline` control keys `<CR>`
     /// submit / `<Esc>` cancel / `<BS>` / …, and the special-buffer `<CR>`/`-` opens).

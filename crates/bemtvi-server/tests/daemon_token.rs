@@ -129,3 +129,50 @@ async fn malformed_uris_fail_loud() {
         assert_eq!(token, "env-token");
     });
 }
+
+/// A failed dial's error is printed — to the terminal, the GUI's error view, the
+/// re-dial log — so it must not carry the bearer token the dial presented. The
+/// CONNECT URL is `https://host:port/<token>`, which makes "connecting to {url}" the
+/// natural thing to write and exactly the thing that leaks it. Exercised with the
+/// *right* token against a cert pin that doesn't match: the case where the peer may be
+/// an impostor, and the error is all the user sees.
+#[tokio::test]
+async fn a_failed_quic_dial_does_not_print_the_token() {
+    use bemtvi_server::{
+        bind_quic_listener, connect_quic_reconnecting, mint_token, serve_quic, ReconnectPolicy,
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let (endpoint, info) =
+                bind_quic_listener("127.0.0.1:0".parse().unwrap(), mint_token()).unwrap();
+            tx.send(info.clone()).unwrap();
+            let _ = serve_quic(endpoint, info.token).await;
+        });
+    });
+    let info = rx.recv().unwrap();
+    let url = format!("https://{}", info.addr);
+    let wrong_pin = vec!["00"; 32].join(":");
+    let token = info.token.clone();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::task::spawn_blocking(move || {
+            connect_quic_reconnecting(&url, &wrong_pin, &token, ReconnectPolicy::default())
+        }),
+    )
+    .await
+    .expect("the dial must fail promptly, not hang")
+    .unwrap();
+    let Err(e) = result else {
+        panic!("a mismatched cert pin must refuse the dial");
+    };
+    let text = format!("{e:#} / {e:?}");
+    assert!(
+        !text.contains(&info.token),
+        "the dial error leaked the bearer token: {text}"
+    );
+}

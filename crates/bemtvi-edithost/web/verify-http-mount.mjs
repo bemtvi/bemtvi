@@ -206,9 +206,84 @@ try {
   );
   check("an unmounted name 404s from the editor", editorMiss === 404, `status ${editorMiss}`);
 
-  // ---- 6. A URL the browser itself loads ---------------------------------
+  // ---- 6. A URL the browser itself loads — sandboxed by default ----------
   // The reason this is a Service Worker and not postMessage plumbing: an <iframe> must be
-  // able to load a mount as an ordinary document.
+  // able to load a mount as an ordinary document. And because the SW serves mounts on the
+  // EDITOR's own origin, a mount's document must not inherit the editor's privileges: every
+  // response carries a `sandbox` CSP (no allow-same-origin), so the page runs in an opaque
+  // origin. The page below is what a hostile README rendered by a preview plugin would run:
+  // it tries the editor's DOM, its OPFS, its storage, and reports back over postMessage
+  // (the one channel an opaque frame keeps).
+  await luaResult(
+    page,
+    `
+    btv.http.mount({
+      name = "hostile",
+      on_request = function(req, respond)
+        respond({
+          headers = {
+            ["content-type"] = "text/html",
+            ["content-security-policy"] = "img-src 'none'",
+          },
+          body = [[<script>
+            (async () => {
+              const r = { origin: String(self.origin) };
+              try { r.parent = typeof window.parent.document.title; } catch (e) { r.parent = "denied:" + e.name; }
+              try { r.editorApi = typeof window.parent.__bemtvi; } catch (e) { r.editorApi = "denied:" + e.name; }
+              try { await navigator.storage.getDirectory(); r.opfs = "OPEN"; } catch (e) { r.opfs = "denied:" + e.name; }
+              try { localStorage.length; r.storage = "OPEN"; } catch (e) { r.storage = "denied:" + e.name; }
+              parent.postMessage({ btvIsolation: r }, "*");
+            })();
+          </script>]],
+        })
+      end,
+    }):next(function(m) _G.hostile_url = m:url() end, function(err) _G.hostile_url = "ERROR: " .. err.message end)
+    `
+  );
+  const hostileUrl = String(await pollGlobal(page, "hostile_url")).match(/http\S+?\/plugin\/hostile\//);
+  check("the hostile mount resolved", !!hostileUrl, String(hostileUrl));
+  const isolation = await page.evaluate(async (u) => {
+    const got = new Promise((res) => {
+      addEventListener("message", (e) => e.data && e.data.btvIsolation && res({ from: e.origin, ...e.data.btvIsolation }));
+      setTimeout(() => res({ from: "TIMEOUT" }), 8000);
+    });
+    const f = document.createElement("iframe");
+    f.src = u;
+    document.body.appendChild(f);
+    const r = await got;
+    try { r.parentReadsFrame = typeof f.contentDocument.body; } catch (e) { r.parentReadsFrame = "denied:" + e.name; }
+    if (f.contentDocument === null) r.parentReadsFrame = "denied:null";
+    return r;
+  }, hostileUrl && hostileUrl[0]);
+  check("a mount's document runs in an opaque origin", isolation.origin === "null" && isolation.from === "null", JSON.stringify(isolation));
+  check("…it cannot reach the editor page (window.parent)", String(isolation.parent).startsWith("denied") && String(isolation.editorApi).startsWith("denied"), JSON.stringify(isolation));
+  check("…it cannot open the editor's OPFS", String(isolation.opfs).startsWith("denied"), JSON.stringify(isolation));
+  check("…it cannot read the editor origin's storage", String(isolation.storage).startsWith("denied"), JSON.stringify(isolation));
+  const hostileHeaders = await page.evaluate(
+    (u) => fetch(u, { cache: "no-store" }).then((r) => r.headers.get("content-security-policy")),
+    hostileUrl && hostileUrl[0]
+  );
+  check(
+    "the sandbox CSP rides beside the plugin's own CSP (merged, not replaced)",
+    /sandbox allow-scripts/.test(hostileHeaders || "") && !/allow-same-origin/.test(hostileHeaders || "") && /img-src 'none'/.test(hostileHeaders || ""),
+    String(hostileHeaders)
+  );
+
+  // `same_origin = true` is the explicit opt-out: that mount's document IS the editor's
+  // origin, so the editor page can read straight into its frame.
+  await luaResult(
+    page,
+    `
+    btv.http.mount({
+      name = "trusted",
+      same_origin = true,
+      on_request = function(req, respond)
+        respond({ headers = { ["content-type"] = "text/html" }, body = "<h1>from lua</h1>" })
+      end,
+    }):next(function(m) _G.trusted_url = m:url() end)
+    `
+  );
+  await pollGlobal(page, "trusted_url");
   const framed = await page.evaluate(async (u) => {
     const f = document.createElement("iframe");
     f.src = u;
@@ -222,8 +297,8 @@ try {
     } catch (e) {
       return "ERR: " + e.message;
     }
-  }, url);
-  check("an <iframe> loads the mount as a real document", framed === "<h1>from lua</h1>", framed);
+  }, `${ORIGIN}/plugin/trusted/`);
+  check("a same_origin mount loads in an <iframe> as an editor-origin document", framed === "<h1>from lua</h1>", framed);
 
   // ---- 7. opts.timeout is honored ON THE WEB ------------------------------
   // The point of moving the deadline into Lua: the browser build has no listener to enforce

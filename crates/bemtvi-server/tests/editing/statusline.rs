@@ -152,6 +152,34 @@ async fn statusline_whole_vlua_expression_renders_result() {
     assert_eq!(status_text(&map), "HELLO");
 }
 
+/// A `%{%…%}` / `%!` result is re-parsed as a format, so an expression that returns
+/// itself recursed until the stack overflowed and the process aborted. The nesting is
+/// capped and the overflow shown on the line instead.
+#[tokio::test]
+async fn statusline_self_returning_expression_stops_with_an_error() {
+    let (rpc, mut incoming) = start(None).await;
+    exec_lua(&rpc, "_G.me = function() return 'x%{%v:lua.me()%}' end").await;
+    let map = redraw_after(&rpc, &mut incoming, ":set statusline=%{%v:lua.me()%}<CR>").await;
+    let text = status_text(&map);
+    assert!(text.contains("too deep"), "statusline: {text}");
+    exec_lua(&rpc, "_G.me2 = function() return 'y%!v:lua.me2()' end").await;
+    let map = redraw_after(&rpc, &mut incoming, ":set statusline=%!v:lua.me2()<CR>").await;
+    let text = status_text(&map);
+    assert!(text.contains("too deep"), "statusline: {text}");
+    // One that splices in two copies of itself would make 2^depth calls per frame.
+    exec_lua(
+        &rpc,
+        "_G.calls = 0 _G.two = function() calls = calls + 1 return '%{%v:lua.two()%}%{%v:lua.two()%}' end",
+    )
+    .await;
+    let map = redraw_after(&rpc, &mut incoming, ":set statusline=%{%v:lua.two()%}<CR>").await;
+    let text = status_text(&map);
+    assert!(text.contains("too many"), "statusline: {text}");
+    let calls = exec_lua(&rpc, "return calls").await.as_i64().unwrap_or(-1);
+    assert!((1..=4096).contains(&calls), "bounded evaluations: {calls}");
+    assert_eq!(lines(&rpc).await, vec![""]);
+}
+
 #[tokio::test]
 async fn statusline_embedded_vlua_expression_renders_result() {
     let (rpc, mut incoming) = start(None).await;

@@ -176,7 +176,8 @@ end
 
 -- Whether provider `p` runs for the window described by `ctx` — its `bufs` filter.
 -- No `bufs` ⇒ every buffer. Otherwise every present constraint must hold (AND):
---   `bufs.filetype = { "lua", … }`        — the buffer's filetype must be in the list;
+--   `bufs.filetype = { "lua", … }`        — the buffer's filetype must be in the list
+--                                            (a single string is a one-element list);
 --   `bufs.buftype  = { "quickfix", … }`   — the buffer's buftype must be in the list
 --                                            (`""` = an ordinary file/scratch buffer,
 --                                            `"quickfix"` / `"terminal"` the special kinds);
@@ -189,6 +190,9 @@ local function decor_matches(p, ctx)
   end
   -- bufs.filetype: the buffer's filetype must be one of the listed languages.
   local fts = bufs.filetype
+  if type(fts) == "string" then
+    fts = { fts }
+  end
   if fts then
     local ft = ctx.filetype or ""
     local ok = false
@@ -205,6 +209,9 @@ local function decor_matches(p, ctx)
   -- bufs.buftype: the buffer's buftype must be one of the listed kinds — `""` (ordinary
   -- file/scratch), `"quickfix"` (quickfix or location-list display), or `"terminal"`.
   local bts = bufs.buftype
+  if type(bts) == "string" then
+    bts = { bts }
+  end
   if bts then
     local bt = ctx.buftype or ""
     local ok = false

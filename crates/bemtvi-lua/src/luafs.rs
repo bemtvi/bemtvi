@@ -779,8 +779,11 @@ fn write_whole(fs: &dyn LuaFs, path: &str, data: &[u8], append: bool) -> io::Res
         }
         Ok(())
     })();
-    let _ = fs.close(fd);
-    res
+    // Close even after a failed write (the fd must not leak), but a close that fails
+    // after every byte was accepted is the write failing late — report it, never a
+    // silent success over data that may not have landed.
+    let closed = fs.close(fd);
+    res.and(closed)
 }
 
 /// Remove `path`: a file via `unlink`, a directory via `rmdir` (emptying it first
@@ -792,14 +795,26 @@ fn remove_path(fs: &dyn LuaFs, path: &str, recursive: bool) -> io::Result<()> {
     // deleting `file:///` — would take the whole disk with it. Everything
     // *below* the root is the ordinary delete contract; the root itself never
     // is (no editor feature has a legitimate reason to delete it).
-    if path == "/" {
-        return Err(io::Error::new(
+    let refuse = || {
+        io::Error::new(
             io::ErrorKind::InvalidInput,
-            "EINVAL: refusing to remove the filesystem root '/'",
-        ));
+            format!("EINVAL: refusing to remove the filesystem root '{path}'"),
+        )
+    };
+    // Every spelling of the root (`//`, `/.`, `/..`) is the root.
+    if is_root(&lexical_normalize(std::path::Path::new(path))) {
+        return Err(refuse());
     }
     let st = fs.lstat(path)?;
     if st.kind == FileKind::Dir {
+        // A relative path can climb to the root too (`../..` from a shallow cwd).
+        // `lstat` said Dir, so this is no symlink: its realpath is what would go.
+        if fs
+            .realpath(path)
+            .is_ok_and(|real| is_root(std::path::Path::new(&real)))
+        {
+            return Err(refuse());
+        }
         if recursive {
             for e in fs.scandir(path)? {
                 let child = std::path::Path::new(path).join(&e.name);
@@ -816,6 +831,22 @@ fn remove_path(fs: &dyn LuaFs, path: &str, recursive: bool) -> io::Result<()> {
 /// when `recursive`. A directory `src` without `recursive` is an error, not a silent
 /// skip.
 fn copy_path(fs: &dyn LuaFs, src: &str, dst: &str, recursive: bool) -> io::Result<()> {
+    // A directory copied into itself would recurse into the copy it is writing until
+    // the path grows too long; refuse up front, before anything is created.
+    if recursive && fs.lstat(src)?.kind == FileKind::Dir {
+        if let (Some(s), Some(d)) = (resolve_path(fs, src), resolve_path(fs, dst)) {
+            if d.starts_with(&s) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("EINVAL: refusing to copy '{src}' into itself ('{dst}')"),
+                ));
+            }
+        }
+    }
+    copy_tree(fs, src, dst, recursive)
+}
+
+fn copy_tree(fs: &dyn LuaFs, src: &str, dst: &str, recursive: bool) -> io::Result<()> {
     let st = fs.lstat(src)?;
     if st.kind == FileKind::Dir {
         if !recursive {
@@ -828,10 +859,61 @@ fn copy_path(fs: &dyn LuaFs, src: &str, dst: &str, recursive: bool) -> io::Resul
         for e in fs.scandir(src)? {
             let cs = std::path::Path::new(src).join(&e.name);
             let cd = std::path::Path::new(dst).join(&e.name);
-            copy_path(fs, &cs.to_string_lossy(), &cd.to_string_lossy(), true)?;
+            copy_tree(fs, &cs.to_string_lossy(), &cd.to_string_lossy(), true)?;
         }
         Ok(())
     } else {
         fs.copyfile(src, dst, false)
     }
+}
+
+/// `path` with `.` dropped, `..` folded into its parent (a `..` at the root stays at
+/// the root) and repeated separators collapsed — purely lexical, no fs access.
+fn lexical_normalize(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !out.has_root() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Whether `path` names a filesystem root (`/`, or `C:\` on Windows).
+fn is_root(path: &std::path::Path) -> bool {
+    path.has_root()
+        && path
+            .components()
+            .all(|c| !matches!(c, std::path::Component::Normal(_)))
+}
+
+/// `path` resolved through `fs`: the realpath of its longest existing prefix with the
+/// missing tail appended and normalized lexically. `None` when no prefix resolves.
+fn resolve_path(fs: &dyn LuaFs, path: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(path);
+    if let Ok(real) = fs.realpath(path) {
+        return Some(std::path::PathBuf::from(real));
+    }
+    let name = p.file_name().map(std::ffi::OsStr::to_os_string);
+    let parent = match p.parent() {
+        Some(par) if !par.as_os_str().is_empty() => par.to_string_lossy().into_owned(),
+        _ if p.has_root() => return None,
+        _ => ".".to_string(),
+    };
+    let mut base = resolve_path(fs, &parent)?;
+    match name {
+        Some(n) => base.push(n),
+        // A trailing `..` / `.` component: keep it for the lexical pass below.
+        None => base.push(p.components().next_back()?.as_os_str()),
+    }
+    Some(lexical_normalize(&base))
 }

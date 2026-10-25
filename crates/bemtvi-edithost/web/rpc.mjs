@@ -30,6 +30,19 @@ import { encode, decodeMultiStream } from "./vendor/msgpack/index.mjs";
 // the `btv.fs.watch` streaming leg, which the native edit-host doesn't).
 const GROUP_TAGS = { control: 0, proc: 1, lsp: 2, term: 3 };
 
+// Decode caps, matching the native reader in `crates/bemtvi-rpc/src/lib.rs` (`MAX_VALUES`
+// values and `MAX_FRAME` bytes per frame; a map entry is two values). msgpack declares a
+// container's size up front, so without these a 5-byte header could make the decoder buffer
+// or allocate toward 4 GiB. A frame over a cap is refused at its header and the link is
+// closed loudly (`_refuse`).
+const DECODE_LIMITS = {
+  maxArrayLength: 1 << 22,
+  maxMapLength: 1 << 21,
+  maxStrLength: 64 << 20,
+  maxBinLength: 64 << 20,
+  maxExtLength: 64 << 20,
+};
+
 /**
  * The leg group that owns a wire method — the JS mirror of `LegGroup::classify`. The four
  * arms partition the method namespace disjointly; an unknown method defaults to Control (the
@@ -87,7 +100,17 @@ export class RpcClient {
   }
 
   async _readLoop(readable) {
-    for await (const frame of decodeMultiStream(readable)) {
+    const frames = decodeMultiStream(readable, DECODE_LIMITS);
+    for (;;) {
+      let next;
+      try {
+        next = await frames.next();
+      } catch (e) {
+        if (e && e.name === "DecodeError") return this._refuse(e);
+        throw e;
+      }
+      if (next.done) break;
+      const frame = next.value;
       if (!Array.isArray(frame) || frame.length < 1) continue;
       const type = frame[0];
       if (type === 1) {
@@ -117,6 +140,21 @@ export class RpcClient {
     }
     // Clean EOF (the daemon hung up): fail any still-pending requests.
     this._fail(new Error("daemon stream ended"));
+  }
+
+  // The daemon sent a frame the wire can't accept (over a decode cap, or malformed): the
+  // stream can't be resynced past it, so fail every in-flight request with the reason, say so
+  // in the console, and close the session.
+  _refuse(e) {
+    const err = new Error(`daemon sent an invalid frame (${e.message}); closing the connection`);
+    err.protocol = true;
+    console.error(`bemtvi: ${err.message}`);
+    this._fail(err);
+    try {
+      this.transport.close();
+    } catch {
+      // Already closing/closed — nothing to do.
+    }
   }
 
   _fail(err) {

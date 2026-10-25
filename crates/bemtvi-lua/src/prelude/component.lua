@@ -265,6 +265,10 @@ local function view_backend(opts)
     close = function()
       v:close()
     end,
+    -- `fn()` when the USER closes the view's window (`:q` / `<C-w>c`).
+    on_user_close = function(fn)
+      v:on_close(fn)
+    end,
     -- Surface-specific ctx: the live cursor + buffer-local key binding.
     ctx = function()
       return {
@@ -291,7 +295,10 @@ local function view_backend(opts)
         bo = setmetatable({}, {
           __index = function(_, k)
             local b = v:bufnr()
-            return b and vim.bo[b][k] or nil
+            if not b then
+              return nil
+            end
+            return vim.bo[b][k]
           end,
           __newindex = function(_, k, val)
             local b = v:bufnr()
@@ -303,7 +310,10 @@ local function view_backend(opts)
         wo = setmetatable({}, {
           __index = function(_, k)
             local w = v:winid()
-            return w and vim.wo[w][k] or nil
+            if not w then
+              return nil
+            end
+            return vim.wo[w][k]
           end,
           __newindex = function(_, k, val)
             local w = v:winid()
@@ -538,6 +548,13 @@ function btv.component(def)
     backend.show(show_mode)
 
     local inst = { _closed = false, _on_close = {} }
+    -- The user closing the surface's window closes the instance, so its teardown hooks
+    -- run instead of it living on, rendering into a view nobody can see.
+    if backend.on_user_close then
+      backend.on_user_close(function()
+        inst:close()
+      end)
+    end
     local state -- whatever setup returns; the render input
     local gen = 0 -- render generation, so a slow async render can't clobber a newer one
     local dirty = false
@@ -563,8 +580,10 @@ function btv.component(def)
       local mine = gen
       -- `render` may be sync or async; fold both into one promise chain. A stale result
       -- (a newer render started meanwhile) is dropped.
-      btv.promise
-        .try(def.render, state, inst)
+      -- Run inside its own coroutine (`btv.async`), so a render that awaits works on
+      -- every render, not only the first one (which happens to run inside setup's).
+      btv
+        .async(def.render)(state, inst)
         :next(function(out)
           if mine == gen and not inst._closed then
             backend.apply(out)
@@ -603,6 +622,15 @@ function btv.component(def)
       end,
       refresh = schedule_render,
       on_close = function(fn)
+        -- Registered after the instance closed (an async `setup` still running when it
+        -- did): run it now, or it never would.
+        if inst._closed then
+          local ok, err = pcall(fn)
+          if not ok then
+            btv.notify("btv.component: on_close error: " .. tostring(err), 4)
+          end
+          return
+        end
         inst._on_close[#inst._on_close + 1] = fn
       end,
       close = function()

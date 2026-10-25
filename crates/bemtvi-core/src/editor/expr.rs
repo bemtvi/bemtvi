@@ -418,7 +418,15 @@ struct Parser<'a> {
     /// Resolver for `&option` references. `None` (e.g. `:echo`) means options are
     /// not available here and any `&option` fails loud.
     opts: Option<OptResolver<'a>>,
+    /// Current recursion depth (nested parens / ternaries / unary operators),
+    /// bounded by [`MAX_EXPR_DEPTH`] so a pathological input fails loud instead of
+    /// overflowing the stack.
+    depth: usize,
 }
+
+/// How deep an expression may nest before evaluation refuses it. Far beyond any
+/// real `:echo` / statusline expression, and far below what the stack holds.
+const MAX_EXPR_DEPTH: usize = 200;
 
 impl<'a> Parser<'a> {
     fn peek(&self) -> Option<&Tok> {
@@ -442,9 +450,24 @@ impl<'a> Parser<'a> {
         Ok(parts.join(" "))
     }
 
+    /// Run one recursive descent step under the depth bound.
+    fn nested(&mut self, step: fn(&mut Self) -> Result<Value, String>) -> Result<Value, String> {
+        if self.depth >= MAX_EXPR_DEPTH {
+            return Err("E1169: Expression too recursive".to_string());
+        }
+        self.depth += 1;
+        let v = step(self);
+        self.depth -= 1;
+        v
+    }
+
     /// Lowest precedence: the ternary `cond ? then : else`. Right-associative, so
     /// `a ? b : c ? d : e` parses as `a ? b : (c ? d : e)`.
     fn ternary(&mut self) -> Result<Value, String> {
+        self.nested(Self::ternary_step)
+    }
+
+    fn ternary_step(&mut self) -> Result<Value, String> {
         let cond = self.logic_or()?;
         if matches!(self.peek(), Some(Tok::Question)) {
             self.next();
@@ -548,6 +571,10 @@ impl<'a> Parser<'a> {
     }
 
     fn unary(&mut self) -> Result<Value, String> {
+        self.nested(Self::unary_step)
+    }
+
+    fn unary_step(&mut self) -> Result<Value, String> {
         if matches!(self.peek(), Some(Tok::Minus)) {
             self.next();
             let v = self.unary()?;
@@ -649,13 +676,15 @@ fn arith(a: &Value, b: &Value, op: char) -> Result<Value, String> {
                 if y == 0 {
                     return Err("E1154: Divide by zero".to_string());
                 }
-                x / y // Rust integer division truncates toward zero, like Vim
+                // Rust integer division truncates toward zero, like Vim; wrapping
+                // so `i64::MIN / -1` (the one overflowing quotient) can't panic.
+                x.wrapping_div(y)
             }
             '%' => {
                 if y == 0 {
                     return Err("E1154: Divide by zero".to_string());
                 }
-                x % y
+                x.wrapping_rem(y)
             }
             _ => unreachable!(),
         }));
@@ -697,6 +726,7 @@ pub(crate) fn eval_echo(input: &str) -> Result<String, String> {
         toks,
         pos: 0,
         opts: None,
+        depth: 0,
     };
     p.eval_all()
 }
@@ -715,6 +745,7 @@ pub fn eval_expr(input: &str, resolve_opt: OptResolver) -> Result<String, String
         toks,
         pos: 0,
         opts: Some(resolve_opt),
+        depth: 0,
     };
     let value = p.ternary()?;
     if p.peek().is_some() {

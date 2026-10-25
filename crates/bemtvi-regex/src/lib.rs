@@ -475,15 +475,15 @@ impl VimRegex {
                     &mut timed_out,
                 )
             };
+            // The engine may have freed our program and recompiled it (NFA→BT
+            // fallback); adopt the pointer it wrote back so we don't keep a
+            // dangling one. It can also be left NULL if recompilation failed.
+            self.prog.set(rm.regprog);
             if timed_out != 0 {
                 return Err(VimRegexError(
                     "vim regex match timed out (pattern too expensive for this line)".into(),
                 ));
             }
-            // The engine may have freed our program and recompiled it (NFA→BT
-            // fallback); adopt the pointer it wrote back so we don't keep a
-            // dangling one. It can also be left NULL if recompilation failed.
-            self.prog.set(rm.regprog);
             if !matched {
                 if let Some(err) = pending_error() {
                     return Err(err);

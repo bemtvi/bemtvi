@@ -60,6 +60,22 @@ pub(crate) fn lua_int(n: i64) -> mlua::Integer {
     }
 }
 
+/// A Lua number for an integer that arrived from *outside* (a JSON document, a
+/// msgpack payload): an integer when it fits the VM's `lua_Integer`, else a float.
+///
+/// Unlike [`lua_int`], whose callers promise the value fits, external data carries
+/// whatever the peer sent — a millisecond timestamp, a file size, an id from an LSP
+/// server — and on wasm32 (a 32-bit `lua_Integer`) narrowing that would panic.
+/// Lua itself takes the same route for an integer literal too large to be one.
+#[inline]
+#[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)] // infallible on native
+pub(crate) fn lua_number(n: i64) -> mlua::Value {
+    match mlua::Integer::try_from(n) {
+        Ok(i) => mlua::Value::Integer(i),
+        Err(_) => mlua::Value::Number(n as f64),
+    }
+}
+
 /// Read a color field (`fg`/`bg`/`sp`) from an `nvim_set_hl` opts table. A
 /// string (`"#rrggbb"` / `"NONE"` / a name) is kept verbatim; an integer color
 /// is normalized to `#rrggbb`; anything else (incl. absent) is `None`. The core
@@ -282,7 +298,7 @@ fn rmpv_to_lua_at(lua: &Lua, value: &rmpv::Value, depth: usize) -> mlua::Result<
         R::Nil => mlua::Value::Nil,
         R::Boolean(b) => mlua::Value::Boolean(*b),
         R::Integer(i) => match i.as_i64() {
-            Some(n) => mlua::Value::Integer(lua_int(n)),
+            Some(n) => lua_number(n),
             None => mlua::Value::Number(i.as_f64().unwrap_or(0.0)),
         },
         R::F32(n) => mlua::Value::Number(*n as f64),
@@ -337,7 +353,7 @@ fn json_to_lua_at(lua: &Lua, value: &serde_json::Value, depth: usize) -> mlua::R
         J::Null => mlua::Value::Nil,
         J::Bool(b) => mlua::Value::Boolean(*b),
         J::Number(n) => match n.as_i64() {
-            Some(i) => mlua::Value::Integer(lua_int(i)),
+            Some(i) => lua_number(i),
             None => mlua::Value::Number(n.as_f64().unwrap_or(0.0)),
         },
         J::String(s) => mlua::Value::String(lua.create_string(s)?),

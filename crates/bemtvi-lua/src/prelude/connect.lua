@@ -125,7 +125,10 @@ function btv.connect.connect(url)
     end)
     :catch(function(err)
       btv.notify(
-        "connect (" .. provider.label .. ") failed: " .. tostring(err),
+        "connect ("
+          .. provider.label
+          .. ") failed: "
+          .. tostring(type(err) == "table" and err.message or err),
         vim.log.levels.ERROR
       )
     end)

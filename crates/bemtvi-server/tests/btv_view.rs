@@ -584,6 +584,51 @@ async fn view_on_close_fires_on_user_quit_only() {
     );
 }
 
+/// A view component learns when the USER closes its window (`:q`): the instance closes,
+/// so its `ctx.on_close` teardown hooks run (releasing the autocmds / timers `setup`
+/// armed) instead of the instance living on, re-rendering into a view nobody sees.
+#[tokio::test]
+async fn view_component_closes_when_the_user_quits_its_window() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, "imain<Esc>").await;
+    exec_lua(
+        &rpc,
+        r#"_G.cclosed = 0
+           btv.component({
+             setup = function(ctx)
+               ctx.on_close(function() _G.cclosed = _G.cclosed + 1 end)
+               _G.cready = true
+               return ctx.reactive({})
+             end,
+             render = function() return { lines = { "x" } } end,
+           }).mount({ split = "vsplit" })"#,
+    )
+    .await;
+    let mut ready = false;
+    for _ in 0..100 {
+        if exec_lua(&rpc, "return _G.cready == true").await.as_bool() == Some(true) {
+            ready = true;
+            break;
+        }
+        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    }
+    assert!(ready, "the component's setup ran");
+    feed_sync(&rpc, ":q<CR>").await;
+    let mut n = None;
+    for _ in 0..100 {
+        n = lua_u64(&rpc, "return _G.cclosed").await;
+        if n == Some(1) {
+            break;
+        }
+        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    }
+    assert_eq!(
+        n,
+        Some(1),
+        "`:q` on the component window ran its on_close hook once"
+    );
+}
+
 /// `:set_decor` lays extmarks on the view buffer (read back via
 /// `nvim_buf_get_extmarks`), the rendering layer for icons / indent guides / signs.
 #[tokio::test]
@@ -1284,6 +1329,43 @@ async fn view_component_sets_buffer_options_via_ctx_bo() {
         rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
     }
     assert!(ok, "ctx.bo set the view buffer's shiftwidth to 8");
+}
+
+/// Reading a `false` option back through `ctx.bo` returns `false`, not `nil` — a
+/// handler testing `ctx.bo.expandtab == false` must see what the buffer holds.
+#[tokio::test]
+async fn view_component_ctx_bo_reads_false_as_false() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"btv.component({
+             setup = function(ctx)
+               _G.vctx = ctx
+               ctx.bo.expandtab = false
+               return ctx.reactive({})
+             end,
+             render = function()
+               return { lines = { "x" } }
+             end,
+           }).mount({ float = { width = 12, height = 3, grab = true } })"#,
+    )
+    .await;
+    let mut got = String::new();
+    for _ in 0..100 {
+        got = exec_lua(
+            &rpc,
+            "return _G.vctx and type(_G.vctx.bo.expandtab) or 'none'",
+        )
+        .await
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+        if got != "none" {
+            break;
+        }
+        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    }
+    assert_eq!(got, "boolean", "ctx.bo.expandtab read back false, not nil");
 }
 
 /// A view component can set window-local options on the window showing it via `ctx.wo`

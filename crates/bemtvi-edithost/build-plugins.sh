@@ -34,7 +34,7 @@ PLUGINS=(
   "bemtvi/bemtvi-lspconfig	deafc538b71140646acc9b4bf0eaa302f669267c"
   "bemtvi/bemtvi-diff	05bb889a91e21a317efa7dcd089833215284b24d"
   "bemtvi/bemtvi-snippets	ad5eff3ed906efd6057fe9cedab1bd838424b9fd"
-  "bemtvi/bemtvi-markdown-preview	f192efbd789e4a8240dbb59ef0dcd1c9e00be627"
+  "bemtvi/bemtvi-markdown-preview	8472323d9bf06d0a15ba46a01a2a7a33752313b5"
 )
 
 force=0

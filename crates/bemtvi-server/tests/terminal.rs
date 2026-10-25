@@ -1329,3 +1329,119 @@ async fn ctrl_c_does_not_trim_after_a_repainting_child_that_never_scrolled() {
         ls.len()
     );
 }
+
+/// `'scrollback'` is bounded like neovim's (`SB_MAX`, one million rows): a larger value
+/// is refused with E474 instead of letting a chatty child grow the history without end.
+#[tokio::test]
+async fn scrollback_above_the_maximum_is_rejected() {
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, ":set scrollback=1000000<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return btv.o.scrollback").await.as_i64(),
+        Some(1_000_000)
+    );
+    feed(&rpc, ":set scrollback=1000001<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return btv.o.scrollback").await.as_i64(),
+        Some(1_000_000),
+        "the out-of-range value was not applied"
+    );
+}
+
+/// A child can send a window title of any length; the buffer name keeps a bounded head
+/// of it (cut on a character boundary) rather than the whole thing.
+#[tokio::test]
+async fn an_enormous_window_title_is_cut_to_a_bounded_name() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+    let script = write_temp(
+        "term_huge_title",
+        "sh",
+        "awk 'BEGIN { printf \"\\033]2;\"; for (i = 0; i < 15000; i++) printf \"é\"; printf \"\\007\" }'\nsleep 5\n",
+    );
+    command(&rpc, &format!("terminal sh {script}")).await;
+    let mut name = String::new();
+    for _ in 0..200 {
+        name = buf_name(&rpc).await;
+        if name.starts_with('é') {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        name.starts_with("éé"),
+        "title applied: {:?}",
+        &name[..name.len().min(40)]
+    );
+    assert!(
+        name.len() <= 4096,
+        "name kept bounded: {} bytes",
+        name.len()
+    );
+    assert!(name.chars().all(|c| c == 'é'), "cut on a char boundary");
+}
+
+/// The resident set of this (test) process in KiB — the server runs in-process.
+#[cfg(target_os = "linux")]
+fn rss_kib() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// A child that opens an OSC string and streams megabytes into it: the escape parser
+/// buffers an OSC payload whole until its terminator, so this used to grow memory with
+/// every byte. The payload is capped, and output after the terminator still renders.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_unterminated_osc_flood_keeps_memory_bounded() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+    let script = write_temp(
+        "term_osc_flood",
+        "sh",
+        "printf '\\033]2;'\nhead -c 200000000 /dev/zero | tr '\\000' x\nprintf '\\007AFTER-OSC\\n'\nsleep 5\n",
+    );
+    let before = rss_kib();
+    command(&rpc, &format!("terminal sh {script}")).await;
+    let started = std::time::Instant::now();
+    while !has_line(&lines(&rpc).await, "AFTER-OSC") {
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "output after the OSC string never rendered"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let grown_mib = rss_kib().saturating_sub(before) / 1024;
+    assert!(
+        grown_mib < 100,
+        "a 200MB OSC payload grew the process by {grown_mib} MiB"
+    );
+    assert!(buf_name(&rpc).await.len() <= 4096);
+}
+
+/// A title whose escape sequence arrives split across PTY reads (the `ESC` in one chunk,
+/// `]2;…` in the next) still lands: the OSC cap tracks the stream across chunks.
+#[tokio::test]
+async fn a_window_title_split_across_reads_still_applies() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+    let script = write_temp(
+        "term_split_title",
+        "sh",
+        "printf '\\033'\nsleep 0.3\nprintf ']2;split'\nsleep 0.3\nprintf -- '-title\\007'\nsleep 5\n",
+    );
+    command(&rpc, &format!("terminal sh {script}")).await;
+    for _ in 0..100 {
+        if buf_name(&rpc).await == "split-title" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(buf_name(&rpc).await, "split-title");
+}

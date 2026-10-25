@@ -31,6 +31,8 @@ bemtvi-lsp.workspace = true
 # test deps.
 bemtvi-rpc.workspace = true
 rmpv.workspace = true
+# `BEMTVI_ARGV` carries the positional file args to `btv.argv()` as a JSON array.
+serde_json.workspace = true
 
 [dev-dependencies]
 ratatui.workspace = true

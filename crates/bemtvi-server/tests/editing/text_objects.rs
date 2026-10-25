@@ -333,14 +333,46 @@ async fn di_quote_with_dangling_quote_works_on_the_right_side() {
 }
 
 #[tokio::test]
-async fn ci_quote_two_strings_seeks_forward_over_the_gap() {
+async fn ci_quote_between_two_strings_takes_the_gap() {
     let (rpc, _incoming) = start(None).await;
-    // Even quote count, proper gap: cursor in the gap selects the next string,
-    // it does not grab the inter-string space.
+    // vim's `current_quote`: off a quote, the string runs from the nearest quote
+    // before the cursor to the next one — between two strings, the gap itself.
     feed(&rpc, "i\"a\" \"b\"<Esc>");
     // Cursor on the space between the strings (column 3).
     feed(&rpc, "0lllci\"X<Esc>");
-    assert_eq!(lines(&rpc).await, vec!["\"a\" \"X\""]);
+    assert_eq!(lines(&rpc).await, vec!["\"a\"X\"b\""]);
+}
+
+/// The same with words in the gap, every flavour (expected from neovim).
+#[tokio::test]
+async fn quote_objects_between_two_strings_match_vim() {
+    let (rpc, _incoming) = start(None).await;
+    let text = ["say \"one\" and \"two\" end"];
+    for col in [9, 10, 12] {
+        assert_eq!(
+            edit_probe(&rpc, &text, (1, col), "di\"").await,
+            vec!["say \"one\"\"two\" end"],
+            "di\" at {col}"
+        );
+        assert_eq!(
+            edit_probe(&rpc, &text, (1, col), "da\"").await,
+            vec!["say \"onetwo\" end"],
+            "da\" at {col}"
+        );
+    }
+    // Before the first string it still seeks forward; on a quote it pairs.
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 0), "di\"").await,
+        vec!["say \"\" and \"two\" end"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 8), "di\"").await,
+        vec!["say \"\" and \"two\" end"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 14), "di\"").await,
+        vec!["say \"one\" and \"\" end"]
+    );
 }
 
 // ----- paragraph & sentence text objects -----------------------------------
@@ -585,4 +617,206 @@ async fn v_f_then_delete_includes_the_target() {
     feed(&rpc, "ihello world<Esc>");
     feed(&rpc, "0vfod");
     assert_eq!(lines(&rpc).await, vec![" world"]);
+}
+
+// ----- vim ground truth (nvim --clean) for object edges and counts ---------
+
+#[tokio::test]
+async fn daw_on_the_last_word_of_a_line_takes_leading_space_not_the_newline() {
+    let (rpc, _incoming) = start(None).await;
+    let text = ["one two three", "four five"];
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 12), "daw").await,
+        vec!["one two", "four five"]
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv.reg.get('-')").await,
+        Value::from(" three")
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 4), "d2aw").await,
+        vec!["one", "four five"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 3), "d2aw").await,
+        vec!["one", "four five"]
+    );
+    // Indentation is not "leading white space" for `aw`.
+    assert_eq!(
+        edit_probe(&rpc, &["  foo"], (1, 2), "daw").await,
+        vec!["  "]
+    );
+    // `das` on the last sentence of a line likewise stays on its line.
+    assert_eq!(
+        edit_probe(
+            &rpc,
+            &["Hello world.  This is it.", "Next."],
+            (1, 16),
+            "das"
+        )
+        .await,
+        vec!["Hello world.", "Next."]
+    );
+}
+
+#[tokio::test]
+async fn is_on_the_gap_between_sentences_selects_the_gap() {
+    let (rpc, _incoming) = start(None).await;
+    let text = ["Hello world.  This is it.  Another one!"];
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 12), "dis").await,
+        vec!["Hello world.This is it.  Another one!"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 12), "das").await,
+        vec!["Hello world.  Another one!"]
+    );
+}
+
+#[tokio::test]
+async fn paragraph_counts_take_whole_blocks() {
+    let (rpc, _incoming) = start(None).await;
+    let text = ["a1", "a2", "", "", "b1", "b2", "", "c1"];
+    assert_eq!(edit_probe(&rpc, &text, (1, 0), "d2ap").await, vec!["c1"]);
+    assert_eq!(
+        edit_probe(&rpc, &text, (3, 0), "d2ap").await,
+        vec!["a1", "a2"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 0), "d3ip").await,
+        vec!["", "c1"]
+    );
+}
+
+#[tokio::test]
+async fn bracket_object_count_selects_the_outer_level() {
+    let (rpc, _incoming) = start(None).await;
+    let text = ["x = (a, (b, c), d)"];
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 9), "d2i(").await,
+        vec!["x = ()"]
+    );
+    assert_eq!(edit_probe(&rpc, &text, (1, 9), "d2a(").await, vec!["x = "]);
+    // Asking for more levels than exist is a no-op, as in vim.
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 6), "d2i(").await,
+        vec!["x = (a, (b, c), d)"]
+    );
+}
+
+#[tokio::test]
+async fn ci_paren_on_empty_parens_inserts_between_them() {
+    let (rpc, _incoming) = start(None).await;
+    assert_eq!(
+        edit_probe(&rpc, &["f()"], (1, 1), "ci(x<Esc>").await,
+        vec!["f(x)"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &["f()"], (1, 2), "ci)x<Esc>").await,
+        vec!["f(x)"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &["s = \"\""], (1, 4), "ci\"x<Esc>").await,
+        vec!["s = \"x\""]
+    );
+}
+
+#[tokio::test]
+async fn repeating_an_object_in_visual_mode_grows_the_selection() {
+    let (rpc, _incoming) = start(None).await;
+    let words = ["one two three"];
+    assert_eq!(
+        edit_probe(&rpc, &words, (1, 0), "vawawd").await,
+        vec!["three"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &words, (1, 0), "viwiwiwd").await,
+        vec![" three"]
+    );
+    let parens = ["x = (a, (b, c), d)"];
+    assert_eq!(
+        edit_probe(&rpc, &parens, (1, 9), "va(a(d").await,
+        vec!["x = "]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &parens, (1, 9), "vi(i(d").await,
+        vec!["x = ()"]
+    );
+    let paras = ["a1", "a2", "", "", "b1", "b2", "", "c1"];
+    assert_eq!(
+        edit_probe(&rpc, &paras, (1, 0), "vipipd").await,
+        vec!["b1", "b2", "", "c1"]
+    );
+    assert_eq!(edit_probe(&rpc, &paras, (1, 0), "vapapd").await, vec!["c1"]);
+}
+
+#[tokio::test]
+async fn as_takes_the_line_break_before_the_next_sentence() {
+    let (rpc, _incoming) = start(None).await;
+    // The white space after a sentence runs on to the next sentence's start, line
+    // break and indent included; ending in column 0 from the indent, `das` is
+    // linewise (vim's exclusive-motion rule).
+    assert_eq!(
+        edit_probe(&rpc, &["Foo bar.", "Baz qux."], (1, 0), "das").await,
+        vec!["Baz qux."]
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv.reg.gettype('\"')").await,
+        Value::from("V")
+    );
+    assert_eq!(
+        edit_probe(&rpc, &["  Foo bar.", "Baz qux."], (1, 3), "das").await,
+        vec!["Baz qux."]
+    );
+    assert_eq!(
+        edit_probe(
+            &rpc,
+            &["Hello world.  This is it.", "  Next."],
+            (1, 16),
+            "das"
+        )
+        .await,
+        vec!["Hello world.  Next."]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &["One. Two.", "Three."], (1, 5), "das").await,
+        vec!["One.", "Three."]
+    );
+    edit_probe(&rpc, &["a b", "c d", "", "e"], (1, 0), "yas").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.reg.get('\"')").await,
+        Value::from("a b\nc d\n")
+    );
+    // Leading blanks reach back over a line break only when blanks precede it.
+    assert_eq!(
+        edit_probe(&rpc, &["Foo bar.  ", "Baz qux."], (2, 0), "das").await,
+        vec!["Foo bar."]
+    );
+    // The linewise yank still leaves the cursor at the sentence's start.
+    edit_probe(&rpc, &["Foo bar.", "Baz qux."], (1, 5), "yas").await;
+    assert_eq!(cursor(&rpc).await, (1, 0));
+    // Visual `as` stops short of the line break.
+    assert_eq!(
+        edit_probe(&rpc, &["Foo bar.", "Baz qux."], (1, 0), "vasd").await,
+        vec!["", "Baz qux."]
+    );
+}
+
+#[tokio::test]
+async fn a_counted_inner_quote_takes_the_quotes_but_no_white_space() {
+    // vim's `2i"`: the quotes are included, the white space `a"` adds is not.
+    let (rpc, _incoming) = start(None).await;
+    let text = ["x = \"ab\" + \"cd\""];
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 5), "2di\"").await,
+        vec!["x =  + \"cd\""]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 5), "2ci\"Q<Esc>").await,
+        vec!["x = Q + \"cd\""]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 5), "v2i\"d").await,
+        vec!["x =  + \"cd\""]
+    );
 }

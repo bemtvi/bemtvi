@@ -15,6 +15,9 @@ const eh_redraw_json = M.cwrap("eh_redraw_json", "number", ["number"]);
 const eh_lines = M.cwrap("eh_lines", "number", ["number"]);
 const eh_free_string = M.cwrap("eh_free_string", null, ["number"]);
 const eh_free = M.cwrap("eh_free", null, ["number"]);
+const eh_set_clock = M.cwrap("eh_set_clock", null, ["number", "number"]);
+const eh_next_deadline = M.cwrap("eh_next_deadline", "number", ["number"]);
+const eh_tick_timers = M.cwrap("eh_tick_timers", "number", ["number", "number"]);
 
 // Read an owned char* back as a JS string, then free it Rust-side.
 function readStr(ptr) {
@@ -71,6 +74,30 @@ check(
 readStr(eh_exec_lua(h, 'vim.cmd("%s/hello/world/")'));
 const after = readStr(eh_lines(h));
 check("lua → editor: :substitute via real effects", after === "world", `got ${JSON.stringify(after)}`);
+
+// 4. `:sleep` parks the editor on the JS clock, as natively: keys typed meanwhile are
+//    held (not applied, not lost) and replayed when the Worker wakes at its deadline;
+//    `<C-c>` ends it early.
+eh_set_clock(h, 1000);
+eh_input(h, "<Esc>:sleep 500m<CR>");
+eh_set_clock(h, 1100);
+eh_input(h, "A!<Esc>");
+let held = readStr(eh_lines(h));
+check(":sleep holds input while it runs", held === "world", `got ${JSON.stringify(held)}`);
+check(":sleep's end is the Worker's next wake", eh_next_deadline(h) === 1500, `got ${eh_next_deadline(h)}`);
+eh_tick_timers(h, 1400);
+held = readStr(eh_lines(h));
+check(":sleep still holds before its end", held === "world", `got ${JSON.stringify(held)}`);
+eh_tick_timers(h, 1500);
+held = readStr(eh_lines(h));
+check(":sleep replays held input when it ends", held === "world!", `got ${JSON.stringify(held)}`);
+eh_set_clock(h, 2000);
+eh_input(h, ":sleep 60<CR>");
+eh_set_clock(h, 2010);
+eh_input(h, "A?<Esc>");
+eh_input(h, "<C-c>");
+held = readStr(eh_lines(h));
+check("<C-c> ends a :sleep early and replays what it held", held === "world!?", `got ${JSON.stringify(held)}`);
 
 eh_free(h);
 

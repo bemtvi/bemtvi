@@ -46,7 +46,7 @@ async fn lua_string(rpc: &Rpc, code: &str) -> Option<String> {
 }
 
 /// Mount `name` with the given `on_request` body and wait for the promise to settle.
-/// Returns the mount's base URL (`http://127.0.0.1:53124/plugin/<name>/`).
+/// Returns the mount's base URL (`http://127.0.0.1:53124/<token>/plugin/<name>/`).
 async fn mount(rpc: &Rpc, name: &str, on_request: &str) -> String {
     let marker = format!("_G.mounted_{name}");
     exec_lua(
@@ -108,7 +108,7 @@ fn http_request(url: &str, method: &str, path_suffix: &str, body: Option<&str>) 
     String::from_utf8_lossy(&response).into_owned()
 }
 
-/// Split `http://127.0.0.1:53124/plugin/x/` into (`127.0.0.1:53124`, `/plugin/x/`).
+/// Split `http://127.0.0.1:53124/<token>/plugin/x/` into (`127.0.0.1:53124`, `/<token>/plugin/x/`).
 fn split_url(url: &str) -> (String, String) {
     let rest = url.strip_prefix("http://").expect("an http:// url");
     match rest.find('/') {
@@ -235,8 +235,9 @@ async fn request_fidelity() {
             TcpStream::connect(split_url(&u).0.to_socket_addrs().unwrap().next().unwrap()).unwrap();
         let body = "hello=world";
         let req = format!(
-            "POST /plugin/echo/sub/page.css?v=2 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
+            "POST {}sub/page.css?v=2 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
              Content-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            split_url(&u).1,
             body.len()
         );
         s.write_all(req.as_bytes()).unwrap();
@@ -252,7 +253,8 @@ async fn request_fidelity() {
         lua_string(&rpc, "return _G.seen.method").await.as_deref(),
         Some("POST")
     );
-    // Mount-relative: the handler never sees its own /plugin/echo prefix.
+    // Mount-relative: the handler never sees its own /plugin/echo prefix, and `raw_path`
+    // is the path below the session-token segment — the token never reaches a handler.
     assert_eq!(
         lua_string(&rpc, "return _G.seen.path").await.as_deref(),
         Some("/sub/page.css")
@@ -308,10 +310,11 @@ async fn bare_mount_root_redirects_to_slash() {
         r#"function(req, respond) respond({ body = "served" }) end"#,
     )
     .await;
-    let origin = split_url(&url).0;
+    let mount_path = split_url(&url).1;
+    assert!(mount_path.ends_with("/plugin/app/"), "url: {url}");
 
-    // …/plugin/app  (no trailing slash) → 308 → …/plugin/app/
-    let bare = format!("http://{origin}/plugin/app");
+    // …/plugin/app  (no trailing slash) → 308 → …/plugin/app/ (token segment kept)
+    let bare = url.trim_end_matches('/').to_string();
     let response = tokio::task::spawn_blocking(move || get(&bare))
         .await
         .unwrap();
@@ -321,25 +324,25 @@ async fn bare_mount_root_redirects_to_slash() {
         "a bare mount root must redirect:\n{response}"
     );
     let location = header_value(&response, "location").expect("a Location header");
-    assert_eq!(location, "/plugin/app/");
+    assert_eq!(location, mount_path);
     assert!(
         body_of(&response).is_empty(),
         "a redirect has no body:\n{response}"
     );
 
     // The query survives the redirect (`?v=2` → …/plugin/app/?v=2).
-    let withq = format!("http://{origin}/plugin/app?v=2&x=y");
+    let withq = format!("{}?v=2&x=y", url.trim_end_matches('/'));
     let response = tokio::task::spawn_blocking(move || get(&withq))
         .await
         .unwrap();
     assert_eq!(status_of(&response), 308);
     assert_eq!(
         header_value(&response, "location").as_deref(),
-        Some("/plugin/app/?v=2&x=y")
+        Some(format!("{mount_path}?v=2&x=y").as_str())
     );
 
     // A sub-path is NOT redirected — it is the plugin's own routing.
-    let sub = format!("http://{origin}/plugin/app/thing");
+    let sub = format!("{url}thing");
     let response = tokio::task::spawn_blocking(move || get(&sub))
         .await
         .unwrap();
@@ -441,9 +444,8 @@ async fn unmounted_path_is_404() {
         r#"function(req, respond) respond({ body = "here" }) end"#,
     )
     .await;
-    let origin = split_url(&url).0;
-    let absent = format!("http://{origin}/plugin/absent/");
-    let outside = format!("http://{origin}/not-a-mount");
+    let absent = url.replace("/plugin/present/", "/plugin/absent/");
+    let outside = url.replace("/plugin/present/", "/not-a-mount");
     let (r1, r2) = tokio::task::spawn_blocking(move || (get(&absent), get(&outside)))
         .await
         .unwrap();
@@ -817,8 +819,7 @@ async fn a_cross_origin_probe_cannot_distinguish_a_live_mount_from_a_missing_one
         r#"function(req, respond) respond({ body = "here" }) end"#,
     )
     .await;
-    let (host_port, _) = split_url(&url);
-    let absent = format!("http://{host_port}/plugin/does-not-exist/");
+    let absent = url.replace("/plugin/real/", "/plugin/does-not-exist/");
 
     let live = request_with_origin(&url, "GET", "http://evil.example").await;
     let missing = request_with_origin(&absent, "GET", "http://evil.example").await;
@@ -904,4 +905,376 @@ async fn a_loopback_origin_on_another_port_is_still_foreign() {
 fn free_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     l.local_addr().unwrap().port()
+}
+
+/// Like [`http_request`], but with an explicit `Host` header and no `Origin` — the shape
+/// of a DNS-rebinding read: the attacker's page loads from `rebind.evil.example:<port>`,
+/// re-points that name at 127.0.0.1, and `fetch()`es the mount *same-origin* — a GET a
+/// browser sends without any `Origin`, whose response the page is then allowed to read.
+fn http_request_with_host(url: &str, host: &str) -> String {
+    let (host_port, path) = split_url(url);
+    let addr = host_port
+        .to_socket_addrs()
+        .expect("resolve")
+        .next()
+        .expect("one addr");
+    let mut stream = TcpStream::connect(addr).expect("connect to the mount listener");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).expect("write request");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("read response");
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+/// The `Origin` gate cannot see a DNS-rebinding read (a same-origin GET carries no
+/// `Origin`), but its `Host` still names the attacker's domain. A `Host` that is not an
+/// address literal or `localhost` is refused, while the names the listener is really
+/// reached by keep serving.
+#[tokio::test]
+async fn a_dns_rebound_host_is_refused() {
+    let (rpc, _incoming) = start().await;
+    let url = mount(
+        &rpc,
+        "rebind",
+        r#"function(req, respond) respond({ body = "SECRET" }) end"#,
+    )
+    .await;
+    let (host_port, _) = split_url(&url);
+    let port = host_port.split(':').nth(1).unwrap().to_string();
+
+    for host in [
+        format!("rebind.evil.example:{port}"),
+        "rebind.evil.example".to_string(),
+    ] {
+        let response = tokio::task::spawn_blocking({
+            let (url, host) = (url.clone(), host.clone());
+            move || http_request_with_host(&url, &host)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            status_of(&response),
+            403,
+            "Host {host:?} must be refused, got: {response}"
+        );
+        assert!(!response.contains("SECRET"));
+    }
+
+    for host in [
+        host_port.clone(),
+        format!("localhost:{port}"),
+        format!("[::1]:{port}"),
+    ] {
+        let response = tokio::task::spawn_blocking({
+            let (url, host) = (url.clone(), host.clone());
+            move || http_request_with_host(&url, &host)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            status_of(&response),
+            200,
+            "Host {host:?} names this listener and must serve"
+        );
+    }
+}
+
+/// A response header carrying CR/LF (or an invalid name) cannot go on the wire; it is
+/// refused LOUD — the handler's `respond` raises, so the client sees a 500 and the plugin
+/// an error — rather than the header being dropped silently (a dropped
+/// `content-security-policy` serves untrusted content unprotected).
+#[tokio::test]
+async fn a_header_with_crlf_is_refused_not_dropped() {
+    let (rpc, _incoming) = start().await;
+    let url = mount(
+        &rpc,
+        "crlf",
+        r#"function(req, respond)
+             respond({ headers = { ["x-a"] = "1\r\nx-b: 2" }, body = "ok" })
+           end"#,
+    )
+    .await;
+    let response = tokio::task::spawn_blocking(move || get(&url))
+        .await
+        .unwrap();
+    assert_eq!(status_of(&response), 500, "response:\n{response}");
+}
+
+/// A bad header refused by a `respond` called *after* the handler returned (outside its
+/// error guard) still answers 500 at once and retires the request: no later 504 and no
+/// false "did not respond" timeout report.
+#[tokio::test]
+async fn a_late_respond_with_a_bad_header_answers_500_without_a_timeout() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.notes = {}
+        btv.notify = function(m) table.insert(_G.notes, tostring(m)) end
+        btv.http.mount({
+          name = "latecrlf",
+          timeout = 150,
+          on_request = function(req, respond)
+            btv.schedule(function()
+              _G.raised = not pcall(respond, { headers = { ["x-a"] = "1\r\nx-b: 2" } })
+            end)
+          end,
+        }):next(function(m) _G.late_url = m:url() end)
+        "#,
+    )
+    .await;
+    assert!(
+        await_truthy(&rpc, "_G.late_url").await,
+        "mount never settled"
+    );
+    let url = lua_string(&rpc, "return _G.late_url").await.unwrap();
+    let response = tokio::task::spawn_blocking(move || get(&url))
+        .await
+        .unwrap();
+    assert_eq!(status_of(&response), 500, "response:\n{response}");
+    assert!(
+        await_truthy(&rpc, "_G.raised").await,
+        "respond did not raise"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let notes = lua_string(&rpc, "return table.concat(_G.notes, '|')").await;
+    assert_eq!(
+        notes.as_deref(),
+        Some(""),
+        "no timeout report after the 500"
+    );
+}
+
+/// Closing a mount retires its in-flight requests too: their deadlines must not fire
+/// later and report a timeout (and send a 504) for requests the transport already
+/// answered when the route went away.
+#[tokio::test]
+async fn close_cancels_in_flight_deadlines() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.notes = {}
+        btv.notify = function(m) table.insert(_G.notes, tostring(m)) end
+        btv.http.mount({
+          name = "parked",
+          timeout = 150,
+          on_request = function(req, respond) _G.parked = true end,
+        }):next(function(m) _G.parked_mount = m; _G.parked_url = m:url() end)
+        "#,
+    )
+    .await;
+    assert!(
+        await_truthy(&rpc, "_G.parked_url").await,
+        "mount never settled"
+    );
+    let url = lua_string(&rpc, "return _G.parked_url").await.unwrap();
+    let client = tokio::task::spawn_blocking(move || get(&url));
+    assert!(
+        await_truthy(&rpc, "_G.parked").await,
+        "request never arrived"
+    );
+    exec_lua(&rpc, "_G.parked_mount:close()").await;
+    let _ = client.await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let notes = lua_string(&rpc, "return table.concat(_G.notes, '|')").await;
+    assert_eq!(
+        notes.as_deref(),
+        Some(""),
+        "no late timeout report after close"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The session token and the sandbox
+// ---------------------------------------------------------------------------
+//
+// The `Origin` / `Host` gates only stop *browsers*. Any other local process (or another
+// user on a shared machine) can talk to 127.0.0.1 directly, so the listener also requires an
+// unguessable per-session path segment that only the editor hands out — through
+// `mount:url()`. And because every mount shares one origin with the others (and, on the web
+// build, with the editor itself), a mount's documents run sandboxed in an opaque origin
+// unless the plugin explicitly opts out.
+
+/// The value of every response header `name` (case-insensitive), in order.
+fn header_values(response: &str, name: &str) -> Vec<String> {
+    let head = response
+        .split_once("\r\n\r\n")
+        .map(|(h, _)| h)
+        .unwrap_or(response);
+    head.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            (k.trim().eq_ignore_ascii_case(name)).then(|| v.trim().to_string())
+        })
+        .collect()
+}
+
+/// A request that does not carry this session's token segment is refused with a bare 404 —
+/// the handler never runs, and the listener does not identify itself — while the URL
+/// `mount:url()` returned (which carries it) serves.
+#[tokio::test]
+async fn a_request_without_the_session_token_is_refused() {
+    let (rpc, _incoming) = start().await;
+    let url = mount(
+        &rpc,
+        "guarded",
+        r#"function(req, respond) _G.ran = (_G.ran or 0) + 1; respond({ body = "SECRET" }) end"#,
+    )
+    .await;
+    let (host_port, path) = split_url(&url);
+    let token = path
+        .strip_prefix('/')
+        .and_then(|p| p.strip_suffix("/plugin/guarded/"))
+        .unwrap_or_else(|| panic!("mount url carries no token segment: {url}"))
+        .to_string();
+    assert!(
+        token.len() >= 32 && token.bytes().all(|b| b.is_ascii_hexdigit()),
+        "the token must be >=128 bits of hex, got {token:?}"
+    );
+
+    let mut wrong = token.clone().into_bytes();
+    wrong[0] = if wrong[0] == b'0' { b'1' } else { b'0' };
+    let wrong = String::from_utf8(wrong).unwrap();
+    for bad in [
+        format!("http://{host_port}/plugin/guarded/"),
+        format!("http://{host_port}/{wrong}/plugin/guarded/"),
+        format!(
+            "http://{host_port}/{}/plugin/guarded/",
+            &token[..token.len() - 1]
+        ),
+        format!("http://{host_port}/{token}x/plugin/guarded/"),
+        format!("http://{host_port}/"),
+    ] {
+        let response = tokio::task::spawn_blocking({
+            let bad = bad.clone();
+            move || get(&bad)
+        })
+        .await
+        .unwrap();
+        assert_eq!(status_of(&response), 404, "{bad} must 404:\n{response}");
+        assert!(!response.contains("SECRET"), "{bad} reached the handler");
+        assert!(
+            !response.to_lowercase().contains("bemtvi"),
+            "a token-less probe must not learn what is listening:\n{response}"
+        );
+    }
+    assert_eq!(
+        exec_lua(&rpc, "return _G.ran == nil").await,
+        Value::Boolean(true),
+        "no token-less request may reach Lua"
+    );
+
+    let good = tokio::task::spawn_blocking(move || get(&url))
+        .await
+        .unwrap();
+    assert_eq!(status_of(&good), 200, "{good}");
+    assert_eq!(body_of(&good), "SECRET");
+
+    // The token is per session, stable across mounts.
+    let other = mount(&rpc, "second", r#"function(req, respond) respond({}) end"#).await;
+    assert!(
+        other.contains(&format!("/{token}/plugin/second/")),
+        "every mount shares the session token: {other}"
+    );
+}
+
+/// Every mount response carries a `sandbox` CSP without `allow-same-origin`, so a mount's
+/// document runs in an opaque origin and cannot script the editor (on the web build the
+/// editor shares the origin) or another mount. A CSP the plugin set itself is kept beside
+/// it — never dropped — so both policies apply.
+#[tokio::test]
+async fn mount_responses_are_sandboxed_and_keep_the_plugin_csp() {
+    let (rpc, _incoming) = start().await;
+    let plain = mount(
+        &rpc,
+        "plainpage",
+        r#"function(req, respond) respond({ body = "<h1>hi</h1>" }) end"#,
+    )
+    .await;
+    let own = mount(
+        &rpc,
+        "ownpolicy",
+        r#"function(req, respond)
+             respond({ headers = { ["Content-Security-Policy"] = "default-src 'none'" }, body = "x" })
+           end"#,
+    )
+    .await;
+    let (r1, r2) = tokio::task::spawn_blocking(move || (get(&plain), get(&own)))
+        .await
+        .unwrap();
+
+    let sandboxed = |csps: &[String]| {
+        csps.iter().any(|p| {
+            p.split(',').any(|policy| {
+                policy.split(';').any(|d| {
+                    let mut words = d.split_whitespace();
+                    words.next() == Some("sandbox") && !words.any(|w| w == "allow-same-origin")
+                })
+            })
+        })
+    };
+    let c1 = header_values(&r1, "content-security-policy");
+    assert!(sandboxed(&c1), "no sandbox CSP on a mount response:\n{r1}");
+    assert!(
+        c1.iter().any(|p| p.contains("allow-scripts")),
+        "the sandbox must still let the page run its own script:\n{r1}"
+    );
+
+    let c2 = header_values(&r2, "content-security-policy");
+    assert!(
+        sandboxed(&c2),
+        "a plugin CSP must not displace the sandbox:\n{r2}"
+    );
+    assert!(
+        c2.iter().any(|p| p.contains("default-src 'none'")),
+        "the plugin's own CSP was dropped:\n{r2}"
+    );
+}
+
+/// `same_origin = true` is the explicit, documented-as-dangerous opt-out: the mount's
+/// responses carry no added sandbox (the plugin's own headers are untouched). It must be a
+/// boolean.
+#[tokio::test]
+async fn same_origin_opt_in_skips_the_sandbox() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"
+        btv.http.mount({
+          name = "trusted",
+          same_origin = true,
+          on_request = function(req, respond) respond({ body = "t" }) end,
+        }):next(function(m) _G.trusted_url = m:url() end)
+        "#,
+    )
+    .await;
+    assert!(await_truthy(&rpc, "_G.trusted_url").await, "never settled");
+    let url = lua_string(&rpc, "return _G.trusted_url").await.unwrap();
+    let response = tokio::task::spawn_blocking(move || get(&url))
+        .await
+        .unwrap();
+    assert_eq!(status_of(&response), 200);
+    assert!(
+        header_values(&response, "content-security-policy").is_empty(),
+        "a same_origin mount must not be sandboxed:\n{response}"
+    );
+
+    let err = lua_string(
+        &rpc,
+        r#"
+        local ok, err = pcall(btv.http.mount, { name = "x", same_origin = "yes", on_request = function() end })
+        return tostring(err)
+        "#,
+    )
+    .await
+    .unwrap();
+    assert!(
+        err.contains("same_origin"),
+        "expected a same_origin complaint, got: {err}"
+    );
 }

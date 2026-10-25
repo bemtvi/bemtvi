@@ -564,7 +564,9 @@ end
 -- ```
 --
 -- The directory is *named*, not created: `btv.fs.mkdir(dir, { recursive = true })`
--- when you are about to write into it.
+-- when you are about to write into it. It raises when the process has no home, no
+-- `$XDG_*` base and no platform default to put the directory under — rather than
+-- answering a path relative to the working directory.
 function btv.stdpath(what)
   return vim.fn.stdpath(what)
 end
@@ -645,7 +647,7 @@ function btv.fname.modify(fname, mods)
   while i <= n do
     local m = mods:sub(i, i + 1)
     if m == ":p" then
-      fname = simplify_abs(absolute(fname))
+      fname = simplify_abs(absolute(btv.utils.expanduser(fname)))
       i = i + 2
     elseif m == ":~" then
       local home = os.getenv("HOME") or ""

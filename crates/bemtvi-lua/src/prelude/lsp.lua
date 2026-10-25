@@ -866,7 +866,7 @@ end
 
 local function remove_lsp_keymaps(buf)
   for _, m in ipairs(lsp_default_keymaps()) do
-    btv.keymap.del(m[1], m[2], { buffer = buf })
+    btv._keymap_del_default(m[1], m[2], buf)
   end
 end
 
@@ -1019,7 +1019,8 @@ function btv.lsp.stop(name, opts)
     error("btv.lsp.stop: opts must be a table", 2)
   end
   if opts and opts.disable then
-    btv.lsp.disable(name)
+    -- `name` is the server's reported name; the gate lives under its config key.
+    btv.lsp.disable(btv.lsp._config_key[name] or name)
   end
   return lsp_promise(function(id)
     btv._lsp_stop(name, id)
@@ -1040,13 +1041,14 @@ function btv.lsp.restart(name)
   -- the registry, so the respawn applies a config changed since the server started —
   -- without depending on an async FileType/root-resolution having refreshed the
   -- server-side spawn cache first.
-  local cfg = resolve(name)
+  local key = btv.lsp._config_key[name] or name
+  local cfg = resolve(key)
   btv._lsp_restart(
     name,
     nonempty(cfg.init_options),
     nonempty(cfg.settings),
     nonempty(cfg.capabilities),
-    config_priority(name, cfg)
+    config_priority(key, cfg)
   )
 end
 
@@ -1433,7 +1435,7 @@ local METHOD_CAPABILITY = {
   ["textDocument/signatureHelp"] = "signatureHelpProvider",
   ["textDocument/completion"] = "completionProvider",
   ["textDocument/formatting"] = "documentFormattingProvider",
-  ["textDocument/rangeFormatting"] = "documentFormattingProvider",
+  ["textDocument/rangeFormatting"] = "documentRangeFormattingProvider",
   ["textDocument/rename"] = "renameProvider",
   ["textDocument/codeAction"] = "codeActionProvider",
   ["textDocument/semanticTokens/full"] = "semanticTokensProvider",
@@ -1594,6 +1596,27 @@ function btv.lsp.client_by_id(id)
   return btv.lsp._clients[id]
 end
 
+-- Sort `list` (client handles) into the routing order: `priority` descending, then
+-- config name, then client id — so "the first client" is the same one every call,
+-- not whichever the registry's hash order yields.
+local function sort_clients(list)
+  local rank = {}
+  for _, c in ipairs(list) do
+    local ok, p = pcall(config_priority, c.name, config_of_client(c.name))
+    rank[c.id] = ok and p or 0
+  end
+  table.sort(list, function(a, b)
+    if rank[a.id] ~= rank[b.id] then
+      return rank[a.id] > rank[b.id]
+    end
+    if a.name ~= b.name then
+      return a.name < b.name
+    end
+    return a.id < b.id
+  end)
+  return list
+end
+
 -- `btv.lsp.clients(filter)`: a snapshot list of active clients, narrowable by
 -- `filter.bufnr` (the clients attached to that buffer; `0`/nil = current) and/or
 -- `filter.name` (the config name). Reads the mirror — no request is issued.
@@ -1601,7 +1624,8 @@ end
 -- A buffer can have **several** clients attached (`pyright` + `ruff`, `ts_ls` +
 -- `eslint`): every server enabled for its filetype attaches, so a `bufnr` filter
 -- may return more than one. Don't index `[1]` expecting "the" server — filter by
--- `name`, or by what the client advertises in `server_capabilities`.
+-- `name`, or by what the client advertises in `server_capabilities`. The list is in
+-- routing order: `priority` descending, then config name, then client id.
 function btv.lsp.clients(filter)
   filter = filter or {}
   local out = {}
@@ -1619,7 +1643,7 @@ function btv.lsp.clients(filter)
       end
     end
   end
-  return out
+  return sort_clients(out)
 end
 
 -- `btv.lsp.progress(filter)`: the `$/progress` work language servers are running
@@ -1729,7 +1753,8 @@ end
 -- `btv.lsp.request(method, params, handler, target)`: sugar resolving one of the
 -- buffer's clients and issuing `client:request`. `target` is a bufnr (`0`/nil =
 -- current) or `{ bufnr =, name = }`, where `name` picks the attached client by config
--- name instead of taking the first. No matching client fails loud.
+-- name instead of taking the first — the first in `btv.lsp.clients` order (highest
+-- `priority`, then config name). No matching client fails loud.
 function btv.lsp.request(method, params, handler, target)
   local client = request_client("btv.lsp.request", target)
   if client then
@@ -2142,7 +2167,12 @@ end
 -- and a deletion at the old, and a `create` whose file is already gone again is
 -- reported as the deletion it ended up being. Trusting the class alone would tell a
 -- server to re-read a file that isn't there.
-local pump_watch = btv.async(function(client_id, watch, specs)
+--
+-- An `overflow` batch (the watch dropped changes nobody pulled in time) has no paths:
+-- the protocol has no "rescan" message, so every matching file still under `dir` is
+-- re-sent as `Changed` — the server re-reads what exists. A deletion lost in the
+-- overflow cannot be recovered that way, so that is said out loud.
+local pump_watch = btv.async(function(client_id, watch, specs, dir)
   local globs = {}
   for i, spec in ipairs(specs) do
     globs[i] = spec.glob
@@ -2154,6 +2184,26 @@ local pump_watch = btv.async(function(client_id, watch, specs)
       return -- `:stop()` — the registration was retired, or its client went away
     end
     local changes = {}
+    if ev.kind == "overflow" then
+      local files = btv.await(btv.fs.walk(dir, { hidden = true }))
+      for _, rel in ipairs(files) do
+        local path = dir .. "/" .. rel
+        for _, i in ipairs(set:matches(path)) do
+          if specs[i].kind & WATCH_KIND_BIT[2] ~= 0 then
+            changes[#changes + 1] = { uri = watched_uri(path), type = 2 }
+            break
+          end
+        end
+      end
+      btv.notify(
+        "btv.lsp: file watch on "
+          .. dir
+          .. " overflowed; re-sent "
+          .. #changes
+          .. " watched files as changed (deletions in the gap may be missed)",
+        vim.log.levels.WARN
+      )
+    end
     for _, path in ipairs(ev.paths or {}) do
       local matched = set:matches(path)
       if #matched > 0 then
@@ -2224,7 +2274,7 @@ local function arm_file_watches(client_id, root, entry, options)
       entry.watches[#entry.watches + 1] = watch
       -- A watch that can't arm (a root that doesn't exist, the inotify limit) rejects
       -- the pump. Say so: the alternative is a server that looks watched and isn't.
-      pump_watch(client_id, watch, specs):catch(function(err)
+      pump_watch(client_id, watch, specs, dir):catch(function(err)
         btv.notify(
           "btv.lsp: file watch on " .. dir .. " ended: " .. tostring(err),
           vim.log.levels.WARN

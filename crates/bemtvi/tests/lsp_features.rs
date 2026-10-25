@@ -1882,6 +1882,73 @@ async fn code_action_cancel_resolves_nil() {
     );
 }
 
+/// A `btv.ui.select` opened over a pending code-action chooser takes the menu: picking
+/// in the select resolves the select (not a code action), and the superseded chooser's
+/// promise settles `nil` with no edit applied.
+#[tokio::test]
+async fn select_over_code_action_chooser_does_not_apply_an_action() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_ca_select_over");
+    let uri = file_uri(&dir, "a.rs");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "code_action": [
+                    {{
+                        "title": "Replace with bar",
+                        "edit": {{ "changes": {{ "{uri}": [
+                            {{ "range": {{ "start": {{ "line": 0, "character": 4 }}, "end": {{ "line": 0, "character": 7 }} }}, "newText": "bar" }}
+                        ] }} }}
+                    }},
+                    {{
+                        "title": "Replace with baz",
+                        "edit": {{ "changes": {{ "{uri}": [
+                            {{ "range": {{ "start": {{ "line": 0, "character": 4 }}, "end": {{ "line": 0, "character": 7 }} }}, "newText": "baz" }}
+                        ] }} }}
+                    }}
+                ]
+            }}"#
+        ),
+    );
+    let (rpc, mut incoming) = open_with_server(&dir, "let foo = 1\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+    exec_lua(
+        &rpc,
+        r#"
+        _G.ca_res, _G.ca_done, _G.pick = "unset", false, "unset"
+        btv.lsp.code_action():next(function(res) _G.ca_res, _G.ca_done = res, true end)
+        "#,
+    )
+    .await;
+    let listed = poll_menu_items(&rpc, &mut incoming)
+        .await
+        .is_some_and(|rows| rows.iter().any(|r| r.contains("Replace with bar")));
+    assert!(listed, "the code action should appear in the chooser");
+    exec_lua(
+        &rpc,
+        "btv.ui.select({ 'one', 'two' }, {}):next(function(item) _G.pick = item end)",
+    )
+    .await;
+    feed(&rpc, "jj<CR>");
+    assert!(
+        await_lua_eq(&rpc, "tostring(_G.pick)", "two").await,
+        "the pick resolves the select"
+    );
+    assert!(
+        await_lua_eq(&rpc, "tostring(_G.ca_done)", "true").await,
+        "the superseded chooser's promise settles"
+    );
+    assert_eq!(
+        lines(&rpc).await.first().map(String::as_str),
+        Some("let foo = 1"),
+        "no code action is applied by a pick in another widget"
+    );
+}
+
 // ===== `btv.lsp.code_action(opts)` — kind filter + one-shot apply =====
 // docs/plans/2026-07-23-code-action-filter-apply.md. `context.only` narrows which
 // actions are offered (sent to the server AND re-applied to the reply); `apply` skips
@@ -5361,5 +5428,319 @@ async fn stopping_a_server_that_never_answers_shutdown_frees_its_name() {
         "a server that never answers `shutdown` must still be torn down — its serve \
          loop holds the name until it ends, so an open-ended wait swallows every \
          later start for that server"
+    );
+}
+
+/// A `:%s` over a large attached buffer journals one edit per line; converting
+/// that batch into a `didChange` must stay linear in the document size. Each
+/// edit's LSP position used to be found by rescanning the whole shadow prefix
+/// (and each edit spliced into a `String`, shifting the tail), so the batch cost
+/// O(edits × document) — tens of thousands of lines froze the editor tick for
+/// many seconds. The server's reconstructed document must still match.
+#[tokio::test]
+async fn large_substitute_syncs_incrementally_without_freezing() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_large_subst_sync");
+    let record = dir.join("rec.jsonl");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{ "record": "{rec}", "position_encoding": "utf-16" }}"#,
+            rec = record.display()
+        ),
+    );
+    let lines_n = 20_000;
+    let original: String = (0..lines_n).map(|i| format!("let a{i} = 1;\n")).collect();
+    let (rpc, _incoming) = open_with_server(&dir, &original).await;
+    assert!(
+        await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+    // Let `didOpen` land before the edit so the batch replays over a seeded shadow.
+    for _ in 0..80 {
+        barrier(&rpc).await;
+        if std::fs::read_to_string(&record)
+            .unwrap_or_default()
+            .contains("textDocument/didOpen")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let started = std::time::Instant::now();
+    bemtvi_test_harness::command(&rpc, "%s/a/b/").await;
+    barrier(&rpc).await;
+    let elapsed = started.elapsed();
+    assert_eq!(lines(&rpc).await[0], "let b0 = 1;");
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "a {lines_n}-line substitute must sync without freezing the tick (took {elapsed:?})"
+    );
+
+    // Replayed line-wise (every change here is single-line ASCII), since the
+    // generic `replay_server_changes` rescans the document per change.
+    let want = lines(&rpc).await;
+    let mut server_view: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        barrier(&rpc).await;
+        let record_text = std::fs::read_to_string(&record).unwrap_or_default();
+        server_view = original.lines().map(str::to_string).collect();
+        for line in record_text.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+            if v["method"] != "textDocument/didChange" {
+                continue;
+            }
+            for ch in v["params"]["contentChanges"].as_array().unwrap() {
+                let r = &ch["range"];
+                let row = r["start"]["line"].as_u64().unwrap() as usize;
+                assert_eq!(
+                    r["end"]["line"].as_u64(),
+                    Some(row as u64),
+                    "single-line change"
+                );
+                let s = r["start"]["character"].as_u64().unwrap() as usize;
+                let e = r["end"]["character"].as_u64().unwrap() as usize;
+                server_view[row].replace_range(s..e, ch["text"].as_str().unwrap());
+            }
+        }
+        if server_view == want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        server_view == want,
+        "the server's reconstructed document must match the buffer after the substitute"
+    );
+}
+
+/// Under the UTF-8 position encoding an LSP `character` *is* a byte offset — and a
+/// server is untrusted, so one can name a byte inside a multibyte character. The
+/// conversion must snap such a column to a character boundary: left raw, the
+/// inlay hint's column and the semantic token's span split `é` in two, and every
+/// consumer slicing the line at them (the mirror, the painter) sees a byte offset
+/// that is not a `str` index.
+#[tokio::test]
+async fn utf8_positions_inside_a_multibyte_char_snap_to_a_boundary() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_utf8_midchar");
+    // `é` is bytes 0..2; character 1 is its second byte.
+    arm_mock(
+        &dir,
+        r#"{
+            "position_encoding": "utf-8",
+            "inlay_hints": [
+                { "position": { "line": 0, "character": 1 }, "label": ": i32", "kind": 1 }
+            ],
+            "semantic_tokens": {
+                "legend": { "tokenTypes": ["variable"], "tokenModifiers": [] },
+                "data": [0, 1, 2, 0, 0]
+            }
+        }"#,
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "éa = 1\n").await;
+    exec_lua(&rpc, "vim.lsp.inlay_hint.enable(true)").await;
+    assert!(
+        await_lua_eq(&rpc, "#btv.lsp.inlay_hint.get({ bufnr = 0 })", "1").await,
+        "the hint should reach the mirror"
+    );
+    let hint_col = exec_lua(
+        &rpc,
+        "return btv.lsp.inlay_hint.get({ bufnr = 0 })[1].inlay_hint.col",
+    )
+    .await;
+    assert!(
+        matches!(hint_col.as_u64(), Some(0) | Some(2)),
+        "the hint column must sit on a character boundary, got {hint_col:?}"
+    );
+    assert!(
+        await_lua_eq(&rpc, "#btv.lsp.semantic_tokens.get_at_pos(0, 0, 2)", "1").await,
+        "the token should be readable"
+    );
+    let start = exec_lua(
+        &rpc,
+        "return btv.lsp.semantic_tokens.get_at_pos(0, 0, 2)[1].start_col",
+    )
+    .await;
+    assert!(
+        matches!(start.as_u64(), Some(0) | Some(2)),
+        "the token must start on a character boundary, got {start:?}"
+    );
+    // The server still paints and answers.
+    barrier(&rpc).await;
+    assert_eq!(exec_lua(&rpc, "return 1 + 1").await.as_u64(), Some(2));
+}
+
+/// Decoding a semantic-tokens reply must cost O(line length + tokens) per line, not
+/// O(tokens × line length): a minified file is one huge line carrying tens of
+/// thousands of tokens, and each token used to copy the whole line and re-walk it
+/// from column 0 to convert its column — freezing the editor tick on every reply.
+#[tokio::test]
+async fn semantic_tokens_on_one_long_line_decode_without_freezing() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_sem_long_line");
+    let tokens = 20_000usize;
+    let stride = 10usize;
+    // `tokens` one-char tokens, one every `stride` columns, all on line 0.
+    let mut data = Vec::with_capacity(tokens * 5);
+    for i in 0..tokens {
+        let delta_start = if i == 0 { 0 } else { stride };
+        data.extend_from_slice(&[0, delta_start, 1, 0, 0]);
+    }
+    let data = data
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "position_encoding": "utf-16",
+                "semantic_tokens": {{
+                    "legend": {{ "tokenTypes": ["variable"], "tokenModifiers": [] }},
+                    "data": [{data}]
+                }}
+            }}"#
+        ),
+    );
+    let line: String = "é".repeat(tokens * stride);
+    let started = std::time::Instant::now();
+    let (rpc, _incoming) = open_with_server(&dir, &format!("{line}\n")).await;
+    // The last token sits at char `(tokens - 1) * stride`; `é` is two bytes.
+    let last = (tokens - 1) * stride * 2;
+    assert!(
+        await_lua_eq(
+            &rpc,
+            &format!("#btv.lsp.semantic_tokens.get_at_pos(0, 0, {last})"),
+            "1"
+        )
+        .await,
+        "the last token should decode at its byte column"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "decoding {tokens} tokens on one line must not freeze the tick (took {elapsed:?})"
+    );
+}
+
+// ------------------------------------------- per-token cost on a long line (perf guards)
+
+/// How long until `expr` reads `want`, polling up to a minute (the regressions
+/// these guard took far longer than [`await_lua_eq`]'s five seconds).
+async fn time_until_lua_eq(
+    rpc: &Rpc,
+    started: std::time::Instant,
+    expr: &str,
+    want: &str,
+) -> Duration {
+    let code = format!("return tostring({expr})");
+    while started.elapsed() < Duration::from_secs(60) {
+        if exec_lua(rpc, &code).await.as_str() == Some(want) {
+            return started.elapsed();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{expr} never read {want}");
+}
+
+/// Attach a UTF-16 mock serving 1000 semantic tokens spread across one `len`-byte
+/// ASCII line; the time until the last one decodes into the mirror.
+async fn time_semantic_tokens(len: usize) -> Duration {
+    let dir = temp_dir("lsp_features_sem_long");
+    let step = len / 1000;
+    let mut data = vec!["0, 0, 3, 0, 0".to_string()];
+    data.extend((1..1000).map(|_| format!("0, {step}, 3, 0, 0")));
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "position_encoding": "utf-16",
+                "semantic_tokens": {{
+                    "legend": {{ "tokenTypes": ["keyword"], "tokenModifiers": [] }},
+                    "data": [{}]
+                }}
+            }}"#,
+            data.join(", ")
+        ),
+    );
+    let started = std::time::Instant::now();
+    let (rpc, _incoming) = open_with_server(&dir, &format!("{}\n", "a".repeat(len))).await;
+    let last = 999 * step;
+    time_until_lua_eq(
+        &rpc,
+        started,
+        &format!("#btv.lsp.semantic_tokens.get_at_pos(0, 0, {last})"),
+        "1",
+    )
+    .await
+}
+
+/// Decoding a token converts its UTF-16 column against its line. On an ASCII line
+/// that is the identity, but the shared converter still walked the line from column
+/// 0 for every token — O(tokens x line length) on a minified file. The token count
+/// is fixed and only the line grows 40x; a ratio, so both halves share the load.
+#[tokio::test]
+async fn semantic_tokens_on_a_long_ascii_line_do_not_scale_with_its_length() {
+    let _guard = serial_lock().lock().await;
+    let short = time_semantic_tokens(10_000).await;
+    let long = time_semantic_tokens(400_000).await;
+    std::env::remove_var("BEMTVI_LSP_CMD");
+    let ratio = long.as_secs_f64() / short.as_secs_f64().max(0.001);
+    assert!(
+        ratio < 3.0,
+        "1000 tokens on a 400k-byte line took {ratio:.1}x the same on a 10k-byte line \
+         ({long:?} vs {short:?}) — token columns are walking the line again",
+    );
+}
+
+/// Attach a UTF-16 mock serving 1000 inlay hints spread across one `len`-byte line;
+/// the time until all of them reach the mirror.
+async fn time_inlay_hints(len: usize) -> Duration {
+    let dir = temp_dir("lsp_features_inlay_long");
+    let step = len / 1000;
+    let hints: Vec<String> = (0..1000)
+        .map(|i| {
+            format!(
+                r#"{{ "position": {{ "line": 0, "character": {} }}, "label": "h", "kind": 1 }}"#,
+                i * step
+            )
+        })
+        .collect();
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{ "position_encoding": "utf-16", "inlay_hints": [{}] }}"#,
+            hints.join(", ")
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, &format!("{}\n", "é".repeat(len / 2))).await;
+    let started = std::time::Instant::now();
+    exec_lua(&rpc, "vim.lsp.inlay_hint.enable(true)").await;
+    time_until_lua_eq(
+        &rpc,
+        started,
+        "#btv.lsp.inlay_hint.get({ bufnr = 0 })",
+        "1000",
+    )
+    .await
+}
+
+/// Each hint's column was converted by copying and walking its whole line, so a
+/// reply's worth of hints on one long line cost hints x line length. The hint count
+/// is fixed and only the line grows 40x; a ratio, so both halves share the load.
+#[tokio::test]
+async fn inlay_hints_on_a_long_line_do_not_scale_with_its_length() {
+    let _guard = serial_lock().lock().await;
+    let short = time_inlay_hints(10_000).await;
+    let long = time_inlay_hints(400_000).await;
+    std::env::remove_var("BEMTVI_LSP_CMD");
+    let ratio = long.as_secs_f64() / short.as_secs_f64().max(0.001);
+    assert!(
+        ratio < 3.0,
+        "1000 inlay hints on a 400k-byte line took {ratio:.1}x the same on a 10k-byte \
+         line ({long:?} vs {short:?}) — hint columns are walking the line again",
     );
 }

@@ -251,3 +251,76 @@ async fn str_list_normalizes_and_fails_loud() {
 // namespace attribution treats an off-runtimepath path and nil identically. The
 // meaningful contract, resolving a sourced user file, is locked by expand.rs's
 // `<sfile>` tests, which run through btv.utils.caller_source.)
+
+// The pure-Lua UTF-8 walkers behind `btv.str.chars` / `to_list` / `displaywidth` /
+// `charpart` document that a malformed sequence counts as ONE 1-byte character, so a
+// Latin-1 byte (`\xe9`, "é") followed by ASCII must not swallow the ASCII bytes after
+// it as fake continuation bytes.
+#[tokio::test]
+async fn utf8_helpers_treat_a_malformed_lead_byte_as_one_char() {
+    let (rpc, _incoming) = start().await;
+    assert_eq!(eval_str(&rpc, r#"btv.str.chars("\xe9t\xe9")"#).await, "3");
+    assert_eq!(
+        eval_str(&rpc, r#"table.concat(btv.str.to_list("\xe9ab"), ",")"#).await,
+        "233,97,98"
+    );
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.displaywidth("\xf0abc")"#).await,
+        "4"
+    );
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.charpart("\xe9ab", 1, 1)"#).await,
+        "a"
+    );
+    // Well-formed multibyte text still decodes as whole characters.
+    assert_eq!(eval_str(&rpc, r#"btv.str.chars("héllo日本")"#).await, "7");
+    assert_eq!(
+        eval_str(&rpc, r#"table.concat(btv.str.to_list("é日😀"), ",")"#).await,
+        "233,26085,128512"
+    );
+}
+
+// `btv.notify_once` shows a given message only the first time, like neovim's — a plugin
+// that warns from a per-keystroke path through it must not flood the message line.
+#[tokio::test]
+async fn notify_once_shows_each_message_only_once() {
+    let (rpc, _incoming) = start().await;
+    let got = eval_str(
+        &rpc,
+        "(function() \
+           local n = 0 \
+           btv.notify = function() n = n + 1 end \
+           local a = btv.notify_once('deprecated: foo') \
+           local b = btv.notify_once('deprecated: foo') \
+           btv.notify_once('deprecated: bar') \
+           return n .. ',' .. tostring(a) .. ',' .. tostring(b) \
+         end)()",
+    )
+    .await;
+    assert_eq!(got, "2,true,false");
+}
+
+// A `file://` URI always names an ABSOLUTE path: a buffer's name is the path as typed
+// (`bemtvi src/main.rs`), and `file://src/main.rs` reads as host `src`, path `/main.rs`
+// to a language server, so a relative path resolves against the cwd first.
+#[tokio::test]
+async fn uri_from_path_resolves_a_relative_path_against_the_cwd() {
+    let (rpc, _incoming) = start().await;
+    let cwd = eval_str(&rpc, "vim.fn.getcwd()").await;
+    assert_eq!(
+        eval_str(&rpc, "btv.utils.uri_from_path('src/main.rs')").await,
+        format!("file://{cwd}/src/main.rs")
+    );
+    assert_eq!(
+        eval_str(
+            &rpc,
+            "btv.utils.uri_to_path(btv.utils.uri_from_path('src/main.rs'))"
+        )
+        .await,
+        format!("{cwd}/src/main.rs")
+    );
+    assert_eq!(
+        eval_str(&rpc, "btv.utils.uri_from_path('/abs/x.rs')").await,
+        "file:///abs/x.rs"
+    );
+}

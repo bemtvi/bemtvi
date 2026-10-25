@@ -252,9 +252,7 @@ async fn oneshot_exec(rpc: &bemtvi_rpc::Rpc, code: &str) -> Result<rmpv::Value> 
 /// chunk body); if it yields a promise the wrapper waits for it to settle. The exit
 /// status reports the outcome for shells/CI: `0` when CODE settles cleanly, non-zero
 /// (with the error on stderr) when it fails to load, throws/rejects, or never settles
-/// within the deadline — never a silent success. A workspace wrapper uses this to read
-/// its config and relaunch with `--shada-namespace` via `btv.reexec`, which replaces
-/// this process (so the wrapper's `:qa!` never runs). `workspace_cwd` mirrors the
+/// within the deadline — never a silent success. `workspace_cwd` mirrors the
 /// interactive launch: a `--workspace DIR` one-shot runs CODE with DIR as the cwd
 /// (unless `--workspace-no-cwd`).
 fn run_lua_oneshot(code: String, shada: &ShadaOpts, workspace_cwd: bool) -> Result<()> {
@@ -311,8 +309,7 @@ fn run_lua_oneshot(code: String, shada: &ShadaOpts, workspace_cwd: bool) -> Resu
         // Run CODE via the bootstrap chunk (see [`oneshot_bootstrap`]): it compiles
         // CODE Lua-side, reports a load failure back as a string value, and otherwise
         // starts the async evaluation that sets the completion globals when it
-        // settles. If CODE calls `btv._reexec`, the process is replaced before the
-        // globals are ever read. A load failure is fatal — surfaced with the Lua error
+        // settles. A load failure is fatal — surfaced with the Lua error
         // and a non-zero exit, never swallowed into a 30-second poll of a flag the
         // chunk never got to set.
         match oneshot_exec(&rpc, &oneshot_bootstrap(&code)).await? {
@@ -325,7 +322,7 @@ fn run_lua_oneshot(code: String, shada: &ShadaOpts, workspace_cwd: bool) -> Resu
         }
 
         // Poll until the chunk settles (each request pumps a server tick, so the async
-        // work — fs reads, the reexec — makes progress), bounded so a hung chunk can't
+        // work — fs reads and the like — makes progress), bounded so a hung chunk can't
         // wedge a shell. One request reads both globals: `nil` while pending, `true` on
         // success, the rejection string on failure. Returning exits the process
         // (dropping the server thread); an error exits non-zero via `main`'s `Result`.
@@ -482,10 +479,10 @@ const RUNTIME_ENV: &str = "BEMTVI_RUNTIME";
 /// `$BEMTVI_RUNTIME` if the user (or a prior launch) exported one, else the standard
 /// `<data-dir>/bemtvi/runtime` (matching `stdpath("data")`). Shared by `--extract-lua-runtime`
 /// and the startup export in `main`, so both agree on the default location.
-fn default_runtime_dir() -> PathBuf {
+fn default_runtime_dir() -> Option<PathBuf> {
     std::env::var_os(RUNTIME_ENV)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(bemtvi_lua::stdpath("data")).join("runtime"))
+        .or_else(|| bemtvi_lua::stdpath("data").map(|data| PathBuf::from(data).join("runtime")))
 }
 
 /// Handle `--extract-lua-runtime [DIR]`: write the embedded `btv.*`/`vim.*` prelude to a
@@ -500,7 +497,12 @@ fn extract_lua_runtime(dir_arg: String) -> Result<()> {
     let dir = if !dir_arg.is_empty() {
         PathBuf::from(dir_arg)
     } else {
-        default_runtime_dir()
+        default_runtime_dir().ok_or_else(|| {
+            anyhow!(
+                "--extract-lua-runtime: no data directory (no home, $XDG_DATA_HOME or \
+                 platform default) — pass a DIR"
+            )
+        })?
     };
 
     let written = bemtvi_lua::extract_prelude(&dir)
@@ -571,15 +573,19 @@ fn main() -> Result<()> {
         .find(|a| !a.starts_with(CONNECT_URI_SCHEME))
         .cloned();
 
-    // Expose every positional file argument to `btv.argv()` (newline-joined), in all
-    // roles, before any server thread reads the environment.
+    // Expose every positional file argument to `btv.argv()` (a JSON array of strings, so
+    // a filename containing a newline stays one argument), in all roles, before any
+    // server thread reads the environment.
     let argv: Vec<&str> = cli
         .targets
         .iter()
         .filter(|a| !a.starts_with(CONNECT_URI_SCHEME))
         .map(String::as_str)
         .collect();
-    std::env::set_var(ARGV_ENV, argv.join("\n"));
+    std::env::set_var(
+        ARGV_ENV,
+        serde_json::to_string(&argv).expect("a list of strings always serializes"),
+    );
 
     // Expose the Lua runtime dir in this process's environment (mirroring BEMTVI_ARGV), so the
     // editor's own Lua and every `btv.run` child — which inherit this env — can resolve
@@ -588,7 +594,9 @@ fn main() -> Result<()> {
     // `<data-dir>/bemtvi/runtime` default. Runs in every role that reaches here (the
     // `--extract-lua-runtime` branch returned above and resolves its own destination).
     if std::env::var_os(RUNTIME_ENV).is_none() {
-        std::env::set_var(RUNTIME_ENV, default_runtime_dir());
+        if let Some(dir) = default_runtime_dir() {
+            std::env::set_var(RUNTIME_ENV, dir);
+        }
     }
 
     // Plugin test runner role: no editor UI — boot an embedded server, drive the Lua
@@ -681,8 +689,7 @@ fn main() -> Result<()> {
     let shada = ShadaOpts::from_cli(&cli, workspace_dir.as_deref())?;
 
     // `--lua` headless mode: source config (so plugins load), run the one-liner, exit —
-    // no UI. A workspace wrapper uses it to read its config and relaunch with the right
-    // `--shada-namespace`; see `btv.reexec`.
+    // no UI.
     if let Some(code) = cli.lua.clone() {
         return run_lua_oneshot(
             code,
@@ -1173,8 +1180,8 @@ where
     shada.resolve_remote_workspace(resolved.remote_cwd.as_deref());
     // Shada follows the config source. `Remote` keeps it on the daemon (Approach A):
     // download its store into a local staging dir now (before `client.host_fs` is moved
-    // below) and sync it back after each flush. A download error disables remote shada —
-    // fall back to the local store rather than clobber the daemon's copy. `Local` uses the
+    // below) and sync it back after each flush. A download error turns shada off for the
+    // session — never the local store, which the daemon's config must not see. `Local` uses the
     // local store (the `--shada-namespace` workspace store + session).
     let (shada_store, remote_shada) = bemtvi_server::resolve_session_shada(
         &client.host_fs,

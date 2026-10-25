@@ -21,6 +21,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { globSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { APPROVALS_KEY, approvalEntry, daemonIdentity } from "./daemon-trust.mjs";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const PORT = 8142;
@@ -109,6 +110,9 @@ try {
   page.on("console", (m) => { if (m.type() === "error") console.log("  [page error]", m.text()); });
   page.on("pageerror", (e) => console.log("  [pageerror]", e.message));
 
+  // The page asks before dialing a `?daemon=` link; pre-approve this daemon (as a user
+  // who approved it earlier would have) so the run connects without the prompt.
+  await page.addInitScript(([k, v]) => localStorage.setItem(k, JSON.stringify([v])), [APPROVALS_KEY, approvalEntry(daemonIdentity(uri))]);
   const pageUrl = `http://localhost:${PORT}/web/?daemon=${encodeURIComponent(uri)}`;
   await page.goto(pageUrl);
 

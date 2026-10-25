@@ -65,6 +65,14 @@ impl EditHost {
         };
         for key in parsed {
             self.process_key(key);
+            // An ex-command this key finished that the SERVER owns (`:lcd`, a user
+            // command, `:lua …`) runs now, before the rest of the batch: a following
+            // `:close` or motion typed in the same input must see its effect, exactly
+            // as if the keys had arrived one at a time.
+            if !self.editor.deferred_commands.is_empty() || !self.editor.lua_queue.is_empty() {
+                self.run_pending();
+                self.refresh_keymaps();
+            }
             // A macro this key started (`<F3>a`) runs BEFORE the rest of the batch —
             // vim puts a played register ahead of the remaining typeahead, so
             // `<F3>aj` moves down after the macro ran, not before it.
@@ -193,17 +201,37 @@ impl EditHost {
     /// stream (Normal mode, the command line, a terminal job, a grabbing menu,
     /// Replace mode's overtype), and then it is replayed key by key *inside* a paste
     /// span, where the insert-mode guards still keep it literal — slower, same text.
+    ///
+    /// The payload is clipboard text, which anyone can shape, so it never runs as
+    /// commands: in Normal / Visual mode core *puts* it ([`Editor::paste_put`]), and
+    /// the replay only ever carries text keys — a control byte in the clipboard (an
+    /// `ESC`, a `<C-\><C-n>`) cannot leave the mode the paste landed in, and on the
+    /// command line or in a grabbing menu only the first line is typed, so a pasted
+    /// line break cannot submit it.
     fn apply_paste(&mut self, payload: Vec<Key>) {
-        if let Some(text) = payload_text(&payload) {
-            if self.editor.paste_literal(&text) {
-                return;
+        let text = payload_text(&payload);
+        if self.editor.paste_literal(&text) || self.editor.paste_put(&text) {
+            return;
+        }
+        let first_line_only =
+            self.editor.mode == bemtvi_core::Mode::Command || self.editor.menu_grabs_input();
+        let mut keys = Vec::with_capacity(payload.len());
+        for key in payload {
+            if first_line_only && key.code == KeyCode::Enter {
+                break;
+            }
+            if !key.ctrl
+                && !key.alt
+                && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab)
+            {
+                keys.push(key);
             }
         }
         // `Editor::input` (not `process_key`) for the markers: they must be recorded
         // into the dot-repeat stream so a `.` of this change re-enters paste mode,
         // and they must not reach the keymap matcher.
         self.editor.input(Key::new(KeyCode::PasteStart));
-        for key in payload {
+        for key in keys {
             self.process_key(key);
         }
         self.editor.input(Key::new(KeyCode::PasteEnd));
@@ -372,8 +400,28 @@ impl EditHost {
             self.editor_input_typed(key);
             return;
         }
+        let key = self.unbound_ctrl_alias(key);
         for step in self.keymaps.feed(self.editing_scope(), key) {
             self.apply_step(step);
+        }
+    }
+
+    /// An unmodified `<C-h>` / `<C-i>` / `<C-j>` / `<C-m>` / `<C-[>` that no map in
+    /// Insert, Replace or the command line claims stands for its named key there
+    /// (vim's `i_CTRL-H`, `c_CTRL-J`, …): the named twin, so the mode's own handling
+    /// — the command line's `<CR>` / `<BS>` are themselves default maps — applies.
+    /// Any other key, or a mapped chord, is returned as is.
+    fn unbound_ctrl_alias(&self, key: Key) -> Key {
+        if !matches!(
+            self.editor.mode,
+            bemtvi_core::Mode::Insert | bemtvi_core::Mode::Replace | bemtvi_core::Mode::Command
+        ) || !self.keymaps.pending_empty()
+        {
+            return key;
+        }
+        match bemtvi_core::text_mode_ctrl_alias(key) {
+            Some(twin) if !self.keymaps.binds(self.editing_scope(), key) => twin,
+            _ => key,
         }
     }
 
@@ -759,6 +807,10 @@ impl EditHost {
             Some(bucket) => MatchScope::Widget(bucket),
             None => self.editing_scope(),
         };
+        let key = match scope {
+            MatchScope::Widget(_) => key,
+            _ => self.unbound_ctrl_alias(key),
+        };
         if let Some(m) = self.keymaps.lookup_default(scope, key) {
             self.fire_mapping(m.rhs, m.silent, m.expr);
         } else {
@@ -769,22 +821,31 @@ impl EditHost {
 }
 
 /// Reconstruct the pasted text from the keys collected between the brackets — the
-/// inverse of the client's `encode_paste`. `None` when the payload holds anything
-/// that is not plain text (a modified key, a named key other than the line break /
-/// tab the encoder emits), which sends the whole paste down the key-replay path
-/// rather than guessing at a character for it.
-fn payload_text(payload: &[Key]) -> Option<String> {
+/// inverse of the client's `encode_paste`. A raw control byte the clipboard carried
+/// (which the notation parser decoded into `<Esc>` / `<C-x>` / `<BS>`) comes back
+/// as that byte, so it is inserted literally like any other pasted character; a key
+/// that has no character at all (an Alt chord, a cursor key) is dropped.
+fn payload_text(payload: &[Key]) -> String {
     let mut out = String::new();
     for key in payload {
-        if key.ctrl || key.alt {
-            return None;
+        if key.alt {
+            continue;
         }
         match key.code {
+            KeyCode::Char(c) if key.ctrl => {
+                let u = (c.to_ascii_uppercase() as u32) ^ 0x40;
+                if let Some(b) = char::from_u32(u).filter(|_| u <= 0x1f || u == 0x7f) {
+                    out.push(b);
+                }
+            }
+            _ if key.ctrl => {}
             KeyCode::Char(c) => out.push(c),
             KeyCode::Enter => out.push('\n'),
             KeyCode::Tab => out.push('\t'),
-            _ => return None,
+            KeyCode::Esc => out.push('\u{1b}'),
+            KeyCode::Backspace => out.push('\u{8}'),
+            _ => {}
         }
     }
-    Some(out)
+    out
 }

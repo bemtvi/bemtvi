@@ -393,6 +393,44 @@ async fn unknown_border_is_rejected_loud() {
     );
 }
 
+/// An ASYNC `render` (one that `btv.await`s) works on every render, not only the
+/// first: a re-render triggered by a reactive write runs from a scheduled microtask,
+/// outside setup's coroutine, and must still get one of its own.
+#[tokio::test]
+async fn float_component_async_render_survives_a_re_render() {
+    let dir = temp_dir("float_component_async");
+    let (rpc, mut incoming) = start(
+        &dir,
+        r#"
+        btv.component({
+          surface = "float",
+          setup = function(ctx)
+            _G.s = ctx.reactive({ t = "one" })
+            return _G.s
+          end,
+          render = function(s)
+            local t = btv.await(btv.promise.resolve(s.t))
+            return { lines = { t }, title = " demo " }
+          end,
+        }).mount({ relative = "editor" })
+        "#,
+    )
+    .await;
+    let map = poll_float(&rpc, &mut incoming, |f| matches!(f, Value::Map(_)))
+        .await
+        .expect("the async render opened the float");
+    assert_eq!(float_lines(&float_of(&map)), vec!["one"]);
+    exec_lua(&rpc, "_G.s.t = 'two'").await;
+    let map = poll_float(
+        &rpc,
+        &mut incoming,
+        |f| matches!(f, Value::Map(m) if float_lines(m) == vec!["two"]),
+    )
+    .await
+    .expect("the async re-render updated the float");
+    assert_eq!(float_lines(&float_of(&map)), vec!["two"]);
+}
+
 /// The `btv.component` "float" backend: the Vue-shaped component model rendered onto a
 /// non-focus content float (the which-key surface). A reactive write re-renders into the
 /// float in place; an EMPTY render hides it. Proves the component model is surface-agnostic

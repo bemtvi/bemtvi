@@ -30,6 +30,9 @@ pub(crate) type RowStyles = Vec<(u16, u16, Style)>;
 /// **replies** to status/identity queries (`vt100` is a screen *model*, so it never
 /// answers them; we must, or apps like fzf that send `\e[6n` stall waiting). The
 /// emulator reads both back via [`vt100::Parser::callbacks_mut`] after each `process`.
+/// The most bytes of a child's window title kept.
+const TITLE_MAX: usize = 4096;
+
 #[derive(Default)]
 struct TermSink {
     title: Option<String>,
@@ -40,7 +43,14 @@ struct TermSink {
 
 impl vt100::Callbacks for TermSink {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
-        self.title = Some(String::from_utf8_lossy(title).into_owned());
+        // The title is a display name for the status/tab line; a child can send any
+        // amount, so keep a bounded head.
+        let title = String::from_utf8_lossy(title);
+        let mut end = title.len().min(TITLE_MAX);
+        while !title.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.title = Some(title[..end].to_string());
     }
 
     /// Answer the terminal queries a screen model can't — the same replies a real
@@ -120,6 +130,68 @@ pub(crate) struct TermEmu {
     /// that never scroll, and counting them falsely arms the trim against an idle
     /// child. Reset to 0 on every input (so steady typing never reads as a flood).
     scrolled_since_input: usize,
+    /// Caps an in-progress OSC string before the parser sees it (see [`OscCap`]).
+    osc_cap: OscCap,
+}
+
+/// The most payload bytes of one OSC string (`ESC ]` … `BEL`/`ST`) passed to the
+/// parser. `vte` buffers an OSC string whole until its terminator, with no limit, so a
+/// child that opens one and never closes it would grow that buffer without end.
+const OSC_MAX: usize = 8192;
+
+/// A byte-stream filter tracking whether the child is inside an OSC string, across PTY
+/// chunks, and dropping its payload past [`OSC_MAX`]. The terminators (`BEL`, `ESC`,
+/// and the `CAN`/`SUB` aborts — the bytes `vte` ends an OSC string on) always pass, so
+/// the parser's state never diverges from the stream's.
+#[derive(Default)]
+struct OscCap {
+    /// The previous byte was `ESC` (outside an OSC string).
+    esc: bool,
+    /// Inside an OSC string, with this many payload bytes passed so far.
+    osc: Option<usize>,
+}
+
+impl OscCap {
+    fn filter<'a>(&mut self, bytes: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        let mut out: Option<Vec<u8>> = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            let keep = match self.osc {
+                Some(n) => match b {
+                    0x07 | 0x18 | 0x1a => {
+                        self.osc = None;
+                        self.esc = false;
+                        true
+                    }
+                    0x1b => {
+                        self.osc = None;
+                        self.esc = true;
+                        true
+                    }
+                    _ if n >= OSC_MAX => false,
+                    _ => {
+                        self.osc = Some(n + 1);
+                        true
+                    }
+                },
+                None => {
+                    if self.esc && b == b']' {
+                        self.osc = Some(0);
+                    }
+                    self.esc = b == 0x1b;
+                    true
+                }
+            };
+            match (&mut out, keep) {
+                (Some(v), true) => v.push(b),
+                (None, false) => out = Some(bytes[..i].to_vec()),
+                _ => {}
+            }
+        }
+        match out {
+            Some(v) => std::borrow::Cow::Owned(v),
+            None => std::borrow::Cow::Borrowed(bytes),
+        }
+    }
 }
 
 impl TermEmu {
@@ -134,6 +206,7 @@ impl TermEmu {
             // and lay out the full buffer.
             last_held: usize::MAX,
             scrollback,
+            osc_cap: OscCap::default(),
             scrolled_since_input: 0,
         }
     }
@@ -166,7 +239,8 @@ impl EditHost {
     pub fn terminal_feed(&mut self, buf: BufferId, bytes: &[u8]) {
         let replies = match self.terminals.get_mut(&buf) {
             Some(emu) => {
-                emu.parser.process(bytes);
+                let bytes = emu.osc_cap.filter(bytes);
+                emu.parser.process(&bytes);
                 // The `^C` flood signal is measured as scrollback growth in
                 // `terminal_project` — NOT as newlines here: a full-screen repainting
                 // TUI's cursor-advance `\n`s never scroll, and counting them would arm
@@ -319,6 +393,7 @@ impl EditHost {
             .get_mut(&buf)
             .expect("emulator present above");
         emu.parser = parser;
+        emu.osc_cap = OscCap::default();
         emu.history.clear();
         emu.history_styles.clear();
         emu.last_held = usize::MAX;
@@ -424,7 +499,9 @@ impl EditHost {
         // arrow/Home/End keystrokes must be encoded (`\EO_` vs `\E[_`). Mirror it to core so
         // the next keystroke is sent in the form the child expects.
         let app_cursor = screen.application_cursor();
-        let title = emu.parser.callbacks().title.clone();
+        // Taken, not cloned: a title is applied once when the child sets it, not
+        // re-copied into the buffer on every projection.
+        let title = emu.parser.callbacks_mut().title.take();
 
         self.editor.terminal_update(
             buf,
@@ -914,6 +991,7 @@ impl EditHost {
 pub(crate) mod native {
     use std::collections::HashMap;
     use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -1013,13 +1091,24 @@ pub(crate) mod native {
         writer: Box<dyn Write + Send>,
         master: MasterSlot,
         killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+        /// Set by the reader thread once it has reaped the child, so a later drop never
+        /// signals a pid the kernel may already have handed to another process.
+        reaped: Arc<AtomicBool>,
     }
 
+    /// Dropping a session (a re-open on the same id, or the actor ending because its
+    /// owner went away — a daemon link dropping) must end its child. Closing our master
+    /// handle alone does not hang the child up: the reader thread holds a dup of the
+    /// master fd, so the child would keep running with that thread parked on it.
+    ///
+    /// Then it closes its master, exactly as owning the master outright did — the slot
+    /// only exists so the Windows waiter can close it *earlier*, never to keep it alive
+    /// longer.
     impl Drop for Session {
-        /// Forgetting a session closes its master, exactly as owning the master
-        /// outright did — the slot only exists so the Windows waiter can close it
-        /// *earlier*, never to keep it alive longer.
         fn drop(&mut self) {
+            if !self.reaped.load(Ordering::Acquire) {
+                let _ = self.killer.kill();
+            }
             drop(take_master(&self.master));
         }
     }
@@ -1090,9 +1179,8 @@ pub(crate) mod native {
                     }
                 }
                 TermCommand::Kill { buf } => {
-                    if let Some(mut s) = sessions.remove(&buf) {
-                        let _ = s.killer.kill();
-                    }
+                    // Dropping the session kills its child.
+                    sessions.remove(&buf);
                 }
             }
         }
@@ -1199,6 +1287,8 @@ pub(crate) mod native {
         let event_tx = event_tx.clone();
         #[cfg(not(windows))]
         let mut child = child;
+        let reaped = Arc::new(AtomicBool::new(false));
+        let reaped_by_thread = reaped.clone();
         std::thread::spawn(move || {
             let mut chunk = [0u8; 8192];
             loop {
@@ -1231,6 +1321,7 @@ pub(crate) mod native {
             // what produced this EOF.
             #[cfg(windows)]
             let code = exit_code.recv().unwrap_or(-1);
+            reaped_by_thread.store(true, Ordering::Release);
             let _ = event_tx.blocking_send(TermEvent::Exit { buf, code });
         });
 
@@ -1238,6 +1329,7 @@ pub(crate) mod native {
             writer,
             master,
             killer,
+            reaped,
         })
     }
 }

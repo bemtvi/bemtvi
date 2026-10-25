@@ -554,7 +554,13 @@ impl Editor {
         // it's the line-start motion), matching the vim grammar.
         if let Some(d) = ch.and_then(|c| c.to_digit(10)) {
             if d != 0 || self.helix_count.is_some() {
-                self.helix_count = Some(self.helix_count.unwrap_or(0) * 10 + d as usize);
+                self.helix_count = Some(
+                    self.helix_count
+                        .unwrap_or(0)
+                        .saturating_mul(10)
+                        .saturating_add(d as usize)
+                        .min(super::MAX_COUNT),
+                );
                 return;
             }
         }

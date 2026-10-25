@@ -75,6 +75,54 @@ async fn explorer_listing_is_read_only_to_ex_command_edits() {
     assert_ex_edits_refused(&rpc, &mut incoming, "explorer").await;
 }
 
+/// A directory holding a file whose name contains a newline (legal on Unix, and not
+/// representable as one listing row) still lists — the other entries, with the
+/// unlistable one reported — and the listing still ends up locked read-only.
+#[cfg(unix)]
+#[tokio::test]
+async fn explorer_with_a_newline_filename_still_lists_and_locks() {
+    let dir = temp_dir("ro_explorer_nl");
+    std::fs::write(dir.join("alpha.txt"), "a\n").expect("write alpha");
+    std::fs::write(dir.join("bad\nname"), "b\n").expect("write newline name");
+    let (rpc, mut incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "_G.notes = {}\n\
+         local orig = btv.notify\n\
+         btv.notify = function(m, l) table.insert(_G.notes, tostring(m)) return orig(m, l) end",
+    )
+    .await;
+    exec_lua(&rpc, &format!("btv.cmd('edit {}')", dir.to_string_lossy())).await;
+    let mut listed = false;
+    for _ in 0..100 {
+        if lines(&rpc).await.iter().any(|l| l == "alpha.txt") {
+            listed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        listed,
+        "the listing fills despite the newline name: {:?}",
+        lines(&rpc).await
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["../".to_string(), "alpha.txt".to_string()]
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv.bo.modifiable").await,
+        rmpv::Value::Boolean(false),
+        "the listing is locked"
+    );
+    let notes = exec_lua(&rpc, "return table.concat(_G.notes, '|')").await;
+    assert!(
+        notes.as_str().unwrap_or_default().contains("newline"),
+        "the unlistable entry is reported: {notes:?}"
+    );
+    assert_ex_edits_refused(&rpc, &mut incoming, "explorer").await;
+}
+
 /// A plugin-owned `btv.view` — read-only at the chokepoints via the same `read_only()`
 /// path (its `view` marker). (Normal-mode inertness is covered in `btv_view.rs`.)
 #[tokio::test]

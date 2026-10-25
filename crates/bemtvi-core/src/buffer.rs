@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use ropey::{LineType, Rope};
+use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
 
 use crate::host::{FileStat, HostFs};
 
@@ -236,6 +237,11 @@ pub struct Buffer {
     /// `changelist.len()` means "at the newest change / not navigating"; a new
     /// change resets it there.
     pub changelistidx: usize,
+    /// The byte span `[start, end)` (in current coordinates) covered by the edits
+    /// since [`Buffer::take_change_span`] last drained it: each edit unions its new
+    /// text into the span, and later edits shift it. The editor turns it into the
+    /// `` `[ `` / `` `] `` marks for a command that did not set them itself.
+    change_span: Option<(usize, usize)>,
     /// What **kind** of buffer this is — the single identity marker (replacing the
     /// former `dir` / `view` / `terminal` / `image` grab-bag). [`BufferKind::Ordinary`]
     /// for every editable file/scratch buffer; a non-ordinary variant carries the
@@ -279,6 +285,11 @@ pub struct Buffer {
     /// that changed underneath us. `None` until we observe an on-disk file (a
     /// scratch buffer, or a `:e new-file` whose target doesn't exist yet).
     disk: Option<FileStat>,
+    /// Off-tick (daemon / web) only: the remote watch reported that the bound file
+    /// drifted from [`disk`](Self::disk) — the fact a local `:w` would learn by
+    /// re-statting, which the off-tick editor can't do on the tick. Cleared whenever the
+    /// baseline is re-taken (a read landing, a write ack).
+    disk_drift: bool,
 }
 
 impl Default for Buffer {
@@ -351,6 +362,7 @@ impl Buffer {
             fold_resync: false,
             changelist: Vec::new(),
             changelistidx: 0,
+            change_span: None,
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
             last_visual: None,
@@ -360,6 +372,7 @@ impl Buffer {
             view_name: None,
             image_gen: 0,
             disk: None,
+            disk_drift: false,
         }
     }
 
@@ -523,6 +536,62 @@ impl Buffer {
             Some(s) => Cow::Borrowed(strip_eol(s)),
             None => Cow::Owned(strip_eol(&sl.to_string()).to_owned()),
         }
+    }
+
+    /// At most the first `max_bytes` of editable line `idx` (cut back to a char
+    /// boundary, newline excluded) — the line's head without materializing the rest,
+    /// for a caller that only shows its start (a `nowrap` row). `O(max_bytes)`.
+    pub fn line_head(&self, idx: usize, max_bytes: usize) -> Cow<'_, str> {
+        let len = self.line_len(idx);
+        if len <= max_bytes {
+            return self.line_cow(idx);
+        }
+        let sl = self.text.line(idx, LINE_TYPE);
+        let sl = sl.slice(..sl.floor_char_boundary(max_bytes));
+        match sl.as_str() {
+            Some(s) => Cow::Borrowed(s),
+            None => Cow::Owned(sl.to_string()),
+        }
+    }
+
+    /// [`unicode::next_grapheme`](crate::unicode::next_grapheme) over editable line
+    /// `idx`, answered straight off the rope: the grapheme boundary after line-local
+    /// byte `byte` (floored to a boundary first), clamped to the line's end.
+    /// `O(log n)` per call, where materializing the line was `O(line)` — and word
+    /// motions step one grapheme at a time, so a `W` across a long word on a huge
+    /// line was quadratic.
+    pub fn next_grapheme_in_line(&self, idx: usize, byte: usize) -> usize {
+        let sl = self.line_text_slice(idx);
+        let from = floor_grapheme_slice(sl, byte);
+        if from >= sl.len() {
+            return sl.len();
+        }
+        next_boundary_slice(sl, from)
+    }
+
+    /// [`unicode::prev_grapheme`](crate::unicode::prev_grapheme) over editable line
+    /// `idx`, off the rope like [`next_grapheme_in_line`](Self::next_grapheme_in_line).
+    pub fn prev_grapheme_in_line(&self, idx: usize, byte: usize) -> usize {
+        let sl = self.line_text_slice(idx);
+        let from = floor_grapheme_slice(sl, byte);
+        if from == 0 {
+            return 0;
+        }
+        prev_boundary_slice(sl, from)
+    }
+
+    /// [`unicode::floor_grapheme`](crate::unicode::floor_grapheme) over editable line
+    /// `idx`, off the rope like [`next_grapheme_in_line`](Self::next_grapheme_in_line).
+    pub fn floor_grapheme_in_line(&self, idx: usize, byte: usize) -> usize {
+        floor_grapheme_slice(self.line_text_slice(idx), byte)
+    }
+
+    /// Editable line `idx` as a rope slice, newline excluded (empty past the end).
+    fn line_text_slice(&self, idx: usize) -> ropey::RopeSlice<'_> {
+        if idx >= self.line_count() {
+            return self.text.slice(0..0);
+        }
+        self.text.line(idx, LINE_TYPE).slice(..self.line_len(idx))
     }
 
     /// Number of bytes in editable line `idx`, excluding the newline. Computed
@@ -754,6 +823,7 @@ impl Buffer {
         // genuine reload has nothing to restore, matching vim.
         self.changelist.clear();
         self.changelistidx = 0;
+        self.change_span = None;
         self.changedtick += 1;
         self.modified = true;
     }
@@ -846,6 +916,20 @@ impl Buffer {
         );
         add_to_changelist(&mut self.changelist, edit.start_point);
         self.changelistidx = self.changelist.len();
+        let (start, old_end, new_end) = (edit.start_byte, edit.old_end_byte, edit.new_end_byte);
+        let shift = |p: usize| {
+            if p <= start {
+                p
+            } else if p >= old_end {
+                p - old_end + new_end
+            } else {
+                new_end
+            }
+        };
+        self.change_span = Some(match self.change_span {
+            Some((lo, hi)) => (shift(lo).min(start), shift(hi).max(new_end)),
+            None => (start, new_end),
+        });
         self.edits.push(edit.clone());
         self.lsp_edits.push(edit.clone());
         self.jump_edits.push(edit.clone());
@@ -887,6 +971,7 @@ impl Buffer {
         // The maintenance insert must not enter the change list either: snapshot it
         // (and its nav pointer) and put it back afterward, as we do for `'.'`.
         let saved_changelist = (self.changelist.clone(), self.changelistidx);
+        let saved_span = self.change_span;
         if n == 0 {
             self.insert(0, "\n");
         } else {
@@ -897,6 +982,13 @@ impl Buffer {
             None => self.marks.remove(&'.'),
         };
         (self.changelist, self.changelistidx) = saved_changelist;
+        self.change_span = saved_span.map(|(lo, hi)| (lo.min(n), hi.min(n)));
+    }
+
+    /// Drain the span the edits since the last drain covered (see
+    /// [`change_span`](Self::change_span)); `None` when nothing was edited.
+    pub fn take_change_span(&mut self) -> Option<(usize, usize)> {
+        self.change_span.take()
     }
 
     /// Write the buffer to `path` (or its bound path). Returns `(bytes, lines)` where
@@ -1050,6 +1142,7 @@ impl Buffer {
     /// saved-state reflects bytes that are actually on the remote.
     pub fn mark_written(&mut self, path: PathBuf, stat: Option<FileStat>) {
         self.disk = stat;
+        self.disk_drift = false;
         self.path = Some(path);
         self.modified = false;
         // The bytes were snapshotted (`to_save_bytes`) when the save was *enqueued*, so
@@ -1072,6 +1165,20 @@ impl Buffer {
     /// `BufNewFile` instead of `BufReadPost` for a file that plainly exists.
     pub fn stamp_disk(&mut self, stat: Option<FileStat>) {
         self.disk = stat;
+        self.disk_drift = false;
+    }
+
+    /// Record that the remote watch saw the bound file drift from the disk baseline
+    /// (off-tick sessions) — see [`disk_drifted`](Self::disk_drifted).
+    pub fn note_disk_drift(&mut self) {
+        self.disk_drift = true;
+    }
+
+    /// Whether the remote watch reported the bound file changed since the baseline was
+    /// last taken — the off-tick stand-in for [`disk_changed`](Self::disk_changed), which
+    /// needs a synchronous stat the off-tick editor never makes.
+    pub fn disk_drifted(&self) -> bool {
+        self.disk_drift
     }
 
     /// The disk snapshot (mtime+size) from the last read/write, or `None` for a
@@ -1127,7 +1234,7 @@ pub enum DiskChange {
 /// Detect the line-ending convention from a file's decoded text: the FIRST line break
 /// decides (`\r\n` → Dos, lone `\r` → Mac, `\n` → Unix), matching how vim picks
 /// `'fileformat'` for a consistently-formatted file. No line break at all → Unix.
-fn detect_fileformat(s: &str) -> crate::options::FileFormat {
+pub(crate) fn detect_fileformat(s: &str) -> crate::options::FileFormat {
     use crate::options::FileFormat;
     let b = s.as_bytes();
     let mut i = 0;
@@ -1149,12 +1256,93 @@ fn detect_fileformat(s: &str) -> crate::options::FileFormat {
 
 /// Normalize a decoded file's line endings to `\n` for the rope (the inverse of
 /// [`Buffer::to_save_bytes`]'s conversion). Unix text is returned untouched.
-fn normalize_eol(s: &str, ff: crate::options::FileFormat) -> Cow<'_, str> {
+pub(crate) fn normalize_eol(s: &str, ff: crate::options::FileFormat) -> Cow<'_, str> {
     use crate::options::FileFormat;
     match ff {
         FileFormat::Unix => Cow::Borrowed(s),
         FileFormat::Dos => Cow::Owned(s.replace("\r\n", "\n")),
         FileFormat::Mac => Cow::Owned(s.replace('\r', "\n")),
+    }
+}
+
+/// [`unicode::floor_grapheme`](crate::unicode::floor_grapheme) over a rope slice.
+fn floor_grapheme_slice(sl: ropey::RopeSlice<'_>, byte: usize) -> usize {
+    if byte >= sl.len() {
+        return sl.len();
+    }
+    let byte = sl.floor_char_boundary(byte);
+    // Between two ASCII characters there is always a boundary except inside a CRLF
+    // (the same O(1) shortcut `unicode::floor_grapheme` takes).
+    let b = sl.byte(byte);
+    if b.is_ascii()
+        && (byte == 0
+            || (sl.byte(byte - 1).is_ascii() && !(sl.byte(byte - 1) == b'\r' && b == b'\n')))
+    {
+        return byte;
+    }
+    let mut gc = GraphemeCursor::new(byte, sl.len(), true);
+    let (chunk, start) = sl.chunk(byte);
+    loop {
+        match gc.is_boundary(chunk, start) {
+            Ok(true) => return byte,
+            Ok(false) => return prev_boundary_slice(sl, byte),
+            Err(GraphemeIncomplete::PreContext(n)) => {
+                let (ctx, ctx_start) = sl.chunk(n - 1);
+                gc.provide_context(ctx, ctx_start);
+            }
+            // `is_boundary` asks only for pre-context; never seen, but fall back to
+            // segmenting the materialized line rather than trusting the cursor.
+            Err(_) => return crate::unicode::floor_grapheme(&sl.to_string(), byte),
+        }
+    }
+}
+
+/// The grapheme boundary after `byte` (itself a boundary) in a rope slice.
+fn next_boundary_slice(sl: ropey::RopeSlice<'_>, byte: usize) -> usize {
+    let mut gc = GraphemeCursor::new(byte, sl.len(), true);
+    let (mut chunk, mut start) = sl.chunk(byte);
+    loop {
+        match gc.next_boundary(chunk, start) {
+            Ok(Some(n)) => return n,
+            Ok(None) => return sl.len(),
+            Err(GraphemeIncomplete::NextChunk) => {
+                start += chunk.len();
+                if start >= sl.len() {
+                    return sl.len();
+                }
+                chunk = sl.chunk(start).0;
+            }
+            Err(GraphemeIncomplete::PreContext(n)) => {
+                let (ctx, ctx_start) = sl.chunk(n - 1);
+                gc.provide_context(ctx, ctx_start);
+            }
+            // Not asked for by `next_boundary`; segment the materialized line instead.
+            Err(_) => return crate::unicode::next_grapheme(&sl.to_string(), byte),
+        }
+    }
+}
+
+/// The grapheme boundary before `byte` (itself a boundary, `> 0`) in a rope slice.
+fn prev_boundary_slice(sl: ropey::RopeSlice<'_>, byte: usize) -> usize {
+    let mut gc = GraphemeCursor::new(byte, sl.len(), true);
+    let (mut chunk, mut start) = sl.chunk(byte);
+    loop {
+        match gc.prev_boundary(chunk, start) {
+            Ok(Some(n)) => return n,
+            Ok(None) => return 0,
+            Err(GraphemeIncomplete::PrevChunk) => {
+                if start == 0 {
+                    return 0;
+                }
+                (chunk, start) = sl.chunk(start - 1);
+            }
+            Err(GraphemeIncomplete::PreContext(n)) => {
+                let (ctx, ctx_start) = sl.chunk(n - 1);
+                gc.provide_context(ctx, ctx_start);
+            }
+            // Not asked for by `prev_boundary`; segment the materialized line instead.
+            Err(_) => return crate::unicode::prev_grapheme(&sl.to_string(), byte),
+        }
     }
 }
 
@@ -1220,6 +1408,30 @@ fn shift_marks(
         }
         None => false,
     });
+}
+
+/// The lines a whole-rope replacement changed, from `old` to `new`: the first
+/// differing line and the end (exclusive) of the differing run in each — the
+/// common prefix and suffix of lines are left out. `None` when they are equal.
+/// Costs a walk over the unchanged prefix and suffix, so callers keep it off the
+/// per-keystroke path (it serves undo/redo of a buffer with manual folds).
+pub(crate) fn changed_line_span(old: &Rope, new: &Rope) -> Option<(usize, usize, usize)> {
+    let (on, nn) = (old.len_lines(LINE_TYPE), new.len_lines(LINE_TYPE));
+    let mut p = 0;
+    while p < on && p < nn && old.line(p, LINE_TYPE) == new.line(p, LINE_TYPE) {
+        p += 1;
+    }
+    if p == on && p == nn {
+        return None;
+    }
+    let mut q = 0;
+    while q < on - p
+        && q < nn - p
+        && old.line(on - 1 - q, LINE_TYPE) == new.line(nn - 1 - q, LINE_TYPE)
+    {
+        q += 1;
+    }
+    Some((p, on - q, nn - q))
 }
 
 /// Shift one `(row, byte-col)` position across an edit that replaced the byte
@@ -1303,10 +1515,17 @@ fn add_to_changelist(list: &mut Vec<(usize, usize)>, pos: (usize, usize)) {
 /// directory's listing from the entries its fetch already read (the `btv.fs` op and the
 /// file-open fetch are separate legs, so the plugin can't re-read remotely), so this
 /// must match the Lua rendering byte-for-byte. The returned text ends with a trailing
-/// newline, ready to load into a buffer.
-pub fn dir_listing(entries: Vec<crate::host::DirEntry>) -> String {
-    let mut entries: Vec<(bool, String)> =
-        entries.into_iter().map(|e| (e.is_dir, e.name)).collect();
+/// newline, ready to load into a buffer. A name holding a line break cannot be one row
+/// (nor be opened from its row text), so it is left out; the second value counts those,
+/// for the caller to report.
+pub fn dir_listing(entries: Vec<crate::host::DirEntry>) -> (String, usize) {
+    let total = entries.len();
+    let mut entries: Vec<(bool, String)> = entries
+        .into_iter()
+        .filter(|e| !e.name.contains(['\n', '\r']))
+        .map(|e| (e.is_dir, e.name))
+        .collect();
+    let skipped = total - entries.len();
     // Directories first, then case-insensitive by name (netrw's default sort).
     entries.sort_by(|a, b| {
         b.0.cmp(&a.0)
@@ -1320,7 +1539,7 @@ pub fn dir_listing(entries: Vec<crate::host::DirEntry>) -> String {
         }
         text.push('\n');
     }
-    text
+    (text, skipped)
 }
 
 /// Fold an edit batch into one replaced **row** span `(start, old_end_row,

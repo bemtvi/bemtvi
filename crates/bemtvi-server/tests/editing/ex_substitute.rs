@@ -952,3 +952,68 @@ async fn a_non_confirm_eol_empty_match_still_hits_every_line() {
     feed(&rpc, ":%s/$/X/g<CR>");
     assert_eq!(lines(&rpc).await, vec!["aaX", "bbX", "ccX"]);
 }
+
+// ----- confirm walk agrees with the bulk substitute -----
+
+/// A `\r` split moves the rest of the line down; the walk must continue *there*.
+/// It kept scanning the split-off head line from the tail's byte offset instead,
+/// so a replacement that itself matched the pattern was re-prompted — and with
+/// `a` every answer re-created the match, spinning forever.
+#[tokio::test]
+async fn confirm_split_replacement_containing_the_pattern_terminates() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "iaXb<Esc>");
+    feed(&rpc, ":s/X/X\\rX/gc<CR>");
+    feed(&rpc, "a");
+    let got = tokio::time::timeout(std::time::Duration::from_secs(10), lines(&rpc))
+        .await
+        .expect("the `a` walk must terminate");
+    assert_eq!(got, vec!["aX", "Xb"]);
+}
+
+/// The count after a confirm walk that split a line reports *one* line, like the
+/// bulk `:s` does for the same substitution.
+#[tokio::test]
+async fn confirm_split_counts_the_original_line_once() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "iaXbXc<Esc>");
+    feed(&rpc, ":s/X/\\r/gc<CR>");
+    feed(&rpc, "y");
+    let map = redraw_after(&rpc, &mut incoming, "y").await;
+    assert_eq!(lines(&rpc).await, vec!["a", "b", "c"]);
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("2 substitutions on 1 line")
+    );
+}
+
+/// An empty match right where a non-empty one ended is not a new match (the
+/// regex engine's rule, and vim's): `:s/a*/X/g` on `bab` is `XbXbX`. Answering
+/// `a` to the confirm form of the same command must give the same line.
+#[tokio::test]
+async fn confirm_all_matches_the_bulk_substitute_for_empty_matches() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ibab<CR>bab<Esc>");
+    feed(&rpc, ":1s/a*/X/g<CR>");
+    feed(&rpc, ":2s/a*/X/gc<CR>");
+    feed(&rpc, "a");
+    assert_eq!(lines(&rpc).await, vec!["XbXbX", "XbXbX"]);
+}
+
+#[tokio::test]
+async fn ampersand_repeats_the_last_substitute_and_g_ampersand_runs_it_everywhere() {
+    let (rpc, _incoming) = start(None).await;
+    let text = ["aaa", "bab", "cac"];
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 0), ":s/a/X/g<CR>j&").await,
+        vec!["XXX", "bXb", "cac"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 0), ":s/a/X/<CR>g&").await,
+        vec!["XXa", "bXb", "cXc"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 0), ":s/a/X/g<CR>g&").await,
+        vec!["XXX", "bXb", "cXc"]
+    );
+}

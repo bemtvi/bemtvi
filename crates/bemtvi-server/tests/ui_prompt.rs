@@ -566,6 +566,42 @@ async fn input_completion_debounce_zero_requeries_every_edit() {
 }
 
 #[tokio::test]
+async fn input_completion_drops_a_superseded_async_result() {
+    let dir = temp_dir("ui_input_complete_stale");
+    let (rpc, _incoming) = start(&dir, "").await;
+
+    // Three queries: the first opens the menu, the second is slow (its promise is held
+    // open), the third answers at once. When the slow one finally lands it is for a
+    // query that no longer exists and must not replace the newer menu.
+    exec_lua(
+        &rpc,
+        "_G.r = nil; _G.calls = 0; _G.slow = nil
+         btv.ui.input({ prompt = '> ', complete_debounce = 0, complete = function(line)
+           _G.calls = _G.calls + 1
+           if _G.calls == 2 then
+             return btv.promise.new(function(resolve) _G.slow = resolve end)
+           end
+           return { { label = line .. '_new' } }
+         end }):next(function(t) _G.r = t end)",
+    )
+    .await;
+
+    feed(&rpc, "a");
+    feed(&rpc, "<Tab>"); // query 1 → menu opens
+    feed(&rpc, "b"); // query 2 → pending
+    feed(&rpc, "c"); // query 3 → { "abc_new" }
+    assert_eq!(exec_lua(&rpc, "return _G.calls").await.as_i64(), Some(3));
+    exec_lua(&rpc, "_G.slow({ { label = 'STALE' } })").await;
+    feed(&rpc, "<Tab>");
+    feed(&rpc, "<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return _G.r").await.as_str(),
+        Some("abc_new"),
+        "the superseded query's late result must not replace the newer menu"
+    );
+}
+
+#[tokio::test]
 async fn input_completion_debounces_refresh_queries() {
     let dir = temp_dir("ui_input_complete_debounce");
     let (rpc, _incoming) = start(&dir, "").await;
@@ -712,5 +748,35 @@ async fn confirm_escape_is_false() {
     assert_eq!(
         exec_lua(&rpc, "return _G.answer").await,
         Value::Boolean(false)
+    );
+}
+
+/// A `btv.ui.input` prompt replaced by a newer one before it is answered settles as a
+/// cancel (`nil`) instead of leaving its promise pending forever.
+#[tokio::test]
+async fn input_replaced_by_another_input_resolves_nil() {
+    let dir = temp_dir("ui_input_replaced");
+    let (rpc, _incoming) = start(&dir, "").await;
+
+    exec_lua(
+        &rpc,
+        "_G.first, _G.second = 'pending', 'pending'
+         btv.ui.input({ prompt = 'a: ' }):next(function(v) _G.first = v or 'nil' end)",
+    )
+    .await;
+    exec_lua(
+        &rpc,
+        "btv.ui.input({ prompt = 'b: ' }):next(function(v) _G.second = v or 'nil' end)",
+    )
+    .await;
+    feed(&rpc, "xy<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return _G.second").await.as_str(),
+        Some("xy")
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.first").await.as_str(),
+        Some("nil"),
+        "the replaced prompt's promise settles as a cancel"
     );
 }

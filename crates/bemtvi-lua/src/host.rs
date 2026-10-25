@@ -148,17 +148,14 @@ fn package_patterns_for(dir: &Path, out: &mut Vec<String>) {
 /// [`bemtvi_core::stdpath`], so every crate that resolves one of these agrees.
 /// Unknown `what` falls back to the cache dir rather than erroring.
 ///
-/// The relative last resort is for a process with no home directory *and* no XDG
-/// or platform base at all; it is the only case where this can return a path that
-/// is not absolute.
-pub fn stdpath(what: &str) -> String {
+/// `None` for a process with no home directory *and* no XDG or platform base at all:
+/// there is no such directory, and the working directory is not a stand-in for one.
+pub fn stdpath(what: &str) -> Option<String> {
     let dir = match what {
         "config" => bemtvi_core::stdpath::config_dir(),
         "data" => bemtvi_core::stdpath::data_dir(),
         "state" => bemtvi_core::stdpath::state_dir(),
         _ => bemtvi_core::stdpath::cache_dir(),
     };
-    dir.unwrap_or_else(|| PathBuf::from(".bemtvi"))
-        .to_string_lossy()
-        .into_owned()
+    dir.map(|d| d.to_string_lossy().into_owned())
 }

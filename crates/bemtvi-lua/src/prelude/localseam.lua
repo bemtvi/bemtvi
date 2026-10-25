@@ -108,6 +108,10 @@ btv.fs_local = {
   rename = function(from, to)
     return local_fs_op({ op = "rename", from = from, to = to })
   end,
+  -- `btv.fs_local.realpath(path)` -> promise of the canonical absolute path.
+  realpath = function(path)
+    return local_fs_op({ op = "realpath", path = path })
+  end,
   -- `btv.fs_local.remove(path[, { recursive }])` -> promise; removes the file/dir.
   remove = function(path, opts)
     return local_fs_op({ op = "remove", path = path, recursive = opts and opts.recursive or false })

@@ -1278,3 +1278,25 @@ async fn star_uses_vim_word_boundaries_under_vim_regexsyntax() {
         "whole-word * skips 'foobar' and lands on the standalone 'foo'"
     );
 }
+
+/// A huge search offset clamps to the buffer instead of walking (or overflowing)
+/// one step at a time: `s-N` used to step back grapheme-by-grapheme N times even
+/// after reaching the buffer start (a freeze), and a line offset of `isize::MAX`
+/// overflowed the line arithmetic.
+#[tokio::test]
+async fn huge_search_offsets_clamp_without_hanging() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "iabc<CR>foo bar<CR>end<Esc>gg");
+    feed(&rpc, "/bar/s-99999999999999<CR>");
+    let got = tokio::time::timeout(std::time::Duration::from_secs(10), cursor(&rpc))
+        .await
+        .expect("a huge negative char offset must not freeze the editor");
+    assert_eq!(got, (1, 0));
+    feed(&rpc, "gg/bar/+9223372036854775807<CR>");
+    let got = tokio::time::timeout(std::time::Duration::from_secs(10), cursor(&rpc))
+        .await
+        .expect("a huge line offset must not wedge the editor");
+    assert_eq!(got, (3, 0));
+    feed(&rpc, "G/foo/-9223372036854775807<CR>");
+    assert_eq!(cursor(&rpc).await, (1, 0));
+}

@@ -362,8 +362,8 @@ async fn server_init(
             remote_path_style = resolved.remote_path_style;
             // Shada follows the config source: `Remote` keeps it on the daemon
             // (download now over `c.host_fs`, before it is moved below; sync back after
-            // each flush), `Local` uses the local store. A download error falls back to
-            // local rather than clobbering the daemon's copy.
+            // each flush), `Local` uses the local store. A download error turns shada off
+            // for the session (never the local store, which the daemon's config must not see).
             let (store, rs) = bemtvi_server::resolve_session_shada(
                 &c.host_fs,
                 config_source,

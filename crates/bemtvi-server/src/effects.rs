@@ -553,6 +553,61 @@ fn drain_widget_actions(
 }
 
 impl EditHost {
+    /// Settle a `btv.ui.select` whose menu another widget is replacing as a cancel
+    /// (`nil`), so its promise never hangs. A no-op when no select is pending.
+    pub(crate) fn cancel_pending_ui_select(&mut self) {
+        if let Some(id) = self.pending_ui_select.take() {
+            if let Err(e) = self.lua.run_ui_select(id, None) {
+                self.editor
+                    .echo(format!("E5108: Error in btv.ui.select callback: {e}"));
+            }
+            self.drain_cancel_loop_ops();
+        }
+    }
+
+    /// Pick up the continuations a cancel just queued (a settled promise's `:next` is a
+    /// `btv.schedule`): a cancel runs mid-pass, after this pass already drained its loop
+    /// ops, so without this they would wait for the next keystroke.
+    fn drain_cancel_loop_ops(&mut self) {
+        for op in self.lua.take_loop_ops() {
+            self.apply_loop_op(op);
+        }
+    }
+
+    /// Close the Lua side of a picker whose menu another widget is replacing: its
+    /// in-flight search is reaped and its result settles as a cancel, so no job keeps
+    /// streaming into a widget that is gone and the next menu result is not routed to it.
+    pub(crate) fn cancel_active_picker(&mut self) {
+        if std::mem::take(&mut self.picker_active) {
+            if let Err(e) = self.lua.run_picker_cancel() {
+                self.editor
+                    .echo(format!("E5108: Error in btv.picker cancel: {e}"));
+            }
+            self.drain_cancel_loop_ops();
+        }
+    }
+
+    /// Release the menu from a code-action chooser another widget is replacing: its
+    /// promise settles `nil` and the new widget's pick can't be applied as an action.
+    fn cancel_pending_code_action(&mut self) {
+        if std::mem::take(&mut self.pending_code_action) {
+            let cb = std::mem::take(&mut self.code_action_cb);
+            self.settle_lsp_promise(cb, bemtvi_lsp::serde_json::Value::Null);
+        }
+    }
+
+    /// The prompt analogue of [`Self::cancel_pending_ui_select`]: a `btv.ui.input` /
+    /// confirm prompt replaced by a newer one settles as a cancel.
+    fn cancel_pending_ui_input(&mut self) {
+        if let Some(id) = self.pending_ui_input.take() {
+            if let Err(e) = self.lua.run_ui_input(id, None) {
+                self.editor
+                    .echo(format!("E5108: Error in vim.ui.input callback: {e}"));
+            }
+            self.drain_cancel_loop_ops();
+        }
+    }
+
     /// Apply the side effects the last Lua chunk left in the runtime: highlight
     /// definitions fold into the core registry, queued ex-commands run against
     /// the editor, and the final captured `print` / `nvim_echo` line becomes the
@@ -677,8 +732,12 @@ impl EditHost {
         // Helix actions a `helix`-bucket keymap fired (`btv._helix_action`): apply each
         // named verb (with its optional count) to the editor. Unknown names fail loud.
         for (action, count) in self.lua.take_helix_actions() {
+            let was_insert = self.editor.mode.is_insert();
             if let Err(e) = self.editor.apply_helix_action(&action, count) {
                 self.editor.echo(format!("E5108: {e}"));
+            }
+            if !was_insert {
+                self.editor.begin_insert_session();
             }
         }
         // Command lines Lua asked to open (`btv.cmdline.open`).
@@ -934,19 +993,16 @@ impl EditHost {
         // editor's global options after the chunk — the same state the `:set` ex
         // path writes. The booleans are the search flags; numeric
         // `showtabline`/`laststatus` and the `statusline` string are wired too.
+        // The core checks the value's kind against the option and validates an
+        // enumerated string as `:setglobal` does, failing loud on either.
         for op in self.lua.take_global_ops() {
-            match op.value {
-                OptionValue::Bool(b) => self.editor.set_global_option_bool(&op.name, b),
-                // `showtabline` is the one wired numeric global (the Lua side
-                // forwards the search booleans and `showtabline`).
-                OptionValue::Number(n) => self.editor.set_global_option_num(&op.name, n),
-                // `statusline` (the one wired string global) — same home the
-                // `:set statusline=…` ex path writes. The Lua bridge forwards only
-                // canonical names, so ignore the handled? result the `:set` path uses.
-                OptionValue::String(s) => {
-                    let _ = self.editor.set_global_option_str(&op.name, &s);
-                }
-            }
+            use bemtvi_core::options::OptionScalar;
+            let value = match op.value {
+                OptionValue::Bool(b) => OptionScalar::Bool(b),
+                OptionValue::Number(n) => OptionScalar::Num(n),
+                OptionValue::String(s) => OptionScalar::Str(s),
+            };
+            self.editor.set_global_option_from_lua(&op.name, value);
         }
         // Per-workspace option overrides from `btv.wso`: set (`Some`) or clear (`None`) the
         // override in the editor's workspace overlay (which wins over the global value). An
@@ -1044,6 +1100,7 @@ impl EditHost {
                 req.complete,
                 req.complete_docs,
             );
+            self.cancel_pending_ui_input();
             self.pending_ui_input = Some(req.cb_id);
         }
         // Prompt completion candidates resolved by an `btv.ui.input{ complete = fn }`
@@ -1066,14 +1123,23 @@ impl EditHost {
         for req in self.lua.take_ui_selects() {
             self.editor
                 .open_menu(req.items, bemtvi_core::MenuPlacement::Cursor, 0);
+            self.cancel_pending_ui_select();
+            self.cancel_pending_code_action();
+            self.cancel_active_picker();
             self.pending_ui_select = Some(req.cb_id);
         }
         // `btv.complete.choice`: a non-grabbing cursor dropdown over a byte range —
         // accepting a row splices the pick over the range natively (no callback), so a
         // plugin snippet engine's own `on_bytes` reacts. The last queued wins.
         for req in self.lua.take_choice_menus() {
+            if req.items.is_empty() {
+                continue;
+            }
             self.editor
                 .open_choice_menu(req.sr, req.sc, req.er, req.ec, req.items);
+            self.cancel_pending_ui_select();
+            self.cancel_pending_code_action();
+            self.cancel_active_picker();
         }
         // `btv.ui.float`: open / update / close the list-less content float. A
         // transient float (`id == 0`) is fire-and-forget and dismissed by the next
@@ -1187,7 +1253,8 @@ impl EditHost {
                     exclude_history: req.exclude_history.clone(),
                 },
             );
-            self.pending_ui_select = None;
+            self.cancel_pending_ui_select();
+            self.cancel_pending_code_action();
             self.picker_active = true;
             // Kick the source's initial run (generation 0) through the same
             // `picker_query_changes` channel a dynamic query edit uses, rather than
@@ -1210,7 +1277,8 @@ impl EditHost {
         // content (a live-grep order isn't reproducible). The source is re-armed
         // Lua-side, so a later query edit re-runs it (or re-ranks, for a static source).
         if self.lua.take_picker_resume() && self.editor.restore_picker_snapshot() {
-            self.pending_ui_select = None;
+            self.cancel_pending_ui_select();
+            self.cancel_pending_code_action();
             self.picker_active = true;
         }
         // `btv.statusline.setup{}` / `reset()`: set the global or a window-local
@@ -1497,6 +1565,7 @@ impl EditHost {
         for req in self.lua.take_confirms() {
             self.editor
                 .open_confirm(req.label, req.accelerators, req.default);
+            self.cancel_pending_ui_input();
             self.pending_ui_input = Some(req.cb_id);
         }
         // Mouse gestures the `btv.test` harness queued (`t:mouse`), replayed at the
@@ -4652,7 +4721,6 @@ impl EditHost {
                 // The LSP code-action chooser is a native select menu: confirming a
                 // row applies that action (neovim's `vim.ui.select` model), cancel is
                 // a no-op. Checked first so it can't be misrouted to a Lua callback.
-                #[cfg(feature = "native")]
                 if std::mem::take(&mut self.pending_code_action) {
                     if let Some(idx) = result {
                         self.apply_code_action(idx);

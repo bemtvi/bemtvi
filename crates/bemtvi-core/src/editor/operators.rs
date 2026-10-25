@@ -19,9 +19,35 @@ pub(crate) const CLIPBOARD_UNAVAILABLE: &str =
 
 impl Editor {
     pub(crate) fn apply_operator(&mut self, op: char, m: MotionResult) {
+        self.apply_operator_inner(op, m);
+        self.op_reg_one = false;
+    }
+
+    fn apply_operator_inner(&mut self, op: char, m: MotionResult) {
         let cur = self.cursor_char();
-        let (lo, hi, linewise, first_line) = match m.kind {
-            MotionKind::Exclusive => (min(cur, m.target), max(cur, m.target), false, 0),
+        let (lo, hi) = match m.kind {
+            MotionKind::Exclusive => {
+                let (lo, hi) = (min(cur, m.target), max(cur, m.target));
+                let lo_line = self.buffer().byte_to_line(lo);
+                let hi_line = self.buffer().byte_to_line(hi);
+                if hi_line > lo_line && hi == self.buffer().line_start(hi_line) {
+                    // `:h exclusive`: an exclusive motion that ends in column 0 of
+                    // a later line stops at the end of the line before it — and
+                    // when it started in the indent, it becomes linewise.
+                    if lo - self.buffer().line_start(lo_line) <= self.first_non_blank(lo_line) {
+                        self.apply_linewise_operator(op, lo_line, hi_line - 1);
+                        if matches!(op, 'y' | LOWER_OP | UPPER_OP | TOGGLE_OP | FOLD_OP) {
+                            // The yank still leaves the cursor where the motion's
+                            // text began, as the charwise one would have.
+                            self.set_cursor_char(lo);
+                        }
+                        return;
+                    }
+                    (lo, hi - 1)
+                } else {
+                    (lo, hi)
+                }
+            }
             MotionKind::Inclusive => {
                 // vim never lets an inclusive charwise motion swallow a line
                 // break: when the motion's end sits where no character exists —
@@ -35,26 +61,70 @@ impl Editor {
                 } else {
                     end + 1
                 };
-                (min(cur, m.target), hi, false, 0)
+                (min(cur, m.target), hi)
             }
             MotionKind::Linewise => {
                 let l1 = self.cursor.line;
                 let l2 = self
                     .buffer()
                     .byte_to_line(m.target.min(self.last_char_idx()));
-                // Expand the line range to cover any closed fold it touches: a
-                // linewise operator over a collapsed fold acts on the whole fold
-                // (vim's rule — `dd`/`yy`/`>>` on a fold takes all its lines).
-                let a = self.fold_line_start(min(l1, l2));
-                let b = self.fold_line_end(max(l1, l2));
-                let lo = self.buffer().line_start(a);
-                let hi = self
-                    .buffer()
-                    .line_start((b + 1).min(self.buffer().line_count()));
-                (lo, hi, true, a)
+                // Where the operated text starts: the earlier of the cursor and the
+                // spot the motion lands on (a line anchor's first non-blank, `j`/`k`'s
+                // kept column) — where vim leaves the cursor after `y` and `zf`.
+                let land = match m.axis {
+                    MoveAxis::LineAnchor => (l2, self.first_non_blank(l2)),
+                    _ => (l2, self.cursor.col),
+                };
+                let start = min((self.cursor.line, self.cursor.col), land);
+                self.apply_linewise_operator(op, min(l1, l2), max(l1, l2));
+                if matches!(op, 'y' | FOLD_OP) {
+                    let line = start.0.min(self.last_line());
+                    let col = start.1.min(self.buffer().line_len(line));
+                    self.set_cursor_char(self.buffer().byte_at(line, col));
+                }
+                return;
             }
         };
-        self.apply_operator_to_range(op, lo, hi, linewise, first_line);
+        self.apply_charwise_operator(op, lo, hi);
+    }
+
+    /// Apply `op` to the charwise range `[lo, hi)` of a motion or text object —
+    /// except that, as vim's `op_delete` does, a delete over several lines that
+    /// starts in the indent and leaves only blanks on its last line deletes the
+    /// lines whole (`d4w` over two whole lines leaves no empty line behind).
+    pub(crate) fn apply_charwise_operator(&mut self, op: char, lo: usize, hi: usize) {
+        if op == 'd' && hi > lo {
+            let lo_line = self.buffer().byte_to_line(lo);
+            let hi_line = self.buffer().byte_to_line(hi);
+            if hi_line > lo_line
+                && lo - self.buffer().line_start(lo_line) <= self.first_non_blank(lo_line)
+                && self.only_blanks_to_eol(hi)
+            {
+                self.apply_linewise_operator(op, lo_line, hi_line);
+                return;
+            }
+        }
+        self.apply_operator_to_range(op, lo, hi, false, 0);
+    }
+
+    /// Apply `op` linewise over lines `first..=last`, widened to cover any closed
+    /// fold they touch: a linewise operator over a collapsed fold acts on the
+    /// whole fold (vim's rule — `dd`/`yy`/`>>` on a fold takes all its lines).
+    fn apply_linewise_operator(&mut self, op: char, first: usize, last: usize) {
+        let a = self.fold_line_start(first);
+        let b = self.fold_line_end(last);
+        let lo = self.buffer().line_start(a);
+        let hi = self
+            .buffer()
+            .line_start((b + 1).min(self.buffer().line_count()));
+        self.apply_operator_to_range(op, lo, hi, true, a);
+    }
+
+    /// Whether everything from byte `at` to the end of its line is a space/tab.
+    fn only_blanks_to_eol(&self, at: usize) -> bool {
+        let line = self.buffer().byte_to_line(at);
+        let eol = self.buffer().byte_at(line, self.buffer().line_len(line));
+        (at..eol).all(|i| matches!(self.char_at(i), ' ' | '\t'))
     }
 
     /// The inclusive line span `[first, last]` touched by the byte range `[lo,
@@ -78,6 +148,11 @@ impl Editor {
         linewise: bool,
         first_line: usize,
     ) {
+        if lo >= hi && matches!(op, '>' | '<' | '=') && lo < self.buffer().len_bytes() {
+            // A shift or reindent works on the operated *lines*, which a motion
+            // that did not move (`>h` in column 0, `>{` at the top) still names.
+            return self.apply_operator_to_range(op, lo, lo + 1, linewise, first_line);
+        }
         if lo >= hi {
             // A change over an empty range (`cl` / `c$` / `cw` on an empty
             // line) still enters Insert mode in vim — the deletion is empty,
@@ -88,6 +163,9 @@ impl Editor {
                     return;
                 }
                 self.push_undo();
+                // The insert opens where the empty range sits — between the
+                // brackets of `ci(` on `()`, not on the cursor's character.
+                self.set_cursor_char_insert(lo);
                 self.mode = Mode::Insert;
                 self.snapshot_taken = true;
             }
@@ -99,6 +177,9 @@ impl Editor {
         if op == FOLD_OP {
             let (first, last) = self.line_span(lo, hi);
             self.create_fold(first, last);
+            // The cursor goes to the start of the folded text (a linewise motion's
+            // caller refines the column).
+            self.set_cursor_char(lo);
             return;
         }
         // A live terminal buffer is read-only — refuse every operator that changes
@@ -120,6 +201,9 @@ impl Editor {
             // the edit start (vim's behavior).
             self.record_change_bounds(lo, hi);
         }
+        if op != 'y' {
+            self.op_repeatable = true;
+        }
         match op {
             'y' => {
                 self.yank_range(lo, hi, linewise);
@@ -134,9 +218,14 @@ impl Editor {
                 // `'report'` counts what the *buffer* lost, so a charwise delete
                 // that merely joins two lines reports one line, not two.
                 let before = self.buffer().line_count();
+                let start_col = self.cursor.col;
                 self.delete_yank_range(lo, hi, linewise);
                 self.delete_range(lo, hi);
                 if linewise {
+                    // The deleted lines took the marks with them; vim leaves both on
+                    // the line that took their place, in the operator's start column.
+                    let line = first_line.min(self.last_line());
+                    self.set_change_marks((line, start_col), (line, start_col));
                     self.settle_after_linewise_delete(first_line);
                 } else {
                     self.set_cursor_char(lo);
@@ -251,6 +340,14 @@ impl Editor {
     /// [`reindent_lines`](Self::reindent_lines) for the same rule under `=`.
     pub(crate) fn shift_lines(&mut self, first: usize, last: usize, right: bool, count: usize) {
         let last = last.min(self.last_line());
+        // vim's `op_shift`: `` `[ `` where the operator started (the cursor, on the
+        // first line), `` `] `` on the last line's last character — set whether or
+        // not any line moved.
+        let start_col = if self.cursor.line == first {
+            self.cursor.col
+        } else {
+            0
+        };
         let opts = self.buffer().options;
         let amount = opts.effective_shiftwidth() * count;
         let tabstop = opts.effective_tabstop();
@@ -279,6 +376,9 @@ impl Editor {
         if changed {
             self.buffer_mut().modified = true;
         }
+        let last_text = self.buffer().line(last);
+        let end_col = unicode::prev_grapheme(&last_text, last_text.len());
+        self.set_change_marks((first, start_col), (last, end_col));
         self.cursor.line = first.min(self.last_line());
         self.cursor.col = self.first_non_blank(self.cursor.line);
         self.clamp_cursor();
@@ -339,6 +439,15 @@ impl Editor {
             return;
         }
         let (lo, hi, linewise, first_line) = self.visual_range();
+        // Every visual operator leaves `` `< `` / `` `> `` on the selection it
+        // consumed; the ones handled before the register check below record them
+        // here (`d`/`y`/`c` record them once that check has passed).
+        if matches!(
+            op,
+            '=' | '>' | '<' | FOLD_OP | LOWER_OP | UPPER_OP | TOGGLE_OP | COMMENT_OP
+        ) {
+            self.record_visual_marks();
+        }
         // `=` reindents the selected lines; unlike d/y/c it neither yanks nor needs
         // the shared snapshot (`reindent_lines` takes its own), so handle it first.
         if op == '=' {
@@ -357,6 +466,7 @@ impl Editor {
             // re-shifts (vim's visual `.`), captured before the buffer mutates.
             self.capture_visual_shape(op);
             let (first, last) = self.line_span(lo, hi);
+            self.set_cursor_char(lo);
             self.shift_lines(first, last, op == '>', self.effective_count());
             self.mode = Mode::Normal;
             self.reset_pending();
@@ -430,7 +540,13 @@ impl Editor {
             }
             'y' => {
                 if linewise {
-                    self.cursor.line = first_line;
+                    // A linewise selection's start is column 0 of its first line
+                    // (vim's `oap->start.col = 0` for `V`), where the yank leaves
+                    // the cursor.
+                    self.cursor = Cursor {
+                        line: first_line,
+                        col: 0,
+                    };
                 } else {
                     self.set_cursor_char(lo);
                 }
@@ -792,7 +908,8 @@ impl Editor {
             if is_clipboard_register(reg) {
                 self.clipboard_write(text, kind);
             } else {
-                self.registers.record_delete(reg, text, kind);
+                let reg_one = self.op_reg_one;
+                self.registers.record_delete(reg, text, kind, reg_one);
             }
         }
     }
@@ -860,24 +977,71 @@ impl Editor {
         if self.cursor.col == 0 {
             return;
         }
-        let new_col = self.cursor.col.saturating_sub(count);
-        let lo = self.buffer().byte_at(self.cursor.line, new_col);
+        // `count` characters back, not bytes.
         let hi = self.cursor_char();
+        let line_start = self.buffer().line_start(self.cursor.line);
+        let mut lo = hi;
+        for _ in 0..count {
+            if lo <= line_start {
+                break;
+            }
+            lo = self.prev_grapheme_idx(lo);
+        }
+        let new_col = lo - line_start;
         self.delete_yank_range(lo, hi, false);
         self.delete_range(lo, hi);
         self.cursor.col = new_col;
         self.clamp_cursor();
     }
 
-    pub(crate) fn delete_to_eol(&mut self) {
-        let len = self.line_len();
+    /// The end of the line `count - 1` lines below the cursor's (clamped to the
+    /// last line): where `{count}D` / `{count}C` / `{count}Y` stop, like `$`.
+    fn count_eol_byte(&self, count: usize) -> usize {
+        let last = self
+            .cursor
+            .line
+            .saturating_add(count.max(1) - 1)
+            .min(self.last_line());
+        self.buffer().byte_at(last, self.buffer().line_len(last))
+    }
+
+    /// `{count}D`: delete from the cursor to the end of the line, and `count - 1`
+    /// more lines (vim's `d$`). With `keep_col` (for `C`) the cursor stays where
+    /// the text was cut, so the insert that follows opens there instead of on
+    /// the last character left.
+    pub(crate) fn delete_to_eol(&mut self, count: usize, keep_col: bool) {
         let lo = self.cursor_char();
-        let hi = self.buffer().byte_at(self.cursor.line, len);
+        let hi = self.count_eol_byte(count);
+        // `D` over several lines from the indent deletes them whole, like any
+        // `d` whose last line has nothing left after it (vim's `op_delete`).
+        let (lo_line, hi_line) = (self.cursor.line, self.buffer().byte_to_line(hi));
+        if !keep_col && hi_line > lo_line && self.cursor.col <= self.first_non_blank(lo_line) {
+            self.apply_linewise_operator('d', lo_line, hi_line);
+            return;
+        }
         if lo < hi {
             self.delete_yank_range(lo, hi, false);
             self.delete_range(lo, hi);
         }
-        self.clamp_cursor();
+        if keep_col {
+            self.set_cursor_char_insert(lo);
+        } else {
+            self.clamp_cursor();
+        }
+    }
+
+    /// `{count}Y`: yank from the cursor to the end of the line, `count - 1` lines
+    /// down (neovim's `Y`, i.e. `y$`). The cursor does not move.
+    pub(crate) fn yank_to_eol(&mut self, count: usize) {
+        if self.yank_write_blocked() {
+            return;
+        }
+        let lo = self.cursor_char();
+        let hi = self.count_eol_byte(count);
+        if lo < hi {
+            self.record_change_bounds(lo, hi);
+            self.yank_range(lo, hi, false);
+        }
     }
 
     pub(crate) fn replace_char(&mut self, c: char, count: usize) {
@@ -1045,11 +1209,11 @@ impl Editor {
             .to_string()
             .chars()
             .map(|c| match op {
-                LOWER_OP => c.to_lowercase().collect::<String>(),
-                UPPER_OP => c.to_uppercase().collect::<String>(),
-                _ if c.is_uppercase() => c.to_lowercase().collect::<String>(),
-                _ if c.is_lowercase() => c.to_uppercase().collect::<String>(),
-                _ => c.to_string(),
+                LOWER_OP => unicode::simple_lower(c),
+                UPPER_OP => unicode::simple_upper(c),
+                _ if c.is_uppercase() => unicode::simple_lower(c),
+                _ if c.is_lowercase() => unicode::simple_upper(c),
+                _ => c,
             })
             .collect();
         self.buffer_mut().remove(lo..hi);
@@ -1233,11 +1397,12 @@ impl Editor {
             }
             let idx = self.cursor_char();
             let c = self.char_at(idx);
-            let swapped: String = if c.is_uppercase() {
-                c.to_lowercase().collect()
+            let swapped = if c.is_uppercase() {
+                unicode::simple_lower(c)
             } else {
-                c.to_uppercase().collect()
-            };
+                unicode::simple_upper(c)
+            }
+            .to_string();
             self.buffer_mut().remove(idx..idx + c.len_utf8());
             self.buffer_mut().insert(idx, &swapped);
             let s = self.buffer().line(self.cursor.line);
@@ -1248,34 +1413,67 @@ impl Editor {
     }
 
     pub(crate) fn join_lines(&mut self, count: usize) {
+        self.join_lines_with(count, true);
+    }
+
+    /// `J` (`spaces = true`) / `gJ` (`spaces = false`): join `count` lines (at
+    /// least two) starting at the cursor's. `J` drops the next line's leading
+    /// white space and puts one space at the joint — none when the line already
+    /// ends in a blank, is empty, or the next line is empty or starts with `)`,
+    /// as vim does. `gJ` joins the lines exactly as they are. The cursor lands on
+    /// the last joint.
+    pub(crate) fn join_lines_with(&mut self, count: usize, spaces: bool) {
         let joins = count.saturating_sub(1).max(1);
         self.push_undo();
+        let first_len = self.line_len();
+        let mut joined = false;
+        // Whether the line last joined in (the cursor's, at first) ends in a blank —
+        // vim's `endcurr1`, which an empty line resets.
+        let mut ends_blank = first_len > 0
+            && matches!(
+                self.buffer()
+                    .text
+                    .byte(self.buffer().byte_at(self.cursor.line, first_len) - 1),
+                b' ' | b'\t'
+            );
         for _ in 0..joins {
             if self.cursor.line + 1 >= self.buffer().line_count() {
                 break;
             }
             let cur_len = self.line_len();
             let eol = self.buffer().byte_at(self.cursor.line, cur_len);
-            // Remove the newline and any leading whitespace of the next line.
             let next_start = self.buffer().line_start(self.cursor.line + 1);
             let mut ws_end = next_start;
-            while ws_end < self.last_char_idx() {
-                let c = self.char_at(ws_end);
-                if c == ' ' || c == '\t' {
-                    ws_end += 1;
-                } else {
-                    break;
+            if spaces {
+                // Remove the newline and any leading whitespace of the next line.
+                while ws_end < self.last_char_idx() {
+                    let c = self.char_at(ws_end);
+                    if c == ' ' || c == '\t' {
+                        ws_end += 1;
+                    } else {
+                        break;
+                    }
                 }
             }
+            let next_first = self.char_at(ws_end);
+            let next_eol = next_start + self.buffer().line_len(self.cursor.line + 1);
+            let next_ends_blank =
+                next_eol > ws_end && matches!(self.buffer().text.byte(next_eol - 1), b' ' | b'\t');
             self.buffer_mut().remove(eol..ws_end);
-            // Insert a single separating space unless the line was empty.
-            if cur_len > 0 {
+            if spaces && cur_len > 0 && !ends_blank && !matches!(next_first, '\n' | ')') {
                 self.buffer_mut().insert_char(eol, ' ');
             }
+            ends_blank = next_ends_blank;
             self.cursor.col = cur_len;
+            joined = true;
         }
         self.buffer_mut().normalize();
         self.buffer_mut().modified = true;
+        // vim's `do_join`: `` `[ `` at the first joint, `` `] `` past the joined line.
+        if joined {
+            let line = self.cursor.line;
+            self.set_change_marks((line, first_len), (line, self.line_len()));
+        }
         self.clamp_cursor();
     }
 
@@ -1527,7 +1725,7 @@ impl Editor {
     /// register replacing a charwise selection splits the line (the text either
     /// side of the selection keeps its own line), and a charwise register replacing
     /// a linewise selection becomes a line of its own.
-    pub(crate) fn visual_paste(&mut self, count: usize) {
+    pub(crate) fn visual_paste(&mut self, count: usize, keep_registers: bool) {
         if !self.modifiable() {
             self.refuse_edit();
             return;
@@ -1545,6 +1743,10 @@ impl Editor {
             self.reset_pending();
             return;
         };
+        if self.paste_too_long(&text, count) {
+            self.reset_pending();
+            return;
+        }
         let (lo, hi, linewise, _first_line) = self.visual_range();
 
         // Leaving Visual mode by operating on the selection stamps `` `< ``/`` `> ``
@@ -1553,8 +1755,13 @@ impl Editor {
         self.record_change_bounds(lo, hi);
         self.push_undo();
 
-        if let Some((replaced, replaced_kind)) = self.slice_for_register(lo, hi, linewise) {
-            self.registers.set_api('"', replaced, replaced_kind, false);
+        // `p` records the replaced text as a delete (unnamed plus `"1`/`"-`); `P`
+        // leaves every register as it was.
+        if !keep_registers {
+            if let Some((replaced, replaced_kind)) = self.slice_for_register(lo, hi, linewise) {
+                self.registers
+                    .record_delete(None, replaced, replaced_kind, false);
+            }
         }
         self.delete_range(lo, hi);
 
@@ -1585,6 +1792,80 @@ impl Editor {
         self.reset_pending();
     }
 
+    /// Apply a bracketed paste in a mode where typed keys are *commands* — neovim's
+    /// `vim.paste`: Normal mode (and the Helix / multi-cursor command modes) puts
+    /// `text` charwise after the cursor, Visual mode replaces the selection with it.
+    /// The payload never becomes keys, so clipboard text such as `:lua …<CR>` lands
+    /// as text instead of running. Registers are left alone. Returns `false` for the
+    /// modes whose paste stays a key stream (Insert has [`Editor::paste_literal`];
+    /// Select mode types it over the selection and goes on in Insert, as typing does;
+    /// the command line, a terminal job, Replace mode and a grabbing menu are the
+    /// server's).
+    pub fn paste_put(&mut self, text: &str) -> bool {
+        let selecting = self.mode.is_visual();
+        let commanding = matches!(
+            self.mode,
+            Mode::Normal | Mode::MultiCursor | Mode::HelixNormal | Mode::HelixSelect
+        );
+        if !(selecting || commanding) || self.menu_grabs_input() {
+            return false;
+        }
+        self.reset_pending();
+        if !self.modifiable() {
+            self.refuse_edit();
+            return true;
+        }
+        if text.is_empty() || self.paste_too_long(text, 1) {
+            return true;
+        }
+        self.mouse_dragging = false;
+        self.dismiss_transient_content_float();
+        self.close_transient_doc_floats();
+        let pre_tick = self.buffer().changedtick;
+        if selecting {
+            let (lo, hi, linewise, _first_line) = self.visual_range();
+            self.record_visual_marks();
+            self.record_change_bounds(lo, hi);
+            self.push_undo();
+            self.delete_range(lo, hi);
+            if linewise {
+                self.insert_lines_at(lo, &format!("{text}\n"));
+            } else {
+                let last_len = text.len() - crate::unicode::prev_grapheme(text, text.len());
+                self.buffer_mut().insert(lo, text);
+                self.buffer_mut().normalize();
+                self.set_cursor_char((lo + text.len()).saturating_sub(last_len));
+            }
+            self.buffer_mut().modified = true;
+            self.buffer_mut().normalize();
+            self.mode = Mode::Normal;
+            self.clamp_cursor();
+        } else {
+            self.paste_text(text, false, 1, true);
+        }
+        self.settle_after_edit(pre_tick);
+        true
+    }
+
+    /// Refuse a put whose `count` copies of `text` would exceed 64 MiB (vim's
+    /// `E1240`, with a bound far below its `MAXCOL`): a `99999999p` would otherwise
+    /// freeze the editor building the text, or abort it outright when the
+    /// allocation fails. A single copy is never refused — it is no larger than
+    /// the register or paste that already holds it.
+    fn paste_too_long(&mut self, text: &str, count: usize) -> bool {
+        const MAX_PUT_BYTES: usize = 64 << 20;
+        if count > 1
+            && text
+                .len()
+                .checked_mul(count)
+                .is_none_or(|n| n > MAX_PUT_BYTES)
+        {
+            self.echo("E1240: Resulting text too long");
+            return true;
+        }
+        false
+    }
+
     /// Insert a linewise `chunk` at byte offset `at` and park the cursor on the
     /// first non-blank of the first line it added — the shared tail of the
     /// line-shaped [`Editor::visual_paste`] combinations.
@@ -1610,7 +1891,7 @@ impl Editor {
     /// Split out so a multi-cursor paste can feed each cursor its own per-cursor
     /// register text (see [`Editor::cursor_registers`]) through the same logic.
     pub(crate) fn paste_text(&mut self, text: &str, linewise: bool, count: usize, after: bool) {
-        if text.is_empty() {
+        if text.is_empty() || self.paste_too_long(text, count) {
             return;
         }
         let before = self.buffer().line_count();

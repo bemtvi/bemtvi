@@ -124,7 +124,10 @@ local function check_command_name(name)
 end
 
 -- `btv.user_command.create(name, command, opts)` [alias `nvim_create_user_command`]:
--- register a global `:Name`. `command` is a function or an ex-command string.
+-- register a global `:Name`. `command` is a function or an ex-command string. A
+-- function is called with `{ name, args, fargs, bang, line1, line2, range }`: the
+-- 1-based `line1`/`line2` of an addressed invocation (`:2,5Name`, `:'<,'>Name`) and
+-- `range` its address count, or the cursor line twice and `range = 0` without one.
 -- `opts.desc` (a one-line summary) is stored alongside the body — `get()` surfaces it
 -- and the command-line completion catalog shows it as the command's docs.
 -- `opts.usage` (a string) is the command's ARGUMENT signature — the part after the
@@ -140,7 +143,8 @@ end
 --     `{"a","b"}`). It returns a list of candidates — each a string, or a table
 --     `{ label =, insert =, doc = }`. A SYNC function (returns a list) shows inline in
 --     the wildmenu and is re-run as you type; an ASYNC one (returns a promise, e.g. an
---     `btv.async` function) lists in the picker. A throw / rejection yields no candidates.
+--     `btv.async` function) lists in the picker. A throw is reported and yields no
+--     candidates.
 function btv.user_command.create(name, command, opts)
   check_command_name(name)
   btv._user_commands[name] = command
@@ -202,6 +206,16 @@ function btv._cleanup_buffer(bufnr)
   btv._buf_user_command_complete[bufnr] = nil
   btv._buf_user_command_usage[bufnr] = nil
   btv._purge_buf_keymaps(bufnr)
+  local kept = {}
+  for _, au in ipairs(btv._autocmds) do
+    if au.buffer ~= bufnr then
+      kept[#kept + 1] = au
+    end
+  end
+  if #kept ~= #btv._autocmds then
+    btv._autocmds = kept
+    btv._au_touch()
+  end
 end
 
 -- `btv.augroup.create(name, opts)` -> id [alias `nvim_create_augroup`]: define (or look
@@ -1611,9 +1625,9 @@ end
 --
 -- INCOMPLETE vs neovim: attributes other than `-buffer` are parsed-and-ignored
 -- (the command still registers and runs, just without arg-count / completion
--- enforcement); the range/count escapes (`<line1>`/`<line2>`/`<count>`) and an
--- invocation-time `<bang>` aren't plumbed through user-command dispatch yet, so
--- they expand to `""`.
+-- enforcement); `<line1>`/`<line2>` expand to the invocation's range (the cursor
+-- line without one), but `<count>` isn't plumbed through user-command dispatch yet,
+-- so it expands to `""`.
 function btv._ex_command(bang, args, bufnr)
   local s = vim.trim(args or "")
   if s == "" then
@@ -1689,28 +1703,35 @@ function btv._ex_command(bang, args, bufnr)
     for _, w in ipairs(o.fargs or {}) do
       fargs[#fargs + 1] = q(w)
     end
-    local out = repl
-      :gsub("<q%-args>", function()
+    -- One pass over the template, so argument text that spells an escape is never
+    -- expanded a second time.
+    local escapes = {
+      ["q-args"] = function()
         return q(a)
-      end)
-      :gsub("<f%-args>", function()
+      end,
+      ["f-args"] = function()
         return table.concat(fargs, ", ")
-      end)
-      :gsub("<args>", function()
+      end,
+      ["args"] = function()
         return a
-      end)
-      :gsub("<bang>", function()
+      end,
+      ["bang"] = function()
         return o.bang and "!" or ""
-      end)
-      :gsub("<line1>", function()
+      end,
+      ["line1"] = function()
+        return tostring(o.line1 or "")
+      end,
+      ["line2"] = function()
+        return tostring(o.line2 or "")
+      end,
+      ["count"] = function()
         return ""
-      end)
-      :gsub("<line2>", function()
-        return ""
-      end)
-      :gsub("<count>", function()
-        return ""
-      end)
+      end,
+    }
+    local out = repl:gsub("<([%a%d%-]+)>", function(k)
+      local f = escapes[k]
+      return f and f() or nil
+    end)
     vim.cmd(out)
   end
   return ""

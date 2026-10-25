@@ -652,8 +652,17 @@ impl HostEffects for NativeEffects {
     }
 
     fn ts_install(&mut self, lang: String) {
-        let dir = bemtvi_ts::data_dir();
         let tx = self.install_tx.clone();
+        let Some(dir) = bemtvi_ts::data_dir() else {
+            let _ = tx.send((
+                lang,
+                Err(anyhow::anyhow!(
+                    "no data directory to install into (no home, $XDG_DATA_HOME or \
+                     platform default)"
+                )),
+            ));
+            return;
+        };
         tokio::task::spawn_blocking(move || {
             let result = bemtvi_ts::install::install(&dir, &lang);
             // The receiver only drops at shutdown; a send error means we're exiting, so

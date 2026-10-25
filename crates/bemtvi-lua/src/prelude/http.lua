@@ -128,7 +128,13 @@ function btv.http.build_url(url, query)
   if qs == "" then
     return url
   end
-  return url .. (url:find("?", 1, true) and "&" or "?") .. qs
+  -- Join onto the part before any `#fragment`, which stays last.
+  local hash = url:find("#", 1, true)
+  local base, frag = url, ""
+  if hash then
+    base, frag = url:sub(1, hash - 1), url:sub(hash)
+  end
+  return base .. (base:find("?", 1, true) and "&" or "?") .. qs .. frag
 end
 
 -- Normalize a caller's `headers` table into the `{ name, value }` pair-list the bridge

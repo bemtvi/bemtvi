@@ -64,11 +64,75 @@ pub(crate) struct SubstConfirm {
     cur: Option<(usize, usize, String)>,
     /// `y`/`a`/`l` to one match already happened on the current line.
     line_dirty: bool,
+    /// Where the previous *non-empty* match on `line` ended: an empty match right
+    /// there is not a new match (the regex engine's and vim's rule), so the walk
+    /// steps over it instead of prompting.
+    no_empty_at: Option<usize>,
     subs: usize,
     nlines: usize,
     last_changed: Option<usize>,
     /// The single undo snapshot is pushed lazily, on the first applied match.
     pushed: bool,
+}
+
+/// `:global`'s marked target lines, followed across every edit its commands make
+/// (vim's mark-then-execute): each target is a `(row, 0)` position shifted by the
+/// buffer's own mark rule ([`crate::buffer::shift_point`]), and dropped when an
+/// edit deletes its line. Rows are stored relative to a shared `base`, so the
+/// common edit — one at or before every remaining target — shifts them all in
+/// O(1) instead of rewriting the list per command.
+struct GlobalTargets {
+    rows: Vec<i64>,
+    base: i64,
+    alive: Vec<bool>,
+}
+
+impl GlobalTargets {
+    fn new(lines: Vec<usize>) -> Self {
+        let alive = vec![true; lines.len()];
+        GlobalTargets {
+            rows: lines.into_iter().map(|l| l as i64).collect(),
+            base: 0,
+            alive,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Target `i`'s current line, or `None` once its line was deleted.
+    fn row(&self, i: usize) -> Option<usize> {
+        self.alive[i].then(|| (self.rows[i] + self.base).max(0) as usize)
+    }
+
+    /// Shift targets `next..` (sorted by row) across one edit that replaced
+    /// `[s, oe)` with text ending at `ne`.
+    fn shift(&mut self, next: usize, s: (usize, usize), oe: (usize, usize), ne: (usize, usize)) {
+        let base = self.base;
+        let pos = |r: i64| ((r + base).max(0) as usize, 0usize);
+        let tail = &self.rows[next..];
+        let lo = next + tail.partition_point(|&r| pos(r) < s);
+        let mid = next + tail.partition_point(|&r| pos(r) < oe);
+        // Inside the replaced span: a swallowed line is gone; otherwise the target
+        // collapses onto the edit's start, as a mark does.
+        for i in lo..mid {
+            if oe.0 > pos(self.rows[i]).0 {
+                self.alive[i] = false;
+            }
+            self.rows[i] = s.0 as i64 - base;
+        }
+        let delta = ne.0 as i64 - oe.0 as i64;
+        if delta != 0 {
+            if mid == next {
+                self.base += delta;
+            } else {
+                for r in &mut self.rows[mid..] {
+                    *r += delta;
+                }
+            }
+        }
+    }
 }
 
 /// Split a substitute body (everything after the leading delimiter) into
@@ -101,6 +165,35 @@ fn expand_tilde(rep: &str, prev: Option<&str>) -> Result<String, ()> {
         }
     }
     Ok(out)
+}
+
+/// Whether a backslash before `c` in a file argument is an escape to drop — the chars
+/// `btv.fname.escape` (`fnameescape`) backslashes, minus the start-of-argument guards
+/// (`\+`, `\>`, `\-`), which would otherwise turn back into a `++opt` before the
+/// argument is parsed. On Windows only `%` / `#`: there `\` is the path separator.
+fn is_fname_escaped(c: char) -> bool {
+    if cfg!(windows) {
+        return matches!(c, '%' | '#');
+    }
+    matches!(
+        c,
+        ' ' | '\t'
+            | '\n'
+            | '*'
+            | '?'
+            | '['
+            | '{'
+            | '`'
+            | '$'
+            | '\\'
+            | '%'
+            | '#'
+            | '\''
+            | '"'
+            | '|'
+            | '!'
+            | '<'
+    )
 }
 
 /// Expand a leading `~` / `~/…` in a file argument to the home directory (vim
@@ -386,8 +479,10 @@ fn trim_ex_args(s: &str) -> &str {
     if trimmed.len() < s.len() {
         let backslashes = trimmed.bytes().rev().take_while(|&b| b == b'\\').count();
         if backslashes % 2 == 1 {
-            // Keep one trailing whitespace char (the escaped one).
-            return &s[..trimmed.len() + 1];
+            // Keep one trailing whitespace char (the escaped one) — a whole char,
+            // which `trim_end` counts in Unicode and may span several bytes.
+            let ws = s[trimmed.len()..].chars().next().map_or(1, char::len_utf8);
+            return &s[..trimmed.len() + ws];
         }
     }
     trimmed
@@ -706,8 +801,10 @@ impl Editor {
         let mut i = 0;
         while i < chars.len() {
             let c = chars[i];
-            // `\%` / `\#` insert a literal `%` / `#`.
-            if c == '\\' && matches!(chars.get(i + 1), Some('%') | Some('#')) {
+            // `\%` / `\#` insert a literal `%` / `#`; off Windows (where `\` is the
+            // separator) so does a backslash before any other char `fnameescape`
+            // escapes, so an escaped name opens the file it names.
+            if c == '\\' && chars.get(i + 1).is_some_and(|&n| is_fname_escaped(n)) {
                 out.push(chars[i + 1]);
                 i += 2;
                 continue;
@@ -1211,7 +1308,23 @@ impl Editor {
             // `:[line]pu[t] [x]` inserts register `x` (default unnamed) as whole
             // lines below the addressed line — always linewise, regardless of the
             // register's own kind. `:put!` inserts above instead.
-            "pu" | "put" => self.ex_put(range, args, bang),
+            "pu" | "put" => {
+                // Line `0` ("above the first line") is legal for `:put`, but the
+                // range parse clamps it into line 1; recover it from the raw text.
+                let addr = range_text.trim();
+                let mut i = 0;
+                let line_zero = range.explicit
+                    && matches!(
+                        self.parse_ex_address_raw(addr, &mut i, self.cursor.line),
+                        Ok(Some(-1))
+                    )
+                    && i == addr.len();
+                if line_zero {
+                    self.ex_put(range, args, true);
+                } else {
+                    self.ex_put(range, args, bang);
+                }
+            }
             // `:hi clear` resets the registry to defaults (empty); other `:hi`
             // forms are no-ops — catppuccin defines groups via the API, not `:hi`.
             "hi" | "highlight" => {
@@ -1923,7 +2036,7 @@ impl Editor {
         // Edit pass. A `\r` in the replacement splits a line into several, so a
         // running `added` offset keeps later original lines pointing at the
         // right (shifted) index.
-        let (subs, nlines, last_changed, failure) = self.with_sandbox(|ed, sb| {
+        let (subs, nlines, last_changed, failure, added) = self.with_sandbox(|ed, sb| {
             let (mut subs, mut nlines) = (0usize, 0usize);
             let mut added = 0i64;
             let mut last_changed: Option<usize> = None;
@@ -1967,7 +2080,7 @@ impl Editor {
                 nlines += 1;
                 last_changed = Some(idx + extra);
             }
-            (subs, nlines, last_changed, failure)
+            (subs, nlines, last_changed, failure, added)
         });
         if let Some(h) = handle {
             self.sandbox_release(h);
@@ -1985,6 +2098,10 @@ impl Editor {
             return;
         };
         self.buffer_mut().normalize();
+        // vim's `do_sub`: `` `[ `` / `` `] `` in column 0 of the range's first and
+        // (shifted) last lines.
+        let range_end = (hi as i64 + added).max(lo as i64) as usize;
+        self.set_change_marks((lo, 0), (range_end.min(self.last_line()), 0));
         self.cursor.line = last;
         self.cursor.col = self.first_non_blank(last);
         self.clamp_cursor();
@@ -2093,19 +2210,31 @@ impl Editor {
         // `report_line_delta`) and the whole run reports its total below — vim's
         // rule, so `:g/x/d` says `7 fewer lines` once instead of seven times.
         let lines_before_run = self.buffer().line_count();
-        // Second pass: run `cmd` on each target. A running `offset` keeps the
-        // remaining (later) targets aligned as the command adds or removes lines.
-        let mut offset: i64 = 0;
-        for t in targets {
-            let line = t as i64 + offset;
-            if line < 0 || line > self.last_line() as i64 {
+        // Second pass: run `cmd` on each target. The targets are marks that ride
+        // every edit a command makes (a later target moves with its text; one whose
+        // line a command deleted is skipped), read off the same edit journal the
+        // jumplists follow. Drain it first so it holds only this run's edits.
+        let id = self.cur_buffer();
+        self.adjust_jumplists_for_buffer(id);
+        let mut marks = GlobalTargets::new(targets);
+        for i in 0..marks.len() {
+            let Some(line) = marks.row(i) else {
+                continue;
+            };
+            if line > self.last_line() {
                 continue;
             }
-            let before = self.buffer().line_count() as i64;
-            self.cursor.line = line as usize;
+            self.cursor.line = line;
             self.cursor.col = 0;
             self.execute_ex(&cmd);
-            offset += self.buffer().line_count() as i64 - before;
+            for edit in self.adjust_jumplists_for_buffer(id) {
+                marks.shift(
+                    i + 1,
+                    edit.start_point,
+                    edit.old_end_point,
+                    edit.new_end_point,
+                );
+            }
         }
         self.in_global = false;
         self.undo_batch_depth -= 1;
@@ -2135,7 +2264,7 @@ impl Editor {
     fn ex_normal(&mut self, range: ExRange, _bang: bool, arg: &str) {
         let keys = normal_keys(arg);
         if keys.is_empty() {
-            // vim's `:normal` requires an argument; an empty one is a no-op here.
+            self.echo("E471: Argument required");
             return;
         }
         // Bound nesting so a `:normal` whose keys run another `:normal` (only
@@ -2160,6 +2289,7 @@ impl Editor {
             self.mode = Mode::Normal;
         }
         self.normal_depth += 1;
+        let entry = self.mode;
 
         if range.explicit {
             // One undo step for the whole range run (the `:global` grouping): force
@@ -2181,6 +2311,7 @@ impl Editor {
                 for &key in &keys {
                     self.input(key);
                 }
+                self.abort_incomplete_normal(entry);
                 offset += self.buffer().line_count() as i64 - before;
             }
             self.undo_batch_depth -= 1;
@@ -2191,6 +2322,7 @@ impl Editor {
             for &key in &keys {
                 self.input(key);
             }
+            self.abort_incomplete_normal(entry);
         }
 
         self.normal_depth -= 1;
@@ -2205,6 +2337,23 @@ impl Editor {
                 self.mode = mode;
                 self.clamp_cursor();
             }
+        }
+    }
+
+    /// End `:normal`'s keys the way vim does when they run out mid-command: as if
+    /// `<Esc>` were typed. An Insert/Replace the keys began is finished, a
+    /// half-typed command line is cancelled, and a pending operator/count is
+    /// dropped. A Visual selection is left alone (vim keeps it: nothing is
+    /// waiting for a key there). Only what the keys opened is closed: a command
+    /// line already open when `:normal` ran (`entry`) is the user's, not ours.
+    fn abort_incomplete_normal(&mut self, entry: Mode) {
+        match self.mode {
+            Mode::Insert | Mode::Replace => self.handle_insert(Key::new(KeyCode::Esc)),
+            Mode::Command if entry != Mode::Command => self.cancel_cmdline(),
+            _ => {}
+        }
+        if !self.pending.is_clean() {
+            self.reset_pending();
         }
     }
 
@@ -2303,10 +2452,17 @@ impl Editor {
             Ok(dest) => dest,
             Err(e) => return self.echo_err(e),
         };
-        // Landing anywhere from just-above the range through its last line would
-        // be a no-op at best and a self-overlapping splice at worst.
-        if dest >= range.lo as i64 - 1 && dest <= range.hi as i64 {
+        // Landing strictly inside the range would be a self-overlapping splice.
+        if dest >= range.lo as i64 && dest < range.hi as i64 {
             return self.echo_err("E134: Cannot move a range of lines into itself");
+        }
+        // Just above the range or just below its last line moves nothing (vim's
+        // `do_move`): leave the buffer unmodified, cursor on the range's last line.
+        if dest == range.lo as i64 - 1 || dest == range.hi as i64 {
+            self.cursor.line = range.hi;
+            self.cursor.col = self.first_non_blank(range.hi);
+            self.clamp_cursor();
+            return;
         }
         self.push_undo();
         let (chunk, span) = self.linewise_span(range);
@@ -2444,6 +2600,7 @@ impl Editor {
             byte: 0,
             cur: None,
             line_dirty: false,
+            no_empty_at: None,
             subs: 0,
             nlines: 0,
             last_changed: None,
@@ -2511,6 +2668,26 @@ impl Editor {
                 }
             };
             match found {
+                Some((s, e, _))
+                    if s == e
+                        && self
+                            .subst_confirm
+                            .as_ref()
+                            .expect("confirm active")
+                            .no_empty_at
+                            == Some(s) =>
+                {
+                    let nb = next_char_boundary(&text, s);
+                    let sc = self.subst_confirm.as_mut().expect("confirm active");
+                    sc.no_empty_at = None;
+                    if nb == s {
+                        sc.line += 1;
+                        sc.byte = 0;
+                        sc.line_dirty = false;
+                    } else {
+                        sc.byte = nb;
+                    }
+                }
                 Some((s, e, repl)) => {
                     self.subst_confirm.as_mut().expect("confirm active").cur =
                         Some((s, e, repl.clone()));
@@ -2538,6 +2715,7 @@ impl Editor {
                     sc.line += 1;
                     sc.byte = 0;
                     sc.line_dirty = false;
+                    sc.no_empty_at = None;
                 }
             }
         }
@@ -2561,7 +2739,7 @@ impl Editor {
         // So use the full cursor-pulling [`scroll_line`], and clear `scroll_from`
         // so the early return doesn't leak a stale scroll gesture.
         if key.ctrl && matches!(key.code, KeyCode::Char('e') | KeyCode::Char('y')) {
-            self.scroll_line(key.code == KeyCode::Char('e'));
+            self.scroll_line(key.code == KeyCode::Char('e'), 1);
             self.scroll_from = None;
             return;
         }
@@ -2645,11 +2823,18 @@ impl Editor {
         sc.last_changed = Some(cont_line);
         if global {
             match cont_byte {
-                Some(b) => sc.byte = b,
+                // The rest of the original line continues on `cont_line` (pushed
+                // down by any `\r` split), still the same line for the count.
+                Some(b) => {
+                    sc.line = cont_line;
+                    sc.byte = b;
+                    sc.no_empty_at = (e > s).then_some(b);
+                }
                 None => {
                     sc.line = cont_line + 1;
                     sc.byte = 0;
                     sc.line_dirty = false;
+                    sc.no_empty_at = None;
                 }
             }
         } else {
@@ -2657,6 +2842,7 @@ impl Editor {
             sc.line = cont_line + 1;
             sc.byte = 0;
             sc.line_dirty = false;
+            sc.no_empty_at = None;
         }
     }
 
@@ -2684,11 +2870,15 @@ impl Editor {
             };
             let sc = self.subst_confirm.as_mut().expect("confirm active");
             match next {
-                Some(b) => sc.byte = b,
+                Some(b) => {
+                    sc.byte = b;
+                    sc.no_empty_at = (e > s).then_some(b);
+                }
                 None => {
                     sc.line += 1;
                     sc.byte = 0;
                     sc.line_dirty = false;
+                    sc.no_empty_at = None;
                 }
             }
         } else {
@@ -2696,6 +2886,7 @@ impl Editor {
             sc.line += 1;
             sc.byte = 0;
             sc.line_dirty = false;
+            sc.no_empty_at = None;
         }
     }
 
@@ -2743,6 +2934,18 @@ impl Editor {
         if self.host_fs_offtick {
             if path.is_none() && self.buffer().path.is_none() {
                 self.echo("E32: No file name");
+                return;
+            }
+            // The stat is off the tick, but the remote watch may already have reported
+            // the file changed — then refuse exactly as the local guard below does.
+            let writes_own_file = match &path {
+                None => true,
+                Some(p) => self.buffer().path.as_deref() == Some(p.as_path()),
+            };
+            if !bang && writes_own_file && self.buffer().disk_drifted() {
+                self.echo(
+                    "WARNING: The file has changed on disk since editing started (add ! to override)",
+                );
                 return;
             }
         } else {
@@ -3271,9 +3474,13 @@ impl Editor {
             let (modified_backed, changed) = {
                 let buf = &self.buffers.get(id).buffer;
                 let backed = buf.modified && buf.path.is_some();
-                let changed = fs
-                    .as_ref()
-                    .is_some_and(|fs| backed && !bang && buf.disk_changed(&**fs));
+                let changed = backed
+                    && !bang
+                    && match fs.as_ref() {
+                        Some(fs) => buf.disk_changed(&**fs),
+                        // Off-tick: what the remote watch reported.
+                        None => buf.disk_drifted(),
+                    };
                 (backed, changed)
             };
             if !modified_backed {

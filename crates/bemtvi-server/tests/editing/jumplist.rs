@@ -568,3 +568,16 @@ async fn deleting_a_jump_targets_line_drops_it_from_the_list() {
         "the dropped entry's slot is gone; 10 remains"
     );
 }
+
+/// A jump back to a column the line no longer reaches (the line was shortened since)
+/// lands on the line's last character, as vim does — never one past it in Normal mode.
+#[tokio::test]
+async fn ctrl_o_to_a_column_past_a_shortened_line_lands_on_its_last_char() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<CR><CR>x<Esc>gg$");
+    assert_eq!(cursor(&rpc).await, (1, 10));
+    feed(&rpc, "Gkk0wDjj");
+    assert_eq!(lines(&rpc).await[0], "hello ");
+    feed(&rpc, "<C-o>");
+    assert_eq!(cursor(&rpc).await, (1, 5));
+}

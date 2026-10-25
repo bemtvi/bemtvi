@@ -2772,3 +2772,58 @@ async fn an_unlisted_buffer_source_contributes_nothing() {
         "a listed buffer source contributes, got {items:?}"
     );
 }
+
+/// A trigger is ONE character (the engine wakes on a single typed char), so a
+/// multi-character `trigger.chars` entry is refused at registration rather than
+/// registering a source that can never be woken by it.
+#[tokio::test]
+async fn a_multi_character_trigger_is_refused_at_registration() {
+    let dir = temp_dir("complete_multichar_trigger");
+    let (rpc, _incoming) = start(&dir, "").await;
+    let got = exec_lua(
+        &rpc,
+        "local ok = pcall(btv.complete.source, { name = 'dbl', trigger = { chars = { '::' } }, \
+           complete = function() end })\n\
+         local ok2 = pcall(btv.complete.source, { name = 'one', trigger = { chars = { 'é' } }, \
+           complete = function() end })\n\
+         return tostring(ok) .. ' ' .. tostring(ok2)",
+    )
+    .await;
+    assert_eq!(got.as_str(), Some("false true"));
+}
+
+/// A source registered while another source's run is IN FLIGHT (a lazy-loaded plugin
+/// calling `btv.complete.source{}` mid-completion) must not orphan that run: the
+/// in-flight source's later `ctx.push` still lands in the popup.
+#[tokio::test]
+async fn a_late_registration_does_not_drop_an_in_flight_run() {
+    let dir = temp_dir("complete_late_inflight");
+    let init = "btv.complete.source {\n\
+           name = 'slow', debounce = 0,\n\
+           complete = function(ctx) _G.saved = ctx; return btv.promise.new(function(r) _G.done = r end) end,\n\
+         }\n\
+         btv.complete.setup { sources = { { 'slow' } }, min_chars = 1, auto = true }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+    feed(&rpc, "iab");
+    let mut saved = false;
+    for _ in 0..100 {
+        if exec_lua(&rpc, "return _G.saved ~= nil").await.as_bool() == Some(true) {
+            saved = true;
+            break;
+        }
+        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    }
+    assert!(saved, "the slow source was dispatched");
+    exec_lua(
+        &rpc,
+        "btv.complete.source { name = 'other', complete = function() end }\n\
+         _G.saved.push(_G.saved.prefix .. '_slow'); _G.done()",
+    )
+    .await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    assert!(
+        menu_items(&menu).contains(&"ab_slow".to_string()),
+        "the in-flight run's push survived the late registration: {:?}",
+        menu_items(&menu)
+    );
+}

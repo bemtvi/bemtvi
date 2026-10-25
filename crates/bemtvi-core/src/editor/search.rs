@@ -237,7 +237,9 @@ impl Editor {
                 SearchDir::Backward => lo,
             });
         }
-        self.run_search(&pattern, dir, offset, count.max(1), None);
+        // After an operator (`dn`, `cN`) the repeat is the operator's motion.
+        let op = self.pending.operator;
+        self.run_search(&pattern, dir, offset, count.max(1), op);
     }
 
     /// `*`/`#` (and `g*`/`g#`): search for the word under the cursor — forward for
@@ -262,7 +264,8 @@ impl Editor {
         };
         self.remember_search(&pattern);
         self.last_search = Some((pattern.clone(), dir, SearchOffset::None));
-        self.run_search(&pattern, dir, SearchOffset::None, count.max(1), None);
+        let op = self.pending.operator;
+        self.run_search(&pattern, dir, SearchOffset::None, count.max(1), op);
     }
 
     /// The keyword (`[A-Za-z0-9_]`) the cursor sits on, or the next one to its
@@ -588,6 +591,7 @@ impl Editor {
             // The cursor now rests on the (offset-adjusted) match; the operator
             // spans from there back to where the search began.
             let m = MotionResult::horizontal(origin, offset.motion_kind());
+            self.op_reg_one = true;
             self.apply_operator(op, m);
         } else if wrapped {
             self.echo(match dir {
@@ -622,8 +626,9 @@ impl Editor {
             }
             SearchOffset::Line(n) => {
                 let last_line = self.last_line() as isize;
-                let line =
-                    (self.buffer().byte_to_line(ms) as isize + n).clamp(0, last_line) as usize;
+                let line = (self.buffer().byte_to_line(ms) as isize)
+                    .saturating_add(n)
+                    .clamp(0, last_line) as usize;
                 self.cursor.line = line;
                 self.cursor.col = self.first_non_blank(line);
                 self.clamp_cursor();
@@ -640,7 +645,11 @@ impl Editor {
         } else {
             let mut b = base;
             for _ in 0..n.unsigned_abs() {
-                b = self.prev_grapheme_idx(b);
+                let prev = self.prev_grapheme_idx(b);
+                if prev == b {
+                    break;
+                }
+                b = prev;
             }
             b
         }

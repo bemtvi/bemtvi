@@ -526,3 +526,21 @@ pub async fn range_fixture() -> (Rpc, UnboundedReceiver<Incoming>) {
     );
     (rpc, incoming)
 }
+
+/// Load `text` into the scratch buffer (no undo step: it rides `btv.buf.set_lines`),
+/// park the cursor at `(1-based line, 0-based byte col)`, feed `keys`, and return
+/// the buffer afterwards — the shape of a vim ground-truth probe.
+pub async fn edit_probe(rpc: &Rpc, text: &[&str], at: (usize, usize), keys: &str) -> Vec<String> {
+    let quoted: Vec<String> = text.iter().map(|l| format!("{l:?}")).collect();
+    exec_lua(
+        rpc,
+        &format!(
+            "btv.buf.set_lines(0, 0, -1, false, {{{}}})",
+            quoted.join(", ")
+        ),
+    )
+    .await;
+    exec_lua(rpc, &format!("btv.win.set_cursor(0, {}, {})", at.0, at.1)).await;
+    feed(rpc, keys);
+    lines(rpc).await
+}

@@ -352,3 +352,115 @@ async fn clicking_off_a_select_box_cancels_it() {
         "a click off the box cancels (resolves with nil) without choosing a row"
     );
 }
+
+/// A `btv.ui.select` replaced by a second one before the user answers must not leave
+/// the first promise pending forever: it resolves `nil` (a cancel), and the second
+/// chooser gets the user's pick.
+#[tokio::test]
+async fn select_replaced_by_another_select_resolves_nil() {
+    let dir = temp_dir("ui_select_replaced");
+    let (rpc, _incoming) = start(&dir, "").await;
+
+    exec_lua(
+        &rpc,
+        "_G.first, _G.second = 'pending', 'pending'
+         btv.ui.select({ 'a1', 'a2' }, {}):next(function(item) _G.first = item or 'nil' end)",
+    )
+    .await;
+    exec_lua(
+        &rpc,
+        "btv.ui.select({ 'b1', 'b2' }, {}):next(function(item) _G.second = item or 'nil' end)",
+    )
+    .await;
+    feed(&rpc, "jj<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return _G.second").await.as_str(),
+        Some("b2")
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.first").await.as_str(),
+        Some("nil"),
+        "the replaced chooser's promise settles as a cancel"
+    );
+}
+
+/// Opening a `btv.picker` over a pending `btv.ui.select` cancels the select: its
+/// promise resolves `nil` instead of hanging.
+#[tokio::test]
+async fn select_replaced_by_a_picker_resolves_nil() {
+    let dir = temp_dir("ui_select_replaced_by_picker");
+    let (rpc, _incoming) = start(
+        &dir,
+        "btv.picker.source { name = 'fruits', items = function(ctx) ctx.push { text = 'apple' } end }",
+    )
+    .await;
+
+    exec_lua(
+        &rpc,
+        "_G.first = 'pending'
+         btv.ui.select({ 'a1', 'a2' }, {}):next(function(item) _G.first = item or 'nil' end)",
+    )
+    .await;
+    exec_lua(&rpc, "btv.picker.open('fruits')").await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.first").await.as_str(),
+        Some("nil"),
+        "the select's promise settles as a cancel when a picker takes the widget"
+    );
+}
+
+/// A `btv.complete.choice` dropdown opened over a pending `btv.ui.select` takes the
+/// menu, so the select's promise settles as a cancel instead of hanging.
+#[tokio::test]
+async fn select_replaced_by_a_choice_menu_resolves_nil() {
+    let dir = temp_dir("ui_select_replaced_by_choice");
+    let (rpc, _incoming) = start(&dir, "").await;
+    feed(&rpc, "ihello<Esc>");
+    exec_lua(
+        &rpc,
+        "_G.first = 'pending'
+         btv.ui.select({ 'a1', 'a2' }, {}):next(function(item) _G.first = item or 'nil' end)",
+    )
+    .await;
+    exec_lua(
+        &rpc,
+        "btv.complete.choice({ 'x', 'y' }, { range = { 0, 0, 0, 1 } })",
+    )
+    .await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.first").await.as_str(),
+        Some("nil"),
+        "the select's promise settles as a cancel when a choice dropdown takes the menu"
+    );
+}
+
+/// A `btv.ui.select` opened over an active picker closes the picker's Lua side too:
+/// the picker is no longer active (its search is reaped), and the select's own pick
+/// still resolves the select.
+#[tokio::test]
+async fn picker_replaced_by_a_select_is_cancelled() {
+    let dir = temp_dir("picker_replaced_by_select");
+    let (rpc, _incoming) = start(
+        &dir,
+        "btv.picker.source { name = 'fruits', items = function(ctx) ctx.push { text = 'apple' } end }",
+    )
+    .await;
+
+    exec_lua(&rpc, "btv.picker.open('fruits')").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv._picker ~= nil").await,
+        Value::Boolean(true)
+    );
+    exec_lua(
+        &rpc,
+        "btv.ui.select({ 's1', 's2' }, {}):next(function(item) _G.sel = item or 'nil' end)",
+    )
+    .await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv._picker == nil").await,
+        Value::Boolean(true),
+        "the replaced picker is cancelled on the Lua side"
+    );
+    feed(&rpc, "j<CR>");
+    assert_eq!(exec_lua(&rpc, "return _G.sel").await.as_str(), Some("s1"));
+}

@@ -618,8 +618,8 @@ pub struct SystemPluginSpec {
 /// per immediate subdirectory. Leaned to DATA (managed artifacts, not hand-edited
 /// config) per the plan's open decision.
 #[cfg(feature = "native")]
-pub fn system_plugin_dir() -> PathBuf {
-    PathBuf::from(bemtvi_lua::stdpath("data")).join("system")
+pub fn system_plugin_dir() -> Option<PathBuf> {
+    bemtvi_core::stdpath::data_dir().map(|dir| dir.join("system"))
 }
 
 /// Scan the [system-plugin dir](system_plugin_dir) into the tier the interactive
@@ -629,7 +629,9 @@ pub fn system_plugin_dir() -> PathBuf {
 /// default-empty `system_plugins` that keeps headless suites hermetic.
 #[cfg(feature = "native")]
 pub fn discover_system_plugins() -> Vec<SystemPluginSpec> {
-    let dir = system_plugin_dir();
+    let Some(dir) = system_plugin_dir() else {
+        return Vec::new();
+    };
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
@@ -737,7 +739,7 @@ pub(crate) type ConfigBundleData = (
     Vec<PathBuf>,
     Vec<(PathBuf, Vec<u8>)>,
     Vec<String>,
-    PathBuf,
+    Option<PathBuf>,
 );
 
 #[cfg(feature = "native")]
@@ -861,6 +863,26 @@ struct WasmTimer {
     repeat_ms: u64,
 }
 
+/// A client message the wasm edit-host holds while a `:sleep` runs, replayed in order
+/// once it ends — the browser twin of the native run loop's `held_input`.
+#[cfg(not(feature = "native"))]
+enum HeldInput {
+    Keys(String),
+    Mouse {
+        button: String,
+        action: String,
+        modifier: String,
+        row: usize,
+        col: usize,
+    },
+}
+
+/// Whether key notation carries `<C-c>`, vim's interrupt, which ends a `:sleep` early.
+#[cfg(not(feature = "native"))]
+fn keys_interrupt_sleep(keys: &str) -> bool {
+    keys.contains('\x03') || keys.to_ascii_lowercase().contains("<c-c>")
+}
+
 /// A window-local status line override (`btv.statusline.setup{win=…}`), stored in
 /// [`EditHost::statusline_window`]. Absence from that map means the window
 /// inherits the global layout.
@@ -981,6 +1003,10 @@ pub struct EditHost {
     /// session targets the workspace store or `none`). `None` otherwise.
     #[cfg(feature = "native")]
     global_history: Option<Box<dyn ShadaStore + Send>>,
+    /// Whether the last live checkpoint (or global-history flush) failed, so a run of
+    /// failures is reported on the message line once rather than on every debounce.
+    #[cfg(feature = "native")]
+    shada_flush_failing: bool,
     /// Whether this launch is a session-scoped **workspace** (its shada is a private
     /// `ns/<uuid>` subfolder). Only then does the shada carry the editor *session*
     /// (open files + layout): capture attaches it at flush, and the boot load applies
@@ -1488,15 +1514,12 @@ pub struct EditHost {
     /// when it confirms / cancels, routing the chosen index to `apply_code_action`
     /// (neovim's `vim.ui.select` model — the successor to the retired code-action panel).
     /// Mutually exclusive with `pending_ui_select` / `picker_active`: one widget at a time.
-    #[cfg(feature = "native")]
     pending_code_action: bool,
     /// The async `btv.lsp.code_action()` promise's `btv._cb_fns` id, stashed while the
     /// chooser menu is open (`0` = none / a fire-and-forget request). Set alongside
     /// `pending_code_action` when the menu opens; settled (resolve `nil`) when the
     /// picked action's edit applies — through a `codeAction/resolve` round-trip if the
-    /// action is lazy — or when the menu is cancelled. Set only on the native confirm
-    /// path, but the field is unconditional so `apply_code_action` (not cfg-gated)
-    /// compiles under the wasm edit-host too.
+    /// action is lazy — or when the menu is cancelled.
     code_action_cb: u64,
     /// Writes whose `BufWritePre` returned an *async* handler promise: the [`PreWrite`]
     /// is parked here, keyed by the `gate_id` handed to Lua, until every handler settles.
@@ -1692,7 +1715,9 @@ pub struct EditHost {
     /// `FileChangedShellPost` once the re-fetch lands in [`EditHost::apply_open`]. The
     /// remote reload can't be synchronous (it crosses the wire), so the post event is
     /// deferred to the fetch's completion rather than fired inline like the local path.
-    reload_posts: HashSet<BufferId>,
+    /// Keyed to the buffer's `changedtick` when the reload was enqueued: a landing that
+    /// finds the buffer edited since must not overwrite those edits.
+    reload_posts: HashMap<BufferId, u64>,
     /// A `:e ++enc=<encoding>` override for an **off-tick** open whose fetch is in flight,
     /// keyed by the target buffer. A deferred [`PendingOpen`](bemtvi_core::PendingOpen)
     /// carries the forced encoding, but the remote read is async: the drain
@@ -1870,6 +1895,15 @@ pub struct EditHost {
     /// native clients' idle-flush timer. Wasm build only.
     #[cfg(not(feature = "native"))]
     flush_due_ms: Option<u64>,
+    /// When a running `:sleep` ends (ms on the JS clock), or `None` while awake. The
+    /// Worker's wait wakes for it ([`next_timer_deadline`](EditHost::next_timer_deadline));
+    /// until then input is held in [`held_input`](Self::held_input) and timers wait, as
+    /// the native run loop parks. Wasm build only.
+    #[cfg(not(feature = "native"))]
+    sleep_until_ms: Option<u64>,
+    /// Client input that arrived during a `:sleep`, replayed in order once it ends.
+    #[cfg(not(feature = "native"))]
+    held_input: std::collections::VecDeque<HeldInput>,
     /// Names of treesitter grammars the browser host has available — the offline set
     /// bundled in `web/vendor/` plus any fetched via `:TSInstall` into OPFS. Seeded at
     /// boot ([`EditHost::seed_ts_installed`]) and extended on each completed install
@@ -2011,6 +2045,8 @@ impl EditHost {
             #[cfg(feature = "native")]
             global_history: None,
             #[cfg(feature = "native")]
+            shada_flush_failing: false,
+            #[cfg(feature = "native")]
             workspace_session: false,
             #[cfg(feature = "native")]
             restore_session: false,
@@ -2109,7 +2145,6 @@ impl EditHost {
             scheme_groups: std::collections::HashSet::new(),
             pending_ui_input: None,
             pending_ui_select: None,
-            #[cfg(feature = "native")]
             pending_code_action: false,
             code_action_cb: 0,
             pending_gated_writes: HashMap::new(),
@@ -2145,7 +2180,7 @@ impl EditHost {
             #[cfg(feature = "native")]
             watch_retries: HashMap::new(),
             remote_watches: HashSet::new(),
-            reload_posts: HashSet::new(),
+            reload_posts: HashMap::new(),
             forced_fetch_enc: HashMap::new(),
             terminals: HashMap::new(),
             terminal_frozen: HashMap::new(),
@@ -2177,6 +2212,10 @@ impl EditHost {
             clock_ms: 0,
             #[cfg(not(feature = "native"))]
             flush_due_ms: None,
+            #[cfg(not(feature = "native"))]
+            sleep_until_ms: None,
+            #[cfg(not(feature = "native"))]
+            held_input: std::collections::VecDeque::new(),
             #[cfg(not(feature = "native"))]
             ts_installed: std::collections::BTreeSet::new(),
             #[cfg(not(feature = "native"))]
@@ -2516,7 +2555,51 @@ impl EditHost {
     /// keystroke tick: `input` settles the core (mappings, ex-commands, queued Lua),
     /// then `redraw` pushes a frame through the [`HostEffects`] seam to the UI. Mirrors
     /// one turn of the native [`run`] loop's input arm.
+    ///
+    /// During a `:sleep` the keys are held instead (replayed once it ends), unless they
+    /// carry `<C-c>`, which ends it early — the native loop's `sleep_interruptible`.
     pub fn feed(&mut self, keys: &str) {
+        if let Some(until) = self.sleep_until_ms {
+            let woke = self.clock_ms >= until;
+            self.held_input.push_back(HeldInput::Keys(keys.to_string()));
+            if woke || keys_interrupt_sleep(keys) {
+                self.end_sleep();
+            }
+            return;
+        }
+        self.feed_now(keys);
+    }
+
+    /// End a `:sleep`: replay the held input in order, stopping early if a replayed
+    /// message starts another sleep (the rest stays held for that one).
+    fn end_sleep(&mut self) {
+        self.sleep_until_ms = None;
+        while self.sleep_until_ms.is_none() {
+            let Some(held) = self.held_input.pop_front() else {
+                break;
+            };
+            match held {
+                HeldInput::Keys(keys) => self.feed_now(&keys),
+                HeldInput::Mouse {
+                    button,
+                    action,
+                    modifier,
+                    row,
+                    col,
+                } => self.mouse_now(&button, &action, &modifier, row, col),
+            }
+        }
+    }
+
+    /// Start the `:sleep` the last message ran, if any: hold input until the JS clock
+    /// passes its end.
+    fn arm_sleep(&mut self) {
+        if let Some(ms) = self.editor.take_sleep() {
+            self.sleep_until_ms = Some(self.clock_ms.saturating_add(ms));
+        }
+    }
+
+    fn feed_now(&mut self, keys: &str) {
         // The user is driving now — release any restored-session focus hold so their own
         // navigation wins from here, exactly as the native `btv_input` dispatch arm does.
         // Without this the hold has no release point on the web build at all: `settle_events`
@@ -2537,6 +2620,7 @@ impl EditHost {
             None
         };
         self.redraw();
+        self.arm_sleep();
     }
 
     /// Apply a mouse gesture and repaint — the wasm Worker's `eh_input_mouse` tick.
@@ -2547,6 +2631,24 @@ impl EditHost {
     /// which the Worker sets before this call) so `'mousetime'` multi-click detection
     /// works. A malformed gesture surfaces a loud message rather than a silent no-op.
     pub fn mouse(&mut self, button: &str, action: &str, modifier: &str, row: usize, col: usize) {
+        if let Some(until) = self.sleep_until_ms {
+            let woke = self.clock_ms >= until;
+            self.held_input.push_back(HeldInput::Mouse {
+                button: button.to_string(),
+                action: action.to_string(),
+                modifier: modifier.to_string(),
+                row,
+                col,
+            });
+            if woke {
+                self.end_sleep();
+            }
+            return;
+        }
+        self.mouse_now(button, action, modifier, row, col);
+    }
+
+    fn mouse_now(&mut self, button: &str, action: &str, modifier: &str, row: usize, col: usize) {
         // A click is the user taking over too — release the restored-focus hold so a click
         // into (or away from) a sidebar sticks, matching `btv_input_mouse` natively.
         self.editor.clear_session_focus_hold();
@@ -2573,6 +2675,7 @@ impl EditHost {
             Err(err) => self.editor.message = err,
         }
         self.redraw();
+        self.arm_sleep();
     }
 
     /// Execute a Lua chunk through the **real** effects path (the queued `vim.cmd`s,
@@ -2595,6 +2698,7 @@ impl EditHost {
         self.apply_lua_effects();
         self.run_pending();
         self.redraw();
+        self.arm_sleep();
         rendered
     }
 
@@ -2660,6 +2764,16 @@ impl EditHost {
         // already seeds it back on load — only this half was missing, which made a
         // `btv.wso` write look like it persisted and then quietly not.
         state.workspace_options = self.editor.workspace_options().clone();
+        // `'persisthistory'`: the native flush sites drop the history rings when it
+        // resolves to `none` (`gate_primary_history`); the one web blob is the workspace
+        // store, so the same resolution (with a workspace open) decides here.
+        if bemtvi_core::effective_history_scope(&self.editor.global_options().persisthistory, true)
+            == bemtvi_core::HistoryScope::None
+        {
+            state.ex_history.clear();
+            state.search_history.clear();
+            state.input_history.clear();
+        }
         state
     }
 
@@ -2711,6 +2825,10 @@ impl EditHost {
     /// wait that wakes on a keystroke also wakes to fire the next timer (slice 5d's "one
     /// mechanism" — no busy loop, no separate timer thread).
     pub fn next_timer_deadline(&self) -> Option<u64> {
+        // A `:sleep` parks everything (as the native loop does): its end is the only wake.
+        if let Some(until) = self.sleep_until_ms {
+            return Some(until);
+        }
         // The `timeoutlen` idle flush rides the same wheel, so the one wait that wakes
         // for a `vim.defer_fn` also wakes to resolve a withheld mapped prefix.
         self.wasm_timers
@@ -2734,6 +2852,17 @@ impl EditHost {
         // Through `set_clock` so a callback that edits commits its undo node on this
         // wake's timestamp, not the last keystroke's.
         self.set_clock(now_ms);
+        let mut woke = false;
+        if let Some(until) = self.sleep_until_ms {
+            if now_ms < until {
+                return false;
+            }
+            self.end_sleep();
+            if self.sleep_until_ms.is_some() {
+                return true; // a replayed message slept again; it painted already
+            }
+            woke = true;
+        }
         let mut due: Vec<WasmTimer> = self
             .wasm_timers
             .iter()
@@ -2813,7 +2942,7 @@ impl EditHost {
             self.run_pending();
             self.redraw();
         }
-        fired_any
+        fired_any || woke
     }
 
     /// Arm (or re-arm) a Worker-side timer — the wasm branch of
@@ -3832,7 +3961,7 @@ impl EditHost {
     /// The debounce elapsed: checkpoint the cross-session state into this instance's
     /// store. `exit_cursor` is deliberately left unset — `'0` tracks *clean* exits
     /// only, so a crash must leave the previous session's `'0` intact ([`shada_flush_final`](EditHost::shada_flush_final)
-    /// is its sole writer). Best-effort: a write error is logged, never fatal.
+    /// is its sole writer). Best-effort: a write error is reported, never fatal.
     pub(crate) fn shada_checkpoint(&mut self) {
         if self.shada.is_none() {
             return;
@@ -3856,18 +3985,32 @@ impl EditHost {
         // global store writes history there instead (below).
         self.gate_primary_history(&mut snap);
         let mut flushed = false;
+        let mut failure = None;
         if let Some(store) = self.shada.as_mut() {
             // A live checkpoint never compacts: deleting an absorbed sibling while we
             // hold our lock would hide its data from a concurrent launcher. Only the
             // clean-exit flush compacts.
             match store.flush(&snap, false) {
                 Ok(()) => flushed = true,
-                Err(e) => eprintln!("shada: checkpoint flush failed: {e}"),
+                Err(e) => failure = Some(format!("shada: checkpoint flush failed: {e}")),
             }
         }
         // A workspace launch targeting `global`: write history to the global store
         // instead (history-only, never compacting). A no-op when it isn't the target.
-        self.global_history_flush();
+        if let Err(e) = self.global_history_flush() {
+            failure.get_or_insert(format!("shada: global history flush failed: {e}"));
+        }
+        // The session is running behind the UI, where stderr can't be seen: say on the
+        // message line that state stopped persisting — once per run of failures.
+        match failure {
+            Some(msg) => {
+                if !self.shada_flush_failing {
+                    self.editor.echo_err(msg);
+                }
+                self.shada_flush_failing = true;
+            }
+            None => self.shada_flush_failing = false,
+        }
         // For a `Remote`-config session, push the freshly-committed store to the daemon
         // (fire-and-forget — the editor tick never blocks on the network).
         if flushed {
@@ -3979,12 +4122,11 @@ impl EditHost {
     /// Live-checkpoint the global history store (history-only, `compact = false`): it
     /// shares the global dir with plain sessions' full-state files, so compacting here
     /// would delete their marks / registers — only a plain global session compacts.
-    pub(crate) fn global_history_flush(&mut self) {
+    pub(crate) fn global_history_flush(&mut self) -> std::io::Result<()> {
         let snap = self.global_history_snapshot();
-        if let Some(store) = self.global_history.as_mut() {
-            if let Err(e) = store.flush(&snap, false) {
-                eprintln!("shada: global history flush failed: {e}");
-            }
+        match self.global_history.as_mut() {
+            Some(store) => store.flush(&snap, false),
+            None => Ok(()),
         }
     }
 
@@ -4312,9 +4454,17 @@ where
     // Grammar loads go through the run loop's worker rather than the tick that first
     // needs the language — the server drives the other half of that handshake
     // (`dispatch_grammar_requests` → `ts_load_grammar` → `on_grammars_loaded`).
-    let mut engine = bemtvi_ts::Engine::new(bemtvi_ts::data_dir());
-    engine.defer_loads(true);
-    editor.set_syntax_engine(Box::new(engine));
+    match bemtvi_ts::data_dir() {
+        Some(dir) => {
+            let mut engine = bemtvi_ts::Engine::new(dir);
+            engine.defer_loads(true);
+            editor.set_syntax_engine(Box::new(engine));
+        }
+        None => editor.echo(
+            "treesitter: disabled — no data directory for grammars (no home, \
+             $XDG_DATA_HOME or platform default)",
+        ),
+    }
     // The `"+` / `"*` registers route through an injected clipboard provider.
     // `System` resolves a real host clipboard tool (best effort), falling back to
     // the client terminal's OSC 52 clipboard when this machine has none that could
@@ -4802,12 +4952,17 @@ where
     // and settles. No arm touches `host.editor` / `host.lua` directly, and `host` reaches
     // back out only through its `fx` seam — so this loop + `NativeEffects` are the only
     // native-specific pieces; a wasm Worker (Phase 5) supplies its own of each.
+    // Client messages that arrived during a `:sleep`, replayed in order once it ends.
+    let mut held_input: VecDeque<Incoming> = VecDeque::new();
     loop {
         tokio::select! {
             // Editor input / API calls from the UI client.
-            message = incoming.recv() => {
+            message = inbound::next_client_message(&mut incoming, &mut held_input) => {
                 let Some(message) = message else { break };
                 host.on_client_message(message).await;
+                if let Some(ms) = host.take_sleep() {
+                    inbound::sleep_interruptible(&mut incoming, &mut held_input, ms).await;
+                }
             }
             // Replies from the language servers (initialize handshakes, published
             // diagnostics, server exits, log messages). Selecting here keeps the

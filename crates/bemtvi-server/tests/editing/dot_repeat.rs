@@ -260,3 +260,37 @@ async fn dot_repeats_a_linewise_visual_change() {
     feed(&rpc, "j."); // change three,four -> "hi" => hi,hi,five
     assert_eq!(lines(&rpc).await, vec!["hi", "hi", "five"]);
 }
+
+#[tokio::test]
+async fn dot_replays_an_insert_that_rubbed_out_a_word_with_ctrl_w() {
+    let (rpc, _incoming) = start(None).await;
+    assert_eq!(
+        edit_probe(&rpc, &["  alpha beta"], (1, 4), "ia b<C-w>c<Esc>.").await,
+        vec!["  ala a ccpha beta"]
+    );
+}
+
+#[tokio::test]
+async fn dot_after_a_numbered_register_put_steps_to_the_next_register() {
+    let (rpc, _incoming) = start(None).await;
+    let text = ["one", "two", "three", "four", "five"];
+    // Delete three lines one by one: "1 = three, "2 = two, "3 = one.
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 0), "dddddd\"1p..").await,
+        vec!["four", "three", "two", "one", "five"]
+    );
+    // The classic idiom: undo and repeat walks the ring until the right text shows.
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 0), "dddddd\"1pu.u.").await,
+        vec!["four", "one", "five"]
+    );
+}
+
+/// A shift that moved nothing (`<<` on an unindented line) is still the last
+/// change: `.` repeats the `<<`, not whatever edit came before it.
+#[tokio::test]
+async fn dot_repeats_a_shift_that_moved_nothing() {
+    let (rpc, _incoming) = start(None).await;
+    edit_probe(&rpc, &["alpha", "    beta"], (2, 0), "xk<<j.").await;
+    assert_eq!(lines(&rpc).await, vec!["alpha", "beta"]);
+}

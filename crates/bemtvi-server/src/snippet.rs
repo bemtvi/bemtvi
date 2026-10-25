@@ -102,7 +102,8 @@ impl EditHost {
             .expand_snippet(line_start + word_start, end, parsed);
     }
 
-    /// Apply a `btv.snippet.add` registration to the per-filetype store.
+    /// Apply a `btv.snippet.add` registration to the per-filetype store. Re-adding a
+    /// trigger already registered for the filetype replaces its body in place.
     pub(crate) fn snippet_add(
         &mut self,
         filetype: String,
@@ -111,7 +112,10 @@ impl EditHost {
     ) {
         let list = self.snippet_store.entry(filetype).or_default();
         for (trigger, body) in triggers.into_iter().zip(bodies) {
-            list.push(SnippetEntry { trigger, body });
+            match list.iter_mut().find(|e| e.trigger == trigger) {
+                Some(existing) => existing.body = body,
+                None => list.push(SnippetEntry { trigger, body }),
+            }
         }
     }
 }

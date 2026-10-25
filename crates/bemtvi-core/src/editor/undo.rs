@@ -1266,7 +1266,7 @@ impl Editor {
             snap.extmarks.move_namespace_into(ns, &mut extmarks);
         }
         let ob = self.cur_mut();
-        ob.buffer.text = snap.text;
+        let old_text = std::mem::replace(&mut ob.buffer.text, snap.text);
         // We're back on a previously-seen state: it's clean only if it's the one
         // last written to disk. (`mark_resync` below sets `modified = true`, so
         // decide this first and re-assert it afterwards.)
@@ -1282,6 +1282,11 @@ impl Editor {
         self.buffer_mut().changelist = changelist;
         self.buffer_mut().changelistidx = changelistidx;
         self.buffer_mut().modified = !clean;
+        // vim's `u_undoredo` leaves `` `[ `` / `` `] `` in column 0 of the first and
+        // last lines the undo (or redo) put back.
+        let (first, last) = changed_line_span(&old_text, &self.buffer().text);
+        let top = self.buffer().line_count().saturating_sub(1);
+        self.set_change_marks((first.min(top), 0), (last.min(top), 0));
         // The secondary multi-cursor set is window-local, but the undo tree is
         // shared by every window onto this buffer. Keep the baked `CURSOR_NS`/
         // `ANCHOR_NS` marks only when *this* window baked them; otherwise drop them
@@ -1293,5 +1298,35 @@ impl Editor {
             buf.extmarks.clear(crate::extmark::ANCHOR_NS, None);
         }
         self.clamp_cursor();
+        // A selection still open (Helix select, where `u` is undo) keeps its
+        // anchor; the restored text may no longer reach it.
+        let line = self.visual_anchor.line.min(self.last_line());
+        let s = self.buffer().line(line);
+        let mut col = self.visual_anchor.col.min(s.len());
+        while !s.is_char_boundary(col) {
+            col -= 1;
+        }
+        self.visual_anchor = Cursor { line, col };
     }
+}
+
+/// The lines of `new` that differ from `old`: the first line past their common
+/// head through the last line before their common tail. A span that put back no
+/// line at all (lines were only removed) is the line after the removal.
+fn changed_line_span(old: &ropey::Rope, new: &ropey::Rope) -> (usize, usize) {
+    use ropey::LineType::LF_CR as LT;
+    let (on, nn) = (old.len_lines(LT), new.len_lines(LT));
+    let mut head = 0;
+    while head < on && head < nn && old.line(head, LT) == new.line(head, LT) {
+        head += 1;
+    }
+    let mut tail = 0;
+    while tail < on - head
+        && tail < nn - head
+        && old.line(on - 1 - tail, LT) == new.line(nn - 1 - tail, LT)
+    {
+        tail += 1;
+    }
+    let put_back = nn - head - tail;
+    (head, head + put_back.saturating_sub(1))
 }

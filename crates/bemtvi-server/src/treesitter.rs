@@ -513,7 +513,7 @@ impl EditHost {
         let buf = self.editor.buffer_of(buffer);
         // The extmark lookup structure for this frame, built once rather than
         // re-scanning every mark on each of the rows below (see `HlMarkIndex`).
-        let mark_index = buf.map(crate::extmarks::HlMarkIndex::build);
+        let mark_index = buf.map(|b| crate::extmarks::HlMarkIndex::build(b, segs));
         let rows = segs
             .iter()
             .map(|seg| {
@@ -525,8 +525,20 @@ impl EditHost {
                     return Value::Array(Vec::new());
                 };
                 let ts_spans = spans_by_line.and_then(|m| m.get(&line_idx));
-                let text = b.line_cow(line_idx);
                 let tab = b.options.effective_tabstop();
+                // Only the head of the line this row can paint: everything past it is
+                // off screen, and walking a huge line here for every row every frame
+                // is what froze the editor on a minified file.
+                let Some(row_text) = seg.text(b, tab) else {
+                    return Value::Array(Vec::new());
+                };
+                // Spans starting past a cut head can't reach the screen.
+                let limit = if row_text.clipped() {
+                    row_text.text.len()
+                } else {
+                    usize::MAX
+                };
+                let text = row_text.text;
                 let ts_len = ts_spans.map_or(0, |s| s.len()) as u32;
 
                 // Unprintable control chars are shown as `^X` / `<xx>` tokens
@@ -540,7 +552,7 @@ impl EditHost {
                 // source at SEMANTIC_HL_PRIORITY, between treesitter and extmarks.
                 // Built before the extmark scan so its count offsets the extmark
                 // orders, keeping the source layering deterministic.
-                let sem = self.semantic_intervals(buffer, line_idx, ts_len);
+                let sem = self.semantic_intervals(buffer, line_idx, ts_len, limit);
 
                 // Fast path: no extmarks *and* no semantic tokens on this line ⇒
                 // emit the (already non-overlapping) treesitter spans verbatim,
@@ -562,6 +574,7 @@ impl EditHost {
                     let mut vc = unicode::LineVirtcol::new(&text, tab);
                     let row = spans
                         .iter()
+                        .filter(|s| s.start < limit)
                         .filter_map(|s| {
                             // Clip each full-line span to this row's wrap segment and
                             // rebase to row-local columns (so a wrapped continuation
@@ -588,6 +601,9 @@ impl EditHost {
                 let mut intervals = Vec::new();
                 if let Some(spans) = ts_spans {
                     for (i, s) in spans.iter().enumerate() {
+                        if s.start >= limit {
+                            continue;
+                        }
                         intervals.push(crate::extmarks::HlInterval {
                             start: s.start,
                             end: s.end,

@@ -308,7 +308,9 @@ impl ShadaStore for RedbFileStore {
     fn load(&mut self) -> std::io::Result<PersistState> {
         std::fs::create_dir_all(&self.dir)?;
         let my_path = self.dir.join(instance_filename());
-        // `Database::create`'s open, but through a backend we keep a handle to.
+        // Created private (0600) and fresh — `create_new` also refuses a planted
+        // symlink — then opened through a backend we keep a handle to.
+        create_private_file(&my_path)?;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -340,7 +342,7 @@ impl ShadaStore for RedbFileStore {
                 if path == my_path || path.extension().and_then(|e| e.to_str()) != Some("redb") {
                     continue;
                 }
-                if let Ok(sibling) = Database::open(&path) {
+                if let Some(sibling) = open_sibling(&path) {
                     siblings.push(sibling);
                     absorbed.push(path);
                 }
@@ -390,7 +392,7 @@ impl ShadaStore for RedbFileStore {
                 {
                     continue;
                 }
-                if let Ok(sibling) = Database::open(&path) {
+                if let Some(sibling) = open_sibling(&path) {
                     siblings.push(sibling);
                 }
             }
@@ -1176,6 +1178,23 @@ static INSTANCE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// This instance's store filename: `pid`, a high-resolution timestamp, and a
 /// process-local sequence — unique across every instance that may share a dir.
+/// Open a sibling store for reading, or `None` when it can't be: locked by a live
+/// instance, or damaged. redb validates a file's structure lazily and *panics* on some
+/// corruption (a bit-flipped page, a cut-off table tree) rather than returning an error,
+/// so the open and a full read run under `catch_unwind`: a store that cannot be read
+/// end to end is skipped like a locked one (and, never absorbed, never deleted).
+fn open_sibling(path: &Path) -> Option<Database> {
+    std::panic::catch_unwind(|| {
+        let db = Database::open(path).ok()?;
+        let _ = collect_merge(std::iter::once(&db));
+        Some(db)
+    })
+    .unwrap_or_else(|_| {
+        eprintln!("bemtvi: skipping damaged shada store {}", path.display());
+        None
+    })
+}
+
 fn instance_filename() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1183,6 +1202,21 @@ fn instance_filename() -> String {
         .unwrap_or(0);
     let seq = INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed);
     format!("{}.{}.{}.redb", std::process::id(), nanos, seq)
+}
+
+/// Create `path` as a new, empty, owner-only (`0600`) file, the way vim and neovim create
+/// their viminfo/shada: the store holds registers, history and paths, and a fresh file
+/// would otherwise get whatever the umask allows (typically world-readable). `create_new`
+/// also refuses to follow a symlink planted at the name. redb initializes an empty file.
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
 }
 
 fn now_ms() -> u64 {
@@ -1198,18 +1232,55 @@ fn now_ms() -> u64 {
 /// the policy. Tests build a [`RedbFileStore`] over a temp dir instead, so they
 /// never touch this one.
 ///
-/// The relative last resort only bites a process with no home and no XDG or
-/// platform base; it keeps the editor writable rather than losing the session.
-pub fn shada_dir() -> PathBuf {
-    bemtvi_core::stdpath::state_dir()
-        .unwrap_or_else(|| PathBuf::from(".bemtvi"))
-        .join("shada")
+/// `None` for a process with no home and no XDG or platform base: there is nowhere
+/// to keep the store, and the working directory is not a substitute for one.
+pub fn shada_dir() -> Option<PathBuf> {
+    bemtvi_core::stdpath::state_dir().map(|dir| dir.join("shada"))
+}
+
+/// The store for a session with no [`shada_dir`]: every operation fails, naming why,
+/// so the load surfaces it and persistence is switched off for the session.
+struct NoStateDirStore;
+
+impl NoStateDirStore {
+    fn error() -> std::io::Error {
+        std::io::Error::other(
+            "no state directory (no home, $XDG_STATE_HOME or platform default) — \
+             history, marks and registers will not persist",
+        )
+    }
+}
+
+impl ShadaStore for NoStateDirStore {
+    fn load(&mut self) -> std::io::Result<PersistState> {
+        Err(Self::error())
+    }
+    fn flush(&mut self, _state: &PersistState, _compact: bool) -> std::io::Result<()> {
+        Err(Self::error())
+    }
+    fn reload(&mut self) -> std::io::Result<PersistState> {
+        Err(Self::error())
+    }
+}
+
+/// A [`RedbFileStore`] under `sub` of [`shada_dir`], or the failing store when there
+/// is no state directory.
+fn store_under(sub: &[&str]) -> Box<dyn ShadaStore + Send> {
+    match shada_dir() {
+        Some(mut dir) => {
+            for part in sub {
+                dir.push(part);
+            }
+            Box::new(RedbFileStore::new(dir))
+        }
+        None => Box::new(NoStateDirStore),
+    }
 }
 
 /// The default store for the native binaries: a [`RedbFileStore`] under
 /// [`shada_dir`]. The wasm Worker build injects a redb-over-OPFS store here instead.
 pub fn default_shada() -> Box<dyn ShadaStore + Send> {
-    Box::new(RedbFileStore::new(shada_dir()))
+    store_under(&[])
 }
 
 /// A namespace becomes a single path component under `shada_dir()/ns/`, so it must be a
@@ -1259,7 +1330,7 @@ pub fn workspace_namespace(dir: &Path) -> String {
 /// other workspaces; without one it is the global [`default_shada`].
 pub fn workspace_shada(namespace: Option<&str>) -> Box<dyn ShadaStore + Send> {
     match namespace {
-        Some(ns) => Box::new(RedbFileStore::new(shada_dir().join("ns").join(ns))),
+        Some(ns) => store_under(&["ns", ns]),
         None => default_shada(),
     }
 }
@@ -1386,13 +1457,21 @@ pub async fn prepare_remote_shada(
         }
     };
     for entry in entries {
-        if entry.is_dir || !entry.name.ends_with(".redb") {
+        // The name comes off the wire: it must be a single plain component, or a
+        // hostile daemon could stage files outside the staging dir (`../x.redb`).
+        let mut parts = Path::new(&entry.name).components();
+        let single = matches!(
+            (parts.next(), parts.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        );
+        if entry.is_dir || !single || !entry.name.ends_with(".redb") {
             continue;
         }
         let remote_file = format!("{remote_dir}/{}", entry.name);
         match host_fs.read(remote_file).await? {
             crate::FsRead::File(bytes, _) => {
-                std::fs::write(staging.join(&entry.name), bytes)?;
+                use std::io::Write as _;
+                create_private_file(&staging.join(&entry.name))?.write_all(&bytes)?;
                 downloaded.push(entry.name);
             }
             // A sibling that vanished between the listing and the read (a concurrent
@@ -1412,36 +1491,69 @@ pub async fn prepare_remote_shada(
     ))
 }
 
+/// The store for a `Remote`-config session whose shada can't live on the daemon: every
+/// operation fails with the reason, so the load surfaces it and persistence is off for the
+/// session. Never the local store — the daemon's config runs in this editor, and must not
+/// read this machine's registers and history.
+#[cfg(feature = "native")]
+struct RemoteShadaUnavailable(String);
+
+#[cfg(feature = "native")]
+impl RemoteShadaUnavailable {
+    fn error(&self) -> std::io::Error {
+        std::io::Error::other(format!(
+            "remote shada unavailable ({}) — history, marks and registers will not persist \
+             this session",
+            self.0
+        ))
+    }
+}
+
+#[cfg(feature = "native")]
+impl ShadaStore for RemoteShadaUnavailable {
+    fn load(&mut self) -> std::io::Result<PersistState> {
+        Err(self.error())
+    }
+    fn flush(&mut self, _state: &PersistState, _compact: bool) -> std::io::Result<()> {
+        Err(self.error())
+    }
+    fn reload(&mut self) -> std::io::Result<PersistState> {
+        Err(self.error())
+    }
+}
+
 /// Pick a session's shada store from its [`ConfigSource`](crate::ConfigSource) — the
 /// shared path both native clients take at connect, so the download-or-local decision
 /// lives in one place. `Remote` (with a daemon-reported `state_dir`) keeps shada on the
-/// daemon ([`prepare_remote_shada`]); a download error or a daemon that reported no
-/// `state_dir` falls back to `fallback_local` (never clobbering the daemon's copy with a
-/// fresh empty store). `Local` always uses `fallback_local`. Returns the store (for
-/// [`ServerInit::shada`](crate::ServerInit::shada)) and the optional remote sync target
-/// (for [`ServerInit::remote_shada`](crate::ServerInit::remote_shada)).
+/// daemon ([`prepare_remote_shada`]). A download error or a daemon that reported no
+/// `state_dir` leaves the session with no persistence (a store whose every operation fails,
+/// naming why) — never `local`: a `Remote` session runs the daemon's config, which must not
+/// see this machine's shada, and an empty fresh store can't clobber the daemon's copy.
+/// `Local` uses `local`. Returns the store (for [`ServerInit::shada`](crate::ServerInit::shada))
+/// and the optional remote sync target (for
+/// [`ServerInit::remote_shada`](crate::ServerInit::remote_shada)).
 #[cfg(feature = "native")]
 pub async fn resolve_session_shada(
     host_fs: &dyn crate::HostFsAsync,
     source: crate::ConfigSource,
     state_dir: Option<&str>,
     namespace: Option<&str>,
-    fallback_local: Box<dyn ShadaStore + Send>,
+    local: Box<dyn ShadaStore + Send>,
 ) -> (Box<dyn ShadaStore + Send>, Option<RemoteShada>) {
+    let unavailable = |why: String| -> (Box<dyn ShadaStore + Send>, Option<RemoteShada>) {
+        eprintln!("bemtvi: remote shada unavailable ({why}); shada is off for this session");
+        (Box::new(RemoteShadaUnavailable(why)), None)
+    };
     match (source, state_dir) {
         (crate::ConfigSource::Remote, Some(dir)) => {
             match prepare_remote_shada(host_fs, dir, namespace).await {
                 Ok((store, rs)) => (store, Some(rs)),
-                Err(e) => {
-                    eprintln!("bemtvi: remote shada unavailable ({e}); using local shada");
-                    (fallback_local, None)
-                }
+                Err(e) => unavailable(e.to_string()),
             }
         }
         (crate::ConfigSource::Remote, None) => {
-            eprintln!("bemtvi: daemon reported no shada dir; using local shada");
-            (fallback_local, None)
+            unavailable("the daemon reported no shada dir".to_string())
         }
-        (crate::ConfigSource::Local, _) => (fallback_local, None),
+        (crate::ConfigSource::Local, _) => (local, None),
     }
 }

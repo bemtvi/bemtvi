@@ -840,17 +840,46 @@ local function opt_mutate(self, op, v, noflush)
   opt_promote(self)
   local kind = self._kind
   if kind == "flag" then
-    local s = tostring(v)
-    for i = 1, #s do
-      self._value[s:sub(i, i)] = (op ~= "remove") or nil
+    -- A string of flag chars, a list of them (`{ "c", "r" }`), or a set
+    -- (`{ c = true }`): every form names the flags to add or drop.
+    local flags = {}
+    if type(v) ~= "table" then
+      flags[1] = tostring(v)
+    elseif vim.islist(v) then
+      for _, c in ipairs(v) do
+        flags[#flags + 1] = tostring(c)
+      end
+    else
+      for c, on in pairs(v) do
+        if on then
+          flags[#flags + 1] = tostring(c)
+        end
+      end
+    end
+    for _, s in ipairs(flags) do
+      for i = 1, #s do
+        self._value[s:sub(i, i)] = (op ~= "remove") or nil
+      end
     end
   elseif kind == "map" then
     if op == "remove" then
-      local keys = type(v) == "table" and (vim.islist(v) and v or vim.tbl_keys(v)) or { v }
+      local keys
+      if type(v) == "table" then
+        keys = vim.islist(v) and v or vim.tbl_keys(v)
+      else
+        keys = {}
+        for _, piece in ipairs(opt_split_comma(v)) do
+          keys[#keys + 1] = piece:match("^(.-):") or piece
+        end
+      end
       for _, k in ipairs(keys) do
         self._value[k] = nil
       end
     else
+      -- The string form (`"eob: "`) is the option's own `key:value,…` spelling.
+      if type(v) ~= "table" then
+        v = opt_decode("map", v)
+      end
       for k, val in pairs(v) do
         if op == "append" or self._value[k] == nil then
           self._value[k] = val
@@ -864,7 +893,7 @@ local function opt_mutate(self, op, v, noflush)
         items[#items + 1] = x
       end
     else
-      items[1] = v
+      items = opt_split_comma(v)
     end
     if op == "remove" then
       local drop = {}

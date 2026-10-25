@@ -77,8 +77,14 @@ Stream.__index = Stream
 
 function Stream:next()
   return btv.promise.new(function(resolve)
-    if #self._queue > 0 then
-      resolve(table.remove(self._queue, 1))
+    -- `_qhead` indexes the oldest buffered batch, so a pull is O(1) rather than the
+    -- whole-queue shift `table.remove(q, 1)` costs while a slow consumer lags a flood.
+    local head = self._qhead
+    if self._queue[head] ~= nil then
+      local batch = self._queue[head]
+      self._queue[head] = nil
+      self._qhead = head + 1
+      resolve(batch)
     elseif self._done then
       resolve(nil)
     else
@@ -146,7 +152,7 @@ function btv.run_stream(spec)
   if type(spec) ~= "table" then
     error("btv.run_stream: expected a table { cmd, args, ... }, got " .. type(spec), 2)
   end
-  local self = setmetatable({ _queue = {}, _done = false, _waiter = nil }, Stream)
+  local self = setmetatable({ _queue = {}, _qhead = 1, _qtail = 0, _done = false }, Stream)
   local id = btv._next_cb_id()
   self._id = id
   -- Persistent stdout: hand each batch to a parked waiter, else buffer it.
@@ -156,7 +162,8 @@ function btv.run_stream(spec)
       self._waiter = nil
       waiter(lines)
     else
-      self._queue[#self._queue + 1] = lines
+      self._qtail = self._qtail + 1
+      self._queue[self._qtail] = lines
     end
   end
   -- One-shot exit: mark done and wake any parked waiter with nil (end-of-stream).

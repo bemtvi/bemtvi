@@ -178,6 +178,7 @@ impl EditHost {
                             "bemtvi: write of \"{}\" abandoned (an earlier write failed)",
                             q.path.display()
                         ));
+                        self.cancel_quit_all_gate(q.seq);
                     }
                 }
                 // A failed write in a `:wqa` / `:xa` batch cancels the whole quit (the

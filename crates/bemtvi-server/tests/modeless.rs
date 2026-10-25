@@ -1803,3 +1803,60 @@ async fn ctrl_w_in_a_second_tab_on_the_same_buffer_closes_it() {
     assert_eq!(lines(&rpc).await, v(&[""]), "a fresh empty buffer is left");
     assert_eq!(mode(&rpc).await, "i");
 }
+
+/// A bracketed paste (the GUI's Cmd+V) over a modeless selection replaces it and
+/// leaves the caret after the pasted text, as typing over it does.
+#[tokio::test]
+async fn a_bracketed_paste_over_the_selection_leaves_the_caret_after_it() {
+    let (rpc, _inc) = start_modeless("hello world\n").await;
+    feed(&rpc, "<C-S-Right>");
+    assert_eq!(mode(&rpc).await, "s");
+    feed(&rpc, "<PasteStart>XY<PasteEnd>");
+    assert_eq!(mode(&rpc).await, "i");
+    feed(&rpc, "!");
+    assert_eq!(lines(&rpc).await, v(&["XY! world"]));
+}
+
+/// Sideways wheel notches over a viewport of very long lines stay cheap: each notch
+/// measures the visible lines only as far as it can scroll (plus the sideways
+/// marker's bounded span), never every visible line in full. A regression walks
+/// ~24 MB per notch and blows the budget by an order of magnitude.
+#[tokio::test]
+async fn sideways_wheel_over_huge_lines_is_bounded() {
+    let line = "x".repeat(1_000_000);
+    let text: String = (0..24).map(|_| format!("{line}\n")).collect();
+    let (rpc, _inc) = start_modeless(&text).await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    let started = std::time::Instant::now();
+    for _ in 0..40 {
+        feed_mouse(&rpc, "wheel", "right", 5, 5);
+    }
+    let lc = leftcol(&rpc).await;
+    let took = started.elapsed();
+    assert_eq!(lc, 240, "forty notches of 'mousescroll' hor:6");
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "40 sideways notches over 24 MB of visible text took {took:?}"
+    );
+}
+
+/// A modeless caret move (`<C-Left>`) starts a new insert where it lands, as an
+/// arrow key does, so `<C-u>` stops there. It used to keep the stale start after
+/// the `F`, which the `中` typed before it then straddled — `<C-u>` sliced the line
+/// inside the character and panicked the server.
+#[tokio::test]
+async fn a_caret_move_restarts_the_insert_for_ctrl_u() {
+    let (rpc, _inc) = start_modeless("hello world\n").await;
+    feed(&rpc, "<C-a>FA<C-Left>\u{4e2d}x<C-u>");
+    assert_eq!(lines(&rpc).await, vec!["FA"]);
+}
+
+/// `<C-]>` indents the caret's line under an open insert: where the insert began
+/// moves right with the text (as vim's change_indent moves it), so `<C-u>` still
+/// removes only the typed `x`. Left at byte 3 it fell inside the shifted `中`.
+#[tokio::test]
+async fn indenting_shifts_the_insert_start_with_the_text() {
+    let (rpc, _inc) = start_modeless("\u{4e2d}\n").await;
+    feed(&rpc, "<End>x<C-]><C-u>");
+    assert_eq!(lines(&rpc).await, vec!["\t\u{4e2d}"]);
+}

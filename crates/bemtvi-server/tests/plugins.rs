@@ -292,6 +292,62 @@ async fn lazy_cmd_defers_load_until_invoked() {
     );
 }
 
+// A `cmd` trigger re-dispatches the invocation once the plugin has loaded, expecting
+// the plugin to have replaced the stub with the real command. A plugin that never
+// defines that command (a typo'd trigger, a renamed command) left the stub in place,
+// so the re-dispatch hit the stub again, which re-dispatched again — forever, wedging
+// the editor. It must instead report the missing command loud, once.
+#[tokio::test]
+async fn a_cmd_trigger_the_plugin_never_defines_fails_loud_instead_of_looping() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_ghost_cmd");
+    let repo = make_repo(&src, "ghost");
+    setup_root(&rpc, "plug_ghost_cmd").await;
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.notes = {{}}\n\
+             btv.notify = function(m) _G.notes[#_G.notes + 1] = tostring(m) end\n\
+             btv.plugins {{ {{ name = \"ghost\", dir = \"{dir}\", cmd = \"GhostCmd\" }} }}",
+            dir = q(&repo)
+        ),
+    )
+    .await;
+    exec_lua(&rpc, "local L = btv.plugins.load; btv.plugins.load = function(...) _G.loads = (_G.loads or 0) + 1 return L(...) end").await;
+    exec_lua(&rpc, "vim.cmd('GhostCmd')").await;
+    assert!(
+        poll_true(&rpc, "return _G.ghost_plugin == true").await,
+        "invoking the trigger should load the plugin"
+    );
+    let note = tokio::time::timeout(Duration::from_secs(5), async {
+        for _ in 0..200 {
+            let got = exec_lua(
+                &rpc,
+                "for _, m in ipairs(_G.notes) do \
+                   if m:find('GhostCmd', 1, true) then return m end end return nil",
+            )
+            .await;
+            if let Some(m) = got.as_str() {
+                return Some(m.to_string());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
+    })
+    .await
+    .expect("the editor must stay responsive (the re-dispatch looped)");
+    assert_eq!(
+        exec_lua(&rpc, "return _G.loads").await.as_i64(),
+        Some(1),
+        "one invocation loads once and stops"
+    );
+    let note = note.expect("a loud report naming the undefined command");
+    assert!(
+        note.contains("ghost"),
+        "the report names the plugin: {note}"
+    );
+}
+
 // ----- a local `dir` (dev) plugin loads without cloning ----------------------
 
 #[tokio::test]
@@ -372,6 +428,57 @@ async fn clean_removes_undeclared_dirs() {
         "clean should remove the one orphan dir"
     );
     assert!(!root.join("orphan").exists());
+}
+
+// A plugin name becomes a directory under the install root (`<root>/<name>`) that
+// install clones into, update pulls in, and clean deletes. A name carrying a path
+// separator or a dot-segment — an explicit `name = "../x"`, or one DERIVED from a
+// source ending in `/..` — would resolve outside the root, so `add` must reject it
+// loud instead of cloning into (and later operating on) an arbitrary directory.
+#[tokio::test]
+async fn a_spec_name_that_is_not_a_single_directory_name_is_rejected() {
+    let (rpc, _i) = start().await;
+    let root = setup_root(&rpc, "plug_badname").await;
+    let repo = make_repo(&root.parent().unwrap().join("src"), "alpha");
+    for bad in [
+        format!("{{ 'file://{}', name = '../escape' }}", q(&repo)),
+        format!("{{ 'file://{}', name = 'a/b' }}", q(&repo)),
+        format!("{{ 'file://{}', name = '..' }}", q(&repo)),
+        "'owner/..'".to_string(),
+        format!("{{ 'file://{}', name = '' }}", q(&repo)),
+    ] {
+        let code = format!(
+            "local ok, err = pcall(btv.plugins.add, {{ {bad} }}) \
+             return (not ok) and tostring(err):find('not a plugin name', 1, true) ~= nil"
+        );
+        assert_eq!(
+            lua_bool(&rpc, &code).await,
+            Some(true),
+            "add should reject the spec {bad}"
+        );
+    }
+    assert_eq!(
+        lua_bool(&rpc, "return #btv.plugins._order == 0").await,
+        Some(true),
+        "no rejected spec should be registered"
+    );
+}
+
+// The default plugin name is the source's basename sans `.git` — including for a URL
+// written with a trailing slash, which otherwise kept the `.git` (`repo.git`), so the
+// install dir and the shada namespace differed from the same source spelled without it.
+#[tokio::test]
+async fn the_default_name_drops_dot_git_even_with_a_trailing_slash() {
+    let (rpc, _i) = start().await;
+    for src in [
+        "https://example.com/owner/repo.git/",
+        "https://example.com/owner/repo.git",
+        "owner/repo/",
+        "owner/repo",
+    ] {
+        let got = exec_lua(&rpc, &format!("return btv.plugins._source_name('{src}')")).await;
+        assert_eq!(got.as_str(), Some("repo"), "default name for {src}");
+    }
 }
 
 // ----- config / init accept async functions ----------------------------------
@@ -2320,6 +2427,61 @@ async fn sync_writes_a_lockfile_recording_the_cloned_commit() {
             .await
             .as_str(),
         Some(want.as_str())
+    );
+}
+
+/// The lockfile is replaced whole (written beside it, then renamed over it), so an
+/// interrupted write can never leave a truncated lock: the old file's inode is swapped,
+/// not rewritten in place. A symlinked lockfile keeps its link; the target is replaced.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_lockfile_is_replaced_atomically_through_a_symlink() {
+    use std::os::unix::fs::MetadataExt;
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_lockatomic_src");
+    let repo = make_repo(&src, "alpha");
+    let (_root, cfg) = setup_root_and_config(&rpc, "plug_lockatomic").await;
+    let real = temp_dir("plug_lockatomic_real").join("lock.json");
+    std::fs::write(&real, "{}\n").unwrap();
+    std::fs::create_dir_all(&cfg).unwrap();
+    let lock = cfg.join("bemtvi-lock.json");
+    std::os::unix::fs::symlink(&real, &lock).unwrap();
+    let before = std::fs::metadata(&real).unwrap().ino();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "btv.plugins {{ {{ \"file://{repo}\", name = \"alpha\" }} }}\n\
+             btv.plugins.sync():catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return btv.plugins.locked().alpha ~= nil").await,
+        "err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert!(
+        std::fs::symlink_metadata(&lock)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the symlinked lockfile must stay a symlink"
+    );
+    let text = std::fs::read_to_string(&real).unwrap();
+    assert!(
+        text.contains("\"alpha\""),
+        "target must hold the new lock: {text}"
+    );
+    assert_ne!(
+        std::fs::metadata(&real).unwrap().ino(),
+        before,
+        "the lock must be renamed into place, not truncated and rewritten"
+    );
+    assert!(
+        !real.with_file_name("lock.json.tmp").exists(),
+        "no temp file left behind"
     );
 }
 

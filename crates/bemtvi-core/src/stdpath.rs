@@ -74,14 +74,28 @@ pub fn home_dir() -> Option<PathBuf> {
             return Some(PathBuf::from(joined));
         }
     }
+    // Unix with `$HOME` unset (`env -i`, a service account): the passwd entry, as
+    // neovim's `uv_os_homedir` does. std's lookup reads `$HOME` first (already
+    // known unset) and then `getpwuid_r`; its deprecation is about the Windows half.
+    #[cfg(unix)]
+    {
+        #[allow(deprecated)]
+        if let Some(home) = std::env::home_dir().filter(|h| h.is_absolute()) {
+            return Some(home);
+        }
+    }
     None
 }
 
-/// The base directory a std dir hangs off: `$<xdg_var>` if set, else the Windows
-/// default `%<win_var>%`, else `$HOME/<unix_sub…>`.
+/// The base directory a std dir hangs off: `$<xdg_var>` if set to an absolute path,
+/// else the Windows default `%<win_var>%`, else `$HOME/<unix_sub…>`. A relative
+/// `$XDG_*` value is ignored, as the XDG Base Directory spec requires.
 fn base(xdg_var: &str, win_var: &str, unix_sub: &[&str]) -> Option<PathBuf> {
-    if let Some(dir) = non_empty(xdg_var) {
-        return Some(PathBuf::from(dir));
+    if let Some(dir) = non_empty(xdg_var)
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute())
+    {
+        return Some(dir);
     }
     #[cfg(windows)]
     if let Some(dir) = non_empty(win_var) {

@@ -121,3 +121,36 @@ async fn normal_abbreviation_norm() {
     feed(&rpc, ":norm gg<CR>");
     assert_eq!(cursor(&rpc).await, (1, 0));
 }
+
+/// An incomplete command at the end of `:normal`'s keys is aborted as if `<Esc>`
+/// were typed (vim): an Insert begun by the keys ends there. With a range that
+/// happens per line, so `:%normal Ax` appends to every line instead of the second
+/// line receiving the literal keys `Ax`; and the editor is back in Normal mode
+/// afterwards, so a following `u` undoes rather than being typed.
+#[tokio::test]
+async fn normal_aborts_an_unfinished_insert_per_line_and_at_the_end() {
+    let (rpc, _incoming) = start("a\nb\n").await;
+    feed(&rpc, ":%normal Ax<CR>");
+    assert_eq!(lines(&rpc).await, vec!["ax", "bx"]);
+    assert_eq!(bemtvi_test_harness::mode(&rpc).await, "n");
+    feed(&rpc, "u");
+    assert_eq!(lines(&rpc).await, vec!["a", "b"]);
+    feed(&rpc, ":normal ihi<CR>");
+    assert_eq!(bemtvi_test_harness::mode(&rpc).await, "n");
+    // An operator left pending is dropped, not carried into the next keystroke.
+    feed(&rpc, ":normal d<CR>");
+    feed(&rpc, "j");
+    assert_eq!(lines(&rpc).await, vec!["hia", "b"]);
+}
+
+/// `:normal` with no keys is vim's `E471: Argument required`, not a silent no-op.
+#[tokio::test]
+async fn normal_without_keys_is_e471() {
+    let (rpc, mut incoming) = start("x\n").await;
+    feed(&rpc, ":normal<CR>");
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame =
+        bemtvi_test_harness::drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw");
+    let msg = bemtvi_test_harness::message(&frame);
+    assert!(msg.contains("E471"), "got {msg:?}");
+}

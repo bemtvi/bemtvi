@@ -97,3 +97,32 @@ async fn visual_j_keymap_moves_the_selection_down() {
     feed(&rpc, "K");
     assert_eq!(lines(&rpc).await, vec!["ccc", "aaa", "bbb", "ddd"]);
 }
+
+/// Moving a range to just above itself or just below its last line is a no-op
+/// in vim, not *E134*: the reversing idiom `:g/^/m0` runs `:1m0` on its first
+/// line, and `:m.` names the range's own line. The buffer is untouched and not
+/// modified, and the cursor rests on the range's last line.
+#[tokio::test]
+async fn ex_move_onto_its_own_boundary_is_a_silent_no_op() {
+    let file = write_temp("ex_move_noop", "txt", "aaa\nbbb\nccc\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    let map = redraw_after(&rpc, &mut incoming, ":1m0<CR>").await;
+    let msg = field(&map, "message").and_then(Value::as_str).unwrap_or("");
+    assert!(!msg.contains("E134"), "`:1m0` is a no-op, got {msg:?}");
+    let map = redraw_after(&rpc, &mut incoming, ":1,2m2<CR>").await;
+    let msg = field(&map, "message").and_then(Value::as_str).unwrap_or("");
+    assert!(!msg.contains("E134"), "`:1,2m2` is a no-op, got {msg:?}");
+    assert_eq!(cursor(&rpc).await, (2, 0));
+    assert_eq!(lines(&rpc).await, vec!["aaa", "bbb", "ccc"]);
+    assert_eq!(
+        exec_lua(&rpc, "return vim.bo.modified").await.as_bool(),
+        Some(false)
+    );
+    let map = redraw_after(&rpc, &mut incoming, ":g/^/m0<CR>").await;
+    let msg = field(&map, "message").and_then(Value::as_str).unwrap_or("");
+    assert!(
+        !msg.contains("E134"),
+        "`:g/^/m0` reverses silently, got {msg:?}"
+    );
+    assert_eq!(lines(&rpc).await, vec!["ccc", "bbb", "aaa"]);
+}

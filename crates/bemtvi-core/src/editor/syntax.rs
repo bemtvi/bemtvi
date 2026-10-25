@@ -4,6 +4,9 @@
 use super::*;
 use crate::syntax::{IndentParams, OpenOutcome, Span, SyntaxEngine};
 
+/// The widest indent (in columns) a `btv.indent.expr` verdict may ask for.
+const MAX_INDENT_EXPR_WIDTH: i64 = 10_000;
+
 /// Whitespace that advances the virtual column from `start` to `target`
 /// (`target >= start`), the fill an inserted `<Tab>` lays down. With `expandtab`
 /// it is all spaces; otherwise real tabs that jump to each `tabstop` boundary,
@@ -627,6 +630,13 @@ impl Editor {
     /// Syncs the engine first so the query sees the just-inserted `\n` (and any
     /// edits since the last redraw) — currency is required for a correct verdict.
     pub(crate) fn indent_for(&mut self, line: usize) -> usize {
+        self.indent_rule_for(line).unwrap_or(0)
+    }
+
+    /// [`indent_for`](Self::indent_for), but `None` when no indent rule applies at
+    /// all (no tree-sitter indents, `'indentexpr'`, `'smartindent'` or
+    /// `'autoindent'`) — where vim leaves a split line's leading blanks alone.
+    pub(crate) fn indent_rule_for(&mut self, line: usize) -> Option<usize> {
         let buf = self.current_buffer_id();
         self.ts_load_language_now(buf);
         self.sync_syntax_engine(buf);
@@ -643,25 +653,25 @@ impl Editor {
         };
         self.echo_ts_query_errors();
         if let Some(w) = ts {
-            return w;
+            return Some(w);
         }
         // A user `'indentexpr'` sits *below* the treesitter verdict — structure
         // beats a hand-written rule — but above `smartindent`, so it is the
         // escape hatch for a filetype with no grammar or no `indents.scm`.
         // Declining (`nil`) falls through as if it were not installed.
         if let Some(w) = self.indent_expr_for(line) {
-            return w;
+            return Some(w);
         }
         // `smartindent` (bracket-aware) takes precedence over plain `autoindent`.
         if opts.smartindent {
-            return self.smartindent_for(line);
+            return Some(self.smartindent_for(line));
         }
         // `autoindent`, or the ts-available-but-inconclusive copy-previous the
         // engine has always leaned on, copies the previous non-blank line's indent.
         if opts.autoindent || available {
-            return self.autoindent_copy_prev(line).unwrap_or(0);
+            return Some(self.autoindent_copy_prev(line).unwrap_or(0));
         }
-        0
+        None
     }
 
     /// The `'indentexpr'` verdict for 0-based `line`, or `None` when no expression
@@ -694,6 +704,13 @@ impl Editor {
             None => None,
         });
 
+        // An absurd width would allocate that many blanks (`1e15` → OOM): treat it
+        // as a failure rather than an indent.
+        if let Some(v) = out.filter(|&v| v > MAX_INDENT_EXPR_WIDTH) {
+            failure = Some(crate::sandbox::SandboxError::Runtime(format!(
+                "width {v} is too large (max {MAX_INDENT_EXPR_WIDTH})"
+            )));
+        }
         // Loud once, then off: an indent expression runs per line of a `=` sweep,
         // so a broken one must not echo per line.
         if let Some(err) = failure {
@@ -788,6 +805,16 @@ impl Editor {
             self.buffer_mut().insert(start, &fill);
         }
         self.buffer_mut().normalize();
+        // An open insert's start on this line moves with its text (vim's
+        // change_indent), so `<C-w>`/`<C-u>` keep stopping at the same character.
+        if self.insert_start.0 == line {
+            let col = self.insert_start.1;
+            self.insert_start.1 = if col >= old_ws {
+                col - old_ws + fill.len()
+            } else {
+                col.min(fill.len())
+            };
+        }
         fill.len()
     }
 }

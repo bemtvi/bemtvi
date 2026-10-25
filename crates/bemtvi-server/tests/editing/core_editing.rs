@@ -1230,6 +1230,43 @@ async fn echo_integer_division_truncates_like_vim() {
     assert_eq!(msg, "3", "integer division truncates toward zero");
 }
 
+/// The one integer division that overflows — `i64::MIN / -1` (and its `%`) —
+/// panics in Rust even in release builds; `:echo` must answer instead of taking
+/// the server down.
+#[tokio::test]
+async fn echo_min_int_divided_by_minus_one_does_not_panic() {
+    let (rpc, mut incoming) = start(None).await;
+    let min = "(-9223372036854775807 - 1)";
+    let msg = message(&redraw_after(&rpc, &mut incoming, &format!(":echo {min} % -1<CR>")).await);
+    assert_eq!(msg, "0");
+    let msg = message(&redraw_after(&rpc, &mut incoming, &format!(":echo {min} / -1<CR>")).await);
+    assert_eq!(msg, "-9223372036854775808");
+}
+
+/// The expression parser recurses per nesting level, so an absurdly nested
+/// expression overflowed the server thread's stack (an abort, not a catchable
+/// panic). It fails loud past a depth limit instead.
+#[tokio::test]
+async fn echo_of_a_pathologically_nested_expression_fails_loud() {
+    let (rpc, mut incoming) = start(None).await;
+    exec_lua(
+        &rpc,
+        r#"vim.cmd("echo " .. string.rep("(", 200000) .. "1" .. string.rep(")", 200000))"#,
+    )
+    .await;
+    let msg = message(&redraw_after(&rpc, &mut incoming, "").await);
+    assert!(msg.contains("E"), "expected a loud error, got {msg:?}");
+    exec_lua(
+        &rpc,
+        r#"vim.cmd("echo " .. string.rep("-", 200000) .. "1")"#,
+    )
+    .await;
+    let msg = message(&redraw_after(&rpc, &mut incoming, "").await);
+    assert!(msg.contains("E"), "expected a loud error, got {msg:?}");
+    let msg = message(&redraw_after(&rpc, &mut incoming, ":echo ((1 + 2)) * -(-3)<CR>").await);
+    assert_eq!(msg, "9");
+}
+
 #[tokio::test]
 async fn echo_is_transient_but_echomsg_is_recorded() {
     // `:echo` shows on the message line without joining `:messages`; `:echomsg`
@@ -1362,6 +1399,170 @@ async fn c_w_on_an_empty_line_enters_insert_without_joining() {
     feed(&rpc, "ia<CR><CR>b<Esc>");
     feed(&rpc, "2ggcwXY<Esc>");
     assert_eq!(lines(&rpc).await, vec!["a", "XY", "b"]);
+}
+
+#[tokio::test]
+async fn a_shift_over_an_empty_motion_still_shifts_the_line() {
+    // vim's `op_shift` works on the operated lines even when the motion did not
+    // move: `>h` / `>0` in column 0, `>{` / `>(` at the top of the buffer.
+    let (rpc, _incoming) = start(None).await;
+    exec_lua(&rpc, "btv.o.indentdetect = false").await;
+    command(&rpc, "set sw=8 ts=8 noet").await;
+    for keys in [">h", ">0", ">{", ">("] {
+        assert_eq!(
+            edit_probe(&rpc, &["\tfoo", "x"], (1, 0), keys).await,
+            vec!["\t\tfoo", "x"],
+            "{keys}"
+        );
+    }
+    assert_eq!(
+        edit_probe(&rpc, &["\tfoo", "x"], (1, 0), "<h").await,
+        vec!["foo", "x"]
+    );
+}
+
+#[tokio::test]
+async fn a_case_operator_made_linewise_leaves_the_cursor_where_its_text_began() {
+    // `gU(` from a blank line reaches back to a sentence starting in the indent:
+    // the exclusive motion becomes linewise, and the cursor lands where the
+    // motion's text began, as the charwise operator would have left it.
+    let (rpc, _incoming) = start(None).await;
+    edit_probe(&rpc, &["First.", "  third end.", "", "x"], (3, 0), "gU(").await;
+    assert_eq!(lines(&rpc).await, vec!["First.", "  THIRD END.", "", "x"]);
+    assert_eq!(cursor(&rpc).await, (2, 2));
+}
+
+#[tokio::test]
+async fn visual_y_leaves_the_cursor_at_the_start_of_the_first_line() {
+    let (rpc, _incoming) = start(None).await;
+    edit_probe(&rpc, &["one two", "three four"], (2, 4), "vlY").await;
+    assert_eq!(cursor(&rpc).await, (2, 0));
+    edit_probe(&rpc, &["one two", "three four"], (2, 4), "vkY").await;
+    assert_eq!(cursor(&rpc).await, (1, 0));
+}
+
+#[tokio::test]
+async fn line_motions_plus_minus_underscore_bar_and_screen_lines() {
+    let (rpc, _incoming) = start(None).await;
+    let text = ["  aa bb cc", "bbbbbbbb x", "  cc dd", "dd ee"];
+    for (at, keys, want) in [
+        ((2, 6), "+", (3, 2)),
+        ((2, 6), "<CR>", (3, 2)),
+        ((2, 6), "-", (1, 2)),
+        ((3, 4), "2-", (1, 2)),
+        ((2, 6), "_", (2, 0)),
+        ((2, 6), "2_", (3, 2)),
+        ((2, 6), "5|", (2, 4)),
+        ((2, 6), "H", (1, 2)),
+        ((2, 6), "M", (2, 0)),
+        ((2, 6), "L", (4, 0)),
+        ((4, 3), "2L", (3, 2)),
+        ((1, 0), "2H", (2, 0)),
+    ] {
+        edit_probe(&rpc, &text, at, keys).await;
+        assert_eq!(cursor(&rpc).await, want, "{keys:?} from {at:?}");
+    }
+    // As operator targets: `+`/`-`/`_`/`H`/`L` are linewise, `|` exclusive.
+    assert_eq!(
+        edit_probe(&rpc, &text, (2, 6), "d+").await,
+        vec!["  aa bb cc", "dd ee"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (2, 6), "d-").await,
+        vec!["  cc dd", "dd ee"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (2, 6), "d_").await,
+        vec!["  aa bb cc", "  cc dd", "dd ee"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (2, 6), "d5|").await,
+        vec!["  aa bb cc", "bbbbbb x", "  cc dd", "dd ee"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (2, 6), "dL").await,
+        vec!["  aa bb cc"]
+    );
+    // `+` on the last line and `-` on the first fail.
+    edit_probe(&rpc, &text, (4, 1), "+").await;
+    assert_eq!(cursor(&rpc).await, (4, 1));
+    assert_eq!(edit_probe(&rpc, &text, (4, 1), "d2_").await, text.to_vec());
+    assert_eq!(edit_probe(&rpc, &text, (1, 3), "d-").await, text.to_vec());
+}
+
+#[tokio::test]
+async fn a_linewise_yank_or_fold_leaves_the_cursor_at_the_operated_start() {
+    // vim puts the cursor at the start of the operated text: for a linewise
+    // motion that is the earlier of the cursor and the motion's landing spot
+    // (`gg` / `G` / `N%` land on the first non-blank); `zf` over a charwise
+    // motion keeps the charwise start.
+    let (rpc, _incoming) = start(None).await;
+    let text = ["  aa bb cc", "bbbbbbbb x", "  cc dd", "dd ee"];
+    for (at, keys, want) in [
+        ((2, 6), "ygg", (1, 2)),
+        ((4, 1), "yG", (4, 0)),
+        ((2, 6), "y3%", (1, 2)),
+        ((2, 6), "yk", (1, 6)),
+        ((2, 6), "yj", (2, 6)),
+        ((2, 6), "yy", (2, 6)),
+        ((2, 6), "2yy", (2, 6)),
+        ((2, 6), "y_", (2, 6)),
+        ((3, 4), "y2_", (3, 4)),
+        ((2, 6), "zfj", (2, 6)),
+        ((2, 6), "zfk", (1, 6)),
+        ((3, 4), "zf{", (1, 0)),
+        ((2, 6), "zfap", (1, 0)),
+        ((2, 6), "zfiw", (2, 0)),
+        ((1, 2), "zf}", (1, 2)),
+    ] {
+        edit_probe(&rpc, &text, at, keys).await;
+        assert_eq!(cursor(&rpc).await, want, "{keys:?} from {at:?}");
+        command(&rpc, "normal! zE").await;
+    }
+}
+
+#[tokio::test]
+async fn x_upper_counts_characters_not_bytes() {
+    let (rpc, _incoming) = start(None).await;
+    assert_eq!(edit_probe(&rpc, &["aé b"], (1, 3), "2X").await, vec![" b"]);
+    edit_probe(&rpc, &["aé b"], (1, 3), "X").await;
+    assert_eq!(cursor(&rpc).await, (1, 1));
+}
+
+#[tokio::test]
+async fn s_on_the_last_char_inserts_where_the_char_was() {
+    let (rpc, _incoming) = start(None).await;
+    assert_eq!(
+        edit_probe(&rpc, &["abc", "x"], (1, 0), "$s=<Esc>").await,
+        vec!["ab=", "x"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &["abc", "x"], (1, 1), "5s=<Esc>").await,
+        vec!["a=", "x"]
+    );
+}
+
+#[tokio::test]
+async fn cw_on_the_last_char_of_a_word_changes_only_that_char() {
+    let (rpc, _incoming) = start(None).await;
+    // vim's `cw` is `ce` that stops at the end of the word it starts on.
+    assert_eq!(
+        edit_probe(&rpc, &["foo bar"], (1, 2), "cwX<Esc>").await,
+        vec!["foX bar"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &["ab !", "next"], (1, 3), "cWX<Esc>").await,
+        vec!["ab X", "next"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &["café", "naïve"], (1, 3), "cwX<Esc>").await,
+        vec!["cafX", "naïve"]
+    );
+    // A count still reaches the end of the next word.
+    assert_eq!(
+        edit_probe(&rpc, &["foo bar baz"], (1, 2), "c2wX<Esc>").await,
+        vec!["foX baz"]
+    );
 }
 
 #[tokio::test]
@@ -1611,4 +1812,577 @@ async fn insert_home_and_end_act_on_the_current_line() {
     assert_eq!(lines(&rpc).await, vec!["one", "?two!", "three"]);
     assert_eq!(cursor(&rpc).await, (2, 1));
     feed(&rpc, "<Esc>");
+}
+
+#[tokio::test]
+async fn replace_mode_backspace_restores_the_overtyped_text() {
+    // `R` overtypes; `<BS>` must give the original characters back (vim's replace
+    // stack), not delete them. Multibyte replacements restore their ASCII originals
+    // and characters appended past the end are simply removed.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iabc<Esc>0Rxyz<BS><BS><Esc>");
+    assert_eq!(lines(&rpc).await, vec!["xbc"]);
+    feed(&rpc, "ccabc<Esc>0R中文xyz<BS><BS><BS><BS><Esc>");
+    assert_eq!(lines(&rpc).await, vec!["中bc"]);
+    // Backspacing past where the Replace began only moves the cursor.
+    feed(&rpc, "ccabc<Esc>$Rx<BS><BS>y<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["ayc"]);
+}
+
+#[tokio::test]
+async fn insert_ctrl_w_and_ctrl_u_delete_instead_of_typing_a_letter() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iab cd  <C-w>X<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["ab X"]);
+    feed(&rpc, "ccfoo.bar<C-w><C-w>Y<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["fooY"]);
+    feed(&rpc, "ccab cd<C-u>Z<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["Z"]);
+    // An unbound Ctrl chord inserts nothing.
+    feed(&rpc, "ccq<C-b>r<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["qr"]);
+}
+
+#[tokio::test]
+async fn ctrl_h_j_m_i_are_backspace_enter_and_tab_in_insert_replace_and_cmdline() {
+    let (rpc, _incoming) = start(None).await;
+    // Insert: `i_CTRL-H` rubs out, `i_CTRL-J` / `i_CTRL-M` break the line,
+    // `i_CTRL-I` types a tab.
+    assert_eq!(
+        edit_probe(&rpc, &["ab"], (1, 1), "ixy<C-h>z<Esc>").await,
+        vec!["axzb"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &["ab"], (1, 1), "i<C-j>c<C-m>d<Esc>").await,
+        vec!["a", "c", "db"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &["ab"], (1, 1), "i<C-i><Esc>").await,
+        vec!["a\tb"]
+    );
+    // Replace: `<C-h>` is Replace mode's `<BS>`, restoring what was overtyped.
+    assert_eq!(
+        edit_probe(&rpc, &["abcd"], (1, 0), "Rxy<C-h><Esc>").await,
+        vec!["xbcd"]
+    );
+    // Command line: `c_CTRL-H` deletes, `c_CTRL-J` / `c_CTRL-M` execute.
+    assert_eq!(
+        edit_probe(&rpc, &["x"], (1, 0), ":s/x/yz<C-h>Q<C-m>").await,
+        vec!["yQ"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &["x"], (1, 0), ":s/x/w<C-j>").await,
+        vec!["w"]
+    );
+    // A user's own mapping on the chord still wins.
+    exec_lua(&rpc, "btv.keymap.set('i', '<C-h>', 'MAPPED')").await;
+    assert_eq!(
+        edit_probe(&rpc, &["ab"], (1, 1), "i<C-h><Esc>").await,
+        vec!["aMAPPEDb"]
+    );
+}
+
+#[tokio::test]
+async fn visual_change_on_the_last_empty_line_keeps_the_cursor_in_the_buffer() {
+    // `vc` on a trailing empty line deletes its line break, so the line is gone:
+    // the Insert cursor must land on the new last line, not on the phantom line
+    // past the end, where the typed `X` vanished.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello<CR><CR><Esc>vcX<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["hello", "X"]);
+    assert_eq!(cursor(&rpc).await, (2, 0));
+}
+
+#[tokio::test]
+async fn ctrl_o_restarts_the_insert_where_its_command_left_the_cursor() {
+    // vim re-enters Insert after an `i_CTRL-O` command as a fresh insert at the
+    // cursor, so `<C-u>` stops there. The stale start (byte 5, from `A`) used to
+    // fall inside the second `中` typed after `<C-o>0` — the server panicked.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iab\u{4e2d}<Esc>A<C-o>0\u{4e2d}\u{4e2d}<C-u>X<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["Xab\u{4e2d}"]);
+}
+
+#[tokio::test]
+async fn replace_backspace_past_the_start_then_ctrl_u_survives_multibyte() {
+    // `R` on `_`, `<BS>` back over the 2-byte `é` (only moves: it is before the
+    // session's start), then overtype with a decomposed `e` + U+0301: the start of
+    // the session must follow the cursor back, or `<C-u>` slices the line at the
+    // stale byte 2 — inside the combining mark — and the server panics.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "i\u{e9}_<Esc>R<BS>e\u{301}<C-u>X<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["X"]);
+}
+
+#[tokio::test]
+async fn huge_counts_neither_hang_nor_crash_the_server() {
+    // Each motion stops at the buffer boundary instead of spinning through the
+    // whole count, and a count past `u64::MAX` saturates instead of overflowing.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iabc def<CR>ghi<Esc>gg0");
+    for keys in [
+        "99999999999l",
+        "99999999999w",
+        "gg99999999999e",
+        "99999999999b",
+        "99999999999W",
+        "gg99999999999E",
+        "99999999999B",
+        "99999999999h",
+        "99999999999d99999999999l",
+        "u",
+    ] {
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            feed_sync(&rpc, keys).await;
+        })
+        .await;
+        assert!(r.is_ok(), "`{keys}` must finish promptly");
+    }
+    assert_eq!(cursor(&rpc).await.0, 1, "the server is still responsive");
+}
+
+#[tokio::test]
+async fn helix_count_past_u64_saturates_instead_of_crashing() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ia<CR>b<CR>c<Esc>gg0:helix<CR>");
+    feed_sync(&rpc, "99999999999999999999999999j").await;
+    assert_eq!(
+        cursor(&rpc).await.0,
+        3,
+        "an overflowing count clamps to the last line"
+    );
+}
+
+#[tokio::test]
+async fn paste_with_an_oversized_count_fails_loud_instead_of_aborting() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "iab<Esc>0yl");
+    let msg = message_after(&rpc, &mut incoming, "99999999999P").await;
+    assert!(msg.contains("E1240"), "got {msg:?}");
+    assert_eq!(lines(&rpc).await, vec!["ab"], "nothing was pasted");
+    feed(&rpc, "3P");
+    assert_eq!(lines(&rpc).await, vec!["aaaab"]);
+}
+
+#[tokio::test]
+async fn a_single_put_of_a_register_larger_than_the_count_cap_still_lands() {
+    let (rpc, _incoming) = start(None).await;
+    // 65 MiB of text — more than the cap on a counted put, which guards the
+    // multiplication, not the size of a register that already exists.
+    exec_lua(
+        &rpc,
+        "btv.reg.set('a', string.rep(string.rep('x', 1023) .. '\\n', 65 * 1024))",
+    )
+    .await;
+    feed(&rpc, "\"aP");
+    assert_eq!(
+        exec_lua(&rpc, "return btv.buf.line_count(0)").await,
+        Value::from(65 * 1024 + 1)
+    );
+}
+
+/// A count typed with more digits than fit a machine word saturates instead of
+/// overflowing the `count * 10 + digit` accumulation — a
+/// debug-build panic that took the server down.
+#[tokio::test]
+async fn an_absurdly_long_count_saturates_instead_of_overflowing() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "iabc<CR>def<Esc>gg0");
+    feed(&rpc, "99999999999999999999999x");
+    assert_eq!(lines(&rpc).await, vec!["", "def"]);
+    feed(&rpc, "d99999999999999999999999j");
+    assert_eq!(lines(&rpc).await, vec![""]);
+}
+
+/// `S` is vim's synonym for `cc`: change whole line(s), keeping the indent
+/// rules of `cc`. It used to be unbound, so `SX<Esc>` ran `X` in Normal mode.
+#[tokio::test]
+async fn capital_s_changes_whole_lines_like_cc() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "iaaa<CR>bbb<CR>ccc<Esc>gg");
+    feed(&rpc, "SX<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["X", "bbb", "ccc"]);
+    feed(&rpc, "j2SY<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["X", "Y"]);
+}
+
+/// `{count}go` goes to byte `{count}` of the buffer (1-based, newlines counted;
+/// a bare `go` is byte 1). It used to fall through to `o` and open a line.
+#[tokio::test]
+async fn count_go_jumps_to_a_byte_offset() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "iabc<CR>def<CR>ghi<Esc>");
+    feed(&rpc, "6go");
+    assert_eq!(lines(&rpc).await, vec!["abc", "def", "ghi"]);
+    assert_eq!(cursor(&rpc).await, (2, 1));
+    feed(&rpc, "go");
+    assert_eq!(cursor(&rpc).await, (1, 0));
+    feed(&rpc, "999go");
+    assert_eq!(cursor(&rpc).await, (3, 2));
+}
+
+/// A `g`-prefixed key bemtvi does not implement is a dead end, never the
+/// un-prefixed command: `gX` must not run `X`, nor `gD` run `D`.
+#[tokio::test]
+async fn an_unimplemented_g_command_does_not_fall_through_to_its_suffix() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "iabc<CR>def<Esc>gg");
+    feed(&rpc, "gX");
+    assert_eq!(lines(&rpc).await, vec!["abc", "def"]);
+    feed(&rpc, "gD");
+    assert_eq!(lines(&rpc).await, vec!["abc", "def"]);
+}
+
+/// The escaped-trailing-space rule (`:set fillchars=eob:\ `) keeps the one
+/// whitespace char after an odd backslash run. It kept one *byte*: a multibyte
+/// whitespace char there (U+3000, an IME's full-width space) was sliced through
+/// the middle — a char-boundary panic on a typed command line.
+#[tokio::test]
+async fn an_escaped_multibyte_trailing_space_does_not_split_a_char() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "iabc<Esc>");
+    feed(&rpc, ":echo 'x'\\\u{3000}<CR>");
+    assert_eq!(lines(&rpc).await, vec!["abc"]);
+}
+
+#[tokio::test]
+async fn an_insert_count_lands_the_typed_text_count_times() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "3ix<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["xxx"]);
+    feed(&rpc, "2Ayz<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["xxxyzyz"]);
+    // Replace overtypes each copy.
+    feed(&rpc, "03Rab<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["abababz"]);
+    // One undo takes the whole counted change back; `.` repeats it with its count.
+    feed(&rpc, "u");
+    assert_eq!(lines(&rpc).await, vec!["xxxyzyz"]);
+    feed(&rpc, "ccq<Esc>03iw<Esc>.");
+    assert_eq!(lines(&rpc).await, vec!["wwwwwwq"]);
+    feed(&rpc, "cc<Esc>2ia<CR>b<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["a", "ba", "b"]);
+    // A count too big to build is refused loudly rather than freezing the editor.
+    feed(&rpc, "ggcc<Esc>99999999ix<Esc>");
+    assert_eq!(lines(&rpc).await[0], "x");
+}
+
+// ----- vim ground truth (nvim --clean): joins, counted D/C, Y ----------------
+
+#[tokio::test]
+async fn join_adds_no_space_after_a_blank_before_a_paren_or_around_an_empty_line() {
+    let (rpc, _incoming) = start(None).await;
+    assert_eq!(
+        edit_probe(&rpc, &["foo  ", "   bar"], (1, 0), "J").await,
+        vec!["foo  bar"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &["foo", ")bar"], (1, 0), "J").await,
+        vec!["foo)bar"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &["foo", ""], (1, 0), "J").await,
+        vec!["foo"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &["", "foo"], (1, 0), "J").await,
+        vec!["foo"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &["a", "  b  ", "c)", "", "d"], (1, 0), "5J").await,
+        vec!["a b  c) d"]
+    );
+    // The blank that suppresses the space is the end of the line being joined,
+    // not of the text joined so far: past an empty line the space comes back.
+    assert_eq!(
+        edit_probe(&rpc, &["baz  ", "", "  (paren"], (1, 0), "3J").await,
+        vec!["baz   (paren"]
+    );
+    // A line ending in a multi-byte character does not end in a blank.
+    assert_eq!(
+        edit_probe(&rpc, &["café", "naïve"], (1, 0), "J").await,
+        vec!["café naïve"]
+    );
+}
+
+#[tokio::test]
+async fn gj_joins_lines_verbatim_and_visual_j_joins_the_selection() {
+    let (rpc, _incoming) = start(None).await;
+    let text = ["a", "  b  ", "c)", "", "d", "e"];
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 0), "gJ").await,
+        vec!["a  b  ", "c)", "", "d", "e"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 0), "3gJ").await,
+        vec!["a  b  c)", "", "d", "e"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 0), "vjjJ").await,
+        vec!["a b  c)", "", "d", "e"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (3, 0), "VGJ").await,
+        vec!["a", "  b  ", "c) d e"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (5, 0), "vgJ").await,
+        vec!["a", "  b  ", "c)", "", "de"]
+    );
+    // On the last line there is nothing to join: the cursor stays put.
+    edit_probe(&rpc, &["one", "last line"], (2, 5), "vJ").await;
+    assert_eq!(cursor(&rpc).await, (2, 5));
+}
+
+#[tokio::test]
+async fn change_to_eol_mid_line_inserts_where_the_text_was_cut() {
+    let (rpc, _incoming) = start(None).await;
+    assert_eq!(
+        edit_probe(&rpc, &["alpha beta"], (1, 5), "CQ<Esc>").await,
+        vec!["alphaQ"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &["  indented line"], (1, 2), "CQ<Esc>").await,
+        vec!["  Q"]
+    );
+}
+
+#[tokio::test]
+async fn counted_d_and_c_run_to_the_end_of_a_later_line() {
+    let (rpc, _incoming) = start(None).await;
+    let text = ["alpha beta", "gamma delta", "eps zeta", "eta"];
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 6), "2D").await,
+        vec!["alpha ", "eps zeta", "eta"]
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv.reg.get('1')").await,
+        Value::from("beta\ngamma delta")
+    );
+    assert_eq!(edit_probe(&rpc, &text, (1, 6), "9D").await, vec!["alpha "]);
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 6), "2CX<Esc>").await,
+        vec!["alpha X", "eps zeta", "eta"]
+    );
+    // From the indent, a `D` over several lines takes them whole (vim's
+    // `op_delete` rule for `d$`), leaving no empty line behind.
+    assert_eq!(
+        edit_probe(&rpc, &text, (2, 0), "2D").await,
+        vec!["alpha beta", "eta"]
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv.reg.gettype('1')").await,
+        Value::from("V")
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (3, 0), "9D").await,
+        vec!["alpha beta", "gamma delta"]
+    );
+    // A single line, or `C`, stays charwise.
+    assert_eq!(
+        edit_probe(&rpc, &text, (2, 0), "D").await,
+        vec!["alpha beta", "", "eps zeta", "eta"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (2, 0), "2CX<Esc>").await,
+        vec!["alpha beta", "X", "eta"]
+    );
+}
+
+#[tokio::test]
+async fn y_yanks_to_the_end_of_the_line() {
+    let (rpc, _incoming) = start(None).await;
+    let text = ["alpha beta", "gamma delta"];
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 6), "Yp").await,
+        vec!["alpha bbetaeta", "gamma delta"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 6), "2Y").await,
+        vec!["alpha beta", "gamma delta"]
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv.reg.get('0')").await,
+        Value::from("beta\ngamma delta")
+    );
+}
+
+#[tokio::test]
+async fn an_operator_over_w_stops_at_the_end_of_the_line() {
+    let (rpc, _incoming) = start(None).await;
+    let text = ["alpha beta", "gamma delta", "  eps zeta", "eta"];
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 6), "dw").await,
+        vec!["alpha ", "gamma delta", "  eps zeta", "eta"]
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv.reg.get('-')").await,
+        Value::from("beta")
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 6), "d3w").await,
+        vec!["alpha ", "  eps zeta", "eta"]
+    );
+    edit_probe(&rpc, &text, (1, 6), "yw").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.reg.get('0')").await,
+        Value::from("beta")
+    );
+    // Starting in the indent, a multi-line `w` delete turns linewise.
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 0), "d4w").await,
+        vec!["  eps zeta", "eta"]
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv.reg.gettype('1')").await,
+        Value::from("V")
+    );
+}
+
+#[tokio::test]
+async fn ctrl_w_and_ctrl_u_stop_once_at_the_start_of_the_insert() {
+    let (rpc, _incoming) = start(None).await;
+    let text = ["  alpha beta", "gamma"];
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 4), "Afoo bar<C-u>Q<Esc>").await,
+        vec!["  alpha betaQ", "gamma"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 4), "Afoo bar<C-u><C-u>Q<Esc>").await,
+        vec!["Q", "gamma"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 4), "A x<C-w>y<Esc>").await,
+        vec!["  alpha beta y", "gamma"]
+    );
+}
+
+#[tokio::test]
+async fn a_counted_o_opens_that_many_lines() {
+    let (rpc, _incoming) = start(None).await;
+    let text = ["  alpha beta", "gamma"];
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 4), "3oab<Esc>").await,
+        vec!["  alpha beta", "ab", "ab", "ab", "gamma"]
+    );
+    assert_eq!(cursor(&rpc).await, (4, 1));
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 4), "2Oab<Esc>").await,
+        vec!["ab", "ab", "  alpha beta", "gamma"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 4), "3o<Esc>").await,
+        vec!["  alpha beta", "", "", "", "gamma"]
+    );
+}
+
+#[tokio::test]
+async fn a_cursor_key_cancels_the_insert_count() {
+    let (rpc, _incoming) = start(None).await;
+    assert_eq!(
+        edit_probe(&rpc, &["  alpha beta"], (1, 4), "3ia<Left>b<Esc>").await,
+        vec!["  albapha beta"]
+    );
+}
+
+#[tokio::test]
+async fn enter_without_autoindent_keeps_the_split_texts_leading_blanks() {
+    let (rpc, _incoming) = start(None).await;
+    assert_eq!(
+        edit_probe(&rpc, &["foo   bar"], (1, 3), "i<CR>x<Esc>").await,
+        vec!["foo", "x   bar"]
+    );
+    // Replace mode's `<BS>` over the break then restores the line exactly.
+    assert_eq!(
+        edit_probe(
+            &rpc,
+            &["héllo wörld"],
+            (1, 3),
+            "Rxyz<CR>ab<BS><BS><BS><BS>q<Esc>"
+        )
+        .await,
+        vec!["héxyq wörld"]
+    );
+}
+
+/// Blockwise visual is not implemented: `<C-v>` from Visual (and an unmapped one
+/// from Normal) must say so rather than silently do nothing.
+#[tokio::test]
+async fn blockwise_visual_fails_loud() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ione two<Esc>0");
+    let msg = message_after(&rpc, &mut incoming, "v<C-v>").await;
+    assert!(
+        msg.contains("blockwise visual (<C-v>) is not implemented"),
+        "message: {msg:?}"
+    );
+    // The charwise selection it could not turn blockwise is still up.
+    assert_eq!(mode(&rpc).await, "v");
+    feed(&rpc, "<Esc>");
+    exec_lua(&rpc, "btv.keymap.del('n', '<C-v>')").await;
+    let msg = message_after(&rpc, &mut incoming, "<C-v>").await;
+    assert!(
+        msg.contains("blockwise visual (<C-v>) is not implemented"),
+        "message: {msg:?}"
+    );
+}
+
+/// Forcing a motion's type (`dvj`, `dVw`) is not implemented: the operator must
+/// fail loud instead of being dropped while the motion runs as a bare move.
+#[tokio::test]
+async fn forced_motion_fails_loud() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ione two<CR>three<Esc>gg0");
+    let msg = message_after(&rpc, &mut incoming, "dv").await;
+    assert!(
+        msg.contains("o_v / o_V / o_CTRL-V) is not implemented"),
+        "message: {msg:?}"
+    );
+    let msg = message_after(&rpc, &mut incoming, "dV").await;
+    assert!(msg.contains("is not implemented"), "message: {msg:?}");
+    assert_eq!(lines(&rpc).await, vec!["one two", "three"]);
+}
+
+/// The sentence, paragraph and bracket motions — `(` `)` `{` `}` `%` — move the
+/// cursor where vim's do (expected values from `nvim --headless --clean`;
+/// positions are 1-based line, 0-based column).
+#[tokio::test]
+async fn sentence_paragraph_and_bracket_motions_move_like_vim() {
+    let (rpc, _incoming) = start(None).await;
+    let text = [
+        "  Hello there. This is (a test!) of it.",
+        "Second line? yes",
+        "",
+        "",
+        "Para (two",
+        "spans) lines.  End.",
+        "last",
+    ];
+    for (at, keys, want) in [
+        ((1, 0), ")", (1, 15)),
+        ((1, 15), ")", (1, 33)),
+        ((1, 33), ")", (2, 0)),
+        ((1, 33), "2)", (2, 13)),
+        ((2, 0), "(", (1, 33)),
+        ((2, 0), "2(", (1, 15)),
+        ((6, 15), "(", (5, 0)),
+        ((1, 3), "}", (3, 0)),
+        ((1, 3), "2}", (7, 3)),
+        ((5, 3), "}", (7, 3)),
+        ((6, 7), "{", (4, 0)),
+        ((1, 14), "%", (1, 31)),
+        ((5, 3), "%", (6, 5)),
+        ((6, 2), "%", (5, 5)),
+    ] {
+        edit_probe(&rpc, &text, at, keys).await;
+        assert_eq!(cursor(&rpc).await, want, "{keys:?} from {at:?}");
+    }
+    // A `(` count the buffer's start cannot satisfy fails without moving, and an
+    // operator over it does nothing (vim's `findsent` "didn't actually move").
+    let top = ["", "  Alpha beta. Gamma!", "delta."];
+    edit_probe(&rpc, &top, (2, 2), "3(").await;
+    assert_eq!(cursor(&rpc).await, (2, 2));
+    assert_eq!(edit_probe(&rpc, &top, (2, 2), "d3(").await, top.to_vec());
+    edit_probe(&rpc, &top, (2, 2), "2(").await;
+    assert_eq!(cursor(&rpc).await, (1, 0));
 }

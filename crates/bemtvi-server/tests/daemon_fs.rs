@@ -123,3 +123,88 @@ async fn image_preview_is_remote_and_bytes_fetch_over_the_wire() {
         "bemtvi_image_read returns the bytes the daemon served over the wire"
     );
 }
+
+/// A file reader that yields `remaining` zero bytes, counting what it hands out.
+struct CountingZeros {
+    remaining: usize,
+    served: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::io::Read for CountingZeros {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = buf.len().min(self.remaining);
+        buf[..n].fill(0);
+        self.remaining -= n;
+        self.served
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+/// A daemon fs holding one huge regular file.
+struct HugeFileFs {
+    size: usize,
+    served: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl bemtvi_core::HostFs for HugeFileFs {
+    fn exists(&self, _: &std::path::Path) -> bool {
+        true
+    }
+    fn open_read(&self, _: &std::path::Path) -> std::io::Result<Box<dyn std::io::Read>> {
+        Ok(Box::new(CountingZeros {
+            remaining: self.size,
+            served: self.served.clone(),
+        }))
+    }
+    fn stat(&self, _: &std::path::Path) -> Option<bemtvi_core::FileStat> {
+        Some(bemtvi_core::FileStat {
+            mtime: None,
+            size: self.size as u64,
+        })
+    }
+    fn write_atomic(&self, _: &std::path::Path, _: &[u8]) -> std::io::Result<()> {
+        Err(std::io::Error::other("read-only"))
+    }
+    fn read_dir(&self, _: &std::path::Path) -> std::io::Result<Vec<bemtvi_core::DirEntry>> {
+        Err(std::io::Error::other("not a directory"))
+    }
+    fn canonicalize(&self, p: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+        Ok(p.to_path_buf())
+    }
+}
+
+/// A file too large for one wire frame can never be opened remotely, so the daemon must
+/// refuse it without first reading the whole thing into memory — one `:e` of a
+/// multi-gigabyte log would otherwise make the daemon (which serves every session)
+/// allocate all of it just to throw it away.
+#[tokio::test]
+async fn an_oversized_remote_file_is_refused_without_reading_it_whole() {
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let size = 160 * 1024 * 1024;
+    let fs = HugeFileFs {
+        size,
+        served: served.clone(),
+    };
+    let (client_end, daemon_end) = tokio::io::duplex(1 << 16);
+    let (dr, dw) = tokio::io::split(daemon_end);
+    tokio::spawn(async move {
+        let _ = bemtvi_server::serve_fs_daemon(dr, dw, Box::new(fs)).await;
+    });
+    let (cr, cw) = tokio::io::split(client_end);
+    let (rpc, _incoming) = bemtvi_rpc::connect(cr, cw);
+
+    let reply = rpc
+        .request("fs_read", vec![Value::from("/virtual/huge.log")])
+        .await;
+    let err = reply.expect_err("an oversized file must be refused");
+    assert!(
+        err.to_string().contains("too large"),
+        "the refusal must say why: {err}"
+    );
+    let read = served.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        read <= 65 * 1024 * 1024,
+        "the daemon read {read} bytes of a file it was always going to refuse"
+    );
+}

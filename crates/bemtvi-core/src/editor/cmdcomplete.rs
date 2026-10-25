@@ -196,7 +196,7 @@ impl Editor {
             .chain(std::iter::once(self.cmdline.len()))
             .collect();
         let at = |c: usize| bounds.get(c).copied().unwrap_or(self.cmdline.len());
-        (at(start_char), at(start_char + len_char))
+        (at(start_char), at(start_char.saturating_add(len_char)))
     }
 
     /// Re-run the trigger when a cmdline menu is already open (a content edit

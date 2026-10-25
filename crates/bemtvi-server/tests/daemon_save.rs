@@ -538,3 +538,69 @@ async fn an_empty_remote_file_stays_empty_across_a_write() {
     feed(&rpc, ":w<CR>");
     await_daemon_content(&fake, "/virtual/empty.txt", "").await;
 }
+
+/// A `:wqa` whose write for a buffer is *queued* behind an earlier in-flight `:w` must
+/// still cancel loudly when that earlier write fails: the failure abandons the queued
+/// write, and the batch quit gate waiting on it is dropped (not left waiting forever).
+#[tokio::test]
+async fn wqa_queued_behind_a_failing_write_cancels_the_quit() {
+    let fake = DaemonFs::with("/virtual/g.txt", "data\n");
+    fake.fail_writes(true);
+    let (rpc, mut incoming) = spawn_with_daemon_fs(fake.clone(), "/virtual/g.txt").await;
+    await_lines(&rpc, &["data"]).await;
+
+    feed(&rpc, "ggIx<Esc>:w<CR>:wqa<CR>");
+    await_message_containing(&mut incoming, ":wqa aborted").await;
+    assert!(
+        modified(&rpc).await,
+        "the failed batch leaves the buffer modified"
+    );
+}
+
+/// The fs daemon runs the blocking [`HostFs`](bemtvi_core::HostFs) calls off its async
+/// task: a write that is slow to land (parked here on [`DaemonFs::hold_writes`]) must not
+/// park the runtime the daemon task runs on. The daemon task lives on this test's
+/// *current-thread* runtime, so a write done inline would wedge every other task on it —
+/// the client RPC included — until the write returned. A watchdog thread releases the
+/// hold after a bound either way, so a stall fails the assertion instead of hanging.
+#[tokio::test]
+async fn a_slow_daemon_write_does_not_stall_the_daemon_runtime() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let fake = DaemonFs::with("/virtual/note.txt", "one\n");
+    let (rpc, _incoming) = spawn_with_daemon_fs(fake.clone(), "/virtual/note.txt").await;
+    await_lines(&rpc, &["one"]).await;
+    feed(&rpc, "ggcctwo<Esc>");
+    assert_eq!(await_lines(&rpc, &["two"]).await, vec!["two"]);
+
+    let hold = fake.hold_writes();
+    let released = Arc::new(AtomicBool::new(false));
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let watchdog = {
+        let released = released.clone();
+        std::thread::spawn(move || {
+            let _ = done_rx.recv_timeout(Duration::from_secs(3));
+            released.store(true, Ordering::SeqCst);
+            hold.release();
+        })
+    };
+
+    feed(&rpc, ":w<CR>");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(buf_lines(&rpc, 0).await, vec!["two"]);
+    assert!(
+        !released.load(Ordering::SeqCst),
+        "the editor answered only after the parked daemon write was released — the \
+         write ran inline on the daemon's async task and stalled its runtime"
+    );
+    assert_eq!(
+        fake.content("/virtual/note.txt").as_deref(),
+        Some("one\n"),
+        "the write is still parked (the hold genuinely held it)"
+    );
+
+    let _ = done_tx.send(());
+    watchdog.join().unwrap();
+    await_daemon_content(&fake, "/virtual/note.txt", "two\n").await;
+}

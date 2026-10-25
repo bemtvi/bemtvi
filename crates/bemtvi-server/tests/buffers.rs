@@ -650,6 +650,22 @@ async fn buffer_command_switches_by_number_and_name() {
     std::fs::remove_file(&c).ok();
 }
 
+/// A huge `:bnext` count wraps like any other count instead of overflowing the
+/// index arithmetic (a debug-build panic that took the server down).
+#[tokio::test]
+async fn bnext_with_a_huge_count_wraps_without_overflowing() {
+    let a = temp_file("bnhuge_a", "a\n");
+    let b = temp_file("bnhuge_b", "b\n");
+    let (rpc, _incoming) = start().await;
+    command(&rpc, &format!("e {}", name(&a))).await;
+    command(&rpc, &format!("e {}", name(&b))).await;
+    // usize::MAX is odd: from the 2nd of two buffers it lands on the 1st.
+    command(&rpc, "bnext 18446744073709551615").await;
+    assert_eq!(lines(&rpc).await, vec!["a"]);
+    std::fs::remove_file(&a).ok();
+    std::fs::remove_file(&b).ok();
+}
+
 #[tokio::test]
 async fn bnext_and_bprev_wrap_around() {
     let a = temp_file("a", "a\n");

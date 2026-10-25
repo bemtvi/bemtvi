@@ -252,8 +252,8 @@ pub enum LoopEvent {
         id: u64,
         result: Result<HttpResponse, HttpError>,
     },
-    /// An [`LoopCommand::HttpMount`] settled: `Ok(origin)` (the bound origin, e.g.
-    /// `"http://127.0.0.1:53124"`) resolves the mount promise, `Err(message)` rejects it (a
+    /// An [`LoopCommand::HttpMount`] settled: `Ok(base)` (the bound origin plus the session
+    /// token segment, e.g. `"http://127.0.0.1:53124/<token>"`) resolves the mount promise, `Err(message)` rejects it (a
     /// taken port, a duplicate name). Carrying the origin is what makes `'httpport' = 0`
     /// usable — the concrete port only exists after the bind.
     HttpMountResult {
@@ -270,7 +270,7 @@ pub enum LoopEvent {
     },
     /// The listener moved to a new origin after an `'httphost'`/`'httpport'` write. Every
     /// mount stayed live; only the origin changed, so the Lua side updates the one place
-    /// `Mount:origin()` reads.
+    /// `Mount:origin()` reads. `origin` is the new base URL (origin + session token).
     ///
     /// Echoes back the `host`/`port` it bound with, rather than leaving the editor to assume
     /// the current option values are the ones that landed: two rebinds can be in flight at

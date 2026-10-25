@@ -5,6 +5,9 @@
 
 use crate::encoding::Encoding;
 
+/// The largest `'scrollback'` (neovim's `SB_MAX`).
+pub const SCROLLBACK_MAX: usize = 1_000_000;
+
 /// Global editor options that affect editing and search. Window-local rendering
 /// options (the number gutter) live on [`WindowOptions`]; per-buffer ones on
 /// [`BufferOptions`].
@@ -225,8 +228,8 @@ pub struct Options {
     /// (equivalent to `noscrollanim`). Default `160`.
     pub scrollanimduration: usize,
     /// The maximum number of scrolled-off lines a `:terminal` keeps in scrollback
-    /// (neovim's `'scrollback'`; default `10000`). `0` keeps none. Read when a
-    /// terminal opens; changing it affects terminals opened afterward.
+    /// (neovim's `'scrollback'`; default `10000`, at most [`SCROLLBACK_MAX`]). `0` keeps
+    /// none. Read when a terminal opens; changing it affects terminals opened afterward.
     pub scrollback: usize,
     /// The maximum number of entries kept in each history ring — the `:` ex history,
     /// the `/` search history, and each `btv.ui.input` namespace ring (neovim's
@@ -330,6 +333,29 @@ pub enum OptionScalar {
     Str(String),
 }
 
+/// The integer a string written to a numeric option from Lua stands for, or `None` when
+/// it spells none or `name` isn't a numeric option. A config ported from neovim writes some numeric options as strings —
+/// `'foldcolumn'` is a string option there, taking `"auto"` / `"auto:N"` as well as a
+/// digit — so the bridge coerces rather than refusing: an integer string is its value,
+/// and for `foldcolumn` `"auto:N"` is `N` columns and `"auto"` is `1` (bemtvi's fold
+/// column is a fixed width, so neovim's "up to N" becomes N).
+pub fn coerce_num_option_str(name: &str, value: &str) -> Option<i64> {
+    if !matches!(canonical(name), Some((_, OptKind::Num))) {
+        return None;
+    }
+    let v = value.trim();
+    if let Ok(n) = v.parse::<i64>() {
+        return Some(n);
+    }
+    if name == "foldcolumn" {
+        if v == "auto" {
+            return Some(1);
+        }
+        return v.strip_prefix("auto:")?.parse::<i64>().ok();
+    }
+    None
+}
+
 /// The per-workspace **option overlay**: a sparse map of canonical global-option name →
 /// the workspace's overriding value. It sits *above* the process-global values
 /// ([`crate::Editor`]'s `global_base`): the effective [`Options`] every read sees is
@@ -384,7 +410,9 @@ impl Options {
             ("scrollanimduration", Num(n)) => {
                 self.scrollanimduration = (*n).clamp(0, i64::MAX) as usize
             }
-            ("scrollback", Num(n)) => self.scrollback = (*n).clamp(0, i64::MAX) as usize,
+            ("scrollback", Num(n)) => {
+                self.scrollback = (*n).clamp(0, SCROLLBACK_MAX as i64) as usize
+            }
             ("httpport", Num(n)) => self.httpport = (*n).clamp(0, u16::MAX as i64) as u16,
             ("guiopacity", Num(n)) => self.guiopacity = (*n).clamp(0, 100) as u8,
             ("guihlopacity", Num(n)) => self.guihlopacity = (*n).clamp(0, 100) as u8,

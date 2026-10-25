@@ -149,29 +149,38 @@ local function reconcile()
   local min_chars = all_min or cfg.top_min or 1
 
   -- (Re)publish the active async sources for `btv._complete_run`. A live reconcile (a
-  -- late `source{}`) preserves the in-flight lazy-docs / on_accept bookkeeping and the
-  -- current generation so an open popup mid-resolve isn't torn down; a first setup
-  -- starts them fresh (`prev` is nil).
+  -- late `source{}`) keeps the same table — its in-flight run, lazy-docs / on_accept
+  -- bookkeeping and generation — so an open popup mid-resolve isn't torn down; a first
+  -- setup starts fresh (`prev` is nil).
   local prev = btv._complete
-  btv._complete = {
-    sources = async,
-    gen = prev and prev.gen or 0,
-    debounce = btv.complete.debounce,
-    -- The global trigger-char set: in a trigger context a *plain* source (no
-    -- `trigger`) stays quiet, so it doesn't compete with the trigger-char source.
-    triggers = trigger_set,
-    -- Lazy-docs (`resolve`) bookkeeping: a monotonic id stamped onto each resolvable
-    -- pushed row and a map id → { resolve, item } the server's
-    -- `btv._complete_resolve(id)` looks the callback + original item up in.
-    resolve_next = prev and prev.resolve_next or 0,
-    resolve_items = prev and prev.resolve_items or {},
-    -- `on_accept` bookkeeping, shaped like the resolve map: a monotonic id stamped
-    -- onto each pushed row that carries an `on_accept`, and a map id → { on_accept,
-    -- item } the server's `btv._complete_run_accept(id, …)` looks the callback up in
-    -- when that row is accepted (its accept is delegated so core doesn't splice).
-    accept_next = prev and prev.accept_next or 0,
-    accept_items = prev and prev.accept_items or {},
-  }
+  if prev then
+    -- Update the LIVE table in place: every closure of an in-flight run checks
+    -- `btv._complete == c` before pushing, so swapping in a new table would orphan the
+    -- run — its pushes dropped, its finish never sent, its reapers never called.
+    prev.sources = async
+    prev.debounce = btv.complete.debounce
+    prev.triggers = trigger_set
+  else
+    btv._complete = {
+      sources = async,
+      gen = 0,
+      debounce = btv.complete.debounce,
+      -- The global trigger-char set: in a trigger context a *plain* source (no
+      -- `trigger`) stays quiet, so it doesn't compete with the trigger-char source.
+      triggers = trigger_set,
+      -- Lazy-docs (`resolve`) bookkeeping: a monotonic id stamped onto each resolvable
+      -- pushed row and a map id → { resolve, item } the server's
+      -- `btv._complete_resolve(id)` looks the callback + original item up in.
+      resolve_next = 0,
+      resolve_items = {},
+      -- `on_accept` bookkeeping, shaped like the resolve map: a monotonic id stamped
+      -- onto each pushed row that carries an `on_accept`, and a map id → { on_accept,
+      -- item } the server's `btv._complete_run_accept(id, …)` looks the callback up in
+      -- when that row is accepted (its accept is delegated so core doesn't splice).
+      accept_next = 0,
+      accept_items = {},
+    }
+  end
   -- The server-native `lsp` and `snippets` sources both dispatch off the input path,
   -- so either (like a Lua async source) needs the `(gen, ctx)` emit.
   local has_async = #async > 0 or saw_lsp or saw_snippets
@@ -487,10 +496,15 @@ function btv.complete.source(spec)
         2
       )
     end
+    -- Each trigger is ONE character: the engine wakes on a single typed char, so a
+    -- multi-char entry (`"::"`) could never match and would silently never fire.
     for _, c in ipairs(spec.trigger.chars) do
-      if type(c) ~= "string" or #c == 0 then
+      if type(c) ~= "string" or utf8.len(c) ~= 1 then
         error(
-          "btv.complete.source('" .. spec.name .. "'): trigger.chars must be non-empty strings",
+          "btv.complete.source('"
+            .. spec.name
+            .. "'): trigger.chars must be single-character strings, got "
+            .. tostring(c),
           2
         )
       end

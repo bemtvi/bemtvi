@@ -164,6 +164,9 @@ pub struct ProviderCaps {
     pub signature_trigger_chars: Vec<String>,
     pub completion: bool,
     pub document_formatting: bool,
+    /// `textDocument/rangeFormatting` — a separate provider from whole-document
+    /// formatting.
+    pub document_range_formatting: bool,
     pub rename: bool,
     pub code_action: bool,
     pub semantic_tokens: bool,

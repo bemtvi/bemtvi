@@ -416,3 +416,63 @@ async fn poll_lua(rpc: &Rpc, code: &str) -> Option<String> {
     }
     None
 }
+
+/// The split form of `nvim_open_win` with an unknown buffer handle is a loud
+/// "Invalid buffer id" — like the float form and neovim — not a stray split of
+/// the current buffer reported back as a success.
+#[tokio::test]
+async fn open_win_split_with_unknown_buffer_errors_and_opens_nothing() {
+    let (rpc, _incoming) = start().await;
+    for vertical in [false, true] {
+        let config = Value::Map(vec![(Value::from("vertical"), Value::from(vertical))]);
+        let res = rpc
+            .request(
+                "nvim_open_win",
+                vec![Value::from(999u64), Value::from(true), config],
+            )
+            .await;
+        assert!(res.is_err(), "unknown buffer must error, got {res:?}");
+        assert_eq!(win_handles(&rpc).await.len(), 1, "no split was opened");
+    }
+    // Buffer 0 still means "the current buffer" in the split form.
+    let res = rpc
+        .request(
+            "nvim_open_win",
+            vec![Value::from(0u64), Value::from(true), Value::Map(vec![])],
+        )
+        .await;
+    assert!(res.is_ok(), "buffer 0 is the current buffer: {res:?}");
+    assert_eq!(win_handles(&rpc).await.len(), 2);
+}
+
+/// Pointing a window/focus setter at a handle that names nothing is a loud
+/// error (neovim's "Invalid window id" / "Invalid buffer id"), never an `Ok`
+/// that silently did nothing.
+#[tokio::test]
+async fn window_and_buffer_setters_reject_unknown_handles() {
+    let (rpc, _incoming) = start().await;
+    let cur_buf = req(&rpc, "nvim_get_current_buf", vec![]).await;
+    let cases: Vec<(&str, Vec<Value>)> = vec![
+        (
+            "nvim_win_set_buf",
+            vec![Value::from(0u64), Value::from(999u64)],
+        ),
+        (
+            "nvim_win_set_buf",
+            vec![Value::from(999u64), cur_buf.clone()],
+        ),
+        ("nvim_set_current_buf", vec![Value::from(999u64)]),
+        ("nvim_set_current_win", vec![Value::from(999u64)]),
+        ("nvim_set_current_tabpage", vec![Value::from(999u64)]),
+    ];
+    for (method, args) in cases {
+        let res = rpc.request(method, args.clone()).await;
+        assert!(res.is_err(), "{method}{args:?} must error, got {res:?}");
+    }
+    // The valid forms still succeed.
+    let win = req(&rpc, "nvim_get_current_win", vec![]).await;
+    req(&rpc, "nvim_win_set_buf", vec![win.clone(), cur_buf.clone()]).await;
+    req(&rpc, "nvim_set_current_buf", vec![cur_buf]).await;
+    req(&rpc, "nvim_set_current_win", vec![win]).await;
+    req(&rpc, "nvim_set_current_tabpage", vec![Value::from(0u64)]).await;
+}

@@ -653,6 +653,25 @@ fn parse_special(inner: &str) -> Option<Key> {
     })
 }
 
+/// The named key an unmodified Ctrl-chord stands for in Insert, Replace and the
+/// command line, as vim reads them there: `CTRL-H` is `<BS>`, `CTRL-I` `<Tab>`,
+/// `CTRL-J` / `CTRL-M` `<CR>` and `CTRL-[` `<Esc>`. A terminal speaking the kitty
+/// keyboard protocol delivers these apart from their twins so they stay mappable;
+/// one nobody mapped must still act there, not vanish. `None` for any other key.
+pub fn text_mode_ctrl_alias(key: Key) -> Option<Key> {
+    if !key.ctrl || key.alt || key.shift || key.cmd {
+        return None;
+    }
+    let code = match key.code {
+        KeyCode::Char('h') => KeyCode::Backspace,
+        KeyCode::Char('i') => KeyCode::Tab,
+        KeyCode::Char('j' | 'm') => KeyCode::Enter,
+        KeyCode::Char('[') => KeyCode::Esc,
+        _ => return None,
+    };
+    Some(Key::new(code))
+}
+
 /// Fold the four Ctrl-chords that share a byte with a *named* terminal key onto
 /// that named key: `<C-i>` → `<Tab>` (0x09), `<C-m>` → `<CR>` (0x0d), `<C-[>` →
 /// `<Esc>` (0x1b), `<C-h>` → `<BS>` (0x08). Vim canonicalizes these the same way,

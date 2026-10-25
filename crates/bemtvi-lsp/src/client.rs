@@ -865,6 +865,7 @@ pub(crate) fn provider_caps(caps: &ServerCapabilities) -> ProviderCaps {
             .unwrap_or_default(),
         completion: present("completionProvider"),
         document_formatting: present("documentFormattingProvider"),
+        document_range_formatting: present("documentRangeFormattingProvider"),
         rename: present("renameProvider"),
         code_action: present("codeActionProvider"),
         semantic_tokens: present("semanticTokensProvider"),

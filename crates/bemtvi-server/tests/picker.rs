@@ -1092,6 +1092,39 @@ btv.picker.source {
 }
 
 #[tokio::test]
+async fn opening_a_picker_over_an_open_one_reaps_the_old_job() {
+    // `btv.picker.open` while a picker is already up replaces it — and the replaced
+    // picker's in-flight job must be reaped (`ctx.on_cancel`), exactly as closing it
+    // would, instead of streaming on into the void.
+    let dir = temp_dir("picker_replace_reap");
+    let src = r#"
+_G.reaped = 0
+btv.picker.source {
+  name = "slow",
+  items = function(ctx)
+    ctx.on_cancel(function() _G.reaped = _G.reaped + 1 end)
+    return btv.promise.new(function() end) -- never settles on its own
+  end,
+  confirm = function(item) end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    exec_lua(&rpc, "btv.picker.open('slow')").await;
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("first picker opens");
+    exec_lua(&rpc, "btv.picker.open('slow')").await;
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("second picker opens");
+    assert_eq!(
+        exec_lua(&rpc, "return _G.reaped").await.as_i64(),
+        Some(1),
+        "the replaced picker's job was reaped"
+    );
+}
+
+#[tokio::test]
 async fn prompt_carries_the_caret_column_and_it_tracks_edits() {
     // The picker projects the prompt's text-cursor as `query_cursor` (a char count)
     // so the client can draw a caret in the input box. It advances as you type and
@@ -5088,5 +5121,155 @@ async fn command_palette_lists_and_opens_the_titled_pickers() {
         title.as_deref(),
         Some("Vegetables"),
         "confirm opens the named picker"
+    );
+}
+
+/// Collect a built-in source's items with a recording `ctx`, then confirm the first
+/// one matching `pick` (a Lua predicate over the item). Returns once the confirm ran.
+async fn confirm_builtin(rpc: &Rpc, source: &str, pick: &str) {
+    exec_lua(
+        rpc,
+        &format!(
+            "local src = btv.picker._sources[{source:?}]\n\
+             local items = {{}}\n\
+             src.items({{ push = function(it) items[#items + 1] = it end, query = '' }})\n\
+             local pick = {pick}\n\
+             for _, it in ipairs(items) do\n\
+               if pick(it) then src.confirm(it, 'edit', 'main') return end\n\
+             end\n\
+             error('no matching item among ' .. #items)"
+        ),
+    )
+    .await;
+}
+
+/// A jumplist / marks entry in a *different* unnamed buffer has no path to open, but
+/// confirming it must still land in THAT buffer — not move the cursor within the
+/// current one.
+#[tokio::test]
+async fn jumplist_and_marks_confirm_switch_to_another_unnamed_buffer() {
+    let dir = temp_dir("picker_unnamed_other_buf");
+    let (rpc, _incoming) = start(&dir, "").await;
+    feed(&rpc, "iaaa<CR>bbb<CR>ccc<CR>ddd<Esc>2GmAG");
+    let first = exec_lua(&rpc, "return btv.buf.current()").await;
+    command(&rpc, "enew").await;
+    feed(&rpc, "ione<CR>two<CR>three<CR>four<Esc>gg");
+    let second = exec_lua(&rpc, "return btv.buf.current()").await;
+    assert_ne!(first, second);
+
+    confirm_builtin(
+        &rpc,
+        "jumplist",
+        "function(it) return it.path == '' and it.text == '[No Name]' and it.row == 2 end",
+    )
+    .await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.buf.current()").await,
+        first,
+        "the jumplist entry's buffer becomes current"
+    );
+    assert_eq!(cursor(&rpc).await.0, 2);
+
+    command(&rpc, &format!("buffer {}", second.as_u64().unwrap())).await;
+    feed(&rpc, "gg");
+    confirm_builtin(&rpc, "marks", "function(it) return it.tag == 'A' end").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.buf.current()").await,
+        first,
+        "the global mark's buffer becomes current"
+    );
+    assert_eq!(cursor(&rpc).await.0, 2);
+}
+
+/// A jumplist entry in a non-file buffer (here a `btv.view`, whose name is a display
+/// title) carries no `path`: confirming it returns to that buffer rather than
+/// `:edit`ing a new file named after the title.
+#[tokio::test]
+async fn jumplist_confirm_on_a_non_file_buffer_returns_to_it() {
+    let dir = temp_dir("picker_jumplist_view");
+    let (rpc, _incoming) = start(&dir, "").await;
+    let file = dir.join("real.txt");
+    std::fs::write(&file, "x\n").unwrap();
+    exec_lua(
+        &rpc,
+        r#"_G.vw = btv.view.create{ name = "My Panel" }
+           _G.vw:set_lines{ "one", "two", "three", "four" }
+           _G.vw:mount{ tab = true }"#,
+    )
+    .await;
+    let view_buf = exec_lua(&rpc, "return btv.buf.current()").await;
+    feed(&rpc, "2GG");
+    command(&rpc, &format!("edit {}", file.display())).await;
+    assert_ne!(exec_lua(&rpc, "return btv.buf.current()").await, view_buf);
+    let nbufs = exec_lua(&rpc, "return #btv.buf.list()").await;
+
+    confirm_builtin(
+        &rpc,
+        "jumplist",
+        &format!(
+            "function(it) return it.bufnr == {} and it.row == 2 end",
+            view_buf.as_u64().unwrap()
+        ),
+    )
+    .await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.buf.current()").await,
+        view_buf,
+        "confirm returns to the view's own buffer"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return #btv.buf.list()").await,
+        nbufs,
+        "no file buffer named after the view's title was created"
+    );
+}
+
+/// When no listing tool can run (the pure web client's situation: every spawn exits
+/// `-1`), `files` and `live_grep` fall back to `btv.fs` — and a failing walk/grep there
+/// is reported, not swallowed into an empty picker that looks like "no files".
+#[tokio::test]
+async fn files_and_grep_fs_fallback_failures_are_reported() {
+    let dir = temp_dir("picker_fs_fallback_err");
+    let (rpc, _incoming) = start(&dir, "").await;
+    exec_lua(
+        &rpc,
+        r#"_G.notes = {}
+           btv.notify = function(m) table.insert(_G.notes, tostring(m)) end
+           -- Every tool "could not run": an empty stream that exits -1.
+           btv.run_stream = function()
+             return {
+               next = function() return btv.promise.resolve(nil) end,
+               kill = function() end,
+               exit = function() return { code = -1, stderr = "" } end,
+             }
+           end
+           btv.fs.walk = function() return btv.promise.reject({ message = "walk exploded" }) end
+           btv.fs.grep = function() return btv.promise.reject({ message = "grep exploded" }) end
+           local function run(name, query)
+             local src = btv.picker._sources[name]
+             btv.promise.try(src.items, {
+               push = function() end, on_cancel = function() end,
+               query = query, cwd = "/", rg_globs = {},
+             }):catch(function(e) btv.notify(name .. ": " .. tostring(e)) end)
+           end
+           run("files", "")
+           run("live_grep", "x")"#,
+    )
+    .await;
+    let mut notes = String::new();
+    for _ in 0..100 {
+        notes = exec_lua(&rpc, "return table.concat(_G.notes, '|')")
+            .await
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if notes.contains("walk exploded") && notes.contains("grep exploded") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        notes.contains("walk exploded") && notes.contains("grep exploded"),
+        "both fallback failures reach the source's rejection: {notes:?}"
     );
 }

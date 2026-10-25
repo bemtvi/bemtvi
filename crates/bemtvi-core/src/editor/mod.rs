@@ -107,7 +107,7 @@ pub use self::marks::MarkMirrorEntry;
 pub use self::persist::{
     FileChangelist, FileFolds, FileMarkEntry, GlobalMarkEntry, InputHistoryEntry, JumpPos,
     NumberedMark, PersistState, PluginEntry, PluginNamespace, RegisterEntry, SessionDock,
-    SessionState, SessionTab, SessionWindow, ShadaRequest,
+    SessionHiddenBuffer, SessionLayout, SessionState, SessionTab, SessionWindow, ShadaRequest,
 };
 pub use self::terminal::TerminalOp;
 pub use self::undo::{UndoEntry, UndoTreeView};
@@ -131,6 +131,9 @@ pub(crate) use self::syntax::fill_indent;
 /// log exceeds this, so a long session can't grow it without bound (vim likewise
 /// caps `:messages`).
 const MAX_MESSAGES: usize = 1000;
+
+/// The largest count a command honors — vim's own 999999999 ceiling.
+pub(crate) const MAX_COUNT: usize = 999_999_999;
 
 /// The divider row `:messages` fences a *multi-line* message with, so the
 /// boundaries of a block (a pretty-printed table, a traceback) are visible in
@@ -1294,6 +1297,14 @@ pub struct Editor {
     /// than a pass over the whole buffer. See
     /// [`Editor::sync_fold_inputs`](crate::editor::Editor).
     fold_inputs: std::collections::HashMap<BufferId, fold::FoldInputs>,
+    /// The text each `foldmethod=manual` buffer with folds had at the last fold
+    /// adjustment (a cheap shared rope clone), so an undo/redo — which replaces the
+    /// whole rope and journals no edits — can still be diffed into a line delta.
+    manual_fold_text: std::collections::HashMap<BufferId, ropey::Rope>,
+    /// The folds a window had on a buffer it has since switched away from, keyed by
+    /// `(window, buffer)` — vim keeps folds per window *and* buffer, so `:e` onto
+    /// another file shows that file's folds and coming back restores these.
+    parked_buffer_folds: std::collections::HashMap<(WindowId, BufferId), fold::FoldState>,
     /// Name → id index for the named-list registry, plus the id allocator
     /// ([`Editor::next_named_id`]). Interning a new name allocates the next id and
     /// inserts an empty [`NamedList`] into [`Editor::named_lists`].
@@ -1396,12 +1407,45 @@ pub struct Editor {
     /// or anything routed through the command line). Reset at each boundary; when
     /// set at commit time the candidate is discarded even though the buffer changed.
     change_not_repeatable: bool,
+    /// The command in progress set the `` `[ `` / `` `] `` marks itself (an operator,
+    /// an insert, `J`, a shift, an undo). When it is clear at the command's end, the
+    /// marks come from the span the command's edits covered instead.
+    change_marks_set: bool,
+    /// The command in progress ran a text operator over a real range (`<<`, `gu`,
+    /// …). vim records it for `.` even when the text came out the same, so `.`
+    /// repeats it rather than the change before it.
+    op_repeatable: bool,
+    /// The operator being applied runs over a motion whose delete always fills
+    /// `"1` (vim's `use_reg_one`). Set just before, cleared just after, the apply.
+    op_reg_one: bool,
     /// The text typed during the most recent insert session — vim's `".` register
     /// (last-insert). Cleared the instant a new insert session begins (the
     /// Normal→Insert transition in [`Editor::input`]) and grown char-by-char in
     /// [`Editor::handle_insert`], so once the session ends it holds exactly what
     /// was inserted, read back by `register_text(Some('.'))` and `"."`/`<C-r>.`.
     insert_text: String,
+    /// vim's replace stack: one entry per character typed in the current Replace
+    /// session, holding the grapheme it overtyped (`None` when it was appended past
+    /// the line's end, or was a line break). `<BS>` pops it to restore the original
+    /// text instead of deleting. Paired with the `(buffer, line, col)` the cursor
+    /// was left on by the last push/pop, so moving away invalidates it.
+    replace_stack: Vec<Option<String>>,
+    /// The count an `{count}i`/`a`/`I`/`A`/`R`/`o`/`O` was typed with (and whether
+    /// it opened a line), armed by the command
+    /// and picked up as [`Editor::insert_repeat`] when the insert session opens.
+    insert_repeat_pending: Option<(usize, bool)>,
+    /// How many times the current insert session's text lands in all: on `<Esc>`
+    /// the typed text is replayed `insert_repeat - 1` more times (`3ix<Esc>` →
+    /// `xxx`; overtyping in Replace mode).
+    insert_repeat: usize,
+    /// The insert session was opened by `o`/`O`: each repeat of a counted
+    /// `3o…<Esc>` lands on a line of its own.
+    insert_repeat_lines: bool,
+    /// Where the current insert session began (`line`, `col`) — vim's `Insstart`.
+    /// `i_CTRL-W` / `i_CTRL-U` stop there once before deleting past it; moving the
+    /// cursor with the arrow keys starts a new session here.
+    pub(crate) insert_start: (usize, usize),
+    replace_stack_tick: (BufferId, usize, usize),
     /// The in-flight visual-mode change's size-faithful replay stream (see
     /// [`VisualShape`]). Set by [`Editor::visual_operate`] just before it mutates,
     /// consumed at the dot-repeat commit point in [`Editor::input`]; reset at each
@@ -1461,6 +1505,8 @@ pub struct Editor {
     /// nothing. Shared across both modes since only one is active at a time. See
     /// [`Editor::handle_insert`] / [`Editor::handle_command`].
     awaiting_register: bool,
+    /// Insert-mode `<C-g>` was typed; the next key completes the `i_CTRL-G_*` command.
+    awaiting_ctrl_g: bool,
     visual_anchor: Cursor,
     /// Where `<Esc>` from [`Mode::Select`] lands (set per-entry by
     /// [`Editor::select_range_in_window`]): `true` keeps the default and parks in
@@ -2305,6 +2351,8 @@ impl Editor {
             named_lists: std::collections::HashMap::new(),
             qf_generation: 0,
             fold_inputs: std::collections::HashMap::new(),
+            manual_fold_text: std::collections::HashMap::new(),
+            parked_buffer_folds: std::collections::HashMap::new(),
             named_by_name: std::collections::HashMap::new(),
             next_named_id: 1,
             panel_buffers: Vec::new(),
@@ -2334,8 +2382,17 @@ impl Editor {
             last_change: Vec::new(),
             replaying_change: false,
             change_start_tick: 0,
+            change_marks_set: false,
+            op_repeatable: false,
+            op_reg_one: false,
             change_not_repeatable: false,
             insert_text: String::new(),
+            replace_stack: Vec::new(),
+            insert_repeat_pending: None,
+            insert_repeat: 1,
+            insert_repeat_lines: false,
+            insert_start: (0, 0),
+            replace_stack_tick: (BufferId(0), 0, 0),
             pending_visual: None,
             snapshot_taken: false,
             typing_undo: undo::TypingUndo::default(),
@@ -2348,6 +2405,7 @@ impl Editor {
             now_mono: 0,
             now_ms: 0,
             awaiting_register: false,
+            awaiting_ctrl_g: false,
             visual_anchor: Cursor::default(),
             select_escape_insert: false,
             select_linewise: false,
@@ -2467,6 +2525,17 @@ impl Editor {
     /// (`enter_buffer`, and the `:bdelete` fallback) writes the current buffer
     /// through here; it changes only *which* buffer the window shows.
     fn set_cur_buffer(&mut self, id: BufferId) {
+        let win = self.windows.current;
+        let outgoing = self.windows.cur().buffer;
+        if outgoing != id {
+            let parked = std::mem::take(&mut self.windows.cur_mut().folds);
+            if !parked.is_empty() {
+                self.parked_buffer_folds.insert((win, outgoing), parked);
+            }
+            if let Some(folds) = self.parked_buffer_folds.remove(&(win, id)) {
+                self.windows.cur_mut().folds = folds;
+            }
+        }
         self.windows.cur_mut().buffer = id;
         // The buffer now lives in the focused layer's window — record that as its
         // home so `:ls` and the close-fallback stay scoped to this layer.
@@ -2537,6 +2606,23 @@ impl Editor {
     /// chord window. See [`Editor::now_ms`].
     pub fn set_now_ms(&mut self, ms: u64) {
         self.now_ms = ms;
+    }
+    /// Open a fresh insert session if the editor is now in Insert/Replace: the
+    /// `".` accumulator, replace stack, repeat count, `<C-w>`/`<C-u>` stop and
+    /// typing-undo state all start here. Key dispatch calls it after a key that
+    /// entered Insert; a seam that enters Insert outside it (a drained Helix
+    /// action) calls it too when the mode before was not Insert.
+    pub fn begin_insert_session(&mut self) {
+        if !self.mode.is_insert() {
+            return;
+        }
+        self.insert_text.clear();
+        self.replace_stack.clear();
+        let (repeat, lines) = self.insert_repeat_pending.take().unwrap_or((1, false));
+        self.insert_repeat = repeat;
+        self.insert_repeat_lines = lines;
+        self.insert_start = (self.cursor.line, self.cursor.col);
+        self.reset_typing_undo();
     }
 
     /// Feed a single key into the editor.
@@ -2698,10 +2784,14 @@ impl Editor {
         // `v`, its motions, and the operator, so the bracket opens at the `v` and
         // stays open until the operator returns to Normal.
         let starting = recording && self.mode == Mode::Normal && self.pending.is_clean();
+        if self.mode == Mode::Normal && self.pending.is_clean() {
+            self.begin_change_marks();
+        }
         if starting {
             self.redo_recording.clear();
             self.change_start_tick = self.buffer().changedtick;
             self.change_not_repeatable = false;
+            self.op_repeatable = false;
             self.pending_visual = None;
         }
         if recording {
@@ -2709,8 +2799,12 @@ impl Editor {
         }
 
         match self.mode {
-            Mode::Insert | Mode::Replace => self.handle_insert(key),
-            Mode::Command => self.handle_command(key),
+            Mode::Insert | Mode::Replace => {
+                self.handle_insert(crate::input::text_mode_ctrl_alias(key).unwrap_or(key))
+            }
+            Mode::Command => {
+                self.handle_command(crate::input::text_mode_ctrl_alias(key).unwrap_or(key))
+            }
             // Select mode's printable-replaces keys route through their own handler,
             // not the Normal/Visual command grammar (see [`Editor::handle_select`]).
             Mode::Select => self.handle_select(key),
@@ -2723,9 +2817,8 @@ impl Editor {
         // only this session's typed text. The key that entered insert never types
         // text itself, so clearing after dispatch is safe — the following keys'
         // `handle_insert` calls grow `insert_text` from empty.
-        if matches!(self.mode, Mode::Insert | Mode::Replace) && !was_insert {
-            self.insert_text.clear();
-            self.reset_typing_undo();
+        if !was_insert {
+            self.begin_insert_session();
         }
 
         // `i_CTRL-O`: resume the interrupted insert session once the one-shot Normal
@@ -2760,7 +2853,7 @@ impl Editor {
             let done = self.mode == Mode::Normal && self.pending.is_clean();
             if done {
                 let changed = self.buffer().changedtick != self.change_start_tick;
-                if changed && !self.change_not_repeatable {
+                if (changed || self.op_repeatable) && !self.change_not_repeatable {
                     // A visual-initiated change replays as a *size-faithful*
                     // reselect (vim reselects the same extent from the new cursor,
                     // not the original motions), so commit the synthesized stream
@@ -2780,6 +2873,10 @@ impl Editor {
                 }
                 self.redo_recording.clear();
             }
+        }
+
+        if self.mode == Mode::Normal && self.pending.is_clean() {
+            self.finish_change_marks(false);
         }
 
         self.settle_after_edit(pre_tick);
@@ -2807,6 +2904,9 @@ impl Editor {
             self.insert_normal = None;
             self.mode = resume;
             self.clamp_cursor();
+            // The insert resumes where the command left the cursor, as a cursor
+            // key does: `<C-w>`/`<C-u>` stop there.
+            self.insert_start = (self.cursor.line, self.cursor.col);
             return true;
         }
         false
@@ -3342,8 +3442,14 @@ impl Editor {
 
     // ----- pending-state bookkeeping ---------------------------------------
 
+    /// The operator count times the motion count (`2d3w` = 6), saturated at vim's
+    /// 999999999 ceiling so `line + count` arithmetic downstream cannot overflow.
     fn effective_count(&self) -> usize {
-        self.pending.op_count.unwrap_or(1) * self.pending.count.unwrap_or(1)
+        self.pending
+            .op_count
+            .unwrap_or(1)
+            .saturating_mul(self.pending.count.unwrap_or(1))
+            .min(MAX_COUNT)
     }
 
     fn reset_pending(&mut self) {

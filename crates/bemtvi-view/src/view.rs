@@ -153,7 +153,7 @@ impl ScrollSpan {
         if self.total == 0 || (self.start == 0 && self.shown >= self.total) || track <= 0.0 {
             return None;
         }
-        let total = self.total.max(self.start + self.shown) as f32;
+        let total = self.total.max(self.start.saturating_add(self.shown)) as f32;
         let len = (self.shown as f32 / total * track).clamp(min.min(track), track);
         let off = (self.start as f32 / total * track).min(track - len);
         Some((off, len))

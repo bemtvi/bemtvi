@@ -467,12 +467,20 @@ fn query_modelines(text: &str) -> impl Iterator<Item = &str> {
 /// Lives here because both sides of the query bridge read it: the engine folds the
 /// chain into its on-disk base, and the server walks the same chain for runtimepath
 /// overlays.
+///
+/// Each name is joined into a `queries/<lang>/` path, so only a plain grammar
+/// identifier (ASCII letters, digits, `_`, `-`) is kept: a `../x` from a query file
+/// would otherwise read outside the query roots.
 pub fn parse_query_inherits(text: &str) -> Vec<String> {
     query_modelines(text)
         .filter_map(|body| body.strip_prefix("inherits:"))
         .flat_map(|rest| rest.split(','))
         .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| {
+            !s.is_empty()
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        })
         .map(String::from)
         .collect()
 }

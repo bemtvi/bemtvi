@@ -290,14 +290,14 @@ async fn dock_chord_crosses_from_visual_mode() {
 #[tokio::test]
 async fn lone_ctrl_w_in_insert_is_replayed() {
     let (rpc, _incoming) = start().await;
-    // `<C-w>` in insert mode inserts a literal "w" (its pre-existing behavior);
-    // the chord interceptor holds it one key then replays it, so `abc` still
-    // lands right after it.
-    feed(&rpc, "i<C-w>abc<Esc>");
+    // `<C-w>` in insert mode is `i_CTRL-W` (delete the word before the cursor);
+    // the chord interceptor holds it one key then replays it, so it still rubs
+    // out `xy ` and `abc` lands right after.
+    feed(&rpc, "ixy <C-w>abc<Esc>");
     assert_eq!(
         lines(&rpc).await,
-        vec!["wabc"],
-        "the held <C-w> was replayed, typing continued"
+        vec!["abc"],
+        "the held <C-w> was replayed as i_CTRL-W, typing continued"
     );
 }
 
@@ -2133,4 +2133,45 @@ async fn the_layer_cross_still_skips_a_deliberately_hidden_dock() {
         vec!["main text"],
         "a deliberately hidden dock is not a cross target"
     );
+}
+
+// The `:Dock*` side verbs need a `{side}`; typed bare they must say so rather than
+// silently doing nothing (`:DockOpen` already reported its usage — the rest did not).
+#[tokio::test]
+async fn bare_dock_side_commands_report_their_usage() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "_G.notes = {} btv.notify = function(m) _G.notes[#_G.notes + 1] = tostring(m) end",
+    )
+    .await;
+    for cmd in [
+        "DockClose",
+        "DockFocus",
+        "DockToggle",
+        "DockHide",
+        "DockShow",
+    ] {
+        command(&rpc, cmd).await;
+        let mut got = None;
+        for _ in 0..100 {
+            let v = exec_lua(
+                &rpc,
+                &format!(
+                    "for _, m in ipairs(_G.notes) do \
+                       if m:find(':{cmd} ', 1, true) then return m end end return nil"
+                ),
+            )
+            .await;
+            if let Some(m) = v.as_str() {
+                got = Some(m.to_string());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            got.as_deref().is_some_and(|m| m.contains("usage")),
+            ":{cmd} with no side should report its usage, got {got:?}"
+        );
+    }
 }

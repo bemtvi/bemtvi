@@ -499,3 +499,75 @@ fn bemtvi_runtime_env_respects_existing_export() {
     let _ = std::fs::remove_dir_all(&cfg);
     let _ = std::fs::remove_dir_all(&custom);
 }
+
+/// `btv.argv()` must round-trip every positional file argument verbatim — a filename
+/// containing a newline (legal on unix) is ONE argument, not two.
+#[test]
+fn btv_argv_round_trips_a_filename_with_a_newline() {
+    let cfg = fresh_dir("cfg");
+    let mut cmd = bemtvi(&cfg);
+    cmd.arg("--lua")
+        .arg("local a = btv.argv(); print('N=' .. #a .. ';1=' .. string.format('%q', a[1] or '') .. ';2=' .. (a[2] or 'nil'))")
+        .arg("a\nb")
+        .arg("c\\d");
+    let (status, stdout, stderr, _) = run_io(cmd, Duration::from_secs(45));
+    assert!(
+        status.success(),
+        "--lua must exit 0: {status:?} (stderr: {stderr})"
+    );
+    assert!(
+        stdout.contains("N=2;1=\"a\\\nb\";2=c\\d"),
+        "btv.argv() must keep a newline inside one argument, got stdout: {stdout:?}"
+    );
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+/// With no `$HOME` (an `env -i` launch, a service account) the std dirs must still
+/// resolve outside the working directory: the data dir is where system plugins,
+/// managed plugins and tree-sitter parsers are *loaded* from, so a cwd-relative
+/// fallback runs whatever an untrusted checkout ships under `./.bemtvi/`. Unix
+/// resolves the home from the passwd entry, as neovim does.
+#[cfg(unix)]
+#[test]
+fn std_dirs_without_home_never_resolve_into_the_cwd() {
+    let cfg = fresh_dir("cfg");
+    let cwd = fresh_dir("nohome_cwd");
+    let mut cmd = bemtvi(&cfg);
+    for var in [
+        "HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "BEMTVI_RUNTIME",
+        "BEMTVI_DATA_DIR",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd.current_dir(&cwd);
+    cmd.arg("--lua").arg(
+        "print('DATA=' .. btv.stdpath('data') .. '\\nSTATE=' .. btv.stdpath('state') \
+         .. '\\nCACHE=' .. btv.stdpath('cache'))",
+    );
+    let (status, stdout, stderr, _) = run_io(cmd, Duration::from_secs(45));
+    assert!(
+        status.success(),
+        "--lua must exit 0: {status:?} (stderr: {stderr})"
+    );
+    for key in ["DATA=", "STATE=", "CACHE="] {
+        let line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no {key} line in {stdout:?}"));
+        assert!(
+            Path::new(line).is_absolute(),
+            "{key}{line} resolves against the working directory"
+        );
+    }
+    assert!(
+        !cwd.join(".bemtvi").exists(),
+        "the launch wrote a .bemtvi dir into the working directory"
+    );
+    let _ = std::fs::remove_dir_all(&cfg);
+    let _ = std::fs::remove_dir_all(&cwd);
+}

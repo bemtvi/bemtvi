@@ -153,7 +153,46 @@ impl Editor {
     /// The string twin of [`Editor::set_buf_global_option_bool`] (`regexsyntax`,
     /// `foldmethod`). An invalid value fails loud (`E474`) as on the `:setglobal` path.
     pub fn set_buf_global_option_str(&mut self, name: &str, value: &str) {
+        if let Some(n) = crate::options::coerce_num_option_str(name, value) {
+            return self.apply_set_num(name, NumOp::Set(n), SetScope::Global);
+        }
         self.apply_set_str(name, StrOp::Set(value.to_string()), SetScope::Global);
+    }
+
+    /// Set a wired **global** option from the Lua `btv.o` / `vim.o` bridge. The value is
+    /// checked against the option's kind first — a string written to a boolean, say, is
+    /// refused (`E474`) rather than dropped — and a string then runs through the same
+    /// validation as `:setglobal`, so an enumerated value outside its set
+    /// (`regexsyntax = "perl"`) fails loud instead of being stored unchecked.
+    pub fn set_global_option_from_lua(&mut self, name: &str, value: crate::options::OptionScalar) {
+        use crate::options::OptionScalar::{Bool, Num, Str};
+        let want = match self.options.get_scalar(name) {
+            Some(Bool(_)) => Some("boolean"),
+            Some(Num(_)) => Some("number"),
+            Some(Str(_)) => Some("string"),
+            None => None,
+        };
+        let (got, shown) = match &value {
+            Bool(b) => ("boolean", b.to_string()),
+            Num(n) => ("number", n.to_string()),
+            Str(s) => ("string", s.clone()),
+        };
+        if let Some(want) = want.filter(|&w| w != got) {
+            // A numeric global written as a string that spells an integer is coerced.
+            if let (Some("number"), Str(s)) = (Some(want), &value) {
+                if let Some(n) = crate::options::coerce_num_option_str(name, s) {
+                    self.set_global_option_num(name, n);
+                    return;
+                }
+            }
+            self.reject_bridge_option(name, shown, &format!("not a {want}"));
+            return;
+        }
+        match value {
+            Bool(b) => self.set_global_option_bool(name, b),
+            Num(n) => self.set_global_option_num(name, n),
+            Str(s) => self.apply_set_str(name, StrOp::Set(s), SetScope::Global),
+        }
     }
 
     /// The global values of the buffer-local options — the tier a new buffer is born
@@ -224,7 +263,12 @@ impl Editor {
     }
 
     /// The string twin of [`Editor::set_win_global_option_bool`].
+    /// A numeric option written as an integer string (neovim's spelling of
+    /// `'foldcolumn'`) is coerced, as on the window-local bridge.
     pub fn set_win_global_option_str(&mut self, name: &str, value: &str) {
+        if let Some(n) = crate::options::coerce_num_option_str(name, value) {
+            return self.apply_set_num(name, NumOp::Set(n), SetScope::Global);
+        }
         self.apply_set_str(name, StrOp::Set(value.to_string()), SetScope::Global);
     }
 
@@ -509,6 +553,10 @@ impl Editor {
                         self.echo(format!("E487: Argument must be positive: {name}={v}"));
                         return;
                     }
+                    if let Some(max) = win_num_max(name).filter(|&m| v > m) {
+                        self.echo(format!("E474: Invalid argument: {name}={v} (max {max})"));
+                        return;
+                    }
                     if scope.writes_global() {
                         set(&mut self.win_opts_global, v);
                     }
@@ -697,10 +745,11 @@ impl Editor {
         if name == "guiglyphoverflow" {
             match op {
                 StrOp::Set(value) => {
+                    // Empty is the default — "the client's own setting", like `&`.
                     let canon = value.trim().to_ascii_lowercase().replace('_', "-");
                     if !matches!(
                         canon.as_str(),
-                        "never"
+                        "" | "never"
                             | "always"
                             | "when-followed-by-space"
                             | "whenfollowedbyspace"
@@ -1122,5 +1171,16 @@ impl Editor {
             return 0;
         }
         (digit_count(line_count) + 1).max(opts.numberwidth.max(1))
+    }
+}
+
+/// vim's upper bound on a numeric window option (`E474` past it), for the ones
+/// that size a per-row gutter: `'foldcolumn'` 12, `'numberwidth'` 20. Shared by
+/// the `:set` and `btv.wo` setters.
+pub(crate) fn win_num_max(name: &str) -> Option<i64> {
+    match name {
+        "foldcolumn" => Some(12),
+        "numberwidth" => Some(20),
+        _ => None,
     }
 }

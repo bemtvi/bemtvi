@@ -54,6 +54,7 @@ fn spawn() -> ServerSpawn {
         settings: None,
         capabilities: None,
         env: Vec::new(),
+        path_style: None,
     }
 }
 

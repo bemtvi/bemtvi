@@ -225,3 +225,68 @@ async fn bracket_d_animates_an_off_screen_jump() {
         "`[d` animates its jump as well"
     );
 }
+
+/// `btv.diagnostic.get`'s `severity` filter takes neovim's shapes, not just one
+/// number: `{ min = }` / `{ max = }` (a range — lower numbers are more severe) and a
+/// list of severities. Before, a table compared unequal to every number and the
+/// filter silently matched nothing.
+#[tokio::test]
+async fn diagnostic_get_severity_filter_accepts_ranges_and_lists() {
+    let (rpc, _incoming) = start().await;
+    open_with_diagnostics(&rpc).await;
+    let got = exec_lua(
+        &rpc,
+        r#"
+        local S = btv.diagnostic.severity
+        local function n(sev) return #btv.diagnostic.get(0, { severity = sev }) end
+        return table.concat({
+          n(S.WARN), n({ min = S.WARN }), n({ max = S.WARN }), n({ min = S.ERROR }),
+          n({ S.ERROR, S.WARN }), n({ S.HINT }),
+        }, ",")
+        "#,
+    )
+    .await;
+    assert_eq!(got.as_str(), Some("1,3,1,2,3,0"));
+    let bad = exec_lua(
+        &rpc,
+        "return tostring(pcall(btv.diagnostic.get, 0, { severity = 'loud' }))",
+    )
+    .await;
+    assert_eq!(bad.as_str(), Some("false"), "an unusable filter fails loud");
+}
+
+/// `goto_next` / `goto_prev` accept the same `severity` shapes as
+/// `btv.diagnostic.get`: a name, a `{ min =, max = }` range, or a list.
+#[tokio::test]
+async fn diagnostic_goto_severity_filter_accepts_ranges_and_lists() {
+    let (rpc, _incoming) = start().await;
+    open_with_diagnostics(&rpc).await;
+    // Only the warning (line 4) is at most WARN-severe and at least WARN.
+    exec_lua(
+        &rpc,
+        "btv.diagnostic.goto_next({ severity = { min = 'WARN', max = 'WARN' } })",
+    )
+    .await;
+    assert_eq!(
+        cursor(&rpc).await.0,
+        4,
+        "`{{min=WARN,max=WARN}}` -> the warning"
+    );
+    // `{ min = WARN }` keeps warnings and errors: next from line 4 is line 6.
+    exec_lua(
+        &rpc,
+        "btv.diagnostic.goto_next({ severity = { min = 'WARN' } })",
+    )
+    .await;
+    assert_eq!(cursor(&rpc).await.0, 6);
+    // A list of severities.
+    exec_lua(&rpc, "btv.diagnostic.goto_prev({ severity = { 'ERROR' } })").await;
+    assert_eq!(
+        cursor(&rpc).await.0,
+        2,
+        "a list `{{ERROR}}` skips the warning"
+    );
+    // A name.
+    exec_lua(&rpc, "btv.diagnostic.goto_next({ severity = 'WARN' })").await;
+    assert_eq!(cursor(&rpc).await.0, 4);
+}

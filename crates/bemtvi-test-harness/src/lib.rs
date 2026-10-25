@@ -1224,6 +1224,8 @@ struct DaemonFsTree {
     dirs: std::collections::HashMap<PathBuf, Vec<(bool, String)>>,
     fail_writes: bool,
     hold: Option<Arc<WriteGate>>,
+    read_hold: Option<Arc<WriteGate>>,
+    dir_hold: Option<Arc<WriteGate>>,
 }
 
 /// The shared state behind [`DaemonFs::hold_writes`]: `released` gates the daemon's
@@ -1234,18 +1236,36 @@ struct WriteGate {
     cv: std::sync::Condvar,
 }
 
+impl WriteGate {
+    /// Block the calling daemon task until the gate is released.
+    fn park(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.1 += 1;
+        self.cv.notify_all();
+        while !state.0 {
+            state = self.cv.wait(state).unwrap();
+        }
+        state.1 -= 1;
+    }
+}
+
 /// A parked-writes latch from [`DaemonFs::hold_writes`] — every daemon-side write
 /// blocks until it is [`release`](WriteHold::release)d.
 ///
 /// This is what makes "the buffer was edited *while the write was in flight*"
 /// deterministic instead of a race: park the write, edit, then let the ack land. The
-/// wait is a real blocking wait on the daemon's task, so a test using this **must** run
-/// on a multi-thread runtime (`#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`)
-/// or the parked daemon stalls the editor too.
+/// wait is a real blocking wait, on the blocking pool the fs daemon runs its `HostFs`
+/// calls on — so the runtime the daemon task lives on keeps serving the test meanwhile.
 pub struct WriteHold {
     gate: Arc<WriteGate>,
     tree: Arc<Mutex<DaemonFsTree>>,
+    reads: bool,
+    dirs: bool,
 }
+
+/// A parked-reads latch from [`DaemonFs::hold_reads`] — the read-side twin of
+/// [`WriteHold`] (same `await_parked` / `release`, same multi-thread requirement).
+pub type ReadHold = WriteHold;
 
 impl WriteHold {
     /// Poll until at least one daemon write is parked on this latch, so the test knows
@@ -1280,7 +1300,15 @@ impl Drop for WriteHold {
 
 impl WriteHold {
     fn clear(&self) {
-        self.tree.lock().unwrap().hold = None;
+        let mut tree = self.tree.lock().unwrap();
+        if self.dirs {
+            tree.dir_hold = None;
+        } else if self.reads {
+            tree.read_hold = None;
+        } else {
+            tree.hold = None;
+        }
+        drop(tree);
         self.gate.state.lock().unwrap().0 = true;
         self.gate.cv.notify_all();
     }
@@ -1354,6 +1382,44 @@ impl DaemonFs {
         WriteHold {
             gate,
             tree: self.inner.clone(),
+            reads: false,
+            dirs: false,
+        }
+    }
+
+    /// Park every subsequent [`open_read`](bemtvi_core::HostFs::open_read) until the
+    /// returned [`ReadHold`] is released — the seam for asserting on a buffer that is
+    /// edited *while its (re-)fetch is in flight*.
+    pub fn hold_reads(&self) -> ReadHold {
+        assert!(
+            self.inner.lock().unwrap().read_hold.is_none(),
+            "hold_reads: a hold is already armed"
+        );
+        let gate = Arc::new(WriteGate::default());
+        self.inner.lock().unwrap().read_hold = Some(gate.clone());
+        WriteHold {
+            gate,
+            tree: self.inner.clone(),
+            reads: true,
+            dirs: false,
+        }
+    }
+
+    /// Park every subsequent [`read_dir`](bemtvi_core::HostFs::read_dir) — the
+    /// daemon's directory check behind `fs_chdir` — until the returned hold is released:
+    /// the seam for acting while a remote `:cd` is in flight.
+    pub fn hold_read_dirs(&self) -> ReadHold {
+        assert!(
+            self.inner.lock().unwrap().dir_hold.is_none(),
+            "hold_read_dirs: a hold is already armed"
+        );
+        let gate = Arc::new(WriteGate::default());
+        self.inner.lock().unwrap().dir_hold = Some(gate.clone());
+        WriteHold {
+            gate,
+            tree: self.inner.clone(),
+            reads: false,
+            dirs: true,
         }
     }
 
@@ -1384,6 +1450,10 @@ impl bemtvi_core::HostFs for DaemonFs {
     }
 
     fn open_read(&self, path: &std::path::Path) -> std::io::Result<Box<dyn std::io::Read>> {
+        let hold = self.inner.lock().unwrap().read_hold.clone();
+        if let Some(gate) = hold {
+            gate.park();
+        }
         match self.inner.lock().unwrap().files.get(path) {
             Some(bytes) => Ok(Box::new(std::io::Cursor::new(bytes.clone()))),
             None => Err(std::io::Error::new(
@@ -1410,13 +1480,7 @@ impl bemtvi_core::HostFs for DaemonFs {
         // held, so the test can still read the fake while a write waits.
         let hold = self.inner.lock().unwrap().hold.clone();
         if let Some(gate) = hold {
-            let mut state = gate.state.lock().unwrap();
-            state.1 += 1;
-            gate.cv.notify_all();
-            while !state.0 {
-                state = gate.cv.wait(state).unwrap();
-            }
-            state.1 -= 1;
+            gate.park();
         }
         let mut t = self.inner.lock().unwrap();
         if t.fail_writes {
@@ -1431,6 +1495,10 @@ impl bemtvi_core::HostFs for DaemonFs {
     }
 
     fn read_dir(&self, dir: &std::path::Path) -> std::io::Result<Vec<bemtvi_core::DirEntry>> {
+        let hold = self.inner.lock().unwrap().dir_hold.clone();
+        if let Some(gate) = hold {
+            gate.park();
+        }
         match self.inner.lock().unwrap().dirs.get(dir) {
             Some(entries) => Ok(entries
                 .iter()

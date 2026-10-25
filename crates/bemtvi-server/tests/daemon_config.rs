@@ -611,6 +611,116 @@ async fn local_config_session_keeps_shada_local() {
     );
 }
 
+/// A daemon whose shada dir can't be prepared (every fs op fails) — the other way a
+/// `Remote` session ends up without on-daemon shada.
+struct UnreachableShadaFs;
+
+impl bemtvi_server::HostFsAsync for UnreachableShadaFs {
+    fn read(
+        &self,
+        _path: String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<bemtvi_server::FsRead>> + Send>,
+    > {
+        Box::pin(async { Err(std::io::Error::other("daemon fs unavailable")) })
+    }
+    fn write(
+        &self,
+        _path: String,
+        _bytes: Vec<u8>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::io::Result<Option<bemtvi_core::FileStat>>> + Send,
+        >,
+    > {
+        Box::pin(async { Err(std::io::Error::other("daemon fs unavailable")) })
+    }
+    fn mkdir(
+        &self,
+        _path: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>> {
+        Box::pin(async { Err(std::io::Error::other("daemon fs unavailable")) })
+    }
+}
+
+/// A `Remote`-config session runs the daemon's config in this editor, so when its shada
+/// can't live on the daemon (no `state_dir` reported, or the remote dir can't be prepared)
+/// it must NOT fall back to this machine's global local store — the daemon's config would
+/// then read the local session's registers and history. A local session persists a
+/// register first; neither fallback may restore it.
+#[tokio::test]
+async fn a_remote_session_without_daemon_shada_never_sees_local_shada() {
+    let _g = serial_lock().lock().await;
+    let _xs = EnvGuard::set("XDG_STATE_HOME", Some(&temp_dir("remote_fallback_state")));
+    let _xc = EnvGuard::set("XDG_CACHE_HOME", Some(&temp_dir("remote_fallback_cache")));
+    let _c = EnvGuard::set("BEMTVI_CONFIG", Some(&temp_dir("remote_fallback_cfg")));
+    let _r = EnvGuard::set("BEMTVI_RUNTIMEPATH", None);
+    let _d = EnvGuard::set("BEMTVI_DATA_DIR", Some(&temp_dir("remote_fallback_data")));
+
+    // A plain local session puts a secret in register `a` and quits (flushing the local store).
+    {
+        let init = ServerInit {
+            shada: Some(bemtvi_server::default_shada()),
+            ..Default::default()
+        };
+        let (rpc, incoming) = start_attached(init, 80, 25).await;
+        feed(&rpc, "ilocal-secret<Esc>0\"ay$");
+        assert_eq!(lines(&rpc).await, vec!["local-secret"]);
+        feed(&rpc, ":qa!<CR>");
+        drain_until_exit(incoming).await;
+    }
+    // Sanity: a second local session does restore it (so the checks below can fail).
+    {
+        let init = ServerInit {
+            shada: Some(bemtvi_server::default_shada()),
+            ..Default::default()
+        };
+        let (rpc, _incoming) = start_attached(init, 80, 25).await;
+        feed(&rpc, "\"ap");
+        assert_eq!(
+            lines(&rpc).await,
+            vec!["local-secret"],
+            "the local store persisted `a`"
+        );
+    }
+
+    for (label, fs_unreachable) in [("no state_dir", false), ("unreachable shada dir", true)] {
+        let client = spawn_daemon_client();
+        let (store, remote_shada) = if fs_unreachable {
+            bemtvi_server::resolve_session_shada(
+                &UnreachableShadaFs,
+                ConfigSource::Remote,
+                Some("/daemon/state"),
+                None,
+                bemtvi_server::default_shada(),
+            )
+            .await
+        } else {
+            bemtvi_server::resolve_session_shada(
+                &client.host_fs,
+                ConfigSource::Remote,
+                None,
+                None,
+                bemtvi_server::default_shada(),
+            )
+            .await
+        };
+        assert!(remote_shada.is_none(), "{label}: no on-daemon sync target");
+        let init = ServerInit {
+            shada: Some(store),
+            host_fs_async: Some(Box::new(client.host_fs)),
+            ..Default::default()
+        };
+        let (rpc, _incoming) = start_attached(init, 80, 25).await;
+        feed(&rpc, "\"ap");
+        assert_eq!(
+            lines(&rpc).await,
+            vec![""],
+            "{label}: the Remote session restored the LOCAL session's register `a`"
+        );
+    }
+}
+
 /// The `.redb` store files directly under `dir` (non-recursive), for asserting on the
 /// remote shada mirror's contents.
 fn store_files_in(dir: &std::path::Path) -> Vec<PathBuf> {
@@ -974,5 +1084,77 @@ async fn a_checkpoint_upload_never_overtakes_the_clean_exit_upload() {
         0,
         "the clean-exit upload started while a checkpoint upload was still in flight — \
          the stale bytes can land last and lose the session's final state"
+    );
+}
+
+/// A daemon that answers the remote-shada listing with hostile entry names. The names
+/// come off the wire, so they are the remote host's to choose.
+struct HostileShadaFs;
+
+impl bemtvi_server::HostFsAsync for HostileShadaFs {
+    fn read(
+        &self,
+        path: String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<bemtvi_server::FsRead>> + Send>,
+    > {
+        Box::pin(async move {
+            if path.ends_with("/remote") {
+                let entry = |name: &str| bemtvi_core::DirEntry {
+                    is_dir: false,
+                    name: name.to_string(),
+                };
+                Ok(bemtvi_server::FsRead::Dir {
+                    path,
+                    entries: vec![entry("../escaped.redb"), entry("ok.redb")],
+                })
+            } else {
+                Ok(bemtvi_server::FsRead::File(b"not a store".to_vec(), None))
+            }
+        })
+    }
+    fn write(
+        &self,
+        _path: String,
+        _bytes: Vec<u8>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::io::Result<Option<bemtvi_core::FileStat>>> + Send,
+        >,
+    > {
+        Box::pin(async { Err(std::io::Error::other("unused")) })
+    }
+    fn mkdir(
+        &self,
+        _path: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// The remote-shada mirror stages each sibling the daemon lists under its own name. A
+/// name is one path component on the daemon's side — one that climbs out (`../x.redb`)
+/// must not make the client write outside its staging dir.
+#[tokio::test]
+async fn a_remote_shada_sibling_name_cannot_escape_the_staging_dir() {
+    let _g = serial_lock().lock().await;
+    let cache = temp_dir("remote_shada_escape_cache");
+    let _xc = EnvGuard::set("XDG_CACHE_HOME", Some(&cache));
+
+    let (_store, remote) =
+        bemtvi_server::prepare_remote_shada(&HostileShadaFs, "/daemon/state", None)
+            .await
+            .expect("prepare");
+
+    let escaped = cache.join("bemtvi/remote-shada/escaped.redb");
+    assert!(
+        !escaped.exists(),
+        "a `../` sibling name wrote outside the staging dir: {}",
+        escaped.display()
+    );
+    assert_eq!(
+        remote.downloaded,
+        vec!["ok.redb".to_string()],
+        "only the well-formed sibling is mirrored"
     );
 }

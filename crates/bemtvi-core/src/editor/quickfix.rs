@@ -183,7 +183,10 @@ impl QfStack {
         if self.lists.is_empty() {
             return false;
         }
-        let target = (self.cur + count.max(1)).min(self.lists.len() - 1);
+        let target = self
+            .cur
+            .saturating_add(count.max(1))
+            .min(self.lists.len() - 1);
         let moved = target != self.cur;
         self.cur = target;
         moved

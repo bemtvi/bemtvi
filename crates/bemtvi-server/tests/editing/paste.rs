@@ -322,3 +322,88 @@ async fn charwise_put_sets_the_change_marks_across_the_pasted_span() {
     feed(&rpc, "0`]");
     assert_eq!(cursor(&rpc).await, (1, 9), "`] is the last pasted char");
 }
+
+// ===== a paste is text, never commands =======================================
+
+/// Clipboard text is attacker-shaped (a web page can put anything on it, hidden
+/// control characters included). Pasted in Normal mode it must not run as Normal-mode
+/// keys: `:lua …<CR>` in a paste is text, not a command line to execute.
+#[tokio::test]
+async fn a_normal_mode_paste_does_not_run_as_commands() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, &paste(":lua btv.g.pwned = 1\n"));
+    feed(&rpc, "<Esc>");
+    let pwned = exec_lua(&rpc, "return btv.g.pwned").await;
+    assert!(pwned.is_nil(), "a Normal-mode paste executed its payload");
+    // It is put, like neovim's: charwise, after the cursor.
+    assert_eq!(lines(&rpc).await, vec![":lua btv.g.pwned = 1", ""]);
+    assert_eq!(mode(&rpc).await, "n");
+}
+
+/// In Visual mode the paste replaces the selection — still as text.
+#[tokio::test]
+async fn a_visual_mode_paste_replaces_the_selection_with_text() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>0");
+    feed(&rpc, "ve");
+    feed(&rpc, &paste(":lua btv.g.pwned = 1"));
+    let pwned = exec_lua(&rpc, "return btv.g.pwned").await;
+    assert!(pwned.is_nil(), "a Visual-mode paste executed its payload");
+    assert_eq!(lines(&rpc).await, vec![":lua btv.g.pwned = 1 world"]);
+    assert_eq!(mode(&rpc).await, "n");
+}
+
+/// On the command line a pasted line break must not submit it: only the first
+/// line is typed, and the command waits for the user's own `<CR>`.
+#[tokio::test]
+async fn a_command_line_paste_types_only_its_first_line() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":");
+    feed(&rpc, &paste("lua btv.g.pwned = 1\nlua btv.g.pwned = 2\n"));
+    let pwned = exec_lua(&rpc, "return btv.g.pwned").await;
+    assert!(
+        pwned.is_nil(),
+        "a pasted line break submitted the command line"
+    );
+    feed(&rpc, "<CR>");
+    let ran = exec_lua(&rpc, "return btv.g.pwned").await;
+    assert_eq!(
+        ran.as_i64(),
+        Some(1),
+        "the first line was not typed: {ran:?}"
+    );
+}
+
+/// An `ESC` byte inside the payload must not end Insert mode and turn the rest of
+/// the paste into Normal-mode commands.
+#[tokio::test]
+async fn an_escape_byte_in_an_insert_mode_paste_does_not_leave_insert() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "i");
+    feed(&rpc, &paste("x\u{1b}:lua btv.g.pwned = 1\n"));
+    feed(&rpc, "<Esc>");
+    let pwned = exec_lua(&rpc, "return btv.g.pwned").await;
+    assert!(
+        pwned.is_nil(),
+        "an ESC in the paste broke out of Insert mode"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["x\u{1b}:lua btv.g.pwned = 1", ""],
+        "the ESC byte is pasted literally"
+    );
+}
+
+/// In Select mode a paste replaces the selection like typing does and stays in
+/// Insert, the caret after the pasted text (vim's Select-mode typing rule).
+#[tokio::test]
+async fn a_select_mode_paste_replaces_the_selection_and_stays_in_insert() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world<Esc>0");
+    feed(&rpc, "ve<C-g>");
+    assert_eq!(mode(&rpc).await, "s");
+    feed(&rpc, &paste("XY"));
+    assert_eq!(mode(&rpc).await, "i");
+    feed(&rpc, "!");
+    assert_eq!(lines(&rpc).await, vec!["XY! world"]);
+}

@@ -10,9 +10,10 @@
 --
 -- `btv.http.mount(opts)` publishes a plugin's subroute on the editor's ONE origin and
 -- resolves with a handle whose `:url()` you can hand to a browser. A plugin never binds
--- a port: it mounts at `/plugin/<name>/*` and the editor owns the listener. That is what
--- lets the same plugin code run in the browser build too, where a tab cannot bind a port
--- and a Service Worker serves the same routes instead.
+-- a port: it mounts at `/plugin/<name>/*` (natively under a per-session secret path
+-- segment, so always use `:url()` rather than building the path) and the editor owns the
+-- listener. That is what lets the same plugin code run in the browser build too, where a
+-- tab cannot bind a port and a Service Worker serves the same routes instead.
 --
 -- Nothing starts until a plugin asks — the listener binds lazily on the first mount, so
 -- a config without this file opens no port at all.
@@ -212,6 +213,13 @@ local preview
 btv.http
   .mount({
     name = "preview",
+    -- Every mount's documents are sandboxed into an opaque origin by default, and a
+    -- sandboxed page cannot fetch() back to its own mount — which this page's poll of
+    -- `source` needs. So this demo opts out. That is only OK because the page is entirely
+    -- this file's own code previewing YOUR buffer; a mount that shows untrusted HTML (a
+    -- README from a repo under review) must keep the sandbox, since on the web build an
+    -- unsandboxed page runs with the editor's own privileges.
+    same_origin = true,
 
     on_request = function(req, respond)
       -- "/" (the mount root, with or without a trailing slash) — the page shell.

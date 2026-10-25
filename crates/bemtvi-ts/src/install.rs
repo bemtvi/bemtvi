@@ -244,6 +244,20 @@ fn install_from_repo(data_dir: &Path, spec: &RepoSpec) -> Result<InstallReport> 
         );
     }
 
+    // The declared `path` is a subdir of the repo: an absolute or `..` one would build
+    // (and `tree-sitter generate` would write) outside the unpacked source.
+    if !Path::new(&meta.path).components().all(|c| {
+        matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        bail!(
+            "the grammar path {:?} declared by {owner}/{repo} is not a directory inside the repo",
+            meta.path
+        );
+    }
+
     // 3. Compile the (pre-generated) parser.
     let grammar_root = if meta.path == "." {
         root.clone()
@@ -536,7 +550,7 @@ fn parse_inherits_modeline(text: &str) -> Vec<String> {
             out.extend(
                 rest.split(',')
                     .map(str::trim)
-                    .filter(|s| !s.is_empty())
+                    .filter(|s| crate::loader::is_valid_language(s))
                     .map(String::from),
             );
         }

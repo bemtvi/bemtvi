@@ -1004,20 +1004,21 @@ async fn btv_rust_backed_utility_wrappers_resolve() {
         exec_lua(
             &rpc,
             "local fn = {}\n\
-             for _, n in ipairs({ 'echo', 'argv', 'reexec', 'now_ms', 'runtime_file', 'open' }) do\n\
+             for _, n in ipairs({ 'echo', 'argv', 'now_ms', 'runtime_file', 'open' }) do\n\
                fn[#fn+1] = n .. '=' .. type(btv[n])\n\
              end\n\
              fn[#fn+1] = 'layer.focus=' .. type(btv.layer.focus)\n\
              fn[#fn+1] = 'layer.main=' .. type(btv.layer.main)\n\
              fn[#fn+1] = 'terminal.open=' .. type(btv.terminal.open)\n\
+             fn[#fn+1] = 'reexec=' .. type(btv.reexec) .. '/' .. type(btv._reexec)\n\
              return table.concat(fn, ',')"
         )
         .await
         .as_str(),
         Some(
-            "echo=function,argv=function,reexec=function,now_ms=function,\
+            "echo=function,argv=function,now_ms=function,\
              runtime_file=function,open=function,layer.focus=function,\
-             layer.main=function,terminal.open=function"
+             layer.main=function,terminal.open=function,reexec=nil/nil"
         ),
     );
 
@@ -1433,5 +1434,47 @@ async fn a_lowercase_command_name_is_still_accepted() {
     assert!(
         format!("{ok:?}").contains("true|true"),
         "a lowercase command name must still register, got {ok:?}"
+    );
+}
+
+/// A range on a user command (`:2,3Cmd`, `:'<,'>Cmd`) used to be dropped on the floor:
+/// the callback's `opts` carried no `line1`/`line2`/`range`, so a command written for
+/// a range ran as if none had been given. The callback now sees the range neovim's
+/// way — and, with none given, the cursor line with `range = 0`.
+#[tokio::test]
+async fn a_user_command_callback_observes_the_range() {
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, "ia<CR>b<CR>c<CR>d<Esc>");
+    exec_lua(
+        &rpc,
+        "_G.seen = {}\n\
+         btv.user_command.create('BtvRangeSee', function(o)\n\
+         \x20 _G.seen[#_G.seen + 1] = tostring(o.line1) .. '-' .. tostring(o.line2) .. '/' .. tostring(o.range)\n\
+         end, {})",
+    )
+    .await;
+    feed(&rpc, ":2,3BtvRangeSee<CR>");
+    feed(&rpc, ":BtvRangeSee<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return table.concat(_G.seen, ',')")
+            .await
+            .as_str(),
+        Some("2-3/2,4-4/0"),
+        "an explicit range reaches opts; none falls back to the cursor line"
+    );
+}
+
+/// `:command -range` templates expand `<line1>`/`<line2>`: these used to expand to
+/// `""`, so `:2,3Up` became `,s/…/` and rewrote only the cursor line.
+#[tokio::test]
+async fn a_command_template_expands_line1_and_line2() {
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, "ia<CR>a<CR>a<CR>a<Esc>");
+    feed(&rpc, ":command -range Up <line1>,<line2>s/a/b/<CR>");
+    feed(&rpc, ":2,3Up<CR>");
+    assert_eq!(
+        bemtvi_test_harness::lines(&rpc).await,
+        vec!["a", "b", "b", "a"],
+        "only the addressed lines were rewritten"
     );
 }

@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use bemtvi_server::{ServerInit, SystemPluginSpec};
-use bemtvi_test_harness::{exec_lua, start_attached, temp_dir};
+use bemtvi_test_harness::{drain_to_latest_redraw, exec_lua, message, start_attached, temp_dir};
 
 /// A minimal on-disk system plugin under `base/<name>`: its `plugin/init.lua` runs a
 /// registration script (appends to `_G.LOAD_ORDER`, bumps `_G.SYS_COUNT`, sets a flag),
@@ -194,5 +194,63 @@ async fn a_config_module_shadows_a_same_named_system_module() {
         exec_lua(&rpc, "return _G.RESOLVED").await.as_str(),
         Some("config"),
         "a config module must shadow a same-named system-plugin module",
+    );
+}
+
+/// An `init.lua` / `plugin/*.lua` saved in a non-UTF-8 encoding (a latin1 `é` in a
+/// comment) is still valid Lua — the interpreter is byte-clean, and `require` already
+/// loads such a module — but startup read the file with `read_to_string` and dropped
+/// it on the UTF-8 error with no message, so the whole config silently never ran. Both
+/// now run.
+#[tokio::test]
+async fn a_non_utf8_init_lua_and_plugin_script_still_run() {
+    let base = temp_dir("non_utf8_config");
+    let cfg = base.join("config");
+    std::fs::create_dir_all(cfg.join("plugin")).unwrap();
+    std::fs::write(
+        cfg.join("init.lua"),
+        b"-- caf\xe9 (latin1)\n_G.INIT_RAN = true\n".as_slice(),
+    )
+    .unwrap();
+    std::fs::write(
+        cfg.join("plugin").join("p.lua"),
+        b"-- na\xefve\n_G.PLUGIN_RAN = true\n".as_slice(),
+    )
+    .unwrap();
+    let si = ServerInit {
+        config_dir: Some(cfg.clone()),
+        runtimepath: vec![cfg.clone()],
+        ..Default::default()
+    };
+    let (rpc, _incoming) = start_attached(si, 80, 24).await;
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return { _G.INIT_RAN == true, _G.PLUGIN_RAN == true }"
+        )
+        .await,
+        rmpv::Value::Array(vec![true.into(), true.into()]),
+        "both the init.lua and the plugin/ script ran"
+    );
+}
+
+/// An `init.lua` that exists but can't be read (here: it is a directory) is not "no
+/// config" — it surfaces an error instead of starting as if nothing was configured.
+#[tokio::test]
+async fn an_unreadable_init_lua_is_reported() {
+    let base = temp_dir("unreadable_init");
+    let cfg = base.join("config");
+    std::fs::create_dir_all(cfg.join("init.lua")).unwrap();
+    let si = ServerInit {
+        config_dir: Some(cfg.clone()),
+        runtimepath: vec![cfg.clone()],
+        ..Default::default()
+    };
+    let (rpc, mut incoming) = start_attached(si, 80, 24).await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |m| message(m).contains("init.lua"));
+    assert!(
+        frame.is_some(),
+        "the unreadable init.lua must be reported on the message line"
     );
 }

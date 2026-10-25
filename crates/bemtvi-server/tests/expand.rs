@@ -133,6 +133,24 @@ async fn plain_path_still_expands_env() {
     );
 }
 
+// `:p` expands a leading `~` before making the name absolute, as vim does, so the
+// `:~` form a statusline or a config stores round-trips back to the real path rather
+// than resolving to a literal `<cwd>/~/…` directory.
+#[tokio::test]
+async fn fnamemodify_p_expands_a_leading_tilde() {
+    let (rpc, _incoming) = start().await;
+    let home = std::env::var("HOME").expect("HOME set in dev/CI env");
+    let got = exec_lua(&rpc, "return vim.fn.fnamemodify('~/x/../y', ':p')").await;
+    assert_eq!(got.as_str(), Some(format!("{home}/y").as_str()));
+    let round = exec_lua(
+        &rpc,
+        "local p = os.getenv('HOME') .. '/a/b.txt'\n\
+         return vim.fn.fnamemodify(vim.fn.fnamemodify(p, ':~'), ':p:h')",
+    )
+    .await;
+    assert_eq!(round.as_str(), Some(format!("{home}/a").as_str()));
+}
+
 // Both env-var spellings expand — bare `$VAR` and the `${VAR}` brace form vim also
 // accepts — including mid-string; an unset var is left verbatim in either form.
 #[tokio::test]

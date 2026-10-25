@@ -245,6 +245,19 @@ async fn put_bang_inserts_above_the_current_line() {
     assert_eq!(lines(&rpc).await, vec!["alpha", "alpha", "beta"]);
 }
 
+/// Line `0` is a legal `:put` address meaning "above the first line" (vim's
+/// `:0put`): the register lands at the top, not below line 1 where the clamped
+/// address would put it.
+#[tokio::test]
+async fn put_at_line_zero_inserts_above_the_first_line() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>");
+    feed(&rpc, "\"ayy");
+    feed(&rpc, ":0put a<CR>");
+    assert_eq!(lines(&rpc).await, vec!["beta", "alpha", "beta"]);
+    assert_eq!(cursor(&rpc).await, (1, 0));
+}
+
 #[tokio::test]
 async fn put_of_a_charwise_register_is_still_linewise() {
     let (rpc, _incoming) = start(None).await;
@@ -588,5 +601,134 @@ async fn setreg_still_refuses_the_projected_specials() {
         .await;
         let msg = got.as_str().unwrap_or_default().to_string();
         assert!(msg.contains("E354"), "`{name}` still refused, got {msg:?}");
+    }
+}
+
+// ----- vim ground truth (nvim --clean) ---------------------------------------
+
+#[tokio::test]
+async fn a_multiline_delete_into_a_named_register_still_shifts_the_ring() {
+    let (rpc, _incoming) = start(None).await;
+    edit_probe(&rpc, &["one", "two", "three"], (1, 0), "dd\"add").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.reg.get('a')").await,
+        Value::from("two\n")
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv.reg.get('1')").await,
+        Value::from("two\n")
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv.reg.get('2')").await,
+        Value::from("one\n")
+    );
+}
+
+#[tokio::test]
+async fn appending_a_different_kind_to_a_register_keeps_each_part_on_its_own_lines() {
+    let (rpc, _incoming) = start(None).await;
+    let text = ["alpha beta", "gamma"];
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 6), "\"ayw\"Ayy\"ap").await,
+        vec!["alpha beta", "beta", "alpha beta", "gamma"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &text, (1, 6), "\"ayy\"Ayw\"ap").await,
+        vec!["alpha beta", "alpha beta", "beta", "gamma"]
+    );
+}
+
+#[tokio::test]
+async fn visual_p_records_the_replaced_text_as_a_delete_and_visual_capital_p_keeps_registers() {
+    let (rpc, _incoming) = start(None).await;
+    edit_probe(&rpc, &["one", "two"], (1, 0), "yyjVp").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.reg.get('1')").await,
+        Value::from("two\n")
+    );
+    edit_probe(&rpc, &["alpha beta"], (1, 0), "ywwviwp").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.reg.get('-')").await,
+        Value::from("beta")
+    );
+    assert_eq!(
+        edit_probe(&rpc, &["alpha beta gamma"], (1, 0), "yiwwviwPwviwP").await,
+        vec!["alpha alpha alpha"]
+    );
+}
+
+/// Visual `Y` yanks the selected lines whole (vim's `v_Y`), not nothing.
+#[tokio::test]
+async fn visual_y_upper_yanks_whole_lines() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione two<CR>three<CR>four<Esc>gg0lvjY");
+    let got = exec_lua(
+        &rpc,
+        "return vim.fn.getreg('\"') .. '|' .. vim.fn.getregtype('\"')",
+    )
+    .await;
+    assert_eq!(got.as_str(), Some("one two\nthree\n|V"));
+    assert_eq!(mode(&rpc).await, "n");
+    // `gv` still reselects the charwise selection the `Y` consumed.
+    feed(&rpc, "gv");
+    assert_eq!(mode(&rpc).await, "v");
+}
+
+/// Visual `D` / `X` delete the selected lines whole; `C` changes them.
+#[tokio::test]
+async fn visual_d_x_c_upper_act_linewise() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione two<CR>three<CR>four<Esc>gg0lvD");
+    assert_eq!(lines(&rpc).await, vec!["three", "four"]);
+    feed(&rpc, "vX");
+    assert_eq!(lines(&rpc).await, vec!["four"]);
+    feed(&rpc, "lvCnew<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["new"]);
+}
+
+/// `"1|"-|line 1` after `keys` (the registers reset first).
+async fn reg_one_after(rpc: &Rpc, text: &[&str], at: (usize, usize), keys: &str) -> String {
+    exec_lua(
+        rpc,
+        "for _, r in ipairs({'1', '-', '\"'}) do vim.fn.setreg(r, '') end",
+    )
+    .await;
+    let lines = edit_probe(rpc, text, at, keys).await;
+    let regs = exec_lua(
+        rpc,
+        "return vim.fn.getreg('1') .. '|' .. vim.fn.getreg('-')",
+    )
+    .await;
+    format!("{}|{}", regs.as_str().unwrap_or_default(), lines[0])
+}
+
+/// vim's `use_reg_one` (`:h quote1`): a delete over `%`, `(`, `)`, `{`, `}`,
+/// `` ` ``, `/`, `n` or `N` fills `"1` even within one line — and `"-` too.
+/// (Expected values from vim 9.2.)
+#[tokio::test]
+async fn deletes_over_jump_motions_fill_register_one() {
+    let (rpc, _incoming) = start(None).await;
+    let text = [
+        "foo (bar baz) qux. Next sentence here. Third one",
+        "",
+        "para two",
+    ];
+    for (keys, want) in [
+        ("d%", "(b|(b|foo ar baz) qux. Next sentence here. Third one"),
+        ("d(", "foo (|foo (|bar baz) qux. Next sentence here. Third one"),
+        ("d)", "bar baz) qux. |bar baz) qux. |foo (Next sentence here. Third one"),
+        ("d{", "foo (|foo (|bar baz) qux. Next sentence here. Third one"),
+        (
+            "d}",
+            "bar baz) qux. Next sentence here. Third one|bar baz) qux. Next sentence here. Third one|foo (",
+        ),
+        ("ma3ld`a", "bar|bar|foo ( baz) qux. Next sentence here. Third one"),
+        ("d/Next<CR>", "bar baz) qux. |bar baz) qux. |foo (Next sentence here. Third one"),
+        ("/qux<CR>0dn", "foo (bar baz) |foo (bar baz) |qux. Next sentence here. Third one"),
+        ("/foo<CR>$dN", "foo (bar baz) qux. Next sentence here. Third on|foo (bar baz) qux. Next sentence here. Third on|e"),
+        // A plain motion still leaves `"1` alone.
+        ("dw", "|bar |foo (baz) qux. Next sentence here. Third one"),
+    ] {
+        assert_eq!(reg_one_after(&rpc, &text, (1, 5), keys).await, want, "keys {keys:?}");
     }
 }

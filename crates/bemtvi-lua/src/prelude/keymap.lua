@@ -67,7 +67,13 @@ end
 -- same convention `nvim_create_autocmd` uses), so a buffer-local map declared with
 -- `buffer = 0` is pinned to the buffer that was current when it was set.
 local function keymap_resolve_buffer(buffer)
-  if buffer == 0 then
+  if buffer == false then
+    return nil
+  end
+  if buffer ~= nil and buffer ~= true and (type(buffer) ~= "number" or buffer % 1 ~= 0) then
+    error("btv.keymap: `buffer` must be a buffer number or true, got " .. tostring(buffer), 0)
+  end
+  if buffer == 0 or buffer == true then
     return btv._cur_buf and btv._cur_buf.bufnr or 0
   end
   return buffer
@@ -109,6 +115,33 @@ local function keymap_register(modes, lhs, rhs, opts)
   if opts.unique and keymap_clashes(modes, lhs, buffer) then
     error("E227: mapping already exists for " .. lhs, 0)
   end
+  -- A re-set replaces the earlier entry of the same tier (user vs `default`) in the
+  -- requested modes, so re-running a setup cannot stack entries without bound.
+  local default = opts.default or false
+  local want = {}
+  for _, m in ipairs(modes) do
+    want[m] = true
+  end
+  local kept = {}
+  for _, e in ipairs(btv._keymaps) do
+    if e.lhs == lhs and e.buffer == buffer and e.default == default then
+      local remaining = {}
+      for _, m in ipairs(e.modes) do
+        if not want[m] then
+          remaining[#remaining + 1] = m
+        end
+      end
+      if #remaining > 0 then
+        e.modes = remaining
+        kept[#kept + 1] = e
+      elseif e.rhs.kind == "lua" then
+        btv._keymap_fns[e.id] = nil
+      end
+    else
+      kept[#kept + 1] = e
+    end
+  end
+  btv._keymaps = kept
   keymap_seq = keymap_seq + 1
   local id = keymap_seq
   local rhs_data
@@ -165,7 +198,9 @@ end
 -- with any function RHS it held — only when no modes remain. Re-sourcing a config
 -- that re-sets the same map therefore leaves exactly one mapping, so it can't
 -- double-fire. Bumps the version so the server rebuilds its tries.
-local function keymap_remove(modes, lhs, buffer)
+-- `default_only` limits the removal to `default`-tier entries, leaving a user map on
+-- the same key alone.
+local function keymap_remove(modes, lhs, buffer, default_only)
   lhs = keymap_expand_leader(lhs)
   local want = {}
   for _, m in ipairs(modes) do
@@ -173,7 +208,7 @@ local function keymap_remove(modes, lhs, buffer)
   end
   local kept = {}
   for _, e in ipairs(btv._keymaps) do
-    if e.lhs == lhs and e.buffer == buffer then
+    if e.lhs == lhs and e.buffer == buffer and (not default_only or e.default) then
       local remaining = {}
       for _, m in ipairs(e.modes) do
         if not want[m] then
@@ -194,6 +229,44 @@ local function keymap_remove(modes, lhs, buffer)
   btv._keymaps_version = btv._keymaps_version + 1
 end
 
+-- The option keys each setter reads. Anything else (a typo like `buffr`) would be
+-- dropped and the map registered as if it weren't there, so it warns once per key.
+-- `replace_keycodes` / `script` are neovim keys accepted for compatibility.
+local KEYMAP_SET_OPTS = {
+  noremap = true,
+  remap = true,
+  buffer = true,
+  desc = true,
+  default = true,
+  nowait = true,
+  silent = true,
+  expr = true,
+  unique = true,
+  replace_keycodes = true,
+  script = true,
+}
+local KEYMAP_RAW_OPTS = {
+  noremap = true,
+  callback = true,
+  desc = true,
+  default = true,
+  nowait = true,
+  silent = true,
+  expr = true,
+  unique = true,
+  replace_keycodes = true,
+  script = true,
+}
+local keymap_opt_warned = {}
+local function keymap_check_opts(who, opts, known)
+  for k in pairs(opts) do
+    if not known[k] and not keymap_opt_warned[who .. "\0" .. tostring(k)] then
+      keymap_opt_warned[who .. "\0" .. tostring(k)] = true
+      btv.notify(who .. ": unknown option '" .. tostring(k) .. "' ignored", btv.log.levels.WARN)
+    end
+  end
+end
+
 -- `btv.keymap.set`(mode, lhs, rhs, opts): map `lhs` to `rhs` in `mode`.
 -- `rhs` is a function (stored in `btv._keymap_fns`) or a string (fed as keys).
 -- Maps are non-recursive by default (the `btv.keymap.set` convention); pass
@@ -203,6 +276,7 @@ end
 -- marks an overridable built-in — both feed the precedence ladder the server applies.
 function btv.keymap.set(mode, lhs, rhs, opts)
   opts = opts or {}
+  keymap_check_opts("btv.keymap.set", opts, KEYMAP_SET_OPTS)
   -- noremap unless either `noremap = false` or `remap = true` is given.
   local noremap = opts.noremap ~= false and not opts.remap
   keymap_register(keymap_modes(mode), lhs, rhs, {
@@ -236,6 +310,13 @@ function btv.keymap.del(mode, lhs, opts)
   keymap_remove(keymap_modes(mode), lhs, keymap_resolve_buffer(opts.buffer))
 end
 
+-- `btv._keymap_del_default(mode, lhs, buffer)`: remove only the `default`-tier map for
+-- `lhs` — how a built-in that installed defaults takes them back without deleting a
+-- user's own map on the same key.
+function btv._keymap_del_default(mode, lhs, buffer)
+  keymap_remove(keymap_modes(mode), lhs, keymap_resolve_buffer(buffer), true)
+end
+
 -- The lower-level `:map`-family API as canonical `btv.keymap.*` natives (the
 -- nvim_*_keymap names alias onto them at the end of the file). These are a thin
 -- convention-shim over `btv.keymap.set` / `btv.keymap.del` above — there is no
@@ -249,6 +330,7 @@ end
 -- `btv.keymap.raw_buf_set`(buffer, mode, lhs, rhs, opts) [alias `nvim_buf_set_keymap`].
 function btv.keymap.raw_buf_set(buffer, mode, lhs, rhs, opts)
   opts = opts or {}
+  keymap_check_opts("btv.keymap.raw_buf_set", opts, KEYMAP_RAW_OPTS)
   btv.keymap.set(mode, lhs, opts.callback or rhs, {
     noremap = opts.noremap == true,
     buffer = buffer,

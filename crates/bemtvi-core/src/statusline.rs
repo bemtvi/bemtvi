@@ -514,9 +514,20 @@ pub fn expand(
 ) -> Vec<Piece> {
     let mut out = Vec::new();
     let mut group: Option<String> = None;
-    expand_into(items, ctx, eval, &mut group, &mut out);
+    let mut evals = 0;
+    expand_into(items, ctx, eval, &mut group, &mut out, 0, &mut evals);
     out
 }
+
+/// How deep `%{%…%}` / `%!` results may nest. Each level re-parses an expression's
+/// result as a format, so one that returns itself would otherwise recurse until the
+/// stack overflows.
+const MAX_EXPR_DEPTH: usize = 16;
+
+/// How many expressions one line may evaluate. A result that splices in two copies
+/// of itself doubles the work per level, so a depth cap alone would still freeze the
+/// frame on exponentially many calls.
+const MAX_EXPR_EVALS: usize = 512;
 
 /// The recursive worker behind [`expand`]: appends pieces to `out`, threading the
 /// active highlight `group` so re-parsed sub-formats continue under the group in
@@ -527,6 +538,8 @@ fn expand_into(
     eval: &mut dyn FnMut(ExprKind, &str) -> String,
     group: &mut Option<String>,
     out: &mut Vec<Piece>,
+    depth: usize,
+    evals: &mut usize,
 ) {
     for item in items {
         match item {
@@ -540,6 +553,11 @@ fn expand_into(
             }),
             Item::ClickEnd => out.push(Piece::ClickEnd),
             Item::Expr { kind, raw } => {
+                if *evals >= MAX_EXPR_EVALS {
+                    push_text(out, "statusline: too many expressions", group);
+                    return;
+                }
+                *evals += 1;
                 let result = eval(*kind, raw);
                 match kind {
                     ExprKind::Eval => push_text(out, &result, group),
@@ -548,8 +566,16 @@ fn expand_into(
                         // expand it inline. A parse error in the (Lua-produced)
                         // sub-format is surfaced as literal text rather than
                         // dropped, so the failure is visible on the status line.
+                        if depth >= MAX_EXPR_DEPTH {
+                            push_text(
+                                out,
+                                "statusline: %{%…%} / %! results nested too deep",
+                                group,
+                            );
+                            return;
+                        }
                         match parse(&result) {
-                            Ok(sub) => expand_into(&sub, ctx, eval, group, out),
+                            Ok(sub) => expand_into(&sub, ctx, eval, group, out, depth + 1, evals),
                             Err(e) => push_text(out, &e, group),
                         }
                     }

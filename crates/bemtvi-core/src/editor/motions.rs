@@ -170,7 +170,11 @@ impl Editor {
                 let s = self.buffer().line(line);
                 let mut col = self.cursor.col;
                 for _ in 0..count {
-                    col = unicode::prev_grapheme(&s, col);
+                    let prev = unicode::prev_grapheme(&s, col);
+                    if prev == col {
+                        break;
+                    }
+                    col = prev;
                 }
                 MotionResult::exclusive(self.buffer().byte_at(line, col))
             }
@@ -178,7 +182,11 @@ impl Editor {
                 let s = self.buffer().line(line);
                 let mut col = self.cursor.col;
                 for _ in 0..count {
-                    col = unicode::next_grapheme(&s, col);
+                    let next = unicode::next_grapheme(&s, col);
+                    if next == col {
+                        break;
+                    }
+                    col = next;
                 }
                 MotionResult::exclusive(self.buffer().byte_at(line, col))
             }
@@ -235,19 +243,377 @@ impl Editor {
             Motion::BackWord(big) => {
                 let mut idx = self.cursor_char();
                 for _ in 0..count {
-                    idx = self.word_backward(idx, big);
+                    let next = self.word_backward(idx, big);
+                    if next == idx {
+                        break;
+                    }
+                    idx = next;
                 }
                 MotionResult::exclusive(idx)
             }
             Motion::EndWord(big) => {
                 let mut idx = self.cursor_char();
                 for _ in 0..count {
-                    idx = self.word_end(idx, big);
+                    let next = self.word_end(idx, big);
+                    if next == idx {
+                        break;
+                    }
+                    idx = next;
                 }
                 MotionResult::inclusive(idx)
             }
+            Motion::Percent => match raw {
+                // `{count}%`: that percentage into the file, rounded up (vim's
+                // `nv_percent`); over 100 fails.
+                Some(n) => {
+                    if n > 100 {
+                        return None;
+                    }
+                    let lines = last_line + 1;
+                    let l = ((lines * n).div_ceil(100)).clamp(1, lines) - 1;
+                    MotionResult::linewise(self.buffer().line_start(l), MoveAxis::LineAnchor)
+                }
+                None => MotionResult::inclusive(self.matching_bracket()?),
+            },
+            Motion::Sentence(forward) => {
+                let (l, c) = self.sentence_motion(forward, count)?;
+                MotionResult::exclusive(self.buffer().byte_at(l, c))
+            }
+            Motion::Paragraph(forward) => return self.paragraph_motion(forward, count),
+            // `+` / `<CR>` and `-`: `count` lines down / up onto the first non-blank,
+            // linewise; failing (as `j` / `k` do) with no line to go to.
+            Motion::LineDownFirst => {
+                if line >= last_line {
+                    return None;
+                }
+                let l = self.line_below_folds(line, count).min(last_line);
+                MotionResult::linewise(self.buffer().line_start(l), MoveAxis::LineAnchor)
+            }
+            Motion::LineUpFirst => {
+                if line == 0 {
+                    return None;
+                }
+                let l = self.line_above_folds(line, count);
+                MotionResult::linewise(self.buffer().line_start(l), MoveAxis::LineAnchor)
+            }
+            // `_`: `count - 1` lines down (so `d_` is `dd`), first non-blank.
+            Motion::LineFirst => {
+                let l = if count > 1 {
+                    // Like `j`, a count past the last line clamps, but from the last
+                    // line itself there is nowhere to go.
+                    if line >= last_line {
+                        return None;
+                    }
+                    self.line_below_folds(line, count - 1).min(last_line)
+                } else {
+                    line
+                };
+                // Under an operator `_` keeps the cursor's column (vim's `nv_lineop`
+                // only moves to the first non-blank for plain movement and `d`/`<`/`>`).
+                let axis = if self.pending.operator.is_some() {
+                    MoveAxis::VerticalKeep
+                } else {
+                    MoveAxis::LineAnchor
+                };
+                MotionResult::linewise(self.buffer().line_start(l), axis)
+            }
+            // `|`: screen column `count` (1-based) of the cursor's line, exclusive.
+            Motion::Column => {
+                let s = self.buffer().line(line);
+                let tab = self.buffer().options.effective_tabstop();
+                let col = unicode::byte_at_virtcol(&s, count - 1, tab);
+                let col = col.min(unicode::prev_grapheme(&s, s.len()));
+                MotionResult::exclusive(self.buffer().byte_at(line, col))
+            }
+            // `H` / `L`: the `count`-th line from the top / bottom of the window,
+            // `M` its middle line — linewise, onto the first non-blank.
+            Motion::WindowTop | Motion::WindowMiddle | Motion::WindowBottom => {
+                let top = self.top.min(last_line);
+                let bottom = (top + self.text_height().max(1) - 1).min(last_line);
+                let l = match motion {
+                    Motion::WindowTop => (top + count - 1).min(bottom),
+                    Motion::WindowBottom => bottom.saturating_sub(count - 1).max(top),
+                    _ => top + (bottom - top) / 2,
+                };
+                MotionResult::linewise(self.buffer().line_start(l), MoveAxis::LineAnchor)
+            }
         };
         Some(result)
+    }
+
+    /// `%` without a count: the first bracket at or after the cursor on its line,
+    /// then its partner — scanning forward from an opener, backward from a closer,
+    /// counting nesting of that bracket kind (vim's `findmatch`, without its
+    /// comment / preprocessor / quote heuristics). `None` when the line has no
+    /// bracket from the cursor on, or it is unbalanced.
+    fn matching_bracket(&self) -> Option<usize> {
+        let buf = self.buffer();
+        let line = self.cursor.line;
+        let text = buf.line_cow(line);
+        let (rel, ch) = text
+            .char_indices()
+            .find(|&(i, c)| i >= self.cursor.col && "(){}[]".contains(c))?;
+        let (open, close, forward) = match ch {
+            '(' => ('(', ')', true),
+            '[' => ('[', ']', true),
+            '{' => ('{', '}', true),
+            ')' => ('(', ')', false),
+            ']' => ('[', ']', false),
+            _ => ('{', '}', false),
+        };
+        let (open, close) = (open as u8, close as u8);
+        let mut depth = 0usize;
+        let mut l = line;
+        let mut first = true;
+        loop {
+            let t = buf.line_cow(l);
+            let bytes = t.as_bytes();
+            if forward {
+                let from = if first { rel } else { 0 };
+                for (i, &b) in bytes.iter().enumerate().skip(from) {
+                    if b == open {
+                        depth += 1;
+                    } else if b == close {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(buf.line_start(l) + i);
+                        }
+                    }
+                }
+                if l >= self.last_line() {
+                    return None;
+                }
+                l += 1;
+            } else {
+                let upto = if first { rel + 1 } else { bytes.len() };
+                for i in (0..upto).rev() {
+                    let b = bytes[i];
+                    if b == close {
+                        depth += 1;
+                    } else if b == open {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(buf.line_start(l) + i);
+                        }
+                    }
+                }
+                if l == 0 {
+                    return None;
+                }
+                l -= 1;
+            }
+            first = false;
+        }
+    }
+
+    /// The character at `(line, col)` — `None` past the end of the line (vim's
+    /// `NUL`, which `gchar_pos` reads there).
+    fn pos_char(&self, p: (usize, usize)) -> Option<char> {
+        self.buffer().line_cow(p.0).get(p.1..)?.chars().next()
+    }
+
+    /// vim's `inc`: one character forward, through the end-of-line position onto
+    /// the next line. `0` moved within the line, `2` onto its end, `1` onto the
+    /// next line, `-1` nowhere (the end of the buffer).
+    fn pos_inc(&self, p: &mut (usize, usize)) -> i32 {
+        let text = self.buffer().line_cow(p.0);
+        if p.1 < text.len() {
+            p.1 = unicode::next_grapheme(&text, p.1);
+            return if p.1 < text.len() { 0 } else { 2 };
+        }
+        if p.0 < self.last_line() {
+            *p = (p.0 + 1, 0);
+            return 1;
+        }
+        -1
+    }
+
+    /// vim's `dec`: one character back, onto the previous line's end position from
+    /// column 0. `0` within the line, `1` onto the previous line, `-1` nowhere.
+    fn pos_dec(&self, p: &mut (usize, usize)) -> i32 {
+        if p.1 > 0 {
+            let text = self.buffer().line_cow(p.0);
+            p.1 = unicode::prev_grapheme(&text, p.1.min(text.len()));
+            return 0;
+        }
+        if p.0 > 0 {
+            *p = (p.0 - 1, self.buffer().line_len(p.0 - 1));
+            return 1;
+        }
+        -1
+    }
+
+    /// vim's `incl`: [`pos_inc`](Self::pos_inc) that never rests on a line's end.
+    fn pos_incl(&self, p: &mut (usize, usize)) -> i32 {
+        let r = self.pos_inc(p);
+        if r >= 1 && p.1 != 0 {
+            return self.pos_inc(p);
+        }
+        r
+    }
+
+    /// vim's `decl`: [`pos_dec`](Self::pos_dec) that never rests on a line's end.
+    fn pos_decl(&self, p: &mut (usize, usize)) -> i32 {
+        let r = self.pos_dec(p);
+        if r == 1 && p.1 != 0 {
+            return self.pos_dec(p);
+        }
+        r
+    }
+
+    /// `)` / `(`: the start of the `count`-th next / previous sentence — vim's
+    /// `findsent`, step for step. A sentence ends at `.`/`!`/`?`, optionally
+    /// followed by `)`/`]`/`"`/`'`, then a space, a tab or the end of the line; an
+    /// empty line is a boundary of its own. `None` when it runs out of buffer with
+    /// sentences still to go.
+    fn sentence_motion(&self, forward: bool, count: usize) -> Option<(usize, usize)> {
+        const CLOSERS: &str = ")]\"'";
+        const ENDERS: &str = ".!?)]\"'";
+        let empty = |l: usize| self.buffer().line_len(l) == 0;
+        let step = |p: &mut (usize, usize)| {
+            if forward {
+                self.pos_incl(p)
+            } else {
+                self.pos_decl(p)
+            }
+        };
+        let mut pos = (self.cursor.line, self.cursor.col);
+        let mut left = count.max(1);
+        while left > 0 {
+            left -= 1;
+            let prev = pos;
+            let mut noskip = false;
+            'found: {
+                if self.pos_char(pos).is_none() {
+                    // On an empty line: skip to a non-empty one.
+                    while step(&mut pos) != -1 && self.pos_char(pos).is_none() {}
+                    if forward {
+                        break 'found;
+                    }
+                } else if !forward {
+                    self.pos_decl(&mut pos);
+                }
+                // Back over white space and sentence-ending punctuation.
+                let mut found_dot = false;
+                while let Some(c) = self.pos_char(pos) {
+                    if !(c == ' ' || c == '\t' || ENDERS.contains(c)) {
+                        break;
+                    }
+                    let mut t = pos;
+                    if self.pos_decl(&mut t) == -1 || (empty(t.0) && forward) || found_dot {
+                        break;
+                    }
+                    if ".!?".contains(c) {
+                        found_dot = true;
+                    }
+                    if CLOSERS.contains(c) && !self.pos_char(t).is_some_and(|d| ENDERS.contains(d))
+                    {
+                        break;
+                    }
+                    self.pos_decl(&mut pos);
+                }
+                // Find the end of the sentence.
+                let start_line = pos.0;
+                loop {
+                    let Some(c) = self.pos_char(pos) else {
+                        if !forward && pos.0 != start_line {
+                            pos = (pos.0 + 1, 0);
+                        }
+                        break;
+                    };
+                    if ".!?".contains(c) {
+                        let mut t = pos;
+                        let mut r;
+                        loop {
+                            r = self.pos_inc(&mut t);
+                            if r == -1 || !self.pos_char(t).is_some_and(|d| CLOSERS.contains(d)) {
+                                break;
+                            }
+                        }
+                        let tc = self.pos_char(t);
+                        if r == -1 || matches!(tc, None | Some(' ') | Some('\t')) {
+                            pos = t;
+                            if self.pos_char(pos).is_none() {
+                                self.pos_inc(&mut pos);
+                            }
+                            break;
+                        }
+                    }
+                    if step(&mut pos) == -1 {
+                        if left > 0 {
+                            return None;
+                        }
+                        noskip = true;
+                        break;
+                    }
+                }
+            }
+            while !noskip && matches!(self.pos_char(pos), Some(' ' | '\t')) {
+                if self.pos_incl(&mut pos) == -1 {
+                    break;
+                }
+            }
+            if pos == prev {
+                // Didn't actually move: step one character and try again; at the
+                // buffer's edge with sentences still to go, the motion fails.
+                if step(&mut pos) == -1 {
+                    if left > 0 {
+                        return None;
+                    }
+                    break;
+                }
+                left += 1;
+            }
+        }
+        Some(pos)
+    }
+
+    /// `}` / `{`: the `count`-th next / previous empty line past a non-empty one —
+    /// vim's `findpar`. Exclusive, in column 0; running into the last line forward
+    /// lands on its last character instead, inclusively. A closed fold is stepped
+    /// over whole. `None` when the buffer ends with paragraphs still to go.
+    fn paragraph_motion(&self, forward: bool, count: usize) -> Option<MotionResult> {
+        let last = self.last_line();
+        let empty = |l: usize| self.buffer().line_len(l) == 0;
+        let mut curr = self.cursor.line;
+        let mut left = count.max(1);
+        while left > 0 {
+            left -= 1;
+            let mut did_skip = false;
+            let mut first = true;
+            loop {
+                if !empty(curr) {
+                    did_skip = true;
+                }
+                if first {
+                    curr = if forward {
+                        self.fold_line_end(curr)
+                    } else {
+                        self.fold_line_start(curr)
+                    };
+                } else if did_skip && empty(curr) {
+                    break;
+                }
+                first = false;
+                let next = if forward {
+                    (curr < last).then(|| curr + 1)
+                } else {
+                    curr.checked_sub(1)
+                };
+                match next {
+                    Some(n) => curr = n,
+                    None if left > 0 => return None,
+                    None => break,
+                }
+            }
+        }
+        let start = self.buffer().line_start(curr);
+        if forward && curr == last && !empty(curr) {
+            let text = self.buffer().line_cow(curr);
+            let col = unicode::prev_grapheme(&text, text.len());
+            return Some(MotionResult::inclusive(start + col));
+        }
+        Some(MotionResult::exclusive(start))
     }
 
     /// Resolve a `w`/`W` word motion. Special case: `cw` on a non-blank acts like
@@ -264,13 +630,40 @@ impl Editor {
             && idx <= self.last_char_idx()
             && char_class(self.char_at(idx)) != CharClass::Blank
         {
-            for _ in 0..count {
-                idx = self.word_end(idx, big);
+            // On the last character of a word the first unit is that word's end
+            // already (vim's `end_word` with `stop`): `cw` there changes one char.
+            let next_g = self.next_grapheme_idx(idx);
+            let at_word_end = next_g > self.last_char_idx()
+                || self.span_class(next_g, big) != self.span_class(idx, big);
+            for _ in usize::from(at_word_end)..count {
+                let next = self.word_end(idx, big);
+                if next == idx {
+                    break;
+                }
+                idx = next;
             }
             MotionResult::inclusive(idx)
         } else {
-            for _ in 0..count {
-                idx = self.word_forward(idx, big);
+            for n in 0..count {
+                let next = self.word_forward(idx, big);
+                if next == idx {
+                    break;
+                }
+                // Under an operator the last word moved over ends at its line's
+                // end: `dw` on a line's last word stops at the line break instead
+                // of running on to the next line's first word (vim's `fwd_word`
+                // with `eol`), so the break itself is never swallowed.
+                let line = self.buffer().byte_to_line(idx);
+                let eol = self.buffer().byte_at(line, self.buffer().line_len(line));
+                if self.pending.operator.is_some()
+                    && n + 1 == count
+                    && idx < eol
+                    && self.buffer().byte_to_line(next) > line
+                {
+                    idx = eol;
+                    break;
+                }
+                idx = next;
             }
             MotionResult::exclusive(idx)
         }
@@ -516,9 +909,9 @@ impl Editor {
         let charwise = |r: Option<(usize, usize)>| r.map(|(lo, hi)| (lo, hi, false));
         match kind {
             ObjectKind::Word(big) => charwise(self.word_object(ia, count, big)),
-            ObjectKind::Pair(open, close) => self.pair_object(ia, open, close),
-            ObjectKind::Quote(q) => charwise(self.quote_object(ia, q)),
-            ObjectKind::Sentence => charwise(self.sentence_object(ia, count)),
+            ObjectKind::Pair(open, close) => self.pair_object(ia, open, close, count),
+            ObjectKind::Quote(q) => charwise(self.quote_object(ia, q, count)),
+            ObjectKind::Sentence => self.sentence_object_for_use(ia, count),
             ObjectKind::Paragraph => self.paragraph_object(ia, count), // linewise
             // Tree-sitter objects need to query the (mutable) syntax engine, so they
             // resolve through the `&mut self` path [`Editor::ts_text_object_range`],
@@ -607,6 +1000,79 @@ impl Editor {
         }
     }
 
+    /// A text object typed over a selection that already spans more than one
+    /// character grows it, as in vim: a bracket object selects the next pair out
+    /// that is larger than the selection (`va(a(`), and the word / sentence /
+    /// paragraph objects add the object that follows the selection's end
+    /// (`vawaw`, `vipip`). A selection made backwards, a quote object, or a
+    /// user/tree-sitter object resolve from the cursor as before.
+    pub(crate) fn extend_visual_text_object(
+        &mut self,
+        ia: char,
+        key: char,
+        count: usize,
+    ) -> Option<(usize, usize, bool)> {
+        let builtin = if self.textobject_map.contains_key(&format!("{ia}{key}")) {
+            None
+        } else {
+            ObjectKind::from_key(key)
+        };
+        let forward = (self.visual_anchor.line, self.visual_anchor.col)
+            <= (self.cursor.line, self.cursor.col);
+        let kind = match builtin {
+            Some(
+                k @ (ObjectKind::Pair(..)
+                | ObjectKind::Word(_)
+                | ObjectKind::Sentence
+                | ObjectKind::Paragraph),
+            ) if forward => k,
+            _ => return self.resolve_text_object(ia, key, count),
+        };
+        let linewise_sel = self.mode == Mode::VisualLine;
+        let sel_lo = if linewise_sel {
+            self.buffer().line_start(self.visual_anchor.line)
+        } else {
+            self.buffer()
+                .byte_at(self.visual_anchor.line, self.visual_anchor.col)
+        };
+        let sel_hi = self.next_grapheme_idx(self.cursor_char());
+        if let ObjectKind::Pair(..) = kind {
+            // Step outward until the pair is strictly larger than the selection.
+            let mut n = count.max(1);
+            loop {
+                let (lo, hi, lw) = self.text_object_range(ia, kind, n)?;
+                if lo <= sel_lo && hi >= sel_hi && (lo, hi) != (sel_lo, sel_hi) {
+                    return Some((lo, hi, lw));
+                }
+                n += 1;
+            }
+        }
+        // Resolve the object just past the selection's end, then keep the start.
+        let saved = self.cursor;
+        if matches!(kind, ObjectKind::Paragraph) {
+            if self.cursor.line + 1 >= self.buffer().line_count() {
+                return None;
+            }
+            self.cursor = Cursor {
+                line: self.cursor.line + 1,
+                col: 0,
+            };
+        } else {
+            let mut next = sel_hi;
+            if self.char_at(next) == '\n' && next + 1 < self.last_char_idx() {
+                next += 1;
+            }
+            if next >= self.last_char_idx() {
+                return None;
+            }
+            self.set_cursor_char(next);
+        }
+        let range = self.text_object_range(ia, kind, count);
+        self.cursor = saved;
+        let (_, hi, lw) = range?;
+        Some((sel_lo, hi.max(sel_hi), lw))
+    }
+
     /// Register (or, with `capture = None`, unregister) a user tree-sitter text
     /// object: bind the full `i`/`a` + object-key sequence `lhs` (`"il"`, `"af"`, …)
     /// to the exact `textobjects.scm` capture to select. Set from Lua via
@@ -663,10 +1129,13 @@ impl Editor {
         }
         if let Some(op) = self.pending.operator.take() {
             if linewise {
+                // A charwise object made linewise (`das` from the indent) may
+                // start inside its first line.
                 let first_line = self.buffer().byte_to_line(lo);
-                self.apply_operator_to_range(op, lo, hi, true, first_line);
+                let line_lo = self.buffer().line_start(first_line);
+                self.apply_operator_to_range(op, line_lo, hi, true, first_line);
             } else {
-                self.apply_operator_to_range(op, lo, hi, false, 0);
+                self.apply_charwise_operator(op, lo, hi);
             }
         }
         self.reset_pending();
@@ -740,7 +1209,116 @@ impl Editor {
     /// `iw`/`aw` (`big = false`) and `iW`/`aW` (`big = true`). `iw` is the run
     /// under the cursor; `aw` adds the trailing whitespace (or, if there is
     /// none, the leading whitespace). `count` extends over successive spans.
+    ///
+    /// Runs never cross a line break: the end of a line is not "trailing white
+    /// space" for `aw` (vim takes the leading blanks instead, but never the
+    /// indent), and a further count steps over the break to the next line's words
+    /// without counting it as a unit of its own.
     fn word_object(&self, ia: char, count: usize, big: bool) -> Option<(usize, usize)> {
+        let last = self.last_char_idx();
+        let cur = self.cursor_char().min(last);
+        if self.char_at(cur) == '\n' {
+            return self.word_object_on_line_break(ia, count, big);
+        }
+        let is_nl = |i: usize| self.char_at(i) == '\n';
+        let is_blank = |i: usize| matches!(self.char_at(i), ' ' | '\t');
+        // `[start, end)` of the same-class run at `idx`, confined to its line.
+        let run_end = |idx: usize| {
+            let cls = self.span_class(idx, big);
+            let mut e = idx;
+            while e < last && !is_nl(e) && self.span_class(e, big) == cls {
+                e = self.next_grapheme_idx(e);
+            }
+            e
+        };
+        let run_start = |idx: usize| {
+            let cls = self.span_class(idx, big);
+            let mut s = idx;
+            while s > 0 {
+                let p = self.prev_grapheme_idx(s);
+                if is_nl(p) || self.span_class(p, big) != cls {
+                    break;
+                }
+                s = p;
+            }
+            s
+        };
+        // Step over blanks and line breaks to the next word; `None` at buffer end.
+        let next_word = |mut e: usize| {
+            while e < last && (is_nl(e) || is_blank(e)) {
+                e = self.next_grapheme_idx(e);
+            }
+            (e < last).then_some(e)
+        };
+
+        let mut start = run_start(cur);
+        let mut end = run_end(cur);
+
+        if ia == 'i' {
+            for _ in 1..count {
+                if end >= last {
+                    break;
+                }
+                if is_nl(end) {
+                    end = self.next_grapheme_idx(end);
+                    if end >= last {
+                        break;
+                    }
+                    if is_nl(end) {
+                        // An empty line is a unit of its own.
+                        end = self.next_grapheme_idx(end);
+                        continue;
+                    }
+                }
+                end = run_end(end);
+            }
+            return Some((start, end));
+        }
+
+        if is_blank(cur) {
+            // On white space every unit is the white run plus the word after it.
+            for unit in 0..count {
+                if unit > 0 && end < last && is_blank(end) {
+                    end = run_end(end);
+                }
+                end = run_end(next_word(end)?);
+            }
+            return Some((start, end));
+        }
+
+        let mut took_trailing = false;
+        for unit in 0..count {
+            if unit > 0 {
+                end = run_end(next_word(end)?);
+            }
+            took_trailing = end < last && is_blank(end);
+            if took_trailing {
+                end = run_end(end);
+            }
+        }
+        // No trailing white space: take the leading blanks — unless they are the
+        // line's indent.
+        if !took_trailing && start > 0 {
+            let prev = self.prev_grapheme_idx(start);
+            if is_blank(prev) {
+                let s2 = run_start(prev);
+                let line_start = self.buffer().line_start(self.buffer().byte_to_line(s2));
+                if s2 > line_start {
+                    start = s2;
+                }
+            }
+        }
+        Some((start, end))
+    }
+
+    /// `iw`/`aw` with the cursor on a line break (an empty line): the old
+    /// buffer-wide span walk, where the break is part of a blank run.
+    fn word_object_on_line_break(
+        &self,
+        ia: char,
+        count: usize,
+        big: bool,
+    ) -> Option<(usize, usize)> {
         let last = self.last_char_idx();
         let cur = self.cursor_char();
         let (start, end0) = self.class_span(cur, big);
@@ -807,8 +1385,22 @@ impl Editor {
     /// `i(`/`a(` and friends. Find the innermost `open`/`close` pair enclosing
     /// the cursor; `i` excludes the brackets, `a` includes them. The bool is
     /// the linewise flag (see the inner promotion below).
-    fn pair_object(&self, ia: char, open: char, close: char) -> Option<(usize, usize, bool)> {
-        let open_idx = self.find_unmatched_open(open, close, self.cursor_char())?;
+    fn pair_object(
+        &self,
+        ia: char,
+        open: char,
+        close: char,
+        count: usize,
+    ) -> Option<(usize, usize, bool)> {
+        // `{count}i(` selects the `count`-th enclosing pair, so step outward
+        // from the innermost one; more levels than exist is no object at all.
+        let mut open_idx = self.find_unmatched_open(open, close, self.cursor_char())?;
+        for _ in 1..count {
+            if open_idx == 0 {
+                return None;
+            }
+            open_idx = self.find_unmatched_open(open, close, open_idx - 1)?;
+        }
         let close_idx = self.find_match_close(open, close, open_idx)?;
 
         if ia == 'i' {
@@ -922,7 +1514,7 @@ impl Editor {
     ///
     /// A backslash escapes the following byte (vim's `quoteescape`), so `\"` is
     /// not a delimiter and `\\` is a literal backslash followed by a real quote.
-    fn quote_object(&self, ia: char, quote: char) -> Option<(usize, usize)> {
+    fn quote_object(&self, ia: char, quote: char, count: usize) -> Option<(usize, usize)> {
         let line = self.cursor.line;
         let base = self.buffer().line_start(line);
         let s = self.buffer().line(line);
@@ -945,24 +1537,27 @@ impl Editor {
         }
         let cursor_rel = self.cursor_char() - base;
 
-        // First left-to-right pair whose closing quote is at or after the
-        // cursor: it either encloses the cursor or is the next one ahead.
-        let (open, close) = quotes
-            .chunks_exact(2)
-            .map(|p| (p[0], p[1]))
-            .find(|&(_, c)| cursor_rel <= c)
-            // Dangling-quote fallback (odd quote count, e.g. `"trib"uto"`): the
-            // cursor is past the last complete pair but flanked by quotes, so
-            // pair the quote before it with the next one. This lets `i"`/`a"`
-            // work on both sides of a shared quote. (`"a" "b"`-style gaps still
-            // hit the normal path above and seek forward to the next string.)
-            .or_else(|| {
-                let l = *quotes.iter().rev().find(|&&p| p < cursor_rel)?;
-                let r = *quotes.iter().find(|&&p| p >= cursor_rel)?;
-                Some((l, r))
-            })?;
+        // vim's `current_quote`. On a quote, pair the line's quotes left to right
+        // to learn whether it opens or closes a string. Off one, the string runs
+        // from the nearest quote before the cursor (else the first one after it) to
+        // the next quote — so between two strings it is the text between them.
+        let (open, close) = if quotes.contains(&cursor_rel) {
+            quotes
+                .chunks_exact(2)
+                .map(|p| (p[0], p[1]))
+                .find(|&(o, c)| o <= cursor_rel && cursor_rel <= c)?
+        } else {
+            let open = match quotes.iter().rev().find(|&&p| p < cursor_rel) {
+                Some(&p) => p,
+                None => *quotes.iter().find(|&&p| p > cursor_rel)?,
+            };
+            let close = *quotes.iter().find(|&&p| p > open)?;
+            (open, close)
+        };
 
         let (lo_rel, hi_rel) = match ia {
+            // A count takes the quotes too, but not `a"`'s white space (vim's `2i"`).
+            'i' if count >= 2 => (open, close + 1),
             'i' => (open + 1, close),
             _ => {
                 // `a"`: include the quotes, then the trailing whitespace.
@@ -997,6 +1592,15 @@ impl Editor {
             return None;
         }
         let blank = |l: usize| self.buffer().line_len(l) == 0;
+        // The last line of the block (run of same-kind lines) starting at `l`.
+        let block_end = |l: usize| {
+            let kind = blank(l);
+            let mut e = l;
+            while e + 1 < total && blank(e + 1) == kind {
+                e += 1;
+            }
+            e
+        };
         let cur = self.cursor.line.min(total - 1);
         let on_blank = blank(cur);
 
@@ -1004,34 +1608,55 @@ impl Editor {
         while first > 0 && blank(first - 1) == on_blank {
             first -= 1;
         }
-        let mut last = cur;
-        while last + 1 < total && blank(last + 1) == on_blank {
-            last += 1;
-        }
+        let mut last = block_end(cur);
+        let count = count.max(1);
 
-        // `count` extends over further blocks, alternating blank/non-blank.
-        let mut kind = on_blank;
-        for _ in 1..count {
+        if ia == 'i' {
+            // Every block counts, blank or not; running out of them is no object.
+            for _ in 1..count {
+                if last + 1 >= total {
+                    return None;
+                }
+                last = block_end(last + 1);
+            }
+        } else if on_blank {
             if last + 1 >= total {
-                break;
-            }
-            kind = !kind;
-            while last + 1 < total && blank(last + 1) == kind {
-                last += 1;
-            }
-        }
-
-        if ia == 'a' {
-            // Include the trailing block of the opposite kind (blank lines after
-            // a normal paragraph); if there is none, take the preceding one.
-            let trailing = !blank(last);
-            if last + 1 < total && blank(last + 1) == trailing {
-                while last + 1 < total && blank(last + 1) == trailing {
-                    last += 1;
+                // Trailing blank lines: take the paragraph before them instead.
+                while first > 0 && !blank(first - 1) {
+                    first -= 1;
                 }
             } else {
-                let leading = !blank(first);
-                while first > 0 && blank(first - 1) == leading {
+                // Each unit is a blank block plus the paragraph after it.
+                last = block_end(last + 1);
+                for _ in 1..count {
+                    if last + 1 >= total {
+                        return None;
+                    }
+                    last = block_end(last + 1);
+                    if last + 1 >= total {
+                        return None;
+                    }
+                    last = block_end(last + 1);
+                }
+            }
+        } else {
+            // Each unit is a paragraph plus the blank lines after it; with none
+            // after the last one, the blank lines before the first are taken.
+            let mut took_trailing = false;
+            for unit in 0..count {
+                if unit > 0 {
+                    if last + 1 >= total {
+                        return None;
+                    }
+                    last = block_end(last + 1);
+                }
+                took_trailing = last + 1 < total && blank(last + 1);
+                if took_trailing {
+                    last = block_end(last + 1);
+                }
+            }
+            if !took_trailing {
+                while first > 0 && blank(first - 1) {
                     first -= 1;
                 }
             }
@@ -1078,7 +1703,10 @@ impl Editor {
         let is_ws = |c: char| c == ' ' || c == '\t' || c == '\n' || c == '\r';
         let is_close = |c: char| matches!(c, ')' | ']' | '"' | '\'');
 
-        // Each sentence as `(start, text_end, ws_end)`.
+        let is_blank = |c: char| c == ' ' || c == '\t';
+        // Each sentence as `(start, text_end, ws_end)`: `ws_end` is where the next
+        // sentence starts, past every white space character, line breaks and the
+        // next line's indent included.
         let mut segs: Vec<(usize, usize, usize)> = Vec::new();
         let mut s = p_start;
         while s < p_end && is_ws(self.char_at(s)) {
@@ -1125,21 +1753,81 @@ impl Editor {
                 idx = n;
             }
         }
+        // On the white space between two sentences, `is` is that white space and
+        // `as` is the white space plus the sentence after it.
+        let (_, gap_lo, _) = segs[idx];
+        let gap_hi = segs.get(idx + 1).map_or(p_end, |n| n.0);
+        if cursor >= gap_lo && cursor < gap_hi {
+            // A line break at either edge of the gap is not part of it.
+            let lo = if self.char_at(gap_lo) == '\n' {
+                gap_lo + 1
+            } else {
+                gap_lo
+            };
+            if ia == 'i' {
+                let hi = if gap_hi > lo && self.char_at(gap_hi - 1) == '\n' {
+                    gap_hi - 1
+                } else {
+                    gap_hi
+                };
+                return Some((lo, hi));
+            }
+            let end = (idx + count.max(1)).min(segs.len() - 1);
+            return Some((lo, segs[end].1.max(gap_hi)));
+        }
         let start = segs[idx].0;
         let end = (idx + count.max(1) - 1).min(segs.len() - 1);
         let (_, text_end, ws_end) = segs[end];
 
         if ia == 'i' {
-            Some((start, text_end))
-        } else if ws_end > text_end {
-            Some((start, ws_end))
-        } else {
-            // No trailing whitespace: take the leading whitespace instead.
-            let mut lo = start;
-            while lo > p_start && is_ws(self.char_at(self.prev_grapheme_idx(lo))) {
-                lo = self.prev_grapheme_idx(lo);
-            }
-            Some((lo, ws_end))
+            return Some((start, text_end));
         }
+        // The white space up to the next sentence is "trailing" only when it holds
+        // a blank: a bare line break is not, and then the leading blanks on the
+        // line are taken instead (vim's `current_sent`).
+        let buf = self.buffer();
+        let mut before = ws_end;
+        if before > text_end && buf.line_start(buf.byte_to_line(before)) == before {
+            before -= 1;
+        }
+        let trailing = before > text_end && is_blank(self.char_at(before - 1));
+        let mut lo = start;
+        if !trailing {
+            // Back over the leading blanks, through a line break that has blanks
+            // before it.
+            while lo > p_start {
+                let p = self.prev_grapheme_idx(lo);
+                let c = self.char_at(p);
+                let blank_before = |i: usize| matches!(self.buffer().text.byte(i), b' ' | b'\t');
+                if is_blank(c) || (c == '\n' && p > p_start && blank_before(p - 1)) {
+                    lo = p;
+                } else {
+                    break;
+                }
+            }
+        }
+        Some((lo, ws_end))
+    }
+
+    /// `as` resolved for its consumer: a range that runs to column 0 of a later
+    /// line ends before that line break (the end of the buffer's last line, too),
+    /// and under an operator one that also starts in the indent is linewise — vim's
+    /// rule for an exclusive motion ending in column 0 (`:h exclusive-linewise`).
+    fn sentence_object_for_use(&self, ia: char, count: usize) -> Option<(usize, usize, bool)> {
+        let (lo, hi) = self.sentence_object(ia, count)?;
+        let buf = self.buffer();
+        let last = self.last_char_idx();
+        if hi > last {
+            return Some((lo, last, false));
+        }
+        let (lo_line, hi_line) = (buf.byte_to_line(lo), buf.byte_to_line(hi));
+        if ia == 'a' && hi_line > lo_line && buf.line_start(hi_line) == hi {
+            let op_pending = self.pending.operator.is_some() && !self.mode.is_visual();
+            if op_pending && lo - buf.line_start(lo_line) <= self.first_non_blank(lo_line) {
+                return Some((lo, hi, true));
+            }
+            return Some((lo, hi - 1, false));
+        }
+        Some((lo, hi, false))
     }
 }

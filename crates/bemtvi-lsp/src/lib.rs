@@ -27,6 +27,7 @@ mod client;
 mod convert;
 pub mod log;
 mod protocol;
+mod shadow;
 pub mod uri;
 
 // The async client surface — tokio + `async-lsp`. Gated to `native`; absent in the
@@ -63,6 +64,7 @@ pub use protocol::{
     SymbolData, WorkspaceChange, WorkspaceEditData,
 };
 pub use serde_json;
+pub use shadow::DocShadow;
 
 // The native async manager + transport seam: the manager spawns each server
 // through the transport (`bemtvi-server` injects a daemon-backed one for the

@@ -1461,6 +1461,40 @@ async fn deleting_a_buffer_fires_bufdelete_for_it() {
     assert_eq!(msg, "2", "BufDelete fired for the deleted buffer");
 }
 
+#[tokio::test]
+async fn deleting_a_buffer_drops_its_buffer_local_autocmds() {
+    // A buffer-local autocmd belongs to its buffer: once the buffer is gone the
+    // handler goes with it (like its buffer-local keymaps and commands), instead of
+    // lingering in the registry for a bufnr nothing has any more.
+    let dir = temp_dir("au_buflocal_cleanup");
+    let a = dir.join("a.rs");
+    let b = dir.join("b.rs");
+    std::fs::write(&a, "a\n").expect("write a");
+    std::fs::write(&b, "b\n").expect("write b");
+    let (rpc, mut incoming) =
+        start_with_file_and_config(&dir, a.to_str().unwrap(), "_G.del = 0\n").await;
+    redraw_after(&rpc, &mut incoming, &format!(":edit {}<CR>", b.display())).await; // buffer 2
+    exec_lua(
+        &rpc,
+        "btv.autocmd.create('BufEnter', { buffer = 2, callback = function() end })\n\
+         btv.autocmd.create('BufDelete', { buffer = 2, callback = function() _G.del = _G.del + 1 end })",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, ":bdelete<CR>").await; // delete buffer 2
+    let left = exec_lua(
+        &rpc,
+        "local n = 0\n\
+         for _, au in ipairs(btv.autocmd.get({})) do if au.buffer == 2 then n = n + 1 end end\n\
+         return n .. ' ' .. _G.del",
+    )
+    .await;
+    assert_eq!(
+        left.as_str(),
+        Some("0 1"),
+        "the buffer's own BufDelete ran, then its autocmds were dropped"
+    );
+}
+
 // ----- InsertLeave -----------------------------------------------------------
 
 #[tokio::test]
@@ -4027,4 +4061,73 @@ async fn bufmodifiedset_fires_while_typing_in_a_modeless_session() {
     feed(&rpc, "abc");
     let n = exec_lua(&rpc, "return _G.n").await;
     assert_eq!(n.as_u64(), Some(1));
+}
+
+/// Wait (bounded) for the server to exit: an `bemtvi_exit` notification or the closed
+/// channel. `false` when it is still running after `ms`.
+async fn exits_within(incoming: &mut UnboundedReceiver<Incoming>, ms: u64) -> bool {
+    let timeout = std::time::Duration::from_millis(ms);
+    loop {
+        match tokio::time::timeout(timeout, incoming.recv()).await {
+            Ok(None) => break true,
+            Ok(Some(Incoming::Notification { method, .. })) if method == "bemtvi_exit" => {
+                break true
+            }
+            Ok(Some(_)) => continue,
+            Err(_) => break false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn wq_waits_for_an_async_bufwritepre_then_quits() {
+    // `:wq` with an async BufWritePre handler: the quit must wait for the parked write
+    // to commit (the handler's mutation reaching disk), then exit — never quit with the
+    // write still parked, and never stay up forever.
+    let dir = temp_dir("au_wq_async_pre");
+    let file = dir.join("note.txt");
+    std::fs::write(&file, "hello\n").expect("seed file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "vim.api.nvim_create_autocmd('BufWritePre', {\n\
+         \x20 callback = function()\n\
+         \x20   return btv.promise.delay(30):next(function() vim.cmd([[%s/hello/HELLO/]]) end)\n\
+         \x20 end })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, "A!<Esc>").await;
+    feed(&rpc, ":wq<CR>");
+    let quit = exits_within(&mut incoming, 2000).await;
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("read back"),
+        "HELLO!\n",
+        "the async BufWritePre's write landed"
+    );
+    assert!(quit, "`:wq` quits once the parked write commits");
+}
+
+#[tokio::test]
+async fn wqa_waits_for_an_async_bufwritepre_then_quits() {
+    let dir = temp_dir("au_wqa_async_pre");
+    let file = dir.join("note.txt");
+    std::fs::write(&file, "hello\n").expect("seed file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "vim.api.nvim_create_autocmd('BufWritePre', {\n\
+         \x20 callback = function()\n\
+         \x20   return btv.promise.delay(30):next(function() vim.cmd([[%s/hello/HELLO/]]) end)\n\
+         \x20 end })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, "A!<Esc>").await;
+    feed(&rpc, ":wqa<CR>");
+    let quit = exits_within(&mut incoming, 2000).await;
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("read back"),
+        "HELLO!\n",
+        "the async BufWritePre's write landed"
+    );
+    assert!(quit, "`:wqa` quits once the parked write commits");
 }

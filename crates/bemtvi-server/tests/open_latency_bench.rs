@@ -118,7 +118,7 @@ async fn open_latency() {
         eprintln!(
             "skip: python grammar not installed under {} \
              (set BEMTVI_DATA_DIR or install it)",
-            bemtvi_ts::data_dir().display()
+            bemtvi_ts::data_dir().unwrap_or_default().display()
         );
         return;
     }

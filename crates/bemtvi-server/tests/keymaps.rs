@@ -296,6 +296,71 @@ async fn last_set_mapping_wins() {
     );
 }
 
+/// Re-setting a mapping REPLACES it rather than stacking another registry entry:
+/// introspection reports one mapping (the latest), so a `FileType`/`BufEnter`
+/// handler that re-sets its maps every time cannot grow the registry without
+/// bound. A `default` map still sits underneath a user map on the same key
+/// instead of displacing it.
+#[tokio::test]
+async fn re_setting_a_mapping_replaces_the_registry_entry() {
+    let dir = temp_dir("keymap_replace");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    let got = exec_lua(
+        &rpc,
+        "for i = 1, 5 do btv.keymap.set('n', 'zq', 'i' .. i .. '<Esc>') end\n\
+         btv.keymap.set('n', 'zq', 'idef<Esc>', { default = true })\n\
+         local n, rhs = 0, {}\n\
+         for _, m in ipairs(btv.keymap.get('n')) do\n\
+           if m.lhs == 'zq' then n = n + 1; rhs[#rhs + 1] = m.rhs end\n\
+         end\n\
+         table.sort(rhs)\n\
+         return n .. ' ' .. table.concat(rhs, ',')",
+    )
+    .await;
+    assert_eq!(
+        got.as_str(),
+        Some("2 i5<Esc>,idef<Esc>"),
+        "one user entry (the latest) plus the default underneath"
+    );
+    feed(&rpc, "zq");
+    assert_eq!(lines(&rpc).await, vec!["5"], "the user map still wins");
+}
+
+/// `buffer = true` is neovim's spelling of "the current buffer", same as `0`: the
+/// map lands buffer-local and fires. A `buffer` that is neither a number nor `true`
+/// is refused at set time instead of registering a map nothing can resolve.
+#[tokio::test]
+async fn buffer_true_means_the_current_buffer() {
+    let dir = temp_dir("keymap_buf_true");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    let n = exec_lua(
+        &rpc,
+        "btv.keymap.set('n', 'zq', 'iok<Esc>', { buffer = true })\n\
+         local n = 0\n\
+         for _, m in ipairs(btv.keymap.buf_get(0, 'n')) do if m.lhs == 'zq' then n = n + 1 end end\n\
+         return n",
+    )
+    .await;
+    assert_eq!(
+        n.as_i64(),
+        Some(1),
+        "registered buffer-local on the current buffer"
+    );
+    feed(&rpc, "zq");
+    assert_eq!(lines(&rpc).await, vec!["ok"], "the buffer = true map fires");
+    let bad = exec_lua(
+        &rpc,
+        "local ok, err = pcall(btv.keymap.set, 'n', 'zw', 'x', { buffer = 'nope' })\n\
+         return tostring(ok) .. ' ' .. tostring(err):match('buffer') ",
+    )
+    .await;
+    assert_eq!(
+        bad.as_str(),
+        Some("false buffer"),
+        "a non-buffer value fails loud"
+    );
+}
+
 // ----- Phase 2: remap, <leader>, and the visual modes -----------------------
 
 /// `<leader>` in the LHS is expanded from `vim.g.mapleader` at set-time. With the
@@ -1679,6 +1744,27 @@ async fn ctrl_chords_stay_distinct_under_the_keyboard_protocol() {
     }
 }
 
+/// Kept distinct under the protocol, an UNMAPPED `<C-h>` / `<C-i>` / `<C-m>` /
+/// `<C-j>` / `<C-[>` still does what vim gives it in Insert, Replace and the command
+/// line (`i_CTRL-H` is `<BS>`, `i_CTRL-I` `<Tab>`, `i_CTRL-M` / `i_CTRL-J` `<CR>`,
+/// `i_CTRL-[` `<Esc>`) instead of doing nothing; a mapping on the chord still wins.
+#[tokio::test]
+async fn unmapped_ctrl_chords_act_as_their_named_keys_in_insert_and_cmdline() {
+    let dir = temp_dir("keymap_ctrl_insert_alias");
+    let (rpc, _incoming) = start_with_config_kbd(&dir, "").await;
+    feed(&rpc, "iabx<C-h>c<C-m>d<C-j>e<C-i>f<C-[>");
+    assert_eq!(lines(&rpc).await, vec!["abc", "d", "e\tf"]);
+    feed(&rpc, "ggRXY<C-h><C-[>");
+    assert_eq!(lines(&rpc).await, vec!["Xbc", "d", "e\tf"]);
+    feed(&rpc, ":s/X/QZ<C-h>W<C-m>");
+    assert_eq!(lines(&rpc).await, vec!["QWbc", "d", "e\tf"]);
+    feed(&rpc, ":s/Q/R<C-j>");
+    assert_eq!(lines(&rpc).await, vec!["RWbc", "d", "e\tf"]);
+    exec_lua(&rpc, "vim.keymap.set('i', '<C-h>', 'MAPPED')").await;
+    feed(&rpc, "Go<C-h><Esc>");
+    assert_eq!(lines(&rpc).await, vec!["RWbc", "d", "e\tf", "MAPPED"]);
+}
+
 /// The user's real case: on a protocol-capable terminal, `<C-i>` and `<Tab>` can be
 /// bound to *different* actions and each fires only for its own key.
 #[tokio::test]
@@ -1928,4 +2014,57 @@ async fn a_key_that_is_itself_a_mapping_is_never_released_to_the_builtin() {
         }
     }
     assert_eq!(fired, "SHORT", "the idle flush fired the shorter (j) map");
+}
+
+/// One mapping whose `buffer` the registry cannot read (neovim's `buffer = true`
+/// spelling) must not take every *other* mapping down with it: the snapshot used
+/// to fail as a whole and the editor silently ran with no user maps at all.
+#[tokio::test]
+async fn one_unreadable_mapping_does_not_drop_the_others() {
+    let dir = temp_dir("keymap_unreadable");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'Y', 'y$')\n\
+         pcall(vim.keymap.set, 'n', 'Q', 'x', { buffer = true })\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello<Esc>0");
+    assert_eq!(lines(&rpc).await, vec!["hello"]);
+    feed(&rpc, "YP");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["hellohello"],
+        "the well-formed Y map must survive a malformed sibling"
+    );
+}
+
+/// An option key `btv.keymap.set` doesn't know (`buffr` for `buffer`) used to be
+/// dropped without a word — the map silently registered *global* instead of
+/// buffer-local. It now warns once naming the key; the known keys stay silent.
+#[tokio::test]
+async fn an_unknown_keymap_option_warns_naming_it() {
+    let dir = temp_dir("keymap_unknown_opt");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    let got = exec_lua(
+        &rpc,
+        "local notes = {}\n\
+         btv.notify = function(m) notes[#notes + 1] = tostring(m) end\n\
+         btv.keymap.set('n', 'Q', 'dd', { buffer = 0, desc = 'd', silent = true, nowait = true, \
+           noremap = true, remap = false, expr = false, unique = false, default = false })\n\
+         local clean = #notes\n\
+         btv.keymap.set('n', 'Q', 'dd', { buffr = true })\n\
+         btv.keymap.set('n', 'Q', 'dd', { buffr = true })\n\
+         vim.api.nvim_set_keymap('n', 'R', 'dd', { noremaps = true })\n\
+         return { clean, #notes, table.concat(notes, '|') }",
+    )
+    .await;
+    let arr = got.as_array().expect("an array");
+    assert_eq!(arr[0].as_i64(), Some(0), "known keys are silent");
+    assert_eq!(arr[1].as_i64(), Some(2), "one warning per unknown key");
+    let notes = arr[2].as_str().unwrap_or_default();
+    assert!(
+        notes.contains("buffr") && notes.contains("noremaps"),
+        "each warning names its key: {notes:?}"
+    );
 }

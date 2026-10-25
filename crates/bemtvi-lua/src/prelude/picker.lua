@@ -451,6 +451,8 @@ function btv.picker.source(spec)
   btv.picker._sources[spec.name] = spec
 end
 
+local picker_cancel_inflight -- defined with the run machinery below
+
 -- btv.picker.open(name[, opts]): open the picker for the registered source `name`.
 -- Each `opts` field overrides the matching field on the source (which in turn
 -- overrides the picker default):
@@ -502,6 +504,11 @@ function btv.picker.open(name, opts)
   end
   if layer ~= "main" and layer ~= "active" then
     error('btv.picker.open: layer must be "main" or "active"', 2)
+  end
+  -- Opening over a live picker replaces it: reap the old one's in-flight job first,
+  -- as closing it would.
+  if btv._picker then
+    picker_cancel_inflight(btv._picker)
   end
   btv._picker =
     { source = source, items = {}, gen = 0, on_cancel = nil, preview = preview, layer = layer }
@@ -674,7 +681,7 @@ local FLUSH_N = 1000
 
 -- Reap the active picker's in-flight job (a live-grep `rg`) and cancel a pending
 -- debounce, so a new keystroke — or closing the picker — stops the current search.
-local function picker_cancel_inflight(p)
+picker_cancel_inflight = function(p)
   if p.on_cancel then
     local cancel = p.on_cancel
     p.on_cancel = nil
@@ -1172,11 +1179,16 @@ btv.picker.source({
     -- No shell / no rg / no find (the pure web client): walk the tree over btv.fs.
     -- `hidden = true` keeps this leg unrestricted like the two above (the walk's
     -- default `skip` already prunes `.git`).
+    -- A failed walk rejects the run (the picker reports it), unless the picker closed.
     local ok, files = pcall(btv.await, btv.fs.walk(ctx.cwd, { hidden = true }))
-    if ok then
-      for _, f in ipairs(files) do
-        ctx.push({ text = f, path = f })
+    if not ok then
+      if cancelled then
+        return
       end
+      error(type(files) == "table" and files.message or files, 0)
+    end
+    for _, f in ipairs(files) do
+      ctx.push({ text = f, path = f })
     end
   end),
   confirm = function(item, mode, layer)
@@ -1367,10 +1379,14 @@ btv.picker.source({
     -- small and the picker caps results; pushes for a superseded query are dropped by the
     -- sink.
     local ok, matches = pcall(btv.await, btv.fs.grep(ctx.cwd, q, { hidden = true }))
-    if ok then
-      for _, m in ipairs(matches) do
-        emit(lit, m.path, m.row, m.col, m.text)
+    if not ok then
+      if cancelled then
+        return
       end
+      error(type(matches) == "table" and matches.message or matches, 0)
+    end
+    for _, m in ipairs(matches) do
+      emit(lit, m.path, m.row, m.col, m.text)
     end
   end),
   confirm = function(item, mode, layer)
@@ -1753,11 +1769,25 @@ btv.picker.source({
   end,
 })
 
+-- Confirm a marks / jumplist row: open its file through `btv.picker.edit`, or — for
+-- an unnamed buffer, which has no path to open — switch to that buffer (when it is
+-- not the current one) and move the cursor there.
+local function confirm_position(item, mode, layer)
+  if item.path ~= "" then
+    btv.picker.edit(item, mode, layer)
+    return
+  end
+  if item.bufnr and item.bufnr ~= 0 and item.bufnr ~= btv.buf.current() then
+    btv.cmd("buffer " .. item.bufnr)
+  end
+  btv.pos.set(".", { 0, item.row, item.col })
+end
+
 -- marks: the set marks (telescope's `marks`), read from `btv.mark.list` — the
 -- current buffer's specials + `a`–`z`, the globals `A`–`Z`, then the numbered
 -- `0`–`9`. `location` preview scrolls to the mark; confirm jumps via
--- `btv.picker.edit` when the mark names a file, or moves the cursor directly for a
--- mark in an unnamed current buffer (no path to open). Mirror positions are 0-based,
+-- `btv.picker.edit` when the mark names a file, or switches to the mark's unnamed
+-- buffer (no path to open) and moves the cursor there. Mirror positions are 0-based,
 -- so the pushed item's `row`/`col` add 1.
 --
 -- Each row is `<mark> <line>:<col>  <the line's text>` in real columns: the mark name
@@ -1779,18 +1809,13 @@ btv.picker.source({
         head = string.format("%d:%d ", m.line + 1, m.col),
         text = m.text,
         path = m.path,
+        bufnr = m.bufnr,
         row = m.line + 1,
         col = m.col + 1,
       })
     end
   end,
-  confirm = function(item, mode, layer)
-    if item.path ~= "" then
-      btv.picker.edit(item, mode, layer)
-    else
-      btv.pos.set(".", { 0, item.row, item.col })
-    end
-  end,
+  confirm = confirm_position,
 })
 
 -- jumplist: the focused window's jump history (telescope's `jumplist`), read from
@@ -1799,8 +1824,8 @@ btv.picker.source({
 -- single `<C-o>` would take you. Like `:jumps`, an entry in the *current* buffer
 -- shows its line's text; one in another buffer shows the file name (arbitrary
 -- buffers' lines aren't mirrored). `location` preview scrolls to the entry; confirm
--- jumps via `btv.picker.edit` when the entry names a file, else moves the cursor
--- directly for a mark in an unnamed current buffer. Mirror entries are 1-based
+-- jumps via `btv.picker.edit` when the entry names a file, else switches to the
+-- entry's unnamed buffer and moves the cursor there. Mirror entries are 1-based
 -- `lnum` / 0-based `col`, so the pushed item's `col` adds 1.
 --
 -- The `<line>:<col> ` position is a declared `head` column, aligned by the widget and
@@ -1826,22 +1851,21 @@ btv.picker.source({
       end
       -- The location is a real head column (aligned by the widget, kept when the
       -- detail overflows), not a padded prefix inside the label.
+      -- Only a file buffer has a path to reopen; any other kind (a terminal, a
+      -- `btv.view`, a scratch panel) is named for display, so confirm returns to the
+      -- buffer itself instead of `:edit`ing a file called after its title.
+      local file = btv.bo[e.bufnr].buftype == "" and path or ""
       ctx.push({
         head = string.format("%d:%d ", e.lnum, e.col),
         text = detail,
-        path = path,
+        path = file,
+        bufnr = e.bufnr,
         row = e.lnum,
         col = e.col + 1,
       })
     end
   end,
-  confirm = function(item, mode, layer)
-    if item.path ~= "" then
-      btv.picker.edit(item, mode, layer)
-    else
-      btv.pos.set(".", { 0, item.row, item.col })
-    end
-  end,
+  confirm = confirm_position,
 })
 
 -- ----- default leader maps ---------------------------------------------------

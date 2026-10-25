@@ -983,9 +983,16 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     } else {
         Vec::new()
     };
+    // How far right a `nowrap` row can show: the window's columns past `leftcol`, and
+    // a horizontal slide pans across both ends, so cover the further one.
+    let slide = w.focused.then(|| ed.pending_scroll()).flatten();
+    let reach = w
+        .leftcol
+        .max(slide.map_or(0, |ps| ps.from_leftcol.max(ps.to_leftcol)))
+        .saturating_add(width);
     let rows = render_rows(
-        ed, buf, top, height, line_count, w.focused, width, wrap, tabstop, wo, eob, &collapsed,
-        w.cursor, ed.cursor,
+        ed, buf, top, height, line_count, w.focused, width, wrap, reach, tabstop, wo, eob,
+        &collapsed, w.cursor, ed.cursor,
     );
 
     let scroll = if w.focused {
@@ -1054,6 +1061,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 true,
                 width,
                 wrap,
+                reach,
                 tabstop,
                 wo,
                 eob,
@@ -1182,7 +1190,9 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         (0, 0, 0)
     };
     let (cursor_screen_col, cursor_width) = {
-        let line = buf.line_cow(cur_line);
+        // Only the text up to (and a little past) the cursor bears on its column and
+        // cell width, so read that head rather than the whole of a huge line.
+        let line = buf.line_head(cur_line, cur_col.saturating_add(256));
         let tab = buf.options.effective_tabstop();
         (
             unicode::virtcol(&line, cur_col, tab).saturating_sub(cursor_seg_col) + cursor_prefix,
@@ -1218,7 +1228,12 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         let horizontal = (!wrap).then(|| ScrollSpan {
             start: w.leftcol,
             shown: width,
-            total: (ed.window_max_leftcol(w.id) + width).max(w.leftcol + width),
+            // Measured out to 64 screens past the view: a longer line's thumb is at
+            // its minimum either way, and the frame never walks a huge line whole.
+            total: (ed
+                .window_max_leftcol(w.id, w.leftcol.saturating_add(width.saturating_mul(64)))
+                + width)
+                .max(w.leftcol + width),
         });
         ScrollMarkers {
             vertical,
@@ -1526,6 +1541,36 @@ fn fold_text(ed: &Editor, buf: &Buffer, fold: &Fold) -> String {
     format!("+--{:>3} lines: {}", fold.line_count(), first.trim())
 }
 
+/// A `nowrap` row's text: the head of `line` that can reach the screen when the
+/// window shows columns `[0, reach)` — up to and including the grapheme covering
+/// column `reach`, so a client still sees the text run off the right edge. Only a
+/// prefix is cut, so every column a span or the cursor carries keeps its meaning;
+/// what goes is the part of a huge line no window could paint, which would
+/// otherwise be copied into the frame in full on every repaint. The line is read
+/// through a bounded head first, so the cost follows the viewport, not the line.
+fn nowrap_row_text(buf: &Buffer, line: usize, reach: usize, tabstop: usize) -> String {
+    // A display column costs at least one byte except in a run of zero-width
+    // marks; the head is generous, and a head that runs out first falls back to
+    // the whole line, so the result never depends on the guess.
+    let budget = reach.saturating_add(1).saturating_mul(8).max(4096);
+    let head = buf.line_head(line, budget);
+    let clip = |text: &str| -> Option<usize> {
+        let at = unicode::byte_at_virtcol(text, reach + 1, tabstop);
+        (at < text.len()).then(|| unicode::next_grapheme(text, at))
+    };
+    if let Some(end) = clip(&head) {
+        // The grapheme past `reach` must be whole in the head, not cut by it.
+        if end < head.len() {
+            return head[..end].to_string();
+        }
+    }
+    let full = buf.line_cow(line);
+    match clip(&full) {
+        Some(end) => full[..end].to_string(),
+        None => full.into_owned(),
+    }
+}
+
 /// Lay out `height` screen rows starting at buffer line `base`, **expanding** each
 /// buffer line that carries extmark `virt_lines` into extra rows: its
 /// `virt_lines_above` rows, then its text row, then its `virt_lines_below` rows.
@@ -1543,6 +1588,8 @@ fn fold_text(ed: &Editor, buf: &Buffer, fold: &Fold) -> String {
 /// laid out across several [`RowKind::Line`] rows — one per [`unicode::wrap_segments`]
 /// segment, each carrying its byte slice and `start_col`. `tabstop` drives the
 /// cell-accurate break.
+/// Under `nowrap` each row's text is cut to what reaches column `reach` (see
+/// [`nowrap_row_text`]).
 #[allow(clippy::too_many_arguments)]
 fn row_skeleton(
     ed: &Editor,
@@ -1551,6 +1598,7 @@ fn row_skeleton(
     height: usize,
     line_count: usize,
     wrap: bool,
+    reach: usize,
     width: usize,
     tabstop: usize,
     wo: unicode::WrapOpts,
@@ -1613,8 +1661,8 @@ fn row_skeleton(
         // The buffer line's display rows: a single row at `nowrap`, else one per
         // soft-wrap segment. Each carries its byte slice and the screen column it
         // begins at (`start_col`), which `render_rows` uses to clip overlays.
-        let text = buf.line_cow(buf_line);
         if wrap {
+            let text = buf.line_cow(buf_line);
             // The `'breakindent'` / `'showbreak'` prefix on this line's continuation
             // rows; segments wrap into `width - prefix` cells (the first row keeps the
             // full width). The prefix is baked onto the continuation row text here, so
@@ -1652,8 +1700,7 @@ fn row_skeleton(
                     line: buf_line,
                     start_col: 0,
                 },
-                // The row owns its text — only the wrap path above could borrow.
-                text.into_owned(),
+                nowrap_row_text(buf, buf_line, reach, tabstop),
                 None,
                 usize::MAX,
                 0,
@@ -1700,6 +1747,7 @@ fn render_rows(
     focused: bool,
     width: usize,
     wrap: bool,
+    reach: usize,
     tabstop: usize,
     wo: unicode::WrapOpts,
     eob: char,
@@ -1708,7 +1756,7 @@ fn render_rows(
     sel_head: Cursor,
 ) -> Vec<RenderRow> {
     let mut rows = row_skeleton(
-        ed, buf, base, height, line_count, wrap, width, tabstop, wo, eob, folds,
+        ed, buf, base, height, line_count, wrap, reach, width, tabstop, wo, eob, folds,
     );
     if !focused {
         return rows;

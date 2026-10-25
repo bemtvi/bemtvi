@@ -92,8 +92,11 @@ impl EditHost {
                 self.request_lsp_workspace_symbol(&query, cb_id, name.as_deref());
                 return;
             }
-            LspOp::DiagnosticGoto { forward, severity } => {
-                self.diagnostic_goto(forward, severity);
+            LspOp::DiagnosticGoto {
+                forward,
+                severities,
+            } => {
+                self.diagnostic_goto(forward, severities);
                 return;
             }
             LspOp::DiagnosticSetloclist => {
@@ -704,7 +707,7 @@ impl EditHost {
                 let text = self.editor.buffer().document_text();
                 // Seed the sync shadow: this is exactly the text the server now
                 // holds, so later incremental `didChange`s replay their deltas over it.
-                doc.shadow.clone_from(&text);
+                doc.shadow.set(&text);
                 doc.shadow_endofline = self.editor.buffer().options.endofline;
                 doc.version = 1;
                 self.fx.lsp_notify(
@@ -908,7 +911,7 @@ impl EditHost {
             }
         }
         let text = buffer.document_text();
-        doc.shadow.clone_from(&text);
+        doc.shadow.set(&text);
         doc.shadow_endofline = endofline;
         vec![TextDocumentContentChangeEvent {
             range: None,
@@ -1650,7 +1653,10 @@ impl EditHost {
         }
 
         lines.push(String::new());
-        lines.push(format!("Log: {}", bemtvi_lsp::log::log_path().display()));
+        lines.push(match bemtvi_lsp::log::log_path() {
+            Some(path) => format!("Log: {}", path.display()),
+            None => "Log: disabled (no state directory)".to_string(),
+        });
         lines
     }
 

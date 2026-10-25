@@ -210,20 +210,30 @@ function Promise:catch(on_rejected)
   return self:next(nil, on_rejected)
 end
 
+-- A fresh promise adopting `x` (a plain value, or a promise / thenable it waits on).
+local function adopt(x)
+  local p = new_pending()
+  resolve_promise(p, x)
+  return p
+end
+
 -- `:finally(on_finally)` — run `on_finally` whichever way the promise settles, then
 -- pass the original value/reason through untouched (so `finally` can't swallow a
--- result or a rejection). Matches the browser's pass-through semantics.
+-- result or a rejection). Matches the browser's pass-through semantics: when
+-- `on_finally` returns a promise (an async cleanup), the chain waits for it, and a
+-- cleanup that rejects (or throws) replaces the outcome with its own reason.
 function Promise:finally(on_finally)
+  if not is_callable(on_finally) then
+    return self:next()
+  end
   return self:next(function(value)
-    if is_callable(on_finally) then
-      on_finally()
-    end
-    return value
+    return adopt(on_finally()):next(function()
+      return value
+    end)
   end, function(reason)
-    if is_callable(on_finally) then
-      on_finally()
-    end
-    error(reason, 0) -- rethrow so the rejection propagates past finally
+    return adopt(on_finally()):next(function()
+      error(reason, 0) -- rethrow so the rejection propagates past finally
+    end)
   end)
 end
 

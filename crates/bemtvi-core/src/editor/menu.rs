@@ -1586,11 +1586,16 @@ impl Editor {
     /// new query's first batch: the stale results are atomically *replaced* (not
     /// cleared on the keystroke), so the list never flashes empty while a debounced
     /// search is in flight. Same-generation batches append. A push into a closed
-    /// menu is a silent no-op (a late push from a killed job).
+    /// menu is a silent no-op (a late push from a killed job), and so is a push
+    /// *older* than the displayed items (`gen < items_gen`) — a superseded run whose
+    /// results would otherwise append beside the newer ones as duplicates.
     pub fn menu_push(&mut self, items: Vec<MenuItem>, gen: u64) {
         let Some(menu) = self.menu.as_mut() else {
             return;
         };
+        if gen < menu.items_gen {
+            return;
+        }
         if gen > menu.items_gen {
             // First result of a newer run — swap the old results out now.
             menu.reset_items(gen);
@@ -1695,7 +1700,7 @@ impl Editor {
     /// the menu's own keymap bucket. A `Complete` menu does not: it floats over the
     /// text while typing flows on to the document, so the dispatch lets the key
     /// through to `handle_insert`.
-    pub(crate) fn menu_grabs_input(&self) -> bool {
+    pub fn menu_grabs_input(&self) -> bool {
         self.menu
             .as_ref()
             .is_some_and(|m| !matches!(m.kind, MenuKind::Complete | MenuKind::Cmdline))

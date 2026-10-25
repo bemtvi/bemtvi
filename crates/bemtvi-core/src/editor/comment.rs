@@ -64,10 +64,15 @@ fn comment_line(line: &str, parts: &Parts, indent: &str) -> String {
     if is_blank(line) {
         return format!("{}{}{}", indent, parts.left.trim(), parts.right.trim());
     }
-    // `indent` is the block's minimum indent, never longer than this (non-blank)
-    // line's own — so slicing off `indent.len()` bytes always lands on the line's
-    // remaining content.
-    let rest = &line[indent.len()..];
+    // `indent` is the block's minimum indent by byte length, never longer than
+    // this (non-blank) line's own — but the two can be spelled with different
+    // whitespace (a 2-byte NBSP against a 1-byte space), so back the cut off to a
+    // char boundary rather than slice inside a character.
+    let mut cut = indent.len();
+    while !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let rest = &line[cut..];
     format!("{}{}{}{}", indent, parts.left, rest, parts.right)
 }
 

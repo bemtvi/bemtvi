@@ -191,3 +191,18 @@ async fn an_indentexpr_compile_error_is_reported_where_it_is_configured() {
         "got {msg:?}"
     );
 }
+
+#[tokio::test]
+async fn an_absurd_indentexpr_width_is_refused_not_allocated() {
+    // `1e15` columns of indent would allocate a petabyte of blanks; the width is
+    // rejected loudly instead, and the expression uninstalled like a failing one.
+    let dir = temp_dir("ix_huge");
+    let (rpc, mut incoming) = start_with_config(&dir, "btv.indent.expr([[ 1e15 ]])").await;
+    feed_sync(&rpc, "ia<CR>b<Esc>").await;
+    let msg = message_from_any_frame(&rpc, &mut incoming, "gg=G").await;
+    assert!(
+        msg.contains("btv.indent.expr") && msg.contains("too large"),
+        "expected a report, got {msg:?}"
+    );
+    assert_eq!(lines(&rpc).await, vec!["a", "b"]);
+}

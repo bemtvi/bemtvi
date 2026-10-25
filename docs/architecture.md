@@ -316,10 +316,16 @@ typed, and the server *collects* what they enclose instead of dispatching it: in
 ordinary Insert mode the whole payload goes into core as a **single** edit
 (`Editor::paste_literal`), so it is one rope insert and one settle, and — never
 having become keys — it cannot trip a mapping, a snippet jump or a completion
-confirm on the way in. Modes whose behavior is inherently per-character (Normal,
-the command line, a terminal job, a grabbing menu, Replace's overtype) replay the
-payload key by key *inside* the span, where the insert-mode helpers — auto-indent,
-soft tabs, auto-pairs — still stand down; only the speed is lost. Either way the
+confirm on the way in. A paste is clipboard text anyone can shape, so it never
+runs as commands: in Normal and Visual mode core *puts* it (charwise after the
+cursor, or over the selection — `Editor::paste_put`, neovim's `vim.paste`).
+Modes whose behavior is inherently per-character (Select, which types over the
+selection and goes on in Insert, the command line, a terminal job, a grabbing
+menu, Replace's overtype) replay the payload key by key *inside*
+the span, where the insert-mode helpers — auto-indent, soft tabs, auto-pairs —
+still stand down; that replay carries only text keys (a control byte in the
+clipboard cannot leave the mode), and on the command line or in a menu only the
+first line, so a pasted line break cannot submit it. Either way the
 span is recorded around the payload, so a `.` of a change containing a paste
 re-enters paste mode rather than re-indenting what it replays. Because it is only
 notation, every transport (local, daemon, browser) gets all of this for free. The
@@ -1140,7 +1146,9 @@ fs/process half is OPFS or a remote daemon over WebTransport.
   (serverless; shada is one JSON blob in OPFS), to **real local files** via the **File
   System Access API** (`:eo` / `:wo` / bare `:w` on a bound path), or to a real
   `bemtvi --daemon` over **WebTransport** (a JS msgpack-RPC client, `web/rpc.mjs`,
-  reached with `?daemon=bemtvi://…`). All three ride the same off-tick `HostEffects` fs
+  reached with `?daemon=bemtvi://…`, which connects only after the user approves that
+  `HOST:PORT` + cert, and whose session keeps its own per-daemon shada blob — see
+  `web/daemon-trust.mjs`). All three ride the same off-tick `HostEffects` fs
   seam the native edit-host split uses; the Worker fulfills fs requests between ticks.
 - **Lua config runs — plugins included.** Unlike the old core-only web build,
   `init.lua` is sourced at startup: options / keymaps / autocmds / user commands /

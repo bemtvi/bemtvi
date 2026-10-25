@@ -91,15 +91,6 @@ function btv.argv()
   return btv._argv()
 end
 
--- `btv.reexec(args)` -> does not return on success. Replace THIS process with a fresh
--- `bemtvi <args…>` of the current executable — a launcher relaunches the editor with
--- chosen flags this way (e.g. { `"--shada-namespace"`, ns, `"--restore-session"` }). On
--- Unix this `execv()`s (never returns on success); elsewhere it spawns and exits with
--- the child's status. Raises if the exec / spawn itself fails.
-function btv.reexec(args)
-  return btv._reexec(args)
-end
-
 -- `btv.now_ms()` -> a monotonic timestamp in milliseconds (a number) for timing and
 -- scheduling math. Unlike `os.clock` (CPU time, ≈0 across an awaited tick) it advances
 -- with real wall-clock time, so it measures durations that span async work.
@@ -286,31 +277,36 @@ btv.command("DockOpen", function(o)
   btv.dock.open({ side = side, size = tonumber(o.fargs[2]) })
 end, { desc = "Open or focus an edge dock — :DockOpen {left|right|top|bottom} [size]." })
 btv.command("DockClose", function(o)
-  if o.fargs[1] then
-    btv.dock.close(o.fargs[1])
+  if not o.fargs[1] then
+    return btv.notify("usage: :DockClose {left|right|top|bottom}", 4)
   end
+  btv.dock.close(o.fargs[1])
 end, { desc = "Close the dock on {side}, discarding its window and content." })
 btv.command("DockFocus", function(o)
-  if o.fargs[1] then
-    btv.dock.focus(o.fargs[1])
+  if not o.fargs[1] then
+    return btv.notify("usage: :DockFocus {left|right|top|bottom}", 4)
   end
+  btv.dock.focus(o.fargs[1])
 end, { desc = "Move focus to the dock on {side}." })
 -- `:DockToggle`/`:DockHide`/`:DockShow {side}` — collapse a dock from view (keeping
 -- its content) and bring it back, distinct from `:DockClose` (which drops it).
 btv.command("DockToggle", function(o)
-  if o.fargs[1] then
-    btv.dock.toggle(o.fargs[1])
+  if not o.fargs[1] then
+    return btv.notify("usage: :DockToggle {left|right|top|bottom}", 4)
   end
+  btv.dock.toggle(o.fargs[1])
 end, { desc = "Toggle the dock on {side} — hide it if shown, show it if hidden." })
 btv.command("DockHide", function(o)
-  if o.fargs[1] then
-    btv.dock.hide(o.fargs[1])
+  if not o.fargs[1] then
+    return btv.notify("usage: :DockHide {left|right|top|bottom}", 4)
   end
+  btv.dock.hide(o.fargs[1])
 end, { desc = "Hide the dock on {side} from view, keeping its content for :DockShow." })
 btv.command("DockShow", function(o)
-  if o.fargs[1] then
-    btv.dock.show(o.fargs[1])
+  if not o.fargs[1] then
+    return btv.notify("usage: :DockShow {left|right|top|bottom}", 4)
   end
+  btv.dock.show(o.fargs[1])
 end, { desc = "Re-show a dock on {side} that was hidden with :DockHide." })
 
 -- Restore the cursor to its last position when a file is reopened — the editor

@@ -638,6 +638,42 @@ async fn watch_bad_path_rejects_loud() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A consumer that stops pulling buffers a bounded number of change batches: past the
+/// cap the watch delivers one `overflow` batch in place of the rest (loud, not a silent
+/// drop), then resumes buffering once the consumer has pulled past it.
+#[tokio::test]
+async fn watch_buffer_is_capped_with_an_overflow_batch() {
+    let (rpc, _incoming) = start().await;
+    let dir = temp_dir("fs_watch_overflow");
+    exec_lua(&rpc, &format!("_G.W = btv.fs.watch(\"{d}\")", d = q(&dir))).await;
+    // Feed changes through the same entry the server delivers them on, with no pull
+    // outstanding, then drain what the watch buffered. A buffered batch settles its
+    // `:next()` promise synchronously, so the drain reads each settled value in place.
+    let kinds = lua_string(
+        &rpc,
+        "for i = 1, 3000 do\n\
+           btv._run_fs_watch(_G.W._id, { kind = 'modify', paths = { '/f' .. i } })\n\
+         end\n\
+         local n, overflows = 0, 0\n\
+         for _ = 1, 3000 do\n\
+           local ev = _G.W:next()._value\n\
+           n = n + 1\n\
+           if ev.kind == 'overflow' then overflows = overflows + 1 break end\n\
+         end\n\
+         btv._run_fs_watch(_G.W._id, { kind = 'create', paths = { '/after' } })\n\
+         local after = _G.W:next()._value\n\
+         return n .. ':' .. overflows .. ':' .. (after and after.kind or 'none')",
+    )
+    .await;
+    assert_eq!(
+        kinds.as_deref(),
+        Some("1025:1:create"),
+        "1024 buffered batches, then one overflow marker, then buffering resumes"
+    );
+    exec_lua(&rpc, "_G.W:stop()").await;
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ----- btv.hash.file (streaming digest) ----------------------------------------
 
 #[tokio::test]

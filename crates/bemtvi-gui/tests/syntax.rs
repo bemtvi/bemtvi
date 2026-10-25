@@ -5,7 +5,7 @@
 //! showed *no* syntax highlighting without a colorscheme (it ignored the span's
 //! group name, unlike the TUI's `group_style`).
 
-use bemtvi_gui::{apply_search_fg, group_fallback, row_segments, Seg};
+use bemtvi_gui::{apply_search_fg, expand_tabs, group_fallback, row_segments, Seg};
 use bemtvi_view::{HlSpan, Style};
 
 const FG: u32 = 0xc0_c0_c0; // the renderer's DEFAULT_FG stand-in
@@ -238,4 +238,31 @@ fn a_search_recolor_after_cjk_lands_on_its_column() {
     assert_eq!(painted(&out), "日本ab");
     assert_eq!(color_of(&out, "日本"), FG);
     assert_eq!(color_of(&out, "ab"), 0x0f_0f_0f);
+}
+
+#[test]
+fn a_very_long_row_is_only_laid_out_up_to_the_window_edge() {
+    // The server ships whole lines; a 160k-cell row (a minified bundle) shaped in full
+    // on every edit stalls the frame. The row's display text stops at the first
+    // cluster at or past the paintable edge, so a frame costs the viewport, not the
+    // line — with tabs (expanded) or without (a plain copy).
+    let long_plain = "abcdefgh".repeat(20_000);
+    let shown = expand_tabs(&long_plain, 8, 100);
+    assert_eq!(shown, long_plain[..100]);
+
+    let long_tabbed = "ab\tcd".repeat(40_000);
+    let shown = expand_tabs(&long_tabbed, 8, 100);
+    let full = expand_tabs(&long_tabbed, 8, usize::MAX);
+    assert_eq!(shown, full[..100]);
+    let segs = row_segments(&shown, &[], &[], FG, BG, 90);
+    let painted: usize = segs.iter().map(|s| s.text.chars().count()).sum();
+    assert!(
+        painted <= 22,
+        "only the cells from leftcol to the edge are laid out: {painted}"
+    );
+
+    // A wide glyph straddling the limit is kept whole (it starts inside the window),
+    // and a line shorter than the limit is untouched.
+    assert_eq!(expand_tabs("abc日本語", 8, 4), "abc日");
+    assert_eq!(expand_tabs("a\tb", 8, 100), "a       b");
 }

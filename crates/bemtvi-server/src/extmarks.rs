@@ -119,7 +119,12 @@ pub(crate) struct HlMarkIndex<'a> {
 }
 
 impl<'a> HlMarkIndex<'a> {
-    pub(crate) fn build(buf: &'a bemtvi_core::Buffer) -> Self {
+    pub(crate) fn build(buf: &'a bemtvi_core::Buffer, segs: &[crate::redraw::RowSeg]) -> Self {
+        // Only marks reaching the rows this frame draws can paint (see
+        // `viewport_byte_range`): pruning them with an integer compare first keeps the
+        // sort to the handful on screen rather than every mark in the buffer, and keeps
+        // one long mark from making each row's look-back walk the whole buffer's marks.
+        let (lo, hi) = viewport_byte_range(buf, segs).unwrap_or((0, 0));
         let mut marks: Vec<(u32, usize, usize, &'a bemtvi_core::Extmark)> = buf
             .extmarks
             .iter_all()
@@ -128,7 +133,9 @@ impl<'a> HlMarkIndex<'a> {
                 // Mirrors the clip's own guards: no group or no range ⇒ paints nothing.
                 let end = m.end?;
                 m.hl_group.as_deref()?;
-                Some((i as u32, m.start, end, m))
+                // `overlapping` keeps `start < hi && end > lo` for a row inside the
+                // viewport, so nothing outside these bounds can ever be returned.
+                (m.start < hi && end > lo).then_some((i as u32, m.start, end, m))
             })
             .collect();
         marks.sort_by_key(|(order, start, _, _)| (*start, *order));
@@ -240,7 +247,7 @@ impl EditHost {
             return Value::Array(segs.iter().map(|_| Value::Array(Vec::new())).collect());
         };
         // Built once for the whole frame; see `HlMarkIndex`.
-        let mark_index = HlMarkIndex::build(b);
+        let mark_index = HlMarkIndex::build(b, segs);
         let rows = segs
             .iter()
             .map(|seg| {
@@ -248,13 +255,22 @@ impl EditHost {
                     return Value::Array(Vec::new());
                 };
                 let line_idx = n - 1;
-                let text = b.line_cow(line_idx);
                 let tab = b.options.effective_tabstop();
+                // Only the head of the line this row can paint (see `RowSeg::text`).
+                let Some(row_text) = seg.text(b, tab) else {
+                    return Value::Array(Vec::new());
+                };
+                let limit = if row_text.clipped() {
+                    row_text.text.len()
+                } else {
+                    usize::MAX
+                };
+                let text = row_text.text;
 
                 // Semantic tokens sit above extmarks' base order, matching the native
                 // layering (semantic at SEMANTIC_HL_PRIORITY, extmarks at their own
                 // priority); no treesitter spans exist on this build, so base order is 0.
-                let sem = self.semantic_intervals(buffer, line_idx, 0);
+                let sem = self.semantic_intervals(buffer, line_idx, 0, limit);
                 let mut intervals = sem;
                 intervals.extend(self.extmark_intervals(
                     &mark_index,
@@ -373,17 +389,32 @@ impl EditHost {
                 // mark's byte anchor to a screen column (the same tab/wide-char
                 // `virtcol` the inlay hints and hl spans use). Computed once per row.
                 let line_start = buf.line_start(line_idx);
-                let text = buf.line(line_idx);
-                // Screen column of a mark's byte anchor within this line (the
-                // tab/wide-char `virtcol` the inlay hints + hl spans share); used by
-                // the inline and overlay positions.
-                let anchor_col = |m: &bemtvi_core::Extmark| -> u64 {
-                    let byte_col = m.start.saturating_sub(line_start).min(text.len());
-                    unicode::virtcol(&text, byte_col, tabstop) as u64
+                // Only the head of the line this row can show (see `RowSeg::text`).
+                let Some(row_text) = seg.text(buf, tabstop) else {
+                    return Value::Array(Vec::new());
                 };
+                let text = &row_text.text;
+                // Screen column of each mark's byte anchor within this line (the
+                // tab/wide-char `virtcol` the inlay hints + hl spans share); used by
+                // the inline and overlay positions. The marks are sorted by anchor, so
+                // one forward walk serves them all; an anchor past a cut head is off
+                // screen (`None`).
+                let mut vc = unicode::LineVirtcol::new(text, tabstop);
+                let anchor_cols: Vec<Option<u64>> = marks
+                    .iter()
+                    .map(|m| {
+                        let byte_col = m.start.saturating_sub(line_start);
+                        if row_text.clipped() && byte_col > text.len() {
+                            return None;
+                        }
+                        Some(vc.at(byte_col.min(text.len())) as u64)
+                    })
+                    .collect();
+                let anchor_col = |i: usize| anchor_cols[i];
                 let placements: Vec<Value> = marks
                     .iter()
-                    .filter_map(|m| {
+                    .enumerate()
+                    .filter_map(|(i, m)| {
                         // Every mark in `marks` has `decor` (the bucket only kept
                         // marks whose decor carries virt_text).
                         let decor = m.decor.as_deref().expect("virt_text mark has decor");
@@ -400,10 +431,10 @@ impl EditHost {
                         let (pos, col) = match decor.virt_text_pos {
                             VirtTextPos::Eol => seg.is_last().then_some((POS_EOL, 0))?,
                             VirtTextPos::Inline => {
-                                (POS_INLINE, seg.clip_col(anchor_col(m) as usize)? as u64)
+                                (POS_INLINE, seg.clip_col(anchor_col(i)? as usize)? as u64)
                             }
                             VirtTextPos::Overlay => {
-                                (POS_OVERLAY, seg.clip_col(anchor_col(m) as usize)? as u64)
+                                (POS_OVERLAY, seg.clip_col(anchor_col(i)? as usize)? as u64)
                             }
                             VirtTextPos::RightAlign => {
                                 seg.is_last().then_some((POS_RIGHT_ALIGN, 0))?
@@ -793,8 +824,15 @@ impl EditHost {
             // line a plain rule sits on), and repeat the fill text to cover the body
             // width (clipped client-side); a multi-cell glyph just over-provisions a
             // little.
-            let line = buf.line(n - 1);
-            let from = bemtvi_core::unicode::virtcol(&line, line.len(), tabstop);
+            // A line running past the row's reach leaves no room on screen for a fill.
+            let Some(row_text) = seg.text(buf, tabstop) else {
+                continue;
+            };
+            if row_text.clipped() {
+                continue;
+            }
+            let line = &row_text.text;
+            let from = bemtvi_core::unicode::virtcol(line, line.len(), tabstop);
             let chunk = VirtChunk {
                 text: fill.text.repeat(text_width.saturating_sub(from).max(1)),
                 hl_group: fill.hl_group.clone(),

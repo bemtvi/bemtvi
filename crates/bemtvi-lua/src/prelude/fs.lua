@@ -277,6 +277,11 @@ end
 local Watch = {}
 Watch.__index = Watch
 
+-- How many change batches a watch buffers for a consumer that is not pulling. Past
+-- it the watch stops buffering and delivers one `{ kind = "overflow" }` batch in their
+-- place, so a stalled loop costs bounded memory and still learns it missed changes.
+local WATCH_QUEUE_MAX = 1024
+
 -- `:next()` -> promise of the next change batch, nil at end (after `:stop()`), or a
 -- rejection carrying the watch error. SEQUENTIAL like the process Stream: one
 -- outstanding `:next()` at a time (what a `for` loop does); batches arriving between
@@ -286,8 +291,17 @@ function Watch:next()
     -- Buffered batches first, then the terminal error (FIFO, like the process
     -- Stream): events that arrived before the watch failed must not be silently
     -- lost — a consumer loop gets what it already earned, then the rejection.
-    if #self._queue > 0 then
-      resolve(table.remove(self._queue, 1))
+    -- `_qhead` indexes the oldest buffered batch: an O(1) pull, where the whole-queue
+    -- shift of `table.remove(q, 1)` would go quadratic while a consumer lags a flood.
+    local head = self._qhead
+    if self._queue[head] ~= nil then
+      local batch = self._queue[head]
+      self._queue[head] = nil
+      self._qhead = head + 1
+      if batch == self._overflow then
+        self._overflow = nil
+      end
+      resolve(batch)
     elseif self._err ~= nil then
       reject(self._err)
     elseif self._done then
@@ -319,6 +333,11 @@ end
 --
 --   { kind = "create"|"modify"|"remove"|"rename", paths = { <abspath>, … } }
 --
+-- A consumer that stops pulling while changes keep arriving buffers at most 1024
+-- batches; the next change after that is replaced by one
+-- `{ kind = "overflow", paths = {} }` batch (later ones are dropped until the
+-- consumer catches up), which says "changes were missed, rescan".
+--
 -- bursts within a 10 ms window are merged in the server, **one batch per kind**
 -- (paths deduped within each). A burst that mixes kinds therefore yields one batch
 -- each rather than a single coarsened one: writing a new file is a `"create"` plus a
@@ -339,7 +358,8 @@ end
 -- all (serverless browser) REJECTS the first pull — fail loud, never a dead watch.
 -- `:stop()` cancels the watch and ends the iteration.
 function btv.fs.watch(path, opts)
-  local self = setmetatable({ _queue = {}, _done = false, _waiter = nil }, Watch)
+  local self =
+    setmetatable({ _queue = {}, _qhead = 1, _qtail = 0, _done = false, _waiter = nil }, Watch)
   local id = btv._next_cb_id()
   self._id = id
   btv._fs_watch_fns[id] = function(ev, err)
@@ -357,7 +377,15 @@ function btv.fs.watch(path, opts)
       self._waiter = nil
       waiter.resolve(ev)
     else
-      self._queue[#self._queue + 1] = ev
+      if self._overflow then
+        return -- already marked: the consumer rescans when it reaches the marker
+      end
+      if self._qtail - self._qhead + 1 >= WATCH_QUEUE_MAX then
+        self._overflow = { kind = "overflow", paths = {} }
+        ev = self._overflow
+      end
+      self._qtail = self._qtail + 1
+      self._queue[self._qtail] = ev
     end
   end
   -- The pump lives in `_fs_watch_fns` (not `_cb_fns`), so a conversion throw must

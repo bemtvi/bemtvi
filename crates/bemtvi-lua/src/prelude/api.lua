@@ -396,6 +396,9 @@ function btv.buf.offset(bufnr, index)
     return -1
   end
   local lines = buf.lines
+  if type(index) ~= "number" or index < 0 or index > #lines or index % 1 ~= 0 then
+    error("btv.buf.offset: index out of bounds: " .. tostring(index), 2)
+  end
   local off = 0
   for i = 1, index do
     off = off + #(lines[i] or "") + 1
@@ -414,6 +417,17 @@ function btv.buf.text(bufnr, start_row, start_col, end_row, end_col, _opts)
     return {}
   end
   local lines = buf.lines
+  -- Rows must lie in the buffer (`#lines`, the position just past the last line, is
+  -- the end of a range reaching EOF); an unchecked `end_row` would loop to whatever
+  -- number the caller passed.
+  for _, r in ipairs({ start_row, end_row }) do
+    if type(r) ~= "number" or r < 0 or r > #lines or r % 1 ~= 0 then
+      error("btv.buf.text: row out of bounds: " .. tostring(r), 2)
+    end
+  end
+  if end_row < start_row then
+    error("btv.buf.text: end_row is before start_row", 2)
+  end
   if start_row == end_row then
     return { (lines[start_row + 1] or ""):sub(start_col + 1, end_col) }
   end
@@ -997,7 +1011,7 @@ function btv.buf.clear_namespace(buffer, ns, line_start, line_end)
   local marks = btv._extmarks[b] and btv._extmarks[b][ns]
   if marks then
     for id, m in pairs(marks) do
-      if line_end == -1 or (m.row >= line_start and m.row < line_end) then
+      if m.row >= line_start and (line_end == -1 or m.row < line_end) then
         marks[id] = nil
       end
     end
@@ -1824,9 +1838,25 @@ end
 -- `btv.buf.getline(buf, lnum[, end])` [alias `vim.fn.getbufline`]: lines `lnum..end`
 -- (1-based inclusive) of a buffer, or just `lnum` when `end` is omitted. Wraps
 -- `btv.buf.lines` (0-based, end-exclusive). An out-of-range request yields {} (vim).
+-- `buf` may be a number or a `btv.buf.nr` expression (`"%"`, a name); `lnum` / `end`
+-- may be `"$"` for the last line.
 function btv.buf.getline(buf, lnum, lend)
-  lend = lend or lnum
-  return api.nvim_buf_get_lines(btv._resolve_bufnr(buf), lnum - 1, lend, false)
+  local b = type(buf) == "string" and btv.buf.nr(buf) or btv._resolve_bufnr(buf)
+  if b == nil or b < 0 then
+    return {}
+  end
+  local function line(v)
+    if v == "$" then
+      return btv.buf.line_count(b)
+    end
+    return tonumber(v)
+  end
+  lnum = line(lnum)
+  lend = lend ~= nil and line(lend) or lnum
+  if lnum == nil or lend == nil then
+    error('getbufline: line must be a number or "$"', 2)
+  end
+  return api.nvim_buf_get_lines(b, lnum - 1, lend, false)
 end
 vim.fn.getbufline = btv.buf.getline
 

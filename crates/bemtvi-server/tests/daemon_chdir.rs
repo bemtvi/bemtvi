@@ -313,6 +313,123 @@ async fn focus_switch_fires_dirchanged_over_the_wire() {
     );
 }
 
+/// A `:cd` whose daemon reply lands *after* a newer `:lcd` was issued must not clobber that
+/// `:lcd`: confirming the global move leaves the window-local dir the user set meanwhile.
+#[tokio::test]
+async fn cd_ack_does_not_clobber_a_newer_lcd() {
+    let (rpc, _incoming) =
+        spawn_remote(fixture(), "/virtual/proj", "/virtual/proj/README.md").await;
+    await_getcwd(&rpc, "/virtual/proj").await;
+
+    feed(&rpc, ":split<CR>");
+    barrier(&rpc).await;
+    feed(&rpc, ":cd /virtual/proj/src<CR>:lcd /virtual/proj<CR>");
+    barrier(&rpc).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        getcwd(&rpc).await,
+        "/virtual/proj",
+        "the newer `:lcd` survives the earlier `:cd`'s ack"
+    );
+    feed(&rpc, "<C-w>w");
+    assert_eq!(
+        await_getcwd(&rpc, "/virtual/proj/src").await,
+        "/virtual/proj/src",
+        "the other window sees the confirmed global `:cd`"
+    );
+}
+
+/// A rejected `:cd` rolls back only its own move: a newer `:lcd` issued before the
+/// `E344` landed keeps its window-local dir.
+#[tokio::test]
+async fn cd_rejection_does_not_clobber_a_newer_lcd() {
+    let (rpc, mut incoming) =
+        spawn_remote(fixture(), "/virtual/proj", "/virtual/proj/README.md").await;
+    await_getcwd(&rpc, "/virtual/proj").await;
+
+    feed(&rpc, ":cd /virtual/nope<CR>:lcd /virtual/proj/src<CR>");
+    wait_redraw(&mut incoming, |m| message(m).contains("E344")).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        getcwd(&rpc).await,
+        "/virtual/proj/src",
+        "the newer `:lcd` survives the earlier `:cd`'s rollback"
+    );
+}
+
+/// The daemon's home, as `:cd` with no argument (or `~`) resolves it on the daemon, plus
+/// a fixture whose fake fs holds that directory (the real one is never touched).
+fn fixture_with_home() -> (DaemonFs, String) {
+    let home = bemtvi_core::stdpath::home_dir()
+        .expect("test process has a home dir")
+        .display()
+        .to_string();
+    let fs = fixture();
+    fs.dir(&home, &[(false, "notes.txt")]);
+    (fs, home)
+}
+
+/// A `:cd ~` (no optimistic move — only the daemon knows its home) whose ack lands after
+/// a newer `:lcd` must not clear that `:lcd`: in issue order the global `:cd` came first.
+#[tokio::test]
+async fn cd_home_ack_does_not_clobber_a_newer_lcd() {
+    let (fake, home) = fixture_with_home();
+    let (rpc, _incoming) = spawn_remote(fake, "/virtual/proj", "/virtual/proj/README.md").await;
+    await_getcwd(&rpc, "/virtual/proj").await;
+
+    feed(&rpc, ":split<CR>");
+    barrier(&rpc).await;
+    feed(&rpc, ":cd ~<CR>:lcd /virtual/proj/src<CR>");
+    barrier(&rpc).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        getcwd(&rpc).await,
+        "/virtual/proj/src",
+        "the newer `:lcd` survives the earlier `:cd ~`'s ack"
+    );
+    feed(&rpc, "<C-w>w");
+    assert_eq!(
+        await_getcwd(&rpc, &home).await,
+        home,
+        "the other window sees the global `:cd ~`"
+    );
+}
+
+/// An `:lcd ~` whose window closes before the daemon answers installs nothing: no
+/// `DirChanged` fires for a window that no longer exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lcd_home_ack_for_a_closed_window_is_dropped() {
+    let (fake, _home) = fixture_with_home();
+    let (rpc, _incoming) =
+        spawn_remote(fake.clone(), "/virtual/proj", "/virtual/proj/README.md").await;
+    await_getcwd(&rpc, "/virtual/proj").await;
+
+    exec_lua(
+        &rpc,
+        "_G.DIRCHANGED = 0\n\
+         btv.on('DirChanged', function() _G.DIRCHANGED = _G.DIRCHANGED + 1 end)",
+    )
+    .await;
+    feed(&rpc, ":split<CR>");
+    barrier(&rpc).await;
+    let hold = fake.hold_read_dirs();
+    feed(&rpc, ":lcd ~<CR>");
+    hold.await_parked().await;
+    feed(&rpc, ":close<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return #btv.win.list()").await.as_i64(),
+        Some(1)
+    );
+    hold.release();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.DIRCHANGED").await.as_i64(),
+        Some(0),
+        "no DirChanged for the closed window's `:lcd ~`"
+    );
+    assert_eq!(getcwd(&rpc).await, "/virtual/proj");
+}
+
 /// A **Windows** daemon's paths follow the syntax it announced, not the client's
 /// `std::path`: from `C:\proj`, `:cd src` lands in `C:\proj\src` (joined with `\`), a
 /// relative `:e` there fetches `C:\proj\src\main.rs`, and `:cd ..` normalizes back to

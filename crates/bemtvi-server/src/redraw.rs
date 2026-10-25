@@ -11,8 +11,10 @@ use bemtvi_core::view::{
     MenuView, RegionTabline, RegionTablines, RenderRow, ScrollAnim, Separator, TabView, ViewRect,
     WindowRegion, WindowView,
 };
+use bemtvi_core::Buffer;
 use bemtvi_core::{BorderStyle, ContentFloatView, MenuPlacement, VirtChunk, WinHl};
 use rmpv::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Vim's `SHOWCMD_COLS`: the width of the `'showcmd'` corner. A longer run keeps
@@ -145,16 +147,10 @@ impl EditHost {
         } else if !self.editor.message.is_empty() {
             (self.editor.message.clone(), self.editor.message_error)
         } else {
-            // The under-cursor diagnostic is LSP-sourced — empty on the browser build.
-            // It's informational on the message line, so it isn't painted as an error.
-            #[cfg(feature = "native")]
-            {
-                (self.diagnostic_under_cursor().unwrap_or_default(), false)
-            }
-            #[cfg(not(feature = "native"))]
-            {
-                (String::new(), false)
-            }
+            // The under-cursor diagnostic reads the merged (LSP + `btv.diagnostic.set`)
+            // store both builds share. It's informational on the message line, so it
+            // isn't painted as an error.
+            (self.diagnostic_under_cursor().unwrap_or_default(), false)
         };
 
         // The global `'statusline'` / `'tabline'` formats (empty ⇒ the built-in
@@ -566,6 +562,13 @@ impl EditHost {
         // them once here; every projection below keys on these exactly as it did
         // when they were `WindowView` fields, so the bytes are unchanged. The scroll
         // band reuses the same unbundling over its (taller) row set.
+        // Ship each row only as far as the window can show it (see `clip_row_text`); a
+        // horizontal slide pans across both ends, so cover the further one.
+        let reach = win.leftcol.max(
+            win.scroll
+                .as_ref()
+                .map_or(0, |s| s.from_leftcol.max(s.to_leftcol)),
+        ) + win.rect.width;
         let RowArrays {
             lines,
             numbers,
@@ -576,7 +579,11 @@ impl EditHost {
             search,
             incsearch,
             virt_lines,
-        } = unbundle_rows(&win.rows);
+        } = unbundle_rows(&win.rows, reach);
+        let lines: Vec<&str> = lines
+            .iter()
+            .map(|l| clip_row_text(l, reach, win.tabstop))
+            .collect();
         // Syntax highlights (treesitter) and the LSP overlays (diagnostics / signs /
         // inlay hints) are native-only projections; the browser build emits empty
         // arrays for them so the redraw map keeps a stable shape (JS-side highlighting
@@ -647,12 +654,18 @@ impl EditHost {
         let diagnostics = self.diagnostics_for(win.buffer, &win.winhl, &segments, styles);
         let diagnostics_virt =
             self.diagnostics_virt_text_for(win.buffer, &win.winhl, &segments, styles);
-        #[cfg(feature = "native")]
+        // Inlay hints ride a live LSP, which the browser build has too (the daemon's
+        // LSP leg), and its renderer paints them — so they project on both builds.
         let inlay_hints = self.inlay_hints_for(win.buffer, &win.winhl, &segments, styles);
-        #[cfg(not(feature = "native"))]
-        let inlay_hints = Value::Array(Vec::new());
         let scroll = match &win.scroll {
-            Some(s) => self.project_band(win.buffer, &win.winhl, s, styles),
+            Some(s) => self.project_band(
+                win.buffer,
+                &win.winhl,
+                s,
+                s.from_leftcol.max(s.to_leftcol) + win.rect.width,
+                win.tabstop,
+                styles,
+            ),
             None => Value::Nil,
         };
         let value = Value::Map(vec![
@@ -1205,6 +1218,8 @@ impl EditHost {
         buffer: bemtvi_core::BufferId,
         winhl: &WinHl,
         s: &ScrollAnim,
+        reach: usize,
+        tabstop: usize,
         styles: &mut StyleTable,
     ) -> Value {
         let RowArrays {
@@ -1217,29 +1232,28 @@ impl EditHost {
             search,
             incsearch,
             virt_lines,
-        } = unbundle_rows(&s.rows);
-        // Native-only overlays (see `window_value`); the browser band carries empty
-        // highlight/inlay/diagnostic arrays. Diagnostic underlines and signs ride the
+        } = unbundle_rows(&s.rows, reach);
+        let lines: Vec<&str> = lines
+            .iter()
+            .map(|l| clip_row_text(l, reach, tabstop))
+            .collect();
+        // Diagnostic underlines and signs ride the
         // band too (keyed on the per-row wrap `segments`, the same as the settled
         // window), so they slide with the text instead of blanking out for the slide.
         // Gutter signs ride the band too (extmark + diagnostic, merged), keyed on the
         // band's per-row `segments` so they slide with the text — like `window_value`.
         let diagnostics_signs =
             crate::extmarks::signs_value(&self.merged_sign_cells(buffer, winhl, &segments, styles));
+        // The same per-build split as `window_value`: the browser band carries the
+        // server-sourced overlay highlights (its code highlighting is JS-side), and the
+        // diagnostics project on both builds.
         #[cfg(feature = "native")]
-        let (highlights, inlay_hints, diagnostics_virt, diagnostics) = (
-            self.highlights_for(buffer, winhl, &segments, styles),
-            self.inlay_hints_for(buffer, winhl, &segments, styles),
-            self.diagnostics_virt_text_for(buffer, winhl, &segments, styles),
-            self.diagnostics_for(buffer, winhl, &segments, styles),
-        );
+        let highlights = self.highlights_for(buffer, winhl, &segments, styles);
         #[cfg(not(feature = "native"))]
-        let (highlights, inlay_hints, diagnostics_virt, diagnostics) = (
-            Value::Array(Vec::new()),
-            Value::Array(Vec::new()),
-            Value::Array(Vec::new()),
-            Value::Array(Vec::new()),
-        );
+        let highlights = self.overlay_highlights_for(buffer, winhl, &segments, styles);
+        let inlay_hints = self.inlay_hints_for(buffer, winhl, &segments, styles);
+        let diagnostics_virt = self.diagnostics_virt_text_for(buffer, winhl, &segments, styles);
+        let diagnostics = self.diagnostics_for(buffer, winhl, &segments, styles);
         // Extmark `virt_text` + `virt_lines` ride the band (pure projections, like
         // `window_value`), so they slide with the text instead of flashing on settle.
         let virt_text = self.virt_text_for(buffer, winhl, &segments, &selection, styles);
@@ -1912,9 +1926,87 @@ pub(crate) struct RowSeg {
     pub end: usize,
     /// Row-local prefix width (`'breakindent'`/`'showbreak'`) added when rebasing.
     pub indent: usize,
+    /// How far right the window can show, in row-local columns (`leftcol` + width,
+    /// widened over a horizontal slide) — the same reach [`clip_row_text`] cuts the
+    /// shipped text at.
+    pub reach: usize,
+}
+
+/// The head of a buffer line one [`RowSeg`] projection needs: the text through the
+/// last column the row can paint, never the rest of a huge line.
+pub(crate) struct RowText<'b> {
+    pub text: Cow<'b, str>,
+    /// The whole line's byte length, so a caller can tell a cut head from a line
+    /// that ended (`text.len() < full_len`).
+    pub full_len: usize,
+}
+
+impl RowText<'_> {
+    /// Whether the head stops short of the line's end.
+    pub(crate) fn clipped(&self) -> bool {
+        self.text.len() < self.full_len
+    }
 }
 
 impl RowSeg {
+    /// The exclusive full-line column past which nothing on this row reaches the
+    /// screen: the segment end, or — for the last/only segment — its start plus the
+    /// window's reach.
+    pub(crate) fn col_bound(&self) -> usize {
+        if self.end == usize::MAX {
+            self.start.saturating_add(self.reach)
+        } else {
+            self.end
+        }
+    }
+
+    /// The head of this row's buffer line, through the grapheme covering
+    /// [`col_bound`](Self::col_bound) plus one cell of slack (what [`clip_row_text`]
+    /// ships). `O(head)`, not `O(line)`: the per-row overlay projections run every
+    /// frame for every visible row, so materializing and walking a whole megabyte
+    /// line here froze each frame. `None` for a row with no buffer line.
+    pub(crate) fn text<'b>(&self, buf: &'b Buffer, tabstop: usize) -> Option<RowText<'b>> {
+        let idx = self.line? - 1;
+        let full_len = buf.line_len(idx);
+        let bound = self.col_bound().saturating_add(1);
+        // Every grapheme is at least one byte, so a line no longer in bytes than the
+        // bound can't overrun it.
+        if full_len <= bound {
+            return Some(RowText {
+                text: buf.line_cow(idx),
+                full_len,
+            });
+        }
+        // A cell can take any number of bytes (combining marks), so grow the fetched
+        // head geometrically until the bound column falls inside it.
+        let mut budget = bound.saturating_mul(4).max(256);
+        loop {
+            let head = buf.line_head(idx, budget);
+            let whole = head.len() >= full_len;
+            let at = unicode::byte_at_virtcol(&head, bound, tabstop);
+            if at < head.len() {
+                let end = unicode::next_grapheme(&head, at);
+                if end < head.len() || whole {
+                    let text = match head {
+                        Cow::Borrowed(s) => Cow::Borrowed(&s[..end]),
+                        Cow::Owned(mut s) => {
+                            s.truncate(end);
+                            Cow::Owned(s)
+                        }
+                    };
+                    return Some(RowText { text, full_len });
+                }
+            }
+            if whole {
+                return Some(RowText {
+                    text: head,
+                    full_len,
+                });
+            }
+            budget = budget.saturating_mul(4);
+        }
+    }
+
     /// Clip a full-line screen-column span `[a, b)` to this segment and rebase to
     /// row-local columns (adding the baked-prefix `indent`); `None` if it misses.
     pub(crate) fn clip(&self, a: usize, b: usize) -> Option<(usize, usize)> {
@@ -1974,7 +2066,7 @@ struct RowArrays<'a> {
 /// Unbundle a [`RenderRow`] slice into the parallel per-row arrays the wire
 /// carries (one entry per screen row, in order). The native highlight / inlay /
 /// diagnostic projections then key on `numbers` exactly as before.
-fn unbundle_rows(rows: &[RenderRow]) -> RowArrays<'_> {
+fn unbundle_rows(rows: &[RenderRow], reach: usize) -> RowArrays<'_> {
     RowArrays {
         lines: rows.iter().map(|r| r.text.as_str()).collect(),
         numbers: rows.iter().map(|r| r.number()).collect(),
@@ -1985,6 +2077,7 @@ fn unbundle_rows(rows: &[RenderRow]) -> RowArrays<'_> {
                 start: r.start_col(),
                 end: r.seg_end_col,
                 indent: r.indent,
+                reach,
             })
             .collect(),
         continuation: rows.iter().map(|r| r.is_continuation()).collect(),
@@ -1997,6 +2090,26 @@ fn unbundle_rows(rows: &[RenderRow]) -> RowArrays<'_> {
         incsearch: rows.iter().map(|r| r.incsearch).collect(),
         virt_lines: rows.iter().map(|r| r.virt_line.as_deref()).collect(),
     }
+}
+
+/// The head of a window row's `text` that can reach the screen when the window shows
+/// columns `[0, reach)`: everything up to and including the grapheme that covers
+/// column `reach` (plus a cell of slack past it), so a client still sees the text
+/// running off the right edge. A row that fits comes back whole. Only a prefix is ever
+/// cut, so every column the frame's spans/cursor/selection carry keeps its meaning;
+/// what goes is the part of a huge `nowrap` line no window could paint, which would
+/// otherwise be scrubbed, encoded and sent in full on every frame.
+fn clip_row_text(text: &str, reach: usize, tabstop: usize) -> &str {
+    // Shipping too much is harmless, so a row no longer in bytes than the reach is
+    // passed through without the walk.
+    if text.len() <= reach {
+        return text;
+    }
+    let at = unicode::byte_at_virtcol(text, reach + 1, tabstop);
+    if at >= text.len() {
+        return text;
+    }
+    &text[..unicode::next_grapheme(text, at)]
 }
 
 /// Encode a slice of text rows as a msgpack array of strings — verbatim, the raw

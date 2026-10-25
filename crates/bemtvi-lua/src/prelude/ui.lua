@@ -232,20 +232,34 @@ end
 btv._active_prompt_complete = btv._active_prompt_complete or nil
 btv._prompt_complete_debounced = btv._prompt_complete_debounced or nil
 
+local prompt_complete_seq = 0
+
 -- Run the source once and pipe its candidates (a `{ {label, insert?, doc?}, … }` list
 -- OR a promise of one — an async source like the DAP `completions` round-trip) into
 -- the wildmenu via `btv._prompt_complete_show`. `btv.promise.resolve` adapts the sync
 -- and async shapes uniformly; a nil result or an error resolves to an empty list (the
 -- menu just closes — a completion hiccup must not break the prompt). Shared by the
 -- immediate path and the debounced refresh path.
+--
+-- Each query is numbered, and only the LATEST one's answer is shown, and only while
+-- the prompt that asked is still open: an async source can answer out of order (a
+-- slow query landing after a newer fast one) or after the prompt closed, and either
+-- would otherwise replace the current menu with candidates for text no longer typed.
 function btv._do_prompt_complete(fn, line, col)
+  prompt_complete_seq = prompt_complete_seq + 1
+  local mine = prompt_complete_seq
+  local function show(cands)
+    if mine == prompt_complete_seq and btv._active_prompt_complete == fn then
+      btv._prompt_complete_show(cands)
+    end
+  end
   -- `try` folds a synchronous throw from `fn` into a rejection, so the error
   -- handler below still closes the menu (a completion hiccup must not break the
   -- prompt) instead of the throw escaping the callback uncaught.
   btv.promise.try(fn, line, col):next(function(cands)
-    btv._prompt_complete_show(cands or {})
+    show(cands or {})
   end, function()
-    btv._prompt_complete_show({})
+    show({})
   end)
 end
 

@@ -41,3 +41,10 @@ fn a_view_scrolled_past_the_end_sits_at_the_track_end() {
     assert_eq!(off + len, 110.0);
     assert_eq!(len, 20.0);
 }
+
+#[test]
+fn an_extreme_span_from_the_wire_does_not_overflow() {
+    // `start` / `shown` are raw wire u64s; their sum must not overflow.
+    let (off, len) = span(u64::MAX, u64::MAX, 10).thumb(100.0, 4.0).unwrap();
+    assert!(off >= 0.0 && off + len <= 100.0);
+}

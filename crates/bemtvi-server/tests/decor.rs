@@ -1454,3 +1454,33 @@ btv.decor.provider {
         "a sign from a superseded viewport paints nothing: {signs:?}"
     );
 }
+
+/// `bufs.filetype` / `bufs.buftype` given as a single string scope to that one value,
+/// like a one-element list, instead of silently matching nothing.
+#[tokio::test]
+async fn a_string_bufs_filter_is_a_one_element_list() {
+    let dir = temp_dir("decor_string_ft");
+    let (rpc, _incoming) = start(
+        &dir,
+        r#"
+_G.ran = false
+btv.decor.provider {
+  name = "string_ft",
+  bufs = { filetype = "lua", buftype = "" },
+  on_range = function() _G.ran = true end,
+}
+"#,
+    )
+    .await;
+    let path = write_big_lua(&dir, 20);
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+    let mut ran = false;
+    for _ in 0..100 {
+        if exec_lua(&rpc, "return _G.ran").await.as_bool() == Some(true) {
+            ran = true;
+            break;
+        }
+        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    }
+    assert!(ran, "the provider ran on the lua buffer");
+}

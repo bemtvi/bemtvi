@@ -2371,3 +2371,85 @@ fn an_undefined_status_line_nc_falls_back_to_status_line() {
         );
     }
 }
+
+/// Paint `rows` copies of a `len`-cell line (tabs included, so tab expansion runs too)
+/// into an 80×24 grid and return the time one paint takes plus the painted grid.
+fn paint_long_rows(len: usize, leftcol: u64) -> (std::time::Duration, Buffer) {
+    let line: String = "ab\tcdefgh".repeat(len / 16);
+    let rows: Vec<&str> = std::iter::repeat_n(line.as_str(), 23).collect();
+    let v = view(vec![
+        ("lines", lines(&rows)),
+        ("tabstop", Value::from(8u64)),
+        ("leftcol", Value::from(leftcol)),
+    ]);
+    let start = std::time::Instant::now();
+    let buf = paint(&v, 80, 24);
+    (start.elapsed(), buf)
+}
+
+#[test]
+fn a_very_long_line_paints_in_viewport_time() {
+    // Only ~80 cells of each row are ever visible, so the paint must cost the same
+    // for a 160-cell line and a 160k-cell one (a minified bundle, a log line). The
+    // server ships whole lines, so a client that styles every cell of every row
+    // before the terminal crops them turns each keystroke into a freeze.
+    let (short, short_buf) = paint_long_rows(160, 3);
+    let (long, long_buf) = paint_long_rows(160_000, 3);
+    assert_eq!(
+        row_text(&long_buf, 0),
+        row_text(&short_buf, 0),
+        "the visible cells are the same whatever the line's length"
+    );
+    assert!(
+        row_text(&long_buf, 0).contains("cdefgh"),
+        "the row paints its text"
+    );
+    assert!(
+        long < short * 10 + std::time::Duration::from_millis(150),
+        "painting 160k-cell rows took {long:?} vs {short:?} for 160-cell rows"
+    );
+}
+
+/// A redraw field at the u16 extreme (a hostile or buggy server) must paint, not
+/// panic on arithmetic overflow in the layout / cell maths.
+#[test]
+fn u16_extreme_dock_sizes_paint_without_overflow() {
+    let v = view(vec![
+        ("lines", lines(&["abc"])),
+        ("dock_bottom", Value::from(u64::from(u16::MAX))),
+        ("dock_right", Value::from(u64::from(u16::MAX))),
+    ]);
+    let _ = paint(&v, 80, 24);
+}
+
+#[test]
+fn u16_extreme_padding_paints_without_overflow() {
+    let m = u64::from(u16::MAX);
+    let v = view(vec![
+        ("lines", lines(&["abc"])),
+        (
+            "padding",
+            Value::Array(vec![m.into(), m.into(), m.into(), m.into()]),
+        ),
+    ]);
+    let _ = paint(&v, 80, 24);
+}
+
+#[test]
+fn u16_extreme_colorcolumn_and_cursors_paint_without_overflow() {
+    let m = u64::from(u16::MAX);
+    let v = view(vec![
+        ("lines", lines(&["abc"])),
+        ("number", Value::from(true)),
+        ("number_width", Value::from(4u64)),
+        ("colorcolumn", Value::Array(vec![m.into()])),
+        (
+            "cursors",
+            Value::Array(vec![
+                Value::Array(vec![0u64.into(), m.into()]),
+                Value::Array(vec![m.into(), 0u64.into()]),
+            ]),
+        ),
+    ]);
+    let _ = paint(&v, 80, 24);
+}

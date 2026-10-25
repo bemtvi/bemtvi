@@ -135,6 +135,22 @@
      so it just needs to be focusable and out of the way. */
   #ime { position: absolute; top: 0; left: 0; width: 1px; height: 1px; opacity: 0;
          pointer-events: none; overflow: hidden; outline: none; }
+  /* The `?daemon=` trust prompt (see `confirmDaemonLink`) and the note left when it's declined. */
+  #daemon-trust { position: fixed; inset: 0; z-index: 100; display: flex; align-items: center;
+                  justify-content: center; background: rgba(0, 0, 0, .55); }
+  #daemon-trust .box { max-width: min(560px, calc(100vw - 32px)); padding: 16px 18px; background: var(--status-bg);
+                       color: var(--fg); border: 1px solid var(--gutter); border-radius: 4px;
+                       font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace; }
+  #daemon-trust h1 { margin: 0 0 8px; font-size: 14px; color: var(--accent); }
+  #daemon-trust p { margin: 6px 0; }
+  #daemon-trust code { color: var(--gutter-cur); word-break: break-all; }
+  #daemon-trust .buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+  #daemon-trust button { font: inherit; padding: 4px 12px; border-radius: 3px; cursor: pointer;
+                         border: 1px solid var(--gutter); background: var(--bg); color: var(--fg); }
+  #daemon-trust button:focus { outline: 1px solid var(--accent); }
+  #daemon-note { position: fixed; top: 6px; right: 6px; z-index: 60; max-width: calc(100vw - 32px);
+                 padding: 4px 8px; font-size: 12px; background: var(--status-bg); color: #f08a7e;
+                 border: 1px solid var(--gutter); border-radius: 3px; cursor: pointer; }
 </style>
 </head>
 <body>
@@ -355,9 +371,11 @@
       const totalRows = Math.max(4, Math.floor(rect.height / ch));
       editorRows = totalRows - 1; // reserve the command row, like the TUI client
     }
+    // Quotes too, so a value that ever lands inside an attribute can't close it.
     function escapeHtml(s) {
-      return s.replace(/[&<>\u2580-\u259f]/g, (c) =>
-        c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : blockElementHtml(c));
+      return s.replace(/[&<>"'\u2580-\u259f]/g, (c) =>
+        c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;"
+          : c === '"' ? "&quot;" : c === "'" ? "&#39;" : blockElementHtml(c));
     }
 
     // A block element (U+2580–U+259F: `▀`, `▄`, `█`, …) as an exactly cell-sized box
@@ -759,11 +777,95 @@
     // makes the edit-host open/save files over WebTransport against a remote `bemtvi
     // --daemon --listen`, instead of the serverless OPFS sandbox. The URI is forwarded to
     // the Worker on its own script URL (so the Worker self-configures with no boot race);
-    // no param = serverless OPFS (unchanged). Config + shada stay local either way.
+    // no param = serverless OPFS (unchanged). A daemon session sources the daemon's config
+    // and keeps its shada in OPFS under that daemon's own namespace.
     // The same connection can also be made *at runtime* with `:connect bemtvi://…` (no page
     // param needed) — intercepted on `<CR>` like the file pickers below (`tryConnectIntercept`).
+    //
+    // A link can name ANY daemon, and a daemon session runs that daemon's init.lua in this
+    // page — so a `?daemon=` from the URL connects only once the user approves it (or approved
+    // the same HOST:PORT + cert before). Until then the Worker isn't even created, so nothing
+    // is dialed. Declining boots the local serverless editor and leaves a note saying so.
+    // The daemon session's shada is its own OPFS blob (see daemon-trust.mjs / worker.mjs).
+    const trust = await import("./daemon-trust.mjs");
+    function showDaemonNote(text) {
+      const note = document.createElement("div");
+      note.id = "daemon-note";
+      note.title = "click to dismiss";
+      note.textContent = text;
+      note.addEventListener("click", () => note.remove());
+      document.body.appendChild(note);
+    }
+    // The in-page prompt: resolves true for "Connect", false for "Stay local" / Escape. The
+    // safe choice holds the initial focus, so a stray Enter doesn't connect.
+    function confirmDaemonLink(id) {
+      return new Promise((resolve) => {
+        const overlay = document.createElement("div");
+        overlay.id = "daemon-trust";
+        overlay.setAttribute("role", "dialog");
+        overlay.setAttribute("aria-modal", "true");
+        const box = document.createElement("div");
+        box.className = "box";
+        const h = document.createElement("h1");
+        h.textContent = "Connect to a remote bemtvi daemon?";
+        const p1 = document.createElement("p");
+        p1.append("This link asks to connect to the daemon at ");
+        const host = document.createElement("code");
+        host.textContent = id.hostPort;
+        p1.append(host, " with certificate");
+        const p2 = document.createElement("p");
+        const certEl = document.createElement("code");
+        certEl.textContent = id.cert;
+        p2.append(certEl);
+        const p3 = document.createElement("p");
+        p3.textContent = "A daemon session runs that daemon's config and plugins in this page and can read and write files on its machine. Connect only to a daemon you started.";
+        const buttons = document.createElement("div");
+        buttons.className = "buttons";
+        const stay = document.createElement("button");
+        stay.id = "daemon-trust-local";
+        stay.textContent = "Stay local";
+        const go = document.createElement("button");
+        go.id = "daemon-trust-connect";
+        go.textContent = "Connect";
+        buttons.append(stay, go);
+        box.append(h, p1, p2, p3, buttons);
+        overlay.append(box);
+        const done = (ok) => {
+          overlay.remove();
+          resolve(ok);
+        };
+        stay.addEventListener("click", () => done(false));
+        go.addEventListener("click", () => done(true));
+        overlay.addEventListener("keydown", (e) => {
+          if (e.key === "Escape") done(false);
+        });
+        document.body.appendChild(overlay);
+        stay.focus();
+      });
+    }
+    let daemonUri = new URLSearchParams(location.search).get("daemon");
+    if (daemonUri) {
+      let id = null;
+      try {
+        id = trust.daemonIdentity(daemonUri);
+      } catch (e) {
+        showDaemonNote(`Ignored the ?daemon= link (${e.message || e}); running locally.`);
+        daemonUri = null;
+      }
+      if (id) {
+        let approved = false;
+        try { approved = trust.isDaemonApproved(localStorage, id); } catch { /* no storage: ask every time */ }
+        if (!approved) {
+          if (await confirmDaemonLink(id)) {
+            try { trust.rememberDaemonApproval(localStorage, id); } catch { /* not remembered */ }
+          } else {
+            showDaemonNote(`Not connected to the daemon at ${id.hostPort}; running locally.`);
+            daemonUri = null;
+          }
+        }
+      }
+    }
     const workerUrl = new URL("./worker.mjs", import.meta.url);
-    const daemonUri = new URLSearchParams(location.search).get("daemon");
     if (daemonUri) workerUrl.searchParams.set("daemon", daemonUri);
     // The chord substitutions travel the same way and for the same reason: on the Worker's
     // script URL, so it self-configures with no boot race. They must reach the edit-host
@@ -2212,10 +2314,15 @@
     // Palette colors arrive as `0xRRGGBB` integers (neovim's convention, the shared
     // `style_value` encoding) — the terminal vt100 colors take this path. Coerce to a CSS
     // color: a number → `#rrggbb`, a string passes through, null/undefined → null.
+    // The result is spliced into `style="…"` strings, so only a number or a strict
+    // `#hex` / `var(--name)` spelling passes; anything else is no colour.
     function cssColor(c) {
       if (c == null) return null;
-      if (typeof c === "number") return "#" + (c >>> 0).toString(16).padStart(6, "0");
-      return c;
+      if (typeof c === "number") {
+        return Number.isFinite(c) ? "#" + (c >>> 0).toString(16).padStart(6, "0") : null;
+      }
+      if (typeof c === "string" && /^(#[0-9a-fA-F]{3,8}|var\(--[A-Za-z0-9-]+\))$/.test(c)) return c;
+      return null;
     }
     // `mode` splits the style for the two-layer status bar: "bg" → background only,
     // "fg" → colour + weight/slant/decorations only; omitted → the full style (every

@@ -279,8 +279,11 @@ local function assign_namespace(src)
   local trim = function(p)
     return btv.utils._fold_seps((p:gsub("[/\\]+$", "")))
   end
-  local config = vim.fn and vim.fn.stdpath and vim.fn.stdpath("config")
-  if config and trim(best) == trim(config) then
+  -- `stdpath` raises when the process has no config dir at all; then nothing is it.
+  local has_config, config = pcall(function()
+    return vim.fn and vim.fn.stdpath and vim.fn.stdpath("config")
+  end)
+  if has_config and config and trim(best) == trim(config) then
     return "user"
   end
   return btv.utils.basename(best)
@@ -804,6 +807,12 @@ vim.split = btv.str.split
 -- (vim.fn already exists — the Rust bridge created it before the prelude loads —
 -- so these extend it.)
 
+-- The byte at `j` of `s` when it is a UTF-8 continuation byte (`0x80`-`0xBF`), else nil.
+local function cont(s, j)
+  local c = s:byte(j)
+  return c and c >= 0x80 and c < 0xC0 and c or nil
+end
+
 -- Decode the codepoint starting at byte index `i` (1-based) of `s`, returning
 -- (codepoint, byte_length), or (nil, 0) past the end. A malformed / truncated
 -- sequence is treated as a single 1-byte char so iteration always advances.
@@ -815,18 +824,18 @@ local function utf8_decode(s, i)
   if b < 0x80 then
     return b, 1
   end
-  if b >= 0xF0 then
-    local b2, b3, b4 = s:byte(i + 1), s:byte(i + 2), s:byte(i + 3)
+  if b >= 0xF0 and b < 0xF8 then
+    local b2, b3, b4 = cont(s, i + 1), cont(s, i + 2), cont(s, i + 3)
     if b2 and b3 and b4 then
       return (b % 0x08) * 0x40000 + (b2 % 0x40) * 0x1000 + (b3 % 0x40) * 0x40 + (b4 % 0x40), 4
     end
-  elseif b >= 0xE0 then
-    local b2, b3 = s:byte(i + 1), s:byte(i + 2)
+  elseif b >= 0xE0 and b < 0xF0 then
+    local b2, b3 = cont(s, i + 1), cont(s, i + 2)
     if b2 and b3 then
       return (b % 0x10) * 0x1000 + (b2 % 0x40) * 0x40 + (b3 % 0x40), 3
     end
-  elseif b >= 0xC0 then
-    local b2 = s:byte(i + 1)
+  elseif b >= 0xC0 and b < 0xE0 then
+    local b2 = cont(s, i + 1)
     if b2 then
       return (b % 0x20) * 0x40 + (b2 % 0x40), 2
     end

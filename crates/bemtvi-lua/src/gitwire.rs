@@ -307,7 +307,11 @@ fn git_value_to_value(value: &GitValue) -> Value {
                 Value::Array(rows),
             ])
         }
-        GitValue::Status { dirty, entries } => {
+        GitValue::Status {
+            dirty,
+            entries,
+            notice,
+        } => {
             let rows = entries
                 .iter()
                 .map(|e| {
@@ -323,6 +327,7 @@ fn git_value_to_value(value: &GitValue) -> Value {
                 Value::from("status"),
                 Value::from(*dirty),
                 Value::Array(rows),
+                notice.as_deref().map_or(Value::Nil, Value::from),
             ])
         }
     }
@@ -367,6 +372,7 @@ fn git_value_from_value(v: &Value) -> Result<GitValue, GitError> {
         "status" => GitValue::Status {
             dirty: arr.get(1).and_then(Value::as_bool).unwrap_or(false),
             entries: decode_status_entries(arr.get(2)),
+            notice: arr.get(3).and_then(Value::as_str).map(str::to_string),
         },
         other => return Err(wire_error(&format!("unknown git value tag '{other}'"))),
     })

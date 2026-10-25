@@ -222,3 +222,14 @@ async fn gc_without_a_commentstring_leaves_the_buffer_unchanged() {
     feed(&rpc, "gcc");
     assert_eq!(lines(&rpc).await, vec!["hello"]);
 }
+
+/// The shared indent is the narrowest line's, cut off every line by its byte
+/// length. A line indented with a multibyte whitespace char (NBSP, 2 bytes) next
+/// to one indented with a single space put that cut inside the NBSP — a
+/// char-boundary panic that took the server down on a plain `gcj`.
+#[tokio::test]
+async fn gc_over_a_multibyte_indent_does_not_split_a_char() {
+    let (rpc, _i) = start_file("cmt_nbsp", "rs", " a\n\u{a0}b\n").await;
+    feed(&rpc, "gcj");
+    assert_eq!(lines(&rpc).await, vec![" // a", " // \u{a0}b"]);
+}

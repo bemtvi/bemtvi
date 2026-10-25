@@ -32,6 +32,7 @@ end
 
 -- `btv.snippet.add`(`"rust"`, { { trigger = `"fn"`, body = `"fn ${1:name}() {\n\t$0\n}"` }, ... })
 -- Register snippets for a filetype. `trigger` and `body` are required strings.
+-- Re-adding a trigger already registered for `ft` replaces that snippet's body.
 -- Function bodies (dynamic / context-aware) are not supported yet and error loud
 -- rather than silently dropping the snippet (deferred to a later phase).
 function btv.snippet.add(ft, list)
@@ -58,8 +59,16 @@ function btv.snippet.add(ft, list)
     end
     triggers[#triggers + 1] = s.trigger
     bodies[#bodies + 1] = s.body
-    btv.snippet._byft[ft] = btv.snippet._byft[ft] or {}
-    table.insert(btv.snippet._byft[ft], { trigger = s.trigger, body = s.body })
+    local byft = btv.snippet._byft[ft] or {}
+    btv.snippet._byft[ft] = byft
+    local slot = #byft + 1
+    for j, existing in ipairs(byft) do
+      if existing.trigger == s.trigger then
+        slot = j
+        break
+      end
+    end
+    byft[slot] = { trigger = s.trigger, body = s.body }
   end
   btv._snippet_add(ft, triggers, bodies)
 end

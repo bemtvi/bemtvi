@@ -153,6 +153,57 @@ async fn nonutf8_file_decodes_over_the_wire_like_local() {
     );
 }
 
+/// A CRLF file fetched over the wire detects `'fileformat'` like a local open: the rope
+/// holds `\n` (no stray `\r` on every line) and `'fileformat'` reads `dos`, so a `:w`
+/// writes the `\r\n` back. A classic-Mac file (lone `\r`) splits into its lines too.
+#[tokio::test]
+async fn dos_and_mac_fileformat_detect_over_the_wire_like_local() {
+    let fake = DaemonFs::default();
+    fake.set_bytes("/virtual/dos.txt", b"one\r\ntwo\r\n")
+        .set_bytes("/virtual/mac.txt", b"a\rb\rc\r");
+    let (rpc, _incoming) = spawn_with_daemon_fs(fake.clone(), "/virtual/dos.txt").await;
+
+    assert_eq!(
+        await_lines(&rpc, &["one", "two"]).await,
+        vec!["one", "two"],
+        "a CRLF remote file must open without a trailing `\\r` on every line"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.bo.fileformat")
+            .await
+            .as_str()
+            .unwrap_or_default(),
+        "dos",
+        "the remote replica carries the detected 'fileformat', like a local open"
+    );
+    feed(&rpc, "ggAX<Esc>:w<CR>");
+    for _ in 0..200 {
+        if fake.content("/virtual/dos.txt").as_deref() == Some("oneX\r\ntwo\r\n") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        fake.content("/virtual/dos.txt").as_deref(),
+        Some("oneX\r\ntwo\r\n"),
+        "`:w` writes CRLF back"
+    );
+
+    feed(&rpc, ":edit /virtual/mac.txt<CR>");
+    assert_eq!(
+        await_lines(&rpc, &["a", "b", "c"]).await,
+        vec!["a", "b", "c"],
+        "a lone-`\\r` remote file splits into its lines"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.bo.fileformat")
+            .await
+            .as_str()
+            .unwrap_or_default(),
+        "mac"
+    );
+}
+
 /// `:e ++enc=<encoding>` forces the decode of a **remote** file too. The decode runs
 /// core-side (`load_bytes_into`) on the bytes the daemon ships, so the forced encoding
 /// only has to reach that call — it rides the deferred open through the edit-host's

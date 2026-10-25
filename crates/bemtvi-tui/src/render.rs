@@ -320,6 +320,9 @@ pub(crate) fn render(
     // The permanent dock bands. Each open dock reserves its content extent plus one
     // separator cell toward the main area; all are `0` (and the layout collapses to
     // the pre-dock form) when no dock is open.
+    if let Some(store) = images.as_deref_mut() {
+        store.retain_live(view);
+    }
     let dock = DockLayout::new(frame.area(), view, tabline_rows, global_status_rows);
     let (tabline_area, cmd_area) = (dock.tabline, dock.cmd);
     let global_status_area = dock.global_status;
@@ -341,7 +344,12 @@ pub(crate) fn render(
         // window background — `render_window` only paints the inset content box — so
         // paint the whole box with `Normal` first when there's a margin to fill.
         let outer = window_area(dock.content(win.region), win);
-        if win.padding.horizontal() + win.padding.vertical() > 0 {
+        if win
+            .padding
+            .horizontal()
+            .saturating_add(win.padding.vertical())
+            > 0
+        {
             if let Some(bg) = window_bg(win, view) {
                 frame.render_widget(Block::default().style(bg), outer);
             }
@@ -614,7 +622,7 @@ struct DockLayout {
 impl DockLayout {
     fn new(area: Rect, view: &View, tabline_rows: u16, global_status_rows: u16) -> Self {
         // A dock reserves `content + 1` cells (the `+1` its separator), `0` closed.
-        let res = |n: u16| if n > 0 { n + 1 } else { 0 };
+        let res = |n: u16| if n > 0 { n.saturating_add(1) } else { 0 };
         let (dl, dr, dt, db) = (
             view.dock_left,
             view.dock_right,
@@ -646,13 +654,13 @@ impl DockLayout {
         let top = Rect::new(top_band.x, top_band.y, top_band.width, dt);
         let bottom = Rect::new(
             bottom_band.x,
-            bottom_band.y + res(db) - db,
+            bottom_band.y.saturating_add(res(db) - db),
             bottom_band.width,
             db,
         );
         let left = Rect::new(left_band.x, left_band.y, dl, left_band.height);
         let right = Rect::new(
-            right_band.x + res(dr) - dr,
+            right_band.x.saturating_add(res(dr) - dr),
             right_band.y,
             dr,
             right_band.height,
@@ -829,8 +837,14 @@ fn pad_rect(area: Rect, pad: bemtvi_view::Padding) -> Rect {
     Rect {
         x: area.x + left,
         y: area.y + top,
-        width: area.width.saturating_sub(left + pad.right).max(1),
-        height: area.height.saturating_sub(top + pad.bottom).max(1),
+        width: area
+            .width
+            .saturating_sub(left.saturating_add(pad.right))
+            .max(1),
+        height: area
+            .height
+            .saturating_sub(top.saturating_add(pad.bottom))
+            .max(1),
     }
 }
 
@@ -1253,7 +1267,7 @@ fn render_window(
                 .then(|| {
                     frame_lines
                         .get(row as usize)
-                        .map(|l| expand_tabs(l, tabstop))
+                        .map(|l| expand_tabs(l, tabstop, leftcol + text_inner.width as usize))
                 })
                 .flatten();
             for &col in &win.colorcolumn {
@@ -1268,7 +1282,9 @@ fn render_window(
                     .as_deref()
                     .map_or(ruler, |line| ruler_cell(line, ruler))
                     .max(leftcol);
-                let x = text_inner.x + (cell_col - leftcol) as u16;
+                let x = text_inner
+                    .x
+                    .saturating_add(u16::try_from(cell_col - leftcol).unwrap_or(u16::MAX));
                 if x >= text_inner.right() {
                     continue; // past the right edge of the text area
                 }
@@ -1411,8 +1427,8 @@ fn paint_cursor_cell(
     let Some(rel_col) = screen_col.checked_sub(leftcol) else {
         return;
     };
-    let x = text_inner.x + rel_col;
-    let y = text_inner.y + row;
+    let x = text_inner.x.saturating_add(rel_col);
+    let y = text_inner.y.saturating_add(row);
     if x >= text_inner.right() || y >= text_inner.bottom() {
         return;
     }
@@ -1697,7 +1713,11 @@ fn highlight_line(
     leftcol: usize,
     theme: &LineTheme,
 ) -> Line<'static> {
-    let expanded = expand_tabs(line, tabstop);
+    // Nothing at or past this absolute column can be painted (inline splices only
+    // push glyphs further right), so the walk below stops there: its cost is bounded
+    // by the viewport, not by the line's length.
+    let limit = leftcol.saturating_add(max_width);
+    let expanded = expand_tabs(line, tabstop, limit);
 
     // `~` rows carry no tokens or selection: paint the marker with the theme's
     // EndOfBuffer style (default — terminal foreground — with no colorscheme). The
@@ -1750,6 +1770,14 @@ fn highlight_line(
     // presentation (a lone VS16 is zero-width, so the terminal drops it and the
     // heart reverts to its narrow text form). See [`cells`].
     for g in expanded.graphemes(true) {
+        if col >= limit {
+            // The rest of the row is off the right edge, and so is anything anchored
+            // in it.
+            hi = inlay.len();
+            vi = inline.len();
+            oi = overlays.len();
+            break;
+        }
         while hi < inlay.len() && (inlay[hi].0 as usize) <= col {
             emit_inlay_hint(
                 &inlay[hi],
@@ -2476,13 +2504,16 @@ fn ruler_cell(line: &str, ruler: usize) -> usize {
 /// Expand tabs to spaces at `tabstop` (the buffer's, mirrored from the server),
 /// tracking display width so wide glyphs before a tab advance the column
 /// correctly. No-op for tab-free lines; the result never contains a `\t`.
+/// Expansion stops at the first cluster starting at or past screen column `limit`
+/// (the right edge of what can be painted), so a huge line costs only its visible
+/// prefix.
 ///
 /// The walk steps by grapheme cluster so its column matches the server's
 /// per-cluster `unicode::virtcol` — the metric `cursor_screen_col` and every
 /// highlight span are measured in — and a tab after an emoji lands on the same
 /// stop the server computed. (A tab never joins a cluster, so it is always its
 /// own one-char grapheme here.)
-fn expand_tabs(line: &str, tabstop: usize) -> Cow<'_, str> {
+fn expand_tabs(line: &str, tabstop: usize, limit: usize) -> Cow<'_, str> {
     if !line.contains('\t') {
         // The overwhelmingly common (tab-free) case borrows the line untouched, so
         // a repaint allocates nothing per row here.
@@ -2492,6 +2523,9 @@ fn expand_tabs(line: &str, tabstop: usize) -> Cow<'_, str> {
     let mut out = String::with_capacity(line.len() + tabstop);
     let mut col = 0;
     for g in line.graphemes(true) {
+        if col >= limit {
+            break;
+        }
         if g == "\t" {
             let spaces = tabstop - (col % tabstop);
             for _ in 0..spaces {

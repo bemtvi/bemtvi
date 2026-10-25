@@ -323,6 +323,69 @@ async fn typing_does_not_scale_with_the_diagnostic_count() {
     );
 }
 
+/// Set 200 diagnostics spread evenly across a single line of `len` bytes, then
+/// repaint a few frames; the wall time of both.
+async fn time_diagnosed_long_line(len: usize) -> std::time::Duration {
+    let (rpc, _inc) = start_with_file(&sample(1)).await;
+    exec_lua(
+        &rpc,
+        &format!(
+            "btv.buf.set_lines(0, 0, -1, false, {{ string.rep('ab\\tc', {}) }})",
+            len / 4
+        ),
+    )
+    .await;
+    let _ = lines(&rpc).await;
+    let started = std::time::Instant::now();
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"
+            vim.diagnostic.config({{ underline = true, virtual_text = true, signs = true }})
+            local ds = {{}}
+            for i = 1, 200 do
+              local col = (i - 1) * {step}
+              ds[i] = {{ lnum = 0, col = col, end_lnum = 0, end_col = col + 2,
+                        severity = 1, message = "diag " .. i }}
+            end
+            vim.diagnostic.set(1, 0, ds)
+            "#,
+            step = len / 200
+        ),
+    )
+    .await;
+    for _ in 0..5 {
+        feed(&rpc, "l");
+        let _ = lines(&rpc).await;
+    }
+    assert_eq!(
+        exec_lua(&rpc, "return #vim.diagnostic.get(0)")
+            .await
+            .as_u64(),
+        Some(200),
+        "the benchmark must not pass by having set no diagnostics",
+    );
+    started.elapsed()
+}
+
+#[tokio::test]
+async fn diagnostics_on_a_long_line_do_not_scale_with_its_length() {
+    // Each endpoint used to be converted (on set) and projected (every frame, every
+    // row) by copying and walking the whole line from column 0, so the cost was
+    // diagnostics x line length: a minified file's one line froze the editor. The
+    // diagnostic count and the viewport are fixed here and only the line grows 20x;
+    // a ratio, so both halves see the same machine load.
+    let short = time_diagnosed_long_line(10_000).await;
+    let long = time_diagnosed_long_line(200_000).await;
+    let ratio = long.as_secs_f64() / short.as_secs_f64().max(0.001);
+    assert!(
+        ratio < 4.0,
+        "200 diagnostics on a 200k-byte line cost {ratio:.1}x the same on a 10k-byte \
+         line ({long:?} vs {short:?}) — the diagnostic path is walking the whole line \
+         per diagnostic again",
+    );
+}
+
 // ================================================ an end-exclusive span ends where it says
 //
 // A multi-line diagnostic's `end` is EXCLUSIVE: `[2,0)-[4,0)` reaches up to row 4, not

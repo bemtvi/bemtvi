@@ -168,3 +168,32 @@ async fn normal_abbreviation_keeps_the_bar() {
     feed(&rpc, ":norma iX|Y<CR>");
     assert_eq!(lines(&rpc).await, vec!["X|Yab"]);
 }
+
+/// `:g` marks its target lines and then *follows* them as the command edits the
+/// buffer (vim's mark-then-execute), not by the net line-count change: `:g/a/m$`
+/// lifts each match to the end, which shifts the *later* targets up without
+/// changing the line count, and `:g/a/t$` grows the buffer below every remaining
+/// target, which must not shift them at all.
+#[tokio::test]
+async fn global_follows_its_targets_through_moves_and_copies() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ia1<CR>b<CR>a2<CR>c<Esc>");
+    feed(&rpc, ":g/a/m$<CR>");
+    assert_eq!(lines(&rpc).await, vec!["b", "c", "a1", "a2"]);
+    feed(&rpc, "u");
+    assert_eq!(lines(&rpc).await, vec!["a1", "b", "a2", "c"]);
+    feed(&rpc, ":g/a/t$<CR>");
+    assert_eq!(lines(&rpc).await, vec!["a1", "b", "a2", "c", "a1", "a2"]);
+}
+
+/// A target line the command deletes before `:g` reaches it is skipped (its
+/// mark is gone), not replaced by whatever line slid into its place.
+#[tokio::test]
+async fn global_skips_a_target_an_earlier_command_deleted() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ix1<CR>x2<CR>keep<CR>x3<CR>end<Esc>");
+    // On `x1` delete the next line (`x2`, itself a target): `x2` must not run, and
+    // `x3` then deletes the line after it.
+    feed(&rpc, ":g/x/+1d<CR>");
+    assert_eq!(lines(&rpc).await, vec!["x1", "keep", "x3"]);
+}

@@ -125,6 +125,19 @@ impl EditHost {
         existed: bool,
         stat: Option<bemtvi_core::FileStat>,
     ) {
+        // A watch reload whose buffer was edited while the re-fetch was in flight: the
+        // landing would silently discard those edits (and their undo history). Keep the
+        // user's text and report the conflict instead, as a reload onto a modified buffer.
+        if let Some(&tick) = self.reload_posts.get(&buffer) {
+            if self.editor.changedtick_of(buffer) != Some(tick) {
+                self.reload_posts.remove(&buffer);
+                if self.editor.changedtick_of(buffer).is_some() {
+                    self.editor
+                        .warn_file_change(buffer, FileChangeReason::Conflict);
+                }
+                return;
+            }
+        }
         // A `:e ++enc=` override the drain stashed for this in-flight fetch forces the
         // decode; ordinary opens have no entry and decode through `'fileencodings'`.
         let force_enc = self.forced_fetch_enc.remove(&buffer);
@@ -132,6 +145,8 @@ impl EditHost {
             .load_bytes_into_enc(buffer, Some(path.clone()), bytes, force_enc.as_deref());
         if existed {
             self.editor.mark_replica_read_from_disk(buffer, stat);
+        } else {
+            self.editor.mark_replica_new_file(buffer);
         }
         // A project-wide rename / code action whose edits reached this (off-tick)
         // file stashed them while the fetch was in flight; apply them now that the
@@ -166,7 +181,7 @@ impl EditHost {
         // A remote watch reload (the `HostWatch` leg) deferred its `FileChangedShellPost`
         // to this landing point — fire it now, before `run_pending`, so a handler's
         // queued work drains in the same convergence.
-        if self.reload_posts.remove(&buffer) {
+        if self.reload_posts.remove(&buffer).is_some() {
             self.fire_file_changed_post(buffer);
         }
         self.run_pending();
@@ -190,9 +205,15 @@ impl EditHost {
         dir: String,
         entries: Vec<DirEntry>,
     ) {
-        let text = bemtvi_core::dir_listing(entries);
+        let (text, skipped) = bemtvi_core::dir_listing(entries);
         self.editor
             .load_bytes_into(buffer, Some(dir.clone()), text.as_bytes());
+        if skipped > 0 {
+            self.editor.echo(format!(
+                "explorer: {skipped} {} in {dir} not listed (a newline in the name)",
+                if skipped == 1 { "entry" } else { "entries" }
+            ));
+        }
         // The fill is a read, not an edit; hold it read-only via the `'modifiable'`
         // option (the explorer has no core buffer-kind), and mark it `btvdir` so its
         // `FileType btvdir` autocmd installs the activation maps and the decor provider
@@ -1246,19 +1267,35 @@ impl EditHost {
             win,
             tab,
             undo,
+            before,
         } = pending;
         match done.result {
             Ok(canon) => {
-                // Reverse the optimistic move first (if any), so the canonical install
-                // records the correct `prev`. A `false` return means a later `:cd`
-                // superseded this one — leave its state and skip our announce.
-                if let Some(u) = undo {
-                    if !self.dirs.rollback_optimistic(u) {
-                        return;
+                // Correct the optimistic move in place (if any) to the canonical dir. A
+                // `false` return means a later `:cd` superseded this one — leave its state
+                // and skip our announce.
+                let dir = PathBuf::from(canon);
+                match undo {
+                    Some(u) => {
+                        if !self.dirs.confirm_optimistic(u, dir.clone()) {
+                            return;
+                        }
+                    }
+                    None => {
+                        let win_alive = self.editor.all_window_ids().contains(&win);
+                        let tab_alive = self.editor.tab_is_valid(tab);
+                        if !self.dirs.set_deferred(
+                            scope,
+                            win,
+                            tab,
+                            dir.clone(),
+                            &before,
+                            (win_alive, tab_alive),
+                        ) {
+                            return;
+                        }
                     }
                 }
-                let dir = PathBuf::from(canon);
-                self.dirs.set(scope, win, tab, dir.clone());
                 self.publish_cwd_mirror();
                 let r = self
                     .lua
@@ -2454,6 +2491,9 @@ impl EditHost {
         let Some(buf) = self.editor.find_buffer_by_path(Path::new(&path)) else {
             return; // the buffer was closed since the watch was armed
         };
+        // Whatever the reconcile below decides, the file is no longer what the baseline
+        // says: an off-tick `:w` must refuse to clobber it until it is re-read or forced.
+        self.editor.note_remote_disk_change(buf);
         let reason = if stat.is_none() {
             FileChangeReason::Deleted
         } else if self.editor.buffer_modified(buf) {
@@ -2497,21 +2537,29 @@ impl EditHost {
     /// own file and mark it for a `FileChangedShellPost` once the bytes land in
     /// [`EditHost::apply_open`]. A no-op for a buffer with no path (nothing to re-fetch).
     fn remote_reload(&mut self, buf: BufferId) {
+        let tick = self.editor.changedtick_of(buf).unwrap_or(0);
         if self.editor.enqueue_reload(buf) {
-            self.reload_posts.insert(buf);
+            self.reload_posts.insert(buf, tick);
         }
     }
 
-    /// Source a startup Lua file (the user's `init.lua`). Missing files are
-    /// skipped silently — having no config is normal. A Lua error surfaces on
-    /// the message line; effects are drained through the same path as `:lua`. The
+    /// Source a startup Lua file (the user's `init.lua`). A missing file is
+    /// skipped silently — having no config is normal — but one that exists and
+    /// can't be read is reported. A Lua error surfaces on the message line; effects are drained through the same path as `:lua`. The
     /// script runs to completion synchronously (its options, mappings, and
     /// colorscheme are in place by the time the first frame goes out), matching
     /// neovim sourcing `init.lua` before serving the UI.
     pub(crate) fn source_init(&mut self, path: &Path) {
-        let src = match std::fs::read_to_string(path) {
+        let src = match std::fs::read(path) {
             Ok(src) => src,
-            Err(_) => return, // no config = nothing to source
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                self.editor.echo(format!(
+                    "E5113: Error while sourcing init.lua: can't read {}: {e}",
+                    path.display()
+                ));
+                return;
+            }
         };
         let name = format!("@{}", path.display());
         if let Err(e) = self.lua.exec_named(&src, &name) {
@@ -2552,9 +2600,13 @@ impl EditHost {
                     continue;
                 }
                 for file in collect_lua_scripts(&rt.join(sub)) {
-                    let src = match std::fs::read_to_string(&file) {
+                    let src = match std::fs::read(&file) {
                         Ok(src) => src,
-                        Err(_) => continue,
+                        Err(e) => {
+                            self.editor
+                                .echo(format!("Error sourcing {}: {e}", file.display()));
+                            continue;
+                        }
                     };
                     let name = format!("@{}", file.display());
                     if let Err(e) = self.lua.exec_named(&src, &name) {
@@ -2578,9 +2630,13 @@ impl EditHost {
         for sub in ["plugin", "after/plugin"] {
             for dir in dirs {
                 for file in collect_lua_scripts(&dir.join(sub)) {
-                    let src = match std::fs::read_to_string(&file) {
+                    let src = match std::fs::read(&file) {
                         Ok(src) => src,
-                        Err(_) => continue,
+                        Err(e) => {
+                            self.editor
+                                .echo(format!("Error sourcing {}: {e}", file.display()));
+                            continue;
+                        }
                     };
                     let name = format!("@{}", file.display());
                     if let Err(e) = self.lua.exec_named(&src, &name) {

@@ -1519,7 +1519,7 @@ impl Editor {
             // A per-window override of the global `'scrollanim'` (see
             // [`WindowOptions::scrollanim`]); `Some(value)` shadows the global until unset.
             "scrollanim" => w.options.scrollanim = Some(value),
-            _ => {}
+            _ => self.reject_bridge_option(name, value, "not a boolean option"),
         }
     }
 
@@ -1527,8 +1527,15 @@ impl Editor {
     /// `nvim_win_set_option`), the numeric analogue of
     /// [`Editor::set_window_option_bool`]. Recognizes `numberwidth` (clamped to a
     /// `1` minimum, like the `:set` path), `scrolloff`, `sidescroll`, `sidescrolloff`,
-    /// `foldcolumn`, `foldlevel` and `padding`; a no-op for any other name or unknown id.
+    /// `foldcolumn`, `foldlevel` and `padding`; a no-op for an unknown id, and a loud
+    /// `E474` for a number written to any other option.
     pub fn set_window_option_num(&mut self, id: WindowId, name: &str, value: i64) {
+        if let Some(max) = super::options::win_num_max(name).filter(|&m| value > m) {
+            self.echo(format!(
+                "E474: Invalid argument: {name}={value} (max {max})"
+            ));
+            return;
+        }
         let Some(t) = self.tree_of_window_mut(id) else {
             return;
         };
@@ -1565,29 +1572,35 @@ impl Editor {
             // Re-clamp the viewport once the `&mut w` borrow ends — the text area
             // grew or shrank.
             self.ensure_visible();
+        } else {
+            self.reject_bridge_option(name, value, "not a number option");
         }
     }
 
     /// Set a string window-local option on window `id` (`vim.wo` /
     /// `nvim_win_set_option`), the string analogue of
     /// [`Editor::set_window_option_bool`]. Recognizes `signcolumn`, `fillchars`,
-    /// `winhighlight`, `colorcolumn`, `showbreak`, `breakindentopt` and `padding` (an
-    /// invalid value is ignored, matching the no-op-on-bad-input contract of the other
-    /// bridge setters); a no-op for any other name or unknown id.
+    /// `winhighlight`, `colorcolumn`, `showbreak`, `breakindentopt` and `padding`. An
+    /// invalid value, or a string written to any other option, fails loud (`E474`) as
+    /// on the `:set` path; an unknown id is a no-op.
     pub fn set_window_option_str(&mut self, id: WindowId, name: &str, value: &str) {
         let Some(t) = self.tree_of_window_mut(id) else {
             return;
         };
         let opts = &mut t.get_mut(id).options;
-        // An invalid value is ignored, matching the no-op-on-bad-input contract of
-        // the other bridge setters (`:set` is the loud-error path).
         let mut geometry_changed = false;
+        let mut rejected = None;
         if name == "signcolumn" {
-            if let Some(scl) = crate::options::SignColumn::parse(value) {
-                opts.signcolumn = scl;
+            match crate::options::SignColumn::parse(value) {
+                Some(scl) => opts.signcolumn = scl,
+                None => rejected = Some(""),
             }
-        } else if name == "fillchars" && crate::options::parse_fillchars(value).is_some() {
-            opts.fillchars = value.to_string();
+        } else if name == "fillchars" {
+            if crate::options::parse_fillchars(value).is_some() {
+                opts.fillchars = value.to_string();
+            } else {
+                rejected = Some("");
+            }
         } else if name == "winhighlight" {
             // The per-window highlight remap (`'winhighlight'` / `'winhl'`). Stored
             // raw and parsed to a `WinHl` at projection (like `fillchars`); malformed
@@ -1610,11 +1623,22 @@ impl Editor {
             // junk entries are skipped there, so there's nothing to reject here.
             opts.colorcolumn = value.to_string();
         } else if name == "padding" {
-            // An invalid spec is ignored (the no-op-on-bad-input bridge contract;
-            // `:set padding=` is the loud-error path).
-            if let Some(pad) = crate::options::parse_padding(value) {
-                opts.padding = pad;
-                geometry_changed = true;
+            match crate::options::parse_padding(value) {
+                Some(pad) => {
+                    opts.padding = pad;
+                    geometry_changed = true;
+                }
+                None => rejected = Some(""),
+            }
+        } else {
+            rejected = Some("not a string option");
+        }
+        if let Some(why) = rejected {
+            // A number option written as a string — neovim's spelling for some of
+            // them (`'foldcolumn'` is a string there) — is coerced rather than refused.
+            match crate::options::coerce_num_option_str(name, value) {
+                Some(n) if why == "not a string option" => self.set_window_option_num(id, name, n),
+                _ => self.reject_bridge_option(name, value, why),
             }
         }
         // Re-clamp the viewport once the `&mut opts` borrow ends: `padding` grew or
@@ -1796,6 +1820,11 @@ impl Editor {
         {
             if value < 0 {
                 self.echo(format!("E487: Argument must be positive: {name}={value}"));
+                return;
+            }
+            // neovim's `SB_MAX`: a terminal's history is bounded, however chatty its child.
+            if name == "scrollback" && value > crate::options::SCROLLBACK_MAX as i64 {
+                self.echo(format!("E474: Invalid argument: {name}={value}"));
                 return;
             }
             // Write the *base* layer; recompute applies the workspace overlay on top.

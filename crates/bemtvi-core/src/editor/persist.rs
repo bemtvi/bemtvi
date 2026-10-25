@@ -883,7 +883,7 @@ impl Editor {
                         self.height
                     };
                     if screen > 0 {
-                        (pct * screen / 100).max(1)
+                        (pct.min(100) * screen / 100).max(1)
                     } else {
                         d.size
                     }
@@ -924,12 +924,10 @@ impl Editor {
                 continue;
             }
             if let Some(id) = self.open_buffer_for_restore(&h.path) {
+                let (cursor, top) = self.restored_view(id, h.line, h.col, h.top);
                 let ob = self.buffers.get_mut(id);
-                ob.saved_cursor = Cursor {
-                    line: h.line,
-                    col: h.col,
-                };
-                ob.saved_top = h.top;
+                ob.saved_cursor = cursor;
+                ob.saved_top = top;
             }
         }
     }
@@ -950,6 +948,39 @@ impl Editor {
         // definition, so flag it modified (keeps `:qa` honest and round-trips capture).
         self.buffers.get_mut(id).buffer.modified = true;
         Some(id)
+    }
+
+    /// A saved view (cursor + top line) for `buf`, kept on the buffer's text: the file
+    /// may have shrunk since the capture, or the store may be damaged. A buffer whose
+    /// bytes are still in flight (an off-tick read) can't be checked yet; its landing
+    /// clamps it, so only an absurd value is cut here.
+    fn restored_view(
+        &self,
+        buf: crate::BufferId,
+        line: usize,
+        col: usize,
+        top: usize,
+    ) -> (Cursor, usize) {
+        if self.has_pending_open(buf) {
+            let cap = u32::MAX as usize;
+            return (
+                Cursor {
+                    line: line.min(cap),
+                    col: col.min(cap),
+                },
+                top.min(cap),
+            );
+        }
+        let b = &self.buffers.get(buf).buffer;
+        let last = b.line_count().saturating_sub(1);
+        let line = line.min(last);
+        (
+            Cursor {
+                line,
+                col: col.min(b.line_len(line)),
+            },
+            top.min(last),
+        )
     }
 
     /// Recursively realise a [`SessionLayout`] into a window map + a [`LayoutNode`]
@@ -997,13 +1028,10 @@ impl Editor {
                 }
                 let buf = self.build_leaf_buffer(w)?;
                 let id = self.alloc_window_id();
-                let cursor = Cursor {
-                    line: w.line,
-                    col: w.col,
-                };
+                let (cursor, top) = self.restored_view(buf, w.line, w.col, w.top);
                 let win = Window {
                     options: template.clone(),
-                    ..WindowTree::tiled_window(buf, cursor, w.top, 0)
+                    ..WindowTree::tiled_window(buf, cursor, top, 0)
                 };
                 windows.insert(id, win);
                 if w.active {
@@ -1021,7 +1049,7 @@ impl Editor {
                 for (i, child) in children.iter().enumerate() {
                     if let Some(node) = self.build_layout(child, template, windows, active) {
                         kids.push(node);
-                        kept_sizes.push(sizes.get(i).copied().unwrap_or(1));
+                        kept_sizes.push(sizes.get(i).copied().unwrap_or(1).min(SPLIT_WEIGHT_MAX));
                     }
                 }
                 match kids.len() {
@@ -1362,6 +1390,11 @@ impl Editor {
     }
 }
 
+/// The largest split weight a restore accepts. Captured weights are percentages (or
+/// cells, with `relativesplits` off); a larger one can only come from a damaged store,
+/// and would overflow the layout's `avail * weight` arithmetic.
+const SPLIT_WEIGHT_MAX: usize = 1 << 16;
+
 /// Normalize split weights to percentages summing to ~100 (the last child absorbs the
 /// rounding remainder so the parts always add up). The window model treats split sizes
 /// as proportional weights, so this only changes the STORED representation — a 30/70
@@ -1380,10 +1413,18 @@ fn to_percentages(sizes: &[usize]) -> Vec<usize> {
 /// text so a repeated entry survives only at its most-recent position. At startup
 /// `live` is empty, so this is just the restored list with dups collapsed.
 fn merge_history(live: &mut Vec<String>, restored: Vec<String>) {
-    let mut merged = restored;
-    for entry in live.drain(..) {
-        merged.retain(|e| e != &entry);
-        merged.push(entry);
+    // One pass over each side (a `:rshada` into a full ring used to cost
+    // `live × restored` comparisons): the live entries keep their last occurrence, and
+    // a restored entry survives only when the live ring does not repeat it.
+    let mut seen = std::collections::HashSet::new();
+    let mut newest: Vec<String> = Vec::new();
+    for entry in live.drain(..).rev() {
+        if seen.insert(entry.clone()) {
+            newest.push(entry);
+        }
     }
+    newest.reverse();
+    let mut merged: Vec<String> = restored.into_iter().filter(|e| !seen.contains(e)).collect();
+    merged.extend(newest);
     *live = merged;
 }

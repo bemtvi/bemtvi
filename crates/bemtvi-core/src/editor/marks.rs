@@ -152,7 +152,57 @@ impl Editor {
     /// column (before the normal-mode backstep), so `` `^ `` returns there.
     pub(crate) fn record_last_insert(&mut self) {
         let Cursor { line, col } = self.cursor;
-        self.buffer_mut().marks.insert('^', (line, col));
+        // The insert also brackets what it typed with `` `[ `` (where it began) and
+        // `` `] `` (where it stopped), as vim's insert does.
+        let (start_line, start_col) = self.insert_start;
+        let start_ok = (start_line, start_col) <= (line, col)
+            && start_line < self.buffer().line_count()
+            && start_col <= self.buffer().line_len(start_line);
+        let marks = &mut self.buffer_mut().marks;
+        marks.insert('^', (line, col));
+        if start_ok {
+            marks.insert('[', (start_line, start_col));
+            marks.insert(']', (line, col));
+            self.change_marks_set = true;
+        }
+    }
+
+    /// Open a command's `` `[ `` / `` `] `` bookkeeping: forget the edits made before
+    /// it, so its end sees only its own.
+    pub(crate) fn begin_change_marks(&mut self) {
+        self.change_marks_set = false;
+        self.buffer_mut().take_change_span();
+    }
+
+    /// Close a command's `` `[ `` / `` `] `` bookkeeping: a command that edited text
+    /// without setting the marks itself (`x`, `r`, `~`, `D`, `p`, …) gets them from
+    /// the span its edits covered — `` `[ `` on its first byte, `` `] `` on its last
+    /// (both on the edit point for a pure deletion). `linewise` puts them in column
+    /// 0 of the first and last lines, as vim's ex commands do.
+    pub(crate) fn finish_change_marks(&mut self, linewise: bool) {
+        let Some((lo, hi)) = self.buffer_mut().take_change_span() else {
+            return;
+        };
+        if std::mem::take(&mut self.change_marks_set) {
+            return;
+        }
+        let buf = self.buffer();
+        let len = buf.len_bytes().saturating_sub(1);
+        let lo = lo.min(len);
+        let last = hi.saturating_sub(1).max(lo).min(len);
+        let (l1, l2) = (buf.byte_to_line(lo), buf.byte_to_line(last));
+        let last_line = buf.line_count().saturating_sub(1);
+        let (start, end) = if linewise {
+            ((l1.min(last_line), 0), (l2.min(last_line), 0))
+        } else {
+            (
+                (l1, lo - buf.line_start(l1)),
+                (l2, last - buf.line_start(l2)),
+            )
+        };
+        let marks = &mut self.buffer_mut().marks;
+        marks.insert('[', start);
+        marks.insert(']', end);
     }
 
     /// Record the bounds of the just yanked/changed byte range `[lo, hi)` into the
@@ -173,6 +223,16 @@ impl Editor {
         let marks = &mut self.buffer_mut().marks;
         marks.insert('[', start);
         marks.insert(']', end);
+        self.change_marks_set = true;
+    }
+
+    /// Set the `` `[ `` / `` `] `` marks outright, for a command whose bounds are
+    /// not the span its edits covered (`J`, `>>`, undo).
+    pub(crate) fn set_change_marks(&mut self, start: (usize, usize), end: (usize, usize)) {
+        let marks = &mut self.buffer_mut().marks;
+        marks.insert('[', start);
+        marks.insert(']', end);
+        self.change_marks_set = true;
     }
 
     /// Record the bounds of the selection just left in Visual mode into the
@@ -286,12 +346,24 @@ impl Editor {
     pub(crate) fn mark_location(&self, name: char) -> Option<MarkLocation> {
         if name.is_ascii_uppercase() {
             let &(buf, cursor) = self.global_marks.get(&name)?;
-            self.buffers
-                .map
-                .contains_key(&buf)
-                .then_some(MarkLocation { buf, cursor })
+            let ob = self.buffers.map.get(&buf)?;
+            // Like a file mark below: a restored global mark can point past a file that
+            // shrank. A buffer whose bytes are still in flight is clamped on landing.
+            if self.has_pending_open(buf) {
+                return Some(MarkLocation { buf, cursor });
+            }
+            let line = cursor.line.min(ob.buffer.line_count().saturating_sub(1));
+            let col = clamp_mark_col(&ob.buffer.line_cow(line), cursor.col);
+            Some(MarkLocation {
+                buf,
+                cursor: Cursor { line, col },
+            })
         } else {
             let &(line, col) = self.buffer().marks.get(&buffer_mark_key(name))?;
+            // A mark restored from shada can point past a file that shrank on disk
+            // since it was set: land on the buffer, never index the rope past it.
+            let line = line.min(self.last_line());
+            let col = clamp_mark_col(&self.buffer().line_cow(line), col);
             // After a linewise selection `` `< `` lands on the first line's start and
             // `` `> `` on the last line's final character, as in vim; the stored columns
             // are where the ends were typed, which `gv` still needs.
@@ -364,7 +436,7 @@ impl Editor {
         let col = if line_anchor {
             self.first_non_blank(line)
         } else {
-            loc.cursor.col
+            clamp_mark_col(&self.buffer().line_cow(line), loc.cursor.col)
         };
         self.settle_cursor_byte(self.buffer().byte_at(line, col));
     }
@@ -440,8 +512,10 @@ impl Editor {
                         .to_string();
                     (cur_name.clone(), t)
                 } else {
-                    let n = self.buffer_fallback_name(buf);
-                    (n.clone(), n)
+                    // `path` is what a jump opens — empty for an unnamed buffer, never
+                    // its `[No Name]` display label (that would open a file so named).
+                    let path = self.buffer_name(buf).unwrap_or_default();
+                    (path, self.buffer_fallback_name(buf))
                 };
                 out.push(MarkMirrorEntry {
                     name,
@@ -494,6 +568,14 @@ pub struct MarkMirrorEntry {
     pub col: usize,
     pub path: String,
     pub text: String,
+}
+
+/// Clamp a stored mark column onto `line` (without its line break), snapped to a
+/// grapheme boundary, so a stale column can neither spill into a later line nor
+/// split a multibyte character.
+fn clamp_mark_col(line: &str, col: usize) -> usize {
+    let text = line.trim_end_matches('\r');
+    crate::unicode::floor_grapheme(text, col.min(text.len()))
 }
 
 /// One `:marks` row in vim's layout: the mark name, its 1-based line, 0-based

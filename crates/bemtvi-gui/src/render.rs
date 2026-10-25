@@ -1546,7 +1546,11 @@ impl Renderer {
                             clip.bottom as f32,
                         );
                     }
-                    let display = expand_tabs(raw, win.tabstop.max(1) as usize);
+                    let display = expand_tabs(
+                        raw,
+                        win.tabstop.max(1) as usize,
+                        lc as usize + wcols as usize + 1,
+                    );
                     // Blank the number on a soft-wrap continuation row (vim shows it
                     // on the line's first row only); `numbers` still carries the line.
                     if gutter > 0 && !s.continuation.get(k).copied().unwrap_or(false) {
@@ -1744,7 +1748,11 @@ impl Renderer {
 
                     // Tab-expand onto the display-column grid the wire's highlight /
                     // selection / search spans are all measured in (see `cells`).
-                    let display = expand_tabs(raw, win.tabstop.max(1) as usize);
+                    let display = expand_tabs(
+                        raw,
+                        win.tabstop.max(1) as usize,
+                        win.leftcol as usize + wcols as usize + 1,
+                    );
 
                     // Inline LSP inlay hints on this row, spliced into the text below
                     // (pushing later glyphs right). The column-keyed overlays here —
@@ -5928,13 +5936,23 @@ fn pad_to_width(s: &str, width: usize) -> String {
 /// **display** column ([`cells`]) so a tab after a wide glyph lands on the same stop
 /// the server's `unicode::virtcol` put it on. (A tab never joins a cluster, so it is
 /// always its own one-char grapheme here.)
-fn expand_tabs(line: &str, tabstop: usize) -> String {
-    if !line.contains('\t') {
+///
+/// The result stops at the first cluster starting at or past display column
+/// `limit` — the paintable right edge — so a huge line is laid out (and shaped)
+/// only as far as a window can show it.
+pub fn expand_tabs(line: &str, tabstop: usize, limit: usize) -> String {
+    // A cluster is never wider than its byte length, so a line of at most `limit`
+    // bytes is wholly within the edge.
+    if line.len() <= limit && !line.contains('\t') {
         return line.to_string(); // hot path: one memcpy, no per-cluster walk
     }
-    let mut out = String::with_capacity(line.len());
+    let tabstop = tabstop.max(1);
+    let mut out = String::with_capacity(line.len().min(limit.saturating_mul(4)));
     let mut col = 0;
     for g in line.graphemes(true) {
+        if col >= limit {
+            break;
+        }
         if g == "\t" {
             let n = tabstop - (col % tabstop);
             for _ in 0..n {

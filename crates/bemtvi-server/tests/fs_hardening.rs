@@ -232,6 +232,86 @@ async fn removing_the_filesystem_root_is_refused() {
     );
 }
 
+/// Settle a `btv.fs` promise expression and return `"ok"` or the rejection message.
+async fn settle(rpc: &Rpc, expr: &str) -> String {
+    exec_lua(
+        rpc,
+        &format!(
+            r#"
+            _G.fs_out = nil
+            ({expr})
+              :next(function() _G.fs_out = "ok" end)
+              :catch(function(e) _G.fs_out = tostring(e.message or e) end)
+            "#
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(rpc, "return _G.fs_out ~= nil").await,
+        "the promise never settled: {expr}"
+    );
+    exec_lua(rpc, "return _G.fs_out")
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Every spelling of the root is the root: `//`, `/.`, `/..`, `/./` must be refused
+/// exactly like `/`. (Non-recursive here, so a regression can't walk the disk — the
+/// refusal message is what discriminates.)
+#[cfg(unix)]
+#[tokio::test]
+async fn removing_the_root_under_any_spelling_is_refused() {
+    let (rpc, _incoming) = start().await;
+    for spelling in ["//", "/.", "/..", "/./", "///"] {
+        let err = settle(&rpc, &format!("btv.fs.remove({spelling:?})")).await;
+        assert!(
+            err.contains("refusing to remove the filesystem root"),
+            "removing {spelling:?} must be refused as the root, got {err:?}"
+        );
+    }
+}
+
+/// Copying a directory into itself (`dst` inside `src`) would recurse into the copy
+/// it is writing until the path grows too long; it must be refused up front.
+#[tokio::test]
+async fn copying_a_directory_into_itself_is_refused() {
+    let dir = temp_dir("fs_hardening_copy_into_self");
+    let src = dir.join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("sub/f.txt"), "x").unwrap();
+    let (rpc, _incoming) = start().await;
+    for dst in [
+        src.join("sub/copy"),
+        src.join("."),
+        src.join("sub/../again"),
+    ] {
+        let err = settle(
+            &rpc,
+            &format!("btv.fs.copy({src:?}, {dst:?}, {{ recursive = true }})"),
+        )
+        .await;
+        assert!(
+            err.contains("into itself"),
+            "copying into {dst:?} must be refused, got {err:?}"
+        );
+    }
+    assert!(
+        !src.join("sub/copy").exists() && !src.join("again").exists(),
+        "a refused copy must not create anything"
+    );
+    // A sibling destination still copies.
+    let sibling = dir.join("src-copy");
+    let ok = settle(
+        &rpc,
+        &format!("btv.fs.copy({src:?}, {sibling:?}, {{ recursive = true }})"),
+    )
+    .await;
+    assert_eq!(ok, "ok");
+    assert!(sibling.join("sub/f.txt").exists());
+}
+
 /// `LuaFs::utime` is public API, and `Duration::from_secs_f64` **panics** on
 /// NaN/±inf rather than erroring. Nothing calls it today — there is no
 /// `btv.fs.utime` op — so this is not a live hole; it is the trait staying total,
@@ -301,4 +381,49 @@ async fn an_ordinary_recursive_remove_still_works() {
         "an ordinary recursive remove must succeed"
     );
     assert!(!tree.exists(), "the tree should be gone");
+}
+
+/// A file name is attacker-chosen data in an untrusted checkout, and a name can
+/// hold a `|` or a newline. Fed to `:edit` through `btv.fname.escape` (what the
+/// explorer does), it must open *that file* — never run the tail as a command.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_escaped_file_name_never_runs_its_tail_as_a_command() {
+    let dir = temp_dir("fs_hardening_fname_inject");
+    let (rpc, _incoming) = start().await;
+    for (i, name) in [
+        "a|lua btv.g.pwned = 1",
+        "b\nlua btv.g.pwned = 1",
+        "c\rlua btv.g.pwned = 1",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let file = dir.join(name);
+        std::fs::write(&file, format!("payload {i}\n")).unwrap();
+        exec_lua(
+            &rpc,
+            &format!(
+                "vim.cmd('edit ' .. btv.fname.escape({:?}))",
+                file.to_string_lossy()
+            ),
+        )
+        .await;
+        let want = vec![format!("payload {i}")];
+        let mut got = lines(&rpc).await;
+        for _ in 0..100 {
+            if got == want {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            got = lines(&rpc).await;
+        }
+        let bname = exec_lua(&rpc, "return btv.buf.name(0)").await;
+        let pwned = exec_lua(&rpc, "return btv.g.pwned").await;
+        assert!(
+            pwned.is_nil(),
+            "{name:?}: the name's tail ran as an ex command"
+        );
+        assert_eq!(got, want, "{name:?}: wrong buffer {bname:?}");
+    }
 }

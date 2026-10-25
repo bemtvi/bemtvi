@@ -99,9 +99,9 @@ async fn a_case_operator_dot_repeats() {
 async fn a_width_changing_case_fold_is_replaced_wholesale() {
     let (rpc, _incoming) = start(None).await;
     feed(&rpc, "istraße<Esc>");
-    // `ß` upper-cases to two characters; the span is rewritten, not patched.
+    // `ß` upper-cases to `ẞ`, one byte wider; the span is rewritten, not patched.
     feed(&rpc, "gg0gUU");
-    assert_eq!(lines(&rpc).await, vec!["STRASSE"]);
+    assert_eq!(lines(&rpc).await, vec!["STRAẞE"]);
 }
 
 #[tokio::test]
@@ -141,12 +141,31 @@ async fn a_case_operator_brackets_the_recased_span_with_the_change_marks() {
 
 #[tokio::test]
 async fn a_width_changing_case_fold_brackets_its_grown_span() {
-    // `ß` → `SS` makes the recased text longer than the source, so `']` must follow
-    // the text that was actually written, not the range that was read.
+    // `ß` → `ẞ` makes the recased text longer (in bytes) than the source, so `']`
+    // must follow the text that was actually written, not the range that was read.
     let (rpc, _incoming) = start(None).await;
     feed(&rpc, "ix straße y<Esc>");
     feed(&rpc, "0wgUe");
-    assert_eq!(lines(&rpc).await, vec!["x STRASSE y"]);
+    assert_eq!(lines(&rpc).await, vec!["x STRAẞE y"]);
     feed(&rpc, "0`]");
-    assert_eq!(cursor(&rpc).await, (1, 8), "`] is the last char of STRASSE");
+    assert_eq!(cursor(&rpc).await, (1, 9), "`] is the last char of STRAẞE");
+}
+
+#[tokio::test]
+async fn case_operators_map_one_character_to_one_like_vim() {
+    let (rpc, _incoming) = start(None).await;
+    assert_eq!(
+        edit_probe(&rpc, &["straße"], (1, 0), "gUiw").await,
+        vec!["STRAẞE"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &["İstanbul ı"], (1, 0), "guu").await,
+        vec!["istanbul ı"]
+    );
+    assert_eq!(
+        edit_probe(&rpc, &["İstanbul ı"], (1, 0), "g~~").await,
+        vec!["iSTANBUL I"]
+    );
+    assert_eq!(edit_probe(&rpc, &["ﬁx"], (1, 0), "gUU").await, vec!["ﬁX"]);
+    assert_eq!(edit_probe(&rpc, &["ßa"], (1, 0), "~~").await, vec!["ẞA"]);
 }

@@ -47,6 +47,10 @@ local function run_git(bridge, job)
   end)
 end
 
+-- The `notice` strings already shown this session: an untrusted repository's skipped
+-- filters are reported once, not on every statusline refresh.
+local told = {}
+
 -- Build the two parallel surfaces (`btv.git` over `btv._git_op`, `btv.git_local` over
 -- `btv._local_git_op`) from one verb table, so the twins never drift.
 local function define(surface, bridge)
@@ -114,9 +118,24 @@ local function define(surface, bridge)
   --   if e.index == "!" then ignored[e.path] = true end   -- a file OR a directory
   -- end
   -- ```
+  --
+  -- A repository that is not trusted — owned by another user and not listed in
+  -- `safe.directory`, git's rule — has its own config ignored, so the filter drivers
+  -- it defines (`filter.<name>.clean` and friends) do not run and files are compared
+  -- unfiltered. The result then carries `notice`, a message naming the repository and
+  -- the skipped drivers, and the first such notice per repository is also shown with
+  -- `btv.notify` at `WARN`.
   function surface.status(path, opts)
     opts = opts or {}
-    return run_git(bridge, { op = "status", path = path, ignored = opts.ignored == true })
+    return run_git(bridge, { op = "status", path = path, ignored = opts.ignored == true }):next(
+      function(st)
+        if st.notice and not told[st.notice] then
+          told[st.notice] = true
+          btv.notify(st.notice, btv.log.levels.WARN)
+        end
+        return st
+      end
+    )
   end
 
   -- ----- mutation / network verbs (plugin-manager backing) -----

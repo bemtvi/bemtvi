@@ -89,15 +89,58 @@ local function diag_ns_wanted(ns, want)
   return ns == want
 end
 
+-- One severity spelling (a number, or a name such as `"WARN"`) as its number.
+local function diag_severity_number(v)
+  local n = type(v) == "string" and btv.diagnostic.severity[v:upper()] or v
+  if type(n) ~= "number" or n % 1 ~= 0 or btv.diagnostic.severity[n] == nil then
+    error("btv.diagnostic: invalid severity " .. tostring(v), 3)
+  end
+  return n
+end
+
+-- Compile a `severity` filter (nil, one severity, `{ min =, max = }`, or a list of
+-- severities) into a predicate over a diagnostic's severity number.
+local function diag_severity_filter(spec)
+  if spec == nil then
+    return function()
+      return true
+    end
+  end
+  if type(spec) ~= "table" then
+    local want = diag_severity_number(spec)
+    return function(sev)
+      return sev == want
+    end
+  end
+  if spec.min ~= nil or spec.max ~= nil then
+    -- Lower numbers are MORE severe: `min = WARN` keeps WARN and ERROR.
+    local min = spec.min ~= nil and diag_severity_number(spec.min) or 4
+    local max = spec.max ~= nil and diag_severity_number(spec.max) or 1
+    return function(sev)
+      return sev <= min and sev >= max
+    end
+  end
+  local set = {}
+  for _, v in ipairs(spec) do
+    set[diag_severity_number(v)] = true
+  end
+  return function(sev)
+    return set[sev] == true
+  end
+end
+
 -- `btv.diagnostic.get([bufnr, [opts]])`: diagnostics as plain tables. `nil` bufnr →
--- every buffer; `0` → the current one. `opts.severity` (a number) filters. The
--- entries are copied out (callers must not mutate the mirror), each tagged with
--- its `bufnr`, matching neovim's shape.
+-- every buffer; `0` → the current one. `opts.severity` filters: one severity (a
+-- number or a name like `"WARN"`), a range `{ min =, max = }` (lower numbers are
+-- more severe, so `{ min = WARN }` keeps warnings and errors), or a list of
+-- severities. The entries are copied out (callers must not mutate the mirror), each
+-- tagged with its `bufnr`, matching neovim's shape.
 function btv.diagnostic.get(bufnr, opts)
   opts = opts or {}
   local out = {}
+  local wanted = diag_severity_filter(opts.severity)
   local function take(b, d)
-    if opts.severity == nil or d.severity == opts.severity then
+    if wanted(d.severity) then
       local copy = { bufnr = b }
       for k, v in pairs(d) do
         copy[k] = v
@@ -145,14 +188,34 @@ function btv.diagnostic.get(bufnr, opts)
   return out
 end
 
-function btv.diagnostic.goto_next(opts)
-  opts = opts or {}
-  btv._diagnostic_goto(true, opts.severity)
+-- A `severity` filter as the bitmask the native goto reads (bit `s - 1` set when
+-- severity `s` is wanted), or nil for no filter.
+local function diag_severity_mask(spec)
+  if spec == nil then
+    return nil
+  end
+  local wanted = diag_severity_filter(spec)
+  local mask = 0
+  for s = 1, 4 do
+    if wanted(s) then
+      mask = mask | (1 << (s - 1))
+    end
+  end
+  return mask
 end
 
+-- `btv.diagnostic.goto_next([opts])`: move to the next diagnostic in the current
+-- buffer, wrapping. `opts.severity` takes the same shapes as `btv.diagnostic.get`.
+function btv.diagnostic.goto_next(opts)
+  opts = opts or {}
+  btv._diagnostic_goto(true, diag_severity_mask(opts.severity))
+end
+
+-- `btv.diagnostic.goto_prev([opts])`: move to the previous diagnostic, wrapping.
+-- `opts.severity` takes the same shapes as `btv.diagnostic.get`.
 function btv.diagnostic.goto_prev(opts)
   opts = opts or {}
-  btv._diagnostic_goto(false, opts.severity)
+  btv._diagnostic_goto(false, diag_severity_mask(opts.severity))
 end
 
 -- Severity (1=ERROR…4=HINT) → quickfix type char, matching neovim's
@@ -319,12 +382,22 @@ btv.diagnostic._config = {
   update_in_insert = DEFAULT_INSERT_DEBOUNCE_MS,
 }
 
+-- The config keys a rendering surface actually reads; any other key is stored but
+-- warned about once, so a config line with nothing behind it doesn't look applied.
+local DIAG_CONFIG_HONORED = {
+  underline = true,
+  virtual_text = true,
+  signs = true,
+  update_in_insert = true,
+}
+local diag_config_warned = {}
+
 -- `btv.diagnostic.config([opts])`: merge `opts` into the stored config and return
 -- the merged table when called bare. bemtvi renders three surfaces — the underline
 -- spans (`underline`), the inline end-of-line message (`virtual_text`), and the
 -- gutter sign column (`signs`) — so those keys drive rendering; `update_in_insert`
--- gates *when* an update reaches all three. The rest are stored without behavior
--- until a surface exists.
+-- gates *when* an update reaches all three. Any other key is stored without behavior
+-- until a surface exists, and warns once naming it.
 --
 -- `update_in_insert` decides what happens to a diagnostic update that arrives while
 -- you are typing. A language server re-diagnoses after every `didChange` — i.e.
@@ -348,7 +421,7 @@ btv.diagnostic._config = {
 -- that text as you edit around it.
 --
 -- INCOMPLETE: `virtual_lines`, `severity_sort`, … are recorded and echoed back
--- but have no rendering surface yet (`float` is honored by
+-- (with a one-time warning) but have no rendering surface yet (`float` is honored by
 -- `btv.diagnostic.open_float`, but the `config.float` defaults that pre-style it
 -- are not). `_namespace` is ignored (one global config). Faithful once those
 -- diagnostic surfaces exist.
@@ -358,6 +431,15 @@ function btv.diagnostic.config(opts, _namespace)
   end
   for k, v in pairs(opts) do
     btv.diagnostic._config[k] = v
+    if not DIAG_CONFIG_HONORED[k] and not diag_config_warned[k] then
+      diag_config_warned[k] = true
+      btv.notify(
+        "btv.diagnostic.config: '"
+          .. tostring(k)
+          .. "' is stored but not applied (bemtvi has no surface for it yet)",
+        btv.log.levels.WARN
+      )
+    end
   end
   -- `underline`/`virtual_text`/`signs` are true/false/table (a table is an
   -- enabled, filtered form); only an explicit `false`/`nil` disables. The

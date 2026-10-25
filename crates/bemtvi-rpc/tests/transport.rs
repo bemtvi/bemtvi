@@ -798,3 +798,202 @@ async fn a_response_still_arrives_behind_an_undrained_flood_on_an_unbounded_leg(
         .expect("ok");
     assert_eq!(got.as_str(), Some("answered"));
 }
+
+// ====================================================== the per-frame value budget
+//
+// The byte cap alone does not bound the decoded heap: every msgpack value costs at
+// least one wire byte but ~40 bytes as an `rmpv::Value`, so a 64 MiB frame of
+// fixints decodes to gigabytes. The reader caps the number of values a frame may
+// declare at `1 << 22`, checked against declared container lengths before any
+// body byte is buffered or decoded.
+
+const VALUE_CAP: usize = 1 << 22;
+
+/// Header of a `[2, "ping", [<n values>]]` notification: the params array is an
+/// `array32` whose `n` elements follow. The frame holds `n + 4` values (the outer
+/// array, the kind, the method, the params array, then the elements).
+fn notification_header(n: usize) -> Vec<u8> {
+    let mut h = vec![0x93, 0x02, 0xa4, b'p', b'i', b'n', b'g', 0xdd];
+    h.extend_from_slice(&(n as u32).to_be_bytes());
+    h
+}
+
+#[tokio::test]
+async fn a_frame_declaring_one_value_over_the_cap_is_refused_from_its_header() {
+    let (mut peer, rpc, _peer_reader, mut incoming) = rig();
+    let pending = tokio::spawn(async move { rpc.request("waiting", vec![]).await });
+    // Let the request register before the bomb lands.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Only the header: the body never arrives. A reader that only enforces the byte
+    // cap would park here waiting to buffer (and then decode) 4M values; the value
+    // budget refuses the frame from the declared length alone.
+    peer.write_all(&notification_header(VALUE_CAP - 3))
+        .await
+        .unwrap();
+
+    let closed = tokio::time::timeout(Duration::from_secs(2), incoming.recv())
+        .await
+        .expect("the over-budget frame must tear the link down from its header alone");
+    assert!(closed.is_none(), "expected teardown, got {closed:?}");
+
+    // Loud: the in-flight request fails with the reason, naming the limit.
+    let err = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .expect("the in-flight request must fail promptly")
+        .expect("join")
+        .expect_err("the in-flight request must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&VALUE_CAP.to_string()) && msg.contains("value"),
+        "the error must name the value limit, got {msg}"
+    );
+}
+
+#[tokio::test]
+async fn a_complete_frame_one_value_over_the_cap_is_refused() {
+    let (mut peer, _rpc, _peer_reader, mut incoming) = rig();
+    let n = VALUE_CAP - 3; // n + 4 == VALUE_CAP + 1
+    let mut frame = notification_header(n);
+    frame.resize(frame.len() + n, 0x00);
+    let start = std::time::Instant::now();
+    // The reader may hang up mid-write; that is the outcome under test.
+    let _ = peer.write_all(&frame).await;
+    let closed = tokio::time::timeout(Duration::from_secs(10), incoming.recv())
+        .await
+        .expect("the reader must tear down, not hang");
+    assert!(
+        closed.is_none(),
+        "a frame one value over the cap must be refused, not dispatched"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "the refusal must come from the header, not after decoding the body ({:?})",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_frame_exactly_at_the_value_cap_decodes() {
+    let (mut peer, _rpc, _peer_reader, mut incoming) = rig();
+    let n = VALUE_CAP - 4; // n + 4 == VALUE_CAP
+    let mut frame = notification_header(n);
+    frame.resize(frame.len() + n, 0x00);
+    let writer = tokio::spawn(async move {
+        peer.write_all(&frame).await.unwrap();
+        peer
+    });
+    let msg = tokio::time::timeout(Duration::from_secs(60), incoming.recv())
+        .await
+        .expect("a frame at the cap must be dispatched")
+        .expect("a message, not a teardown");
+    match msg {
+        Incoming::Notification { method, params } => {
+            assert_eq!(method, "ping");
+            assert_eq!(params.len(), n, "every element at the cap survives");
+        }
+        other => panic!("expected the ping notification, got {other:?}"),
+    }
+    let _peer = writer.await.unwrap();
+}
+
+/// A params list that holds more values than one frame may carry, though it
+/// encodes to only ~4 MiB — well under the byte cap.
+fn too_many_values() -> Value {
+    Value::Array(vec![Value::Nil; VALUE_CAP + 1])
+}
+
+#[tokio::test]
+async fn a_request_over_the_value_cap_errors_instead_of_killing_the_link() {
+    let (_peer, rpc, _peer_reader, mut incoming) = rig();
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        rpc.request("wide", vec![too_many_values()]),
+    )
+    .await
+    .expect("the refusal must be immediate")
+    .expect_err("a request the peer's reader would reject must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("too large") && msg.contains(&VALUE_CAP.to_string()),
+        "the refusal must name the value limit, got {msg}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), incoming.recv())
+            .await
+            .is_err(),
+        "the connection must stay open after a refused frame"
+    );
+}
+
+#[tokio::test]
+async fn a_response_over_the_value_cap_answers_with_an_error() {
+    let (_peer, rpc, mut peer_reader, _incoming) = rig();
+    rpc.respond(9, Ok(too_many_values()));
+    let mut buf = vec![0u8; 8192];
+    let n = tokio::time::timeout(Duration::from_secs(5), peer_reader.read(&mut buf))
+        .await
+        .expect("a reply must still be sent")
+        .expect("read");
+    let v = rmpv::decode::read_value(&mut &buf[..n]).expect("a small error frame");
+    let arr = v.as_array().expect("array");
+    assert_eq!(arr.get(1).and_then(Value::as_u64), Some(9));
+    let err = arr.get(2).and_then(Value::as_str).unwrap_or_default();
+    assert!(
+        err.contains(&VALUE_CAP.to_string()),
+        "the requester must hear which limit the reply broke, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_notification_over_the_value_cap_is_dropped_and_the_link_survives() {
+    let (_peer, rpc, mut peer_reader, _incoming) = rig();
+    rpc.notify("wide", vec![too_many_values()]);
+    rpc.notify("small", vec![Value::from(1u64)]);
+    let mut buf = vec![0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(5), peer_reader.read(&mut buf))
+        .await
+        .expect("the small notification must reach the peer")
+        .expect("read");
+    let v = rmpv::decode::read_value(&mut &buf[..n]).expect("a frame");
+    assert_eq!(
+        v.as_array().and_then(|a| a.get(1)).and_then(Value::as_str),
+        Some("small"),
+        "the over-budget frame must never reach the wire; the next one must"
+    );
+}
+
+#[tokio::test]
+async fn a_million_line_get_lines_reply_still_round_trips() {
+    // The largest realistic payload class by value count: a whole-buffer
+    // `nvim_buf_get_lines` reply is one string value per line. A million lines is
+    // a quarter of the budget.
+    let (a_r, b_w) = tokio::io::duplex(1 << 20);
+    let (b_r, a_w) = tokio::io::duplex(1 << 20);
+    let (client, _client_in) = connect(a_r, a_w);
+    let (server, mut server_in) = connect(b_r, b_w);
+    let lines: Vec<Value> = (0..1_000_000)
+        .map(|i| Value::from(format!("line {i:>12} of the buffer")))
+        .collect();
+    let expect = lines.len();
+    tokio::spawn(async move {
+        if let Some(Incoming::Request { id, .. }) = server_in.recv().await {
+            server.respond(id, Ok(Value::Array(lines)));
+        }
+        // Hold the server half open until the client is done.
+        let _ = server_in.recv().await;
+    });
+    let got = tokio::time::timeout(
+        Duration::from_secs(60),
+        client.request("nvim_buf_get_lines", vec![]),
+    )
+    .await
+    .expect("the reply must arrive")
+    .expect("a million-line reply is within budget");
+    let arr = got.as_array().expect("array");
+    assert_eq!(arr.len(), expect);
+    assert_eq!(
+        arr.last().and_then(Value::as_str),
+        Some(format!("line {:>12} of the buffer", 999_999).as_str())
+    );
+}

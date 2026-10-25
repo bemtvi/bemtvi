@@ -137,7 +137,112 @@ pub(crate) struct FoldState {
     cache: Option<FoldKey>,
 }
 
+/// A buffer edit reduced to vim's line-granular `mark_adjust` terms.
+#[derive(Debug, Clone, Copy)]
+enum LineOp {
+    /// `n` lines inserted after line `after` (`-1`: above the first line).
+    Insert { after: isize, n: usize },
+    /// Lines `[first, first + n)` deleted.
+    Delete { first: usize, n: usize },
+}
+
+/// The line insertion/deletion a [`BufferEdit`](crate::buffer::BufferEdit) amounts
+/// to, or `None` when it keeps the line count (an in-line change). An edit that
+/// begins at column 0 acts *before* its first row (`O`, `dd`); one that begins
+/// mid-line acts after it (`o`, `J`).
+fn line_op(e: &crate::buffer::BufferEdit) -> Option<LineOp> {
+    let (a, b, c) = (e.start_point.0, e.old_end_point.0, e.new_end_point.0);
+    let (removed, added) = (b - a, c - a);
+    let at_line_start = e.start_point.1 == 0;
+    if added > removed {
+        let after = if at_line_start {
+            a as isize - 1
+        } else {
+            a as isize
+        };
+        Some(LineOp::Insert {
+            after,
+            n: added - removed,
+        })
+    } else if removed > added {
+        let first = if at_line_start { a } else { a + 1 };
+        Some(LineOp::Delete {
+            first,
+            n: removed - added,
+        })
+    } else {
+        None
+    }
+}
+
+/// The line ops for a changed run of lines: old `[first, old_end)` became new
+/// `[first, new_end)`. Lines paired up in place keep their folds; the surplus is an
+/// insertion or deletion at the run's end.
+fn line_ops_for_span(first: usize, old_end: usize, new_end: usize) -> Vec<LineOp> {
+    let (removed, added) = (old_end - first, new_end - first);
+    if added > removed {
+        vec![LineOp::Insert {
+            after: old_end as isize - 1,
+            n: added - removed,
+        }]
+    } else if removed > added {
+        vec![LineOp::Delete {
+            first: first + added,
+            n: removed - added,
+        }]
+    } else {
+        Vec::new()
+    }
+}
+
 impl FoldState {
+    /// Shift / trim / drop the folds for one line insertion or deletion. A fold
+    /// left shorter than two lines is marked for removal (`start >= end`) and
+    /// dropped by the caller.
+    fn adjust(&mut self, op: LineOp) {
+        match op {
+            LineOp::Insert { after, n } => {
+                for f in &mut self.folds {
+                    if f.start as isize > after {
+                        f.start += n;
+                    }
+                    if f.end as isize > after {
+                        f.end += n;
+                    }
+                }
+            }
+            LineOp::Delete { first, n } => {
+                let last = first + n - 1;
+                for f in &mut self.folds {
+                    if f.end < first {
+                        continue;
+                    }
+                    if f.start > last {
+                        f.start -= n;
+                        f.end -= n;
+                        continue;
+                    }
+                    let start = f.start.min(first);
+                    let end = if f.end > last {
+                        Some(f.end - n)
+                    } else {
+                        first.checked_sub(1)
+                    };
+                    match end {
+                        Some(end) if end > start => {
+                            f.start = start;
+                            f.end = end;
+                        }
+                        _ => {
+                            f.start = 1;
+                            f.end = 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Re-establish the outer-before-inner order after a mutation.
     fn sort(&mut self) {
         self.folds
@@ -663,6 +768,7 @@ impl Editor {
     /// Operates on the focused window only; a non-focused window onto the same
     /// buffer recomputes when it next gains focus.
     pub(crate) fn refresh_folds(&mut self) {
+        self.adjust_manual_folds();
         let source = self.fold_source();
         if source == FoldSource::Manual {
             return;
@@ -701,6 +807,76 @@ impl Editor {
             .folds
             .rebuild_computed(ranges, foldlevel, key);
         self.snap_cursor_to_fold_header();
+    }
+
+    /// Carry every `foldmethod=manual` buffer's hand-made folds across the edits
+    /// made to it since the last pass (vim's `foldMarkAdjust`): lines inserted
+    /// above a fold push it down, lines deleted above pull it up, a deletion
+    /// overlapping a fold trims it, and one swallowing it removes it. Drains those
+    /// buffers' fold journals — nothing else reads them for a manual buffer — and
+    /// adjusts every window showing the buffer, parked trees included.
+    fn adjust_manual_folds(&mut self) {
+        for id in self.buffer_ids() {
+            let Some(ob) = self.buffers.map.get(&id) else {
+                continue;
+            };
+            if ob.buffer.options.foldmethod != crate::options::FoldMethod::Manual {
+                continue;
+            }
+            let has_folds = {
+                let shows = |w: &super::windows::Window| w.buffer == id && !w.folds.is_empty();
+                self.windows.all_windows().any(shows)
+                    || self.parked_trees().any(|t| t.all_windows().any(shows))
+            };
+            let ob = self.buffers.map.get_mut(&id).expect("checked above");
+            let batch = ob.buffer.take_fold_edits();
+            let text = ob.buffer.text.clone();
+            let line_count = ob.buffer.line_count();
+            if !batch.is_empty() {
+                // The per-line computed-source cache is now behind the journal.
+                self.fold_inputs.remove(&id);
+            }
+            let prev = if has_folds {
+                self.manual_fold_text.insert(id, text.clone())
+            } else {
+                self.manual_fold_text.remove(&id)
+            };
+            if !has_folds || batch.is_empty() {
+                continue;
+            }
+            let ops: Vec<LineOp> = if batch.resync {
+                // Undo/redo/reload swapped the rope wholesale: diff it against the
+                // text the folds were last adjusted to.
+                prev.and_then(|old| crate::buffer::changed_line_span(&old, &text))
+                    .map(|(first, old_end, new_end)| line_ops_for_span(first, old_end, new_end))
+                    .unwrap_or_default()
+            } else {
+                batch.edits.iter().filter_map(line_op).collect()
+            };
+            let adjust = |win: &mut super::windows::Window| {
+                if win.buffer != id || win.folds.folds.is_empty() {
+                    return;
+                }
+                for op in &ops {
+                    win.folds.adjust(*op);
+                }
+                win.folds
+                    .folds
+                    .retain(|f| f.end < line_count && f.start < f.end);
+                win.folds.sort();
+                win.folds
+                    .folds
+                    .dedup_by(|a, b| a.start == b.start && a.end == b.end);
+            };
+            for win in self.windows.all_windows_mut() {
+                adjust(win);
+            }
+            for tree in self.parked_trees_mut() {
+                for win in tree.all_windows_mut() {
+                    adjust(win);
+                }
+            }
+        }
     }
 
     /// Snap the focused cursor out of any line a closed fold now hides, onto that

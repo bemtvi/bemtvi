@@ -214,7 +214,9 @@ impl Editor {
         match kind {
             CmdlineKind::Ex => {
                 self.remember_ex(&text);
+                self.begin_change_marks();
                 self.execute_ex(&text);
+                self.finish_change_marks(true);
             }
             CmdlineKind::Search(dir) => {
                 // Commit from the saved origin, not the incsearch preview hop, so the

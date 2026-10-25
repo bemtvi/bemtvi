@@ -395,6 +395,16 @@ pub(crate) enum Motion {
     FindRepeat { reverse: bool }, // ; (same) / , (reversed)
     MarkJumpExact(char, bool),    // `{mark}  (charwise exclusive); bool = set jumplist
     MarkJumpLine(char, bool),     // '{mark}  (linewise, first non-blank); bool = set jumplist
+    Percent,                      // % (matching bracket) / {count}% (that percentage of the file)
+    Sentence(bool),               // ) (true: forward) / ( (backward)
+    Paragraph(bool),              // } (true: forward) / { (backward)
+    LineDownFirst,                // + / <CR> — `count` lines down, first non-blank
+    LineUpFirst,                  // - — `count` lines up, first non-blank
+    LineFirst,                    // _ — `count - 1` lines down, first non-blank
+    Column,                       // | — screen column `count`
+    WindowTop,                    // H — `count`-th line from the window's top
+    WindowMiddle,                 // M — the window's middle line
+    WindowBottom,                 // L — `count`-th line from the window's bottom
 }
 
 /// The four find-char motions. `f`/`t` search forward, `F`/`T` backward; `t`/`T`
@@ -504,32 +514,35 @@ impl ObjectKind {
 /// [`parse_command`], applied in [`Editor::execute_normal`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NormalCmd {
-    InsertBefore,       // i
-    InsertLineStart,    // I
-    InsertAfter,        // a
-    InsertLineEnd,      // A
-    OpenBelow,          // o
-    OpenAbove,          // O
-    DeleteUnder,        // x
-    DeleteBefore,       // X
-    DeleteToEol,        // D
-    ChangeToEol,        // C
-    SubstituteChar,     // s
-    EnterReplace,       // R
-    PasteAfter,         // p
-    PasteBefore,        // P
-    Undo,               // u
-    Redo,               // <C-r>
-    TimeTravel(bool),   // g- (true) / g+
-    Join,               // J
-    ToggleCase,         // ~
-    EnterVisual,        // v
-    EnterVisualLine,    // V
-    EnterSelect(bool),  // gh / gH (Select mode; true = linewise)
-    ToggleVisualSelect, // <C-g> (toggle Visual <-> Select, keeping the selection)
-    VisualSwapEnds,     // o / O (move to other end of selection)
-    ReselectVisual,     // gv (reselect the last Visual selection)
-    EnterCommand,       // :
+    InsertBefore,            // i
+    InsertLineStart,         // I
+    InsertAfter,             // a
+    InsertLineEnd,           // A
+    OpenBelow,               // o
+    OpenAbove,               // O
+    DeleteUnder,             // x
+    DeleteBefore,            // X
+    DeleteToEol,             // D
+    ChangeToEol,             // C
+    YankToEol,               // Y (neovim's `y$`)
+    RepeatSubstitute(bool),  // & (`:s`) / g& (true: `:%&&`, every line, same flags)
+    SubstituteChar,          // s
+    EnterReplace,            // R
+    GotoByte(Option<usize>), // {count}go
+    PasteAfter,              // p
+    PasteBefore,             // P
+    Undo,                    // u
+    Redo,                    // <C-r>
+    TimeTravel(bool),        // g- (true) / g+
+    Join(bool),              // J (true) / gJ (false: no spaces)
+    ToggleCase,              // ~
+    EnterVisual,             // v
+    EnterVisualLine,         // V
+    EnterSelect(bool),       // gh / gH (Select mode; true = linewise)
+    ToggleVisualSelect,      // <C-g> (toggle Visual <-> Select, keeping the selection)
+    VisualSwapEnds,          // o / O (move to other end of selection)
+    ReselectVisual,          // gv (reselect the last Visual selection)
+    EnterCommand,            // :
     /// `"=` — the expression-register prompt. The typed Lua is evaluated in the
     /// sandbox on `<CR>` and the result stored in the `=` register, with the count
     /// and register put back so the following `p`/`P` pastes it.
@@ -561,6 +574,9 @@ enum NormalCmd {
     AddCursor,              // <A-c> (enter MULTICURSOR + place)
     PlaceCursor,            // c (drop a cursor in MULTICURSOR)
     DotRepeat,              // .  (replay the last change)
+    /// A vim command bemtvi does not implement (blockwise visual, forced motions):
+    /// echoed as an error naming what is missing instead of silently doing nothing.
+    Unimplemented(&'static str),
 }
 
 /// The stage of a partially-typed command — what the *next* key means. The
@@ -717,6 +733,9 @@ enum ResolvedCommand {
     MacroPlay(Option<char>),
     /// A visual-mode operator on the current selection (`d`/`y`/`c`).
     VisualOperate(char),
+    /// A visual-mode operator forced linewise (`v_Y`, `v_D`/`v_X`, `v_C`/`v_R`):
+    /// vim's uppercase visual commands act on whole lines of a charwise selection.
+    VisualOperateLinewise(char),
     /// A terminal single-key command (insert, paste, scroll, …).
     Normal(NormalCmd),
     /// A `<C-w>` window command (split, focus, close, …).
@@ -776,6 +795,26 @@ fn is_register_name(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '"' | '%' | '/' | ':' | '.' | '+' | '*')
 }
 
+/// Where the register digit sits when `keys` is a put from a numbered register
+/// (`[count]"{1-8}[count]p`, `P`, `gp`, `gP`) — the one change `.` replays with
+/// the register number bumped.
+fn numbered_put_register(keys: &[Key]) -> Option<usize> {
+    let chars: Vec<Option<char>> = keys.iter().map(|k| k.as_char()).collect();
+    let mut i = leading_count_len(keys);
+    if chars.get(i) != Some(&Some('"')) {
+        return None;
+    }
+    let at = i + 1;
+    if !matches!(chars.get(at), Some(Some('1'..='8'))) {
+        return None;
+    }
+    i = at + 1 + leading_count_len(&keys[at + 1..]);
+    if chars.get(i) == Some(&Some('g')) {
+        i += 1;
+    }
+    (matches!(chars.get(i), Some(Some('p' | 'P'))) && i + 1 == keys.len()).then_some(at)
+}
+
 /// The length of the leading count prefix in a recorded key stream — used by
 /// dot-repeat to strip the recorded command's own count before a `[count].`
 /// override prepends a new one. Mirrors [`parse_step`]'s count rule: a run of
@@ -801,10 +840,24 @@ fn leading_count_len(keys: &[Key]) -> usize {
 /// [`Editor::execute`].
 fn is_jump_motion(m: Motion) -> bool {
     match m {
-        Motion::GotoTop | Motion::GotoLine => true,
+        Motion::GotoTop
+        | Motion::GotoLine
+        | Motion::Percent
+        | Motion::Sentence(_)
+        | Motion::Paragraph(_) => true,
         Motion::MarkJumpExact(_, set) | Motion::MarkJumpLine(_, set) => set,
         _ => false,
     }
+}
+
+/// Whether a delete over motion `m` always fills `"1`, even within one line —
+/// vim's `use_reg_one` (`:h quote1`: `%`, `(`, `)`, `` ` ``, `{`, `}`, and the
+/// searches, which set it on their own path).
+fn uses_reg_one(m: Motion) -> bool {
+    matches!(
+        m,
+        Motion::Percent | Motion::Sentence(_) | Motion::Paragraph(_) | Motion::MarkJumpExact(..)
+    )
 }
 
 /// The registers vim refuses to *write* (yank/delete into): the last-search
@@ -823,6 +876,14 @@ pub(crate) fn is_readonly_register(c: char) -> bool {
 /// them. `"*` and `"+` map to the one provider in v1 (no X11 PRIMARY split).
 pub(crate) fn is_clipboard_register(reg: Option<char>) -> bool {
     matches!(reg, Some('+') | Some('*'))
+}
+
+const BLOCKWISE_MSG: &str = "blockwise visual (<C-v>)";
+const FORCED_MOTION_MSG: &str = "forcing a motion's type (o_v / o_V / o_CTRL-V)";
+
+/// `<C-v>` or its synonym `<C-q>` — vim's blockwise-visual key.
+fn is_blockwise_key(key: Key) -> bool {
+    key.ctrl && !key.alt && matches!(key.code, KeyCode::Char('v' | 'q'))
 }
 
 /// Map a key to its [`Motion`], or `None` if it is not a (g-free) motion key.
@@ -848,6 +909,18 @@ fn classify_motion(key: Key) -> Option<Motion> {
         (_, Some('E')) => Motion::EndWord(true),
         (_, Some(';')) => Motion::FindRepeat { reverse: false },
         (_, Some(',')) => Motion::FindRepeat { reverse: true },
+        (_, Some('%')) => Motion::Percent,
+        (_, Some(')')) => Motion::Sentence(true),
+        (_, Some('(')) => Motion::Sentence(false),
+        (_, Some('}')) => Motion::Paragraph(true),
+        (_, Some('{')) => Motion::Paragraph(false),
+        (KeyCode::Enter, _) | (_, Some('+')) => Motion::LineDownFirst,
+        (_, Some('-')) => Motion::LineUpFirst,
+        (_, Some('_')) => Motion::LineFirst,
+        (_, Some('|')) => Motion::Column,
+        (_, Some('H')) => Motion::WindowTop,
+        (_, Some('M')) => Motion::WindowMiddle,
+        (_, Some('L')) => Motion::WindowBottom,
         _ => return None,
     })
 }
@@ -1276,7 +1349,14 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
         if c.is_ascii_digit() && !(c == '0' && pending.count.is_none()) {
             let d = c as usize - '0' as usize;
             let mut next = pending.clone();
-            next.count = Some(pending.count.unwrap_or(0) * 10 + d);
+            // An absurdly long count saturates rather than overflowing the
+            // accumulation (the typed digits still show in `showcmd`).
+            let count = pending
+                .count
+                .unwrap_or(0)
+                .saturating_mul(10)
+                .saturating_add(d);
+            next.count = Some(count);
             return Prefix(next);
         }
     }
@@ -1367,12 +1447,22 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
             Some('$') => return Complete(ResolvedCommand::Motion(Motion::DisplayLineEnd)),
             // `gh` / `gH` start Select mode (vim's charwise / linewise select) — the
             // keyboard entry to the mode `btv.win.select_range` drives programmatically.
+            Some('&') if pending.operator.is_none() && !mode.is_visual() => {
+                return Complete(ResolvedCommand::Normal(NormalCmd::RepeatSubstitute(true)))
+            }
+            Some('J') if pending.operator.is_none() => {
+                return Complete(ResolvedCommand::Normal(NormalCmd::Join(false)))
+            }
             Some('h') => return Complete(ResolvedCommand::Normal(NormalCmd::EnterSelect(false))),
             Some('H') => return Complete(ResolvedCommand::Normal(NormalCmd::EnterSelect(true))),
             // `gv` reselects the last Visual selection (its area *and* its
             // charwise/linewise shape), read back from the `` `< `` / `` `> ``
             // marks and the buffer's recorded last-visual kind.
             Some('v') => return Complete(ResolvedCommand::Normal(NormalCmd::ReselectVisual)),
+            // `{count}go` — go to byte `{count}` of the buffer (vim's `:goto`).
+            Some('o') if pending.operator.is_none() && !mode.is_visual() => {
+                return Complete(ResolvedCommand::Normal(NormalCmd::GotoByte(pending.count)))
+            }
             Some('t') => {
                 return Complete(ResolvedCommand::Normal(NormalCmd::TabNext(pending.count)))
             }
@@ -1475,6 +1565,14 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
         }
     }
 
+    // Every `g` command bemtvi implements was matched above (`g*`/`g#` are the
+    // word searches below). Any other `g{char}` is a vim command with its own
+    // meaning (`gJ`, `gp`, `gi`, …), never its un-prefixed suffix: refuse it
+    // rather than silently run the wrong command.
+    if gpending && key.as_char().is_some_and(|c| c != '*' && c != '#') {
+        return ParseStep::Refuse;
+    }
+
     parse_command(mode, pending, key, gpending)
 }
 
@@ -1517,6 +1615,21 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
                 op,
                 dir: SearchDir::Backward,
             }),
+            // `dn` / `dN` / `d*` / `d#`: the search repeat is the operator's motion.
+            Some('n') => Complete(RC::Normal(N::SearchNext)),
+            Some('N') => Complete(RC::Normal(N::SearchPrev)),
+            Some(c @ ('*' | '#')) => Complete(RC::Normal(N::SearchWord {
+                dir: if c == '*' {
+                    SearchDir::Forward
+                } else {
+                    SearchDir::Backward
+                },
+                whole_word: !gpending,
+            })),
+            // `o_v` / `o_V` / `o_CTRL-V` force a motion charwise / linewise /
+            // blockwise. Not implemented: say so rather than drop the operator.
+            Some('v' | 'V') => Complete(RC::Normal(N::Unimplemented(FORCED_MOTION_MSG))),
+            _ if is_blockwise_key(key) => Complete(RC::Normal(N::Unimplemented(FORCED_MOTION_MSG))),
             _ => Reset,
         };
     }
@@ -1555,6 +1668,9 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
             // Visual↔Select switch). In Normal it is left unbound (falls through to
             // Reset), as the toggle only makes sense with a live selection.
             KeyCode::Char('g') if mode.is_visual() => Complete(RC::Normal(N::ToggleVisualSelect)),
+            // `<C-v>` / `<C-q>` start blockwise visual, which bemtvi lacks. (Normal
+            // mode's `<C-v>` is a default paste map; only an unmapped one gets here.)
+            _ if is_blockwise_key(key) => Complete(RC::Normal(N::Unimplemented(BLOCKWISE_MSG))),
             _ => Reset,
         };
     }
@@ -1593,6 +1709,10 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
             '<' => return Complete(RC::VisualOperate('<')),
             'v' => return Complete(RC::Normal(N::EnterVisual)),
             'V' => return Complete(RC::Normal(N::EnterVisualLine)),
+            // vim's uppercase visual operators act on whole lines (`v_visop`).
+            'Y' => return Complete(RC::VisualOperateLinewise('y')),
+            'D' | 'X' => return Complete(RC::VisualOperateLinewise('d')),
+            'C' | 'R' => return Complete(RC::VisualOperateLinewise('c')),
             // `o`/`O` move the cursor to the other end of the selection (charwise/
             // linewise both; no visual-block corner distinction yet), so you can
             // extend the side you started from.
@@ -1620,8 +1740,14 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
         'X' => Complete(RC::Normal(N::DeleteBefore)),
         'D' => Complete(RC::Normal(N::DeleteToEol)),
         'C' => Complete(RC::Normal(N::ChangeToEol)),
+        'Y' if !mode.is_visual() => Complete(RC::Normal(N::YankToEol)),
+        '&' if pending.operator.is_none() && !mode.is_visual() => {
+            Complete(RC::Normal(N::RepeatSubstitute(false)))
+        }
         's' => Complete(RC::Normal(N::SubstituteChar)),
         'R' => Complete(RC::Normal(N::EnterReplace)),
+        // `S` is vim's synonym for `cc`: change `count` whole lines.
+        'S' if pending.operator.is_none() => Complete(RC::DoubledOperator('c')),
         'd' | 'c' | 'y' | '=' | '>' | '<' => {
             // Begin an operator (prefix): move count → op_count, drop g-pending.
             // `=` is the reindent operator (`==`, `=motion`, `gg=G`); `>`/`<` are
@@ -1642,7 +1768,7 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
         'P' => Complete(RC::Normal(N::PasteBefore)),
         '.' => Complete(RC::Normal(N::DotRepeat)),
         'u' => Complete(RC::Normal(N::Undo)),
-        'J' => Complete(RC::Normal(N::Join)),
+        'J' => Complete(RC::Normal(N::Join(true))),
         '~' => Complete(RC::Normal(N::ToggleCase)),
         'v' => Complete(RC::Normal(N::EnterVisual)),
         'V' => Complete(RC::Normal(N::EnterVisualLine)),
@@ -2240,6 +2366,7 @@ impl Editor {
                         if is_jump_motion(m) && self.pending.operator.is_none() {
                             self.record_jump_context();
                         }
+                        self.op_reg_one = uses_reg_one(m) && self.pending.operator.is_some();
                         self.apply_resolved_motion(mr);
                     }
                     // A find/`;`/`,` that doesn't match (or `;`/`,` with no prior
@@ -2285,8 +2412,23 @@ impl Editor {
                     self.reset_pending();
                     return;
                 }
-                if let Some((lo, hi, linewise)) = self.resolve_text_object(ia, key, count) {
+                let range = if self.mode.is_visual() && self.visual_anchor != self.cursor {
+                    self.extend_visual_text_object(ia, key, count)
+                } else {
+                    self.resolve_text_object(ia, key, count)
+                };
+                if let Some((lo, hi, linewise)) = range {
+                    // `yas` made linewise still leaves the cursor where the
+                    // sentence began, as the charwise yank would have.
+                    let sentence_yank = linewise
+                        && key == 's'
+                        && !self.mode.is_visual()
+                        && self.pending.operator == Some('y')
+                        && !self.textobject_map.contains_key(&format!("{ia}s"));
                     self.apply_text_object(lo, hi, linewise);
+                    if sentence_yank {
+                        self.set_cursor_char(lo);
+                    }
                 } else if self.mode.is_visual() {
                     // No object at the cursor: keep the selection (and count).
                     self.pending.stage = Stage::Start;
@@ -2325,6 +2467,16 @@ impl Editor {
                 self.play_macro(reg, count);
             }
             ResolvedCommand::VisualOperate(op) => self.visual_operate(op),
+            ResolvedCommand::VisualOperateLinewise(op) => {
+                let shape = self.mode;
+                self.mode = Mode::VisualLine;
+                self.visual_operate(op);
+                // `gv` reselects the selection as it was made (vim's
+                // `VIsual_mode_orig`), not the linewise shape the operator used.
+                if shape != Mode::VisualLine {
+                    self.buffer_mut().last_visual = Some(shape);
+                }
+            }
             ResolvedCommand::Normal(cmd) => self.execute_normal(cmd),
             ResolvedCommand::Window(cmd) => self.execute_window(cmd),
             ResolvedCommand::WindowLayer(cmd) => self.execute_window_layer(cmd),
@@ -2372,7 +2524,7 @@ impl Editor {
                 // Not the chord: replay the held `<C-w>` into the current mode,
                 // then let `input` handle this key normally.
                 self.dock_chord = DockChord::Idle;
-                self.dispatch_mode_key(Key::ctrl('w'));
+                self.replay_held_cw();
                 false
             }
             DockChord::SecondCw => {
@@ -2387,11 +2539,22 @@ impl Editor {
                 }
                 // Dead-end after `<C-w><C-w>`: replay both held `<C-w>`s, then let
                 // `input` handle this key normally.
-                self.dispatch_mode_key(Key::ctrl('w'));
-                self.dispatch_mode_key(Key::ctrl('w'));
+                self.replay_held_cw();
+                self.replay_held_cw();
                 false
             }
         }
+    }
+
+    /// Replay one held `<C-w>` into the current mode on a chord miss. The held key
+    /// never reached the dot-repeat recorder in [`Editor::input`] (the intercept
+    /// returned first), so record it here, ahead of the key that broke the chord —
+    /// otherwise `.` after `ia b<C-w>c<Esc>` would retype the rubbed-out word.
+    fn replay_held_cw(&mut self) {
+        if !self.replaying_change {
+            self.redo_recording.push(Key::ctrl('w'));
+        }
+        self.dispatch_mode_key(Key::ctrl('w'));
     }
 
     /// Route one key into the handler for the current mode, bypassing the dock
@@ -2651,6 +2814,21 @@ impl Editor {
             self.reset_pending();
             return;
         }
+        if matches!(
+            cmd,
+            NormalCmd::InsertBefore
+                | NormalCmd::InsertLineStart
+                | NormalCmd::InsertAfter
+                | NormalCmd::InsertLineEnd
+                | NormalCmd::EnterReplace
+                | NormalCmd::OpenBelow
+                | NormalCmd::OpenAbove
+        ) {
+            // `{count}i…<Esc>` lands the typed text `count` times (see `insert_repeat`);
+            // `{count}o…<Esc>` lands it on `count` lines.
+            let lines = matches!(cmd, NormalCmd::OpenBelow | NormalCmd::OpenAbove);
+            self.insert_repeat_pending = Some((count, lines));
+        }
         match cmd {
             // The insert-entry keys reposition *every* cursor to its own column
             // (line-end for `A`, first-non-blank for `I`, …) before typing — see
@@ -2676,14 +2854,24 @@ impl Editor {
                 self.place_cursor_here();
             }
             NormalCmd::DeleteBefore => self.edit_each_cursor(|ed| ed.delete_before_cursor(count)),
-            NormalCmd::DeleteToEol => self.edit_each_cursor(|ed| ed.delete_to_eol()),
+            NormalCmd::DeleteToEol => self.edit_each_cursor(|ed| ed.delete_to_eol(count, false)),
+            NormalCmd::YankToEol => self.edit_each_cursor(|ed| ed.yank_to_eol(count)),
+            // `&` repeats the last `:s` on this line without its flags; `g&` repeats
+            // it, flags and all, on every line (vim's `:%s//~/&`).
+            NormalCmd::RepeatSubstitute(all) => self.execute_ex(if all { "%&&" } else { "s" }),
             NormalCmd::ChangeToEol => self.edit_each_cursor(|ed| {
-                ed.delete_to_eol();
+                ed.delete_to_eol(count, true);
                 ed.mode = Mode::Insert;
                 ed.snapshot_taken = true;
             }),
             NormalCmd::SubstituteChar => self.edit_each_cursor(|ed| {
+                // The insert opens where the deleted text began, past the line's
+                // new end when `s` took its last character.
+                let at = ed.cursor_char();
                 ed.delete_under_cursor(count);
+                if ed.line_len() > 0 {
+                    ed.set_cursor_char_insert(at);
+                }
                 ed.mode = Mode::Insert;
                 ed.snapshot_taken = true;
             }),
@@ -2696,7 +2884,7 @@ impl Editor {
             // selected text is deleted and the register put in its place. Checked
             // after the multi-cursor arms, which keep their per-cursor broadcast.
             NormalCmd::PasteAfter | NormalCmd::PasteBefore if self.mode.is_visual() => {
-                self.visual_paste(count)
+                self.visual_paste(count, cmd == NormalCmd::PasteBefore)
             }
             NormalCmd::PasteAfter => self.paste(true, count),
             NormalCmd::PasteBefore => self.paste(false, count),
@@ -2723,10 +2911,32 @@ impl Editor {
                 self.change_not_repeatable = true;
                 self.undo_travel(count, back);
             }
-            NormalCmd::Join => self.edit_each_cursor(|ed| ed.join_lines(count.max(2))),
+            // Over a selection `J` / `gJ` join its lines (two at least), then the
+            // selection is dropped.
+            NormalCmd::Join(spaces) if self.mode.is_visual() => {
+                self.record_visual_marks();
+                let top = self.visual_anchor.line.min(self.cursor.line);
+                let bot = self.visual_anchor.line.max(self.cursor.line);
+                self.mode = Mode::Normal;
+                // With no line below there is nothing to join, and the cursor stays.
+                if top + 1 < self.buffer().line_count() {
+                    self.cursor = Cursor { line: top, col: 0 };
+                    self.join_lines_with((bot - top + 1).max(2), spaces);
+                }
+            }
+            NormalCmd::Join(spaces) => {
+                self.edit_each_cursor(|ed| ed.join_lines_with(count.max(2), spaces))
+            }
             NormalCmd::ToggleCase => self.edit_each_cursor(|ed| ed.toggle_case(count)),
             // `R` enters Replace mode: snapshot for undo, then overtype until
             // `<Esc>` (the insert handler honors `Mode::Replace`).
+            NormalCmd::GotoByte(n) => {
+                let target = n.unwrap_or(1).saturating_sub(1).min(self.last_char_idx());
+                self.record_jump_context();
+                self.settle_cursor_byte(target);
+                // A byte on a line break rests on that line's last character.
+                self.clamp_cursor();
+            }
             NormalCmd::EnterReplace => {
                 if !self.modifiable() {
                     self.refuse_edit();
@@ -2787,7 +2997,7 @@ impl Editor {
             }
             NormalCmd::ScrollHalf(down) => self.scroll_half(down),
             NormalCmd::ScrollPage(down) => self.scroll_page(down),
-            NormalCmd::ScrollLine(down) => self.scroll_line(down),
+            NormalCmd::ScrollLine(down) => self.scroll_line(down, count),
             NormalCmd::ViewScroll {
                 place,
                 first_nonblank,
@@ -2802,6 +3012,9 @@ impl Editor {
             NormalCmd::ChangeOlder => self.change_older(count),
             NormalCmd::ChangeNewer => self.change_newer(count),
             NormalCmd::DotRepeat => self.repeat_change(),
+            NormalCmd::Unimplemented(what) => {
+                self.echo_err(format!("E: {what} is not implemented"))
+            }
         }
         self.reset_pending();
     }
@@ -2818,6 +3031,15 @@ impl Editor {
         // `.` itself must never become the new last change — mark this command
         // non-repeatable so a following `.` still replays the original.
         self.change_not_repeatable = true;
+        // `"1p` then `.` puts `"2`, then `"3`, … — vim steps a numbered-register put
+        // to the next register on each repeat (`"1pu.u.` walks the delete ring).
+        if let Some(at) = numbered_put_register(&self.last_change) {
+            if let Some(d) = self.last_change[at].as_char().and_then(|c| c.to_digit(10)) {
+                if d < 9 {
+                    self.last_change[at] = Key::char(char::from_digit(d + 1, 10).unwrap_or('9'));
+                }
+            }
+        }
         // A count typed on `.` (`3.`) *replaces* the recorded command's own count
         // (vim: `dw` then `3.` runs `3dw`): strip the recorded leading count and
         // prepend the new one. With no new count the recorded keys stand verbatim,
@@ -2871,8 +3093,9 @@ impl Editor {
         let count = self.effective_count();
         let last = self.cursor.line + count - 1;
         let target = self.buffer().line_start(last.min(self.last_line()));
-        // axis is unused for the operator path, but the field is required.
-        let m = MotionResult::linewise(target, MoveAxis::LineAnchor);
+        // `VerticalKeep`: the doubled operator's text starts at the cursor itself,
+        // which a yank or fold leaves where it is (see `apply_operator`).
+        let m = MotionResult::linewise(target, MoveAxis::VerticalKeep);
         self.pending.operator = None;
         self.apply_operator(op, m);
         self.reset_pending();
@@ -2890,7 +3113,10 @@ impl Editor {
             return;
         };
         match self.pending.operator {
-            Some(op) => self.apply_operator(op, mr),
+            Some(op) => {
+                self.op_reg_one = uses_reg_one(m);
+                self.apply_operator(op, mr);
+            }
             None => self.apply_movement(mr),
         }
     }
@@ -2904,7 +3130,7 @@ impl Editor {
         let count = self.effective_count();
         let last = self.cursor.line + count - 1;
         let target = self.buffer().line_start(last.min(self.last_line()));
-        let m = MotionResult::linewise(target, MoveAxis::LineAnchor);
+        let m = MotionResult::linewise(target, MoveAxis::VerticalKeep);
         self.apply_operator(op, m);
     }
 
@@ -2920,9 +3146,10 @@ impl Editor {
         };
         if linewise {
             let first_line = self.buffer().byte_to_line(lo);
-            self.apply_operator_to_range(op, lo, hi, true, first_line);
+            let line_lo = self.buffer().line_start(first_line);
+            self.apply_operator_to_range(op, line_lo, hi, true, first_line);
         } else {
-            self.apply_operator_to_range(op, lo, hi, false, 0);
+            self.apply_charwise_operator(op, lo, hi);
         }
     }
 

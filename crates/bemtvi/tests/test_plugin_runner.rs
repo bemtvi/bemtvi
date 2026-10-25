@@ -342,6 +342,48 @@ fn file_level_setup_survives_into_every_test() {
     assert!(stdout.contains("2 passed, 0 failed"), "stdout:\n{stdout}");
 }
 
+/// A test that REDEFINES (or deletes) a baseline mapping or user command does not leak
+/// that into the next test: the baseline's own definition comes back, not just "names
+/// the baseline lacked are removed".
+#[test]
+fn a_redefined_baseline_mapping_or_command_is_put_back() {
+    let dir = fixture_dir("redefine");
+    std::fs::write(
+        dir.join("test/redefine_spec.lua"),
+        r#"
+        btv.keymap.set("n", "zq", "ifile<Esc>")
+        btv.keymap.set("n", "zw", "ikeep<Esc>")
+        btv.user_command.create("Base", "echo 'file'")
+
+        local function rhs(lhs)
+          for _, m in ipairs(btv.keymap.get("n") or {}) do
+            if m.lhs == lhs then return m.rhs end
+          end
+        end
+
+        btv.test.describe("redefine", function()
+          btv.test.it("overrides the baseline", function(t)
+            btv.keymap.set("n", "zq", "itest<Esc>")
+            btv.keymap.del("n", "zw")
+            btv.user_command.create("Base", "echo 'test'")
+            btv.test.expect(rhs("zq")).to_be("itest<Esc>")
+          end)
+
+          btv.test.it("sees the baseline again", function(t)
+            btv.test.expect(rhs("zq")).to_be("ifile<Esc>")
+            btv.test.expect(rhs("zw")).to_be("ikeep<Esc>")
+            btv.test.expect(btv._user_commands.Base).to_be("echo 'file'")
+          end)
+        end)
+        "#,
+    )
+    .unwrap();
+
+    let (ok, stdout) = run(&dir);
+    assert!(ok, "the baseline definitions leaked; stdout:\n{stdout}");
+    assert!(stdout.contains("2 passed, 0 failed"), "stdout:\n{stdout}");
+}
+
 /// A spec that loads a plugin through `btv.plugins{ dir = … }` at file level (what an
 /// example's `init.lua` does) gets that plugin's `plugin/` scripts in its baseline.
 /// The manager sources them asynchronously, so a baseline taken the moment the spec

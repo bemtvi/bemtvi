@@ -268,6 +268,9 @@ pub fn connect_quic_reconnecting(
         .map_err(|e| anyhow!("invalid daemon cert hash {cert_hash:?}: {e}"))?;
     // The bearer token is the CONNECT path; the daemon reads it from `request.path()`.
     let connect_url = format!("{}/{}", url.trim_end_matches('/'), token);
+    // What errors name instead: the CONNECT URL carries the token, and a dial error is
+    // printed (terminal, GUI, re-dial log).
+    let display_url = url.trim_end_matches('/').to_string();
 
     // The current dial's endpoint + connection, kept alive on the link thread for the
     // connection's lifetime; each (re)dial replaces them, dropping the previous (which tears
@@ -279,10 +282,12 @@ pub fn connect_quic_reconnecting(
     // dial binds a fresh local UDP socket — cheap, and it sidesteps reusing a half-torn one.
     let make = move || {
         let connect_url = connect_url.clone();
+        let display_url = display_url.clone();
         let cert_hash = cert_hash.clone();
         let live = live.clone();
         async move {
-            let (endpoint, connection, streams) = quic_dial(&connect_url, cert_hash).await?;
+            let (endpoint, connection, streams) =
+                quic_dial(&connect_url, &display_url, cert_hash).await?;
             // One `Rpc`/inbound stream per leg group (Control/Proc/Lsp/Term). Each rides its
             // own QUIC stream, so a flood on one group can't head-of-line-block another.
             let [(cs, cr), (ps, pr), (ls, lr), (ts, tr)] = streams;
@@ -314,7 +319,8 @@ pub fn connect_quic_reconnecting(
     connect_reconnecting_thread(make, policy)
 }
 
-/// Build the client endpoint, dial `url` (pinning `cert_hash`), and open the native
+/// Build the client endpoint, dial `url` (pinning `cert_hash`; errors name `display_url`,
+/// the token-free form), and open the native
 /// edit-host's four leg-group bidi streams — Control, Proc, Lsp, Term. Returns the endpoint +
 /// connection (the caller keeps them alive) and the stream halves per group, in that order;
 /// the edit-host **reads** that group's daemon pushes off `recv` and **writes** its requests
@@ -322,6 +328,7 @@ pub fn connect_quic_reconnecting(
 /// each stream's leading tag byte — so adding the Term stream needs no daemon-side change.)
 async fn quic_dial(
     url: &str,
+    display_url: &str,
     cert_hash: Sha256Digest,
 ) -> Result<(
     Endpoint<endpoint_side::Client>,
@@ -337,10 +344,9 @@ async fn quic_dial(
         .build();
 
     let endpoint = Endpoint::client(config).context("building the daemon QUIC client endpoint")?;
-    let connection = endpoint
-        .connect(url)
-        .await
-        .with_context(|| format!("connecting to the daemon at {url} (cert/token rejected?)"))?;
+    let connection = endpoint.connect(url).await.with_context(|| {
+        format!("connecting to the daemon at {display_url} (cert/token rejected?)")
+    })?;
     let control = open_group_stream(&connection, LegGroup::Control).await?;
     let proc = open_group_stream(&connection, LegGroup::Proc).await?;
     let lsp = open_group_stream(&connection, LegGroup::Lsp).await?;
@@ -373,7 +379,7 @@ async fn open_group_stream(
 /// Compare two byte slices in time independent of where they first differ (and of the
 /// shared-prefix length), so the bearer-token check leaks neither the token's length
 /// match nor its prefix via timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

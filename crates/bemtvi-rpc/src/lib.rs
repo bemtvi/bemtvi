@@ -92,15 +92,13 @@ pub struct Rpc {
 impl Rpc {
     /// Fire-and-forget notification.
     pub fn notify(&self, method: &str, params: Vec<Value>) {
-        let bytes = notification(method, params);
-        if bytes.len() > MAX_FRAME {
-            eprintln!(
-                "bemtvi-rpc: dropping notification '{method}': encoded frame is {} bytes, \
-                 over the {MAX_FRAME}-byte limit",
-                bytes.len()
-            );
-            return;
-        }
+        let bytes = match notification(method, params) {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                eprintln!("bemtvi-rpc: dropping notification '{method}': the frame {why}");
+                return;
+            }
+        };
         let _ = self.out.send(bytes);
     }
 
@@ -114,15 +112,13 @@ impl Rpc {
     /// connection has closed. Use only for high-volume data that can tolerate pacing;
     /// control/latency-sensitive frames must use [`notify`](Self::notify).
     pub async fn notify_stream(&self, method: &str, params: Vec<Value>) {
-        let bytes = notification(method, params);
-        if bytes.len() > MAX_FRAME {
-            eprintln!(
-                "bemtvi-rpc: dropping stream notification '{method}': encoded frame is {} bytes, \
-                 over the {MAX_FRAME}-byte limit",
-                bytes.len()
-            );
-            return;
-        }
+        let bytes = match notification(method, params) {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                eprintln!("bemtvi-rpc: dropping stream notification '{method}': the frame {why}");
+                return;
+            }
+        };
         let _ = self.stream.send(bytes).await;
     }
 
@@ -154,14 +150,12 @@ impl Rpc {
             Value::from(method),
             Value::Array(params),
         ]);
-        let Some(bytes) = encode_checked(&msg) else {
+        let bytes = match encode_checked(&msg) {
+            Ok(bytes) => bytes,
             // Never sent, so the pending entry must not survive — the guard's
             // `Drop` (bound above) removes it. Name the real cause instead of
             // falling through to the generic connection-closed error.
-            return Err(anyhow!(
-                "rpc request frame too large: '{method}' encodes to more than the \
-                 {MAX_FRAME}-byte limit"
-            ));
+            Err(why) => return Err(anyhow!("rpc request frame too large: '{method}' {why}")),
         };
         if self.out.send(bytes).is_err() {
             if let Some(map) = self.pending.lock().unwrap().as_mut() {
@@ -183,20 +177,22 @@ impl Rpc {
             Err(e) => (e, Value::Nil),
         };
         let msg = Value::Array(vec![Value::from(1u64), Value::from(id), err, res]);
-        let Some(bytes) = encode_checked(&msg) else {
-            // Refuse with a small error reply rather than ship a frame the peer's
-            // reader rejects by tearing the whole link down (taking unrelated
-            // in-flight requests with it). The requester sees a normal RPC error.
-            let refuse = Value::Array(vec![
-                Value::from(1u64),
-                Value::from(id),
-                Value::String(
-                    format!("response frame exceeds the {MAX_FRAME}-byte rpc limit").into(),
-                ),
-                Value::Nil,
-            ]);
-            let _ = self.out.send(encode(&refuse));
-            return;
+        let bytes = match encode_checked(&msg) {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                // Refuse with a small error reply rather than ship a frame the
+                // peer's reader rejects by tearing the whole link down (taking
+                // unrelated in-flight requests with it). The requester sees a
+                // normal RPC error.
+                let refuse = Value::Array(vec![
+                    Value::from(1u64),
+                    Value::from(id),
+                    Value::String(format!("response frame exceeds the rpc limit: it {why}").into()),
+                    Value::Nil,
+                ]);
+                let _ = self.out.send(encode(&refuse));
+                return;
+            }
         };
         let _ = self.out.send(bytes);
     }
@@ -412,11 +408,17 @@ const MAX_DEPTH: usize = 128;
 /// ~40× amplification. This cap is checked against the *declared* length the
 /// instant a container header is read ([`scan_frame`]), so such a frame is
 /// rejected immediately instead of buffering toward [`MAX_FRAME`] and decoding a
-/// multi-gigabyte structure first. Set to [`MAX_FRAME`]: a frame that genuinely
-/// fits within the byte cap can hold at most that many values (each costs ≥1
-/// wire byte), so this never rejects a frame the byte cap would have accepted —
-/// it only short-circuits length prefixes that could never legitimately fit.
-const MAX_VALUES: u64 = MAX_FRAME as u64;
+/// multi-gigabyte structure first.
+///
+/// Deliberately far below [`MAX_FRAME`]: every value costs ≥1 wire byte, so a
+/// byte-sized cap would still let one 64 MiB frame of fixints decode to ~64M
+/// `Value`s (2+ GiB of heap). 4M values bounds a frame's decoded tree to ~160 MiB.
+/// No legitimate payload comes near it — a redraw is viewport-bounded, a
+/// whole-buffer `nvim_buf_get_lines` costs one value per line, file and PTY bytes
+/// ride as one `bin` value — and the sender enforces the same budget
+/// ([`encode_checked`]), so an over-budget payload fails loud at its source
+/// instead of tearing the link down.
+const MAX_VALUES: u64 = 1 << 22;
 
 /// Outcome of [`scan_frame`]: walking the buffered bytes for one complete
 /// top-level msgpack value, enforcing allocation budgets on declared lengths.
@@ -426,8 +428,33 @@ enum Scan {
     /// The buffered bytes are a (valid) prefix of a value — wait for more.
     Incomplete,
     /// Declared sizes exceed [`MAX_VALUES`]/[`MAX_DEPTH`]/[`MAX_FRAME`], or a
-    /// declared str/bin/ext length could never fit — reject the peer.
-    TooLarge,
+    /// declared str/bin/ext length could never fit — reject the peer. Carries
+    /// which budget the frame broke.
+    TooLarge(Reject),
+}
+
+/// Which budget an inbound frame broke, for the loud teardown message.
+#[derive(Clone, Copy)]
+enum Reject {
+    Values,
+    Depth,
+    Payload,
+}
+
+impl std::fmt::Display for Reject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Reject::Values => write!(
+                f,
+                "declares more than {MAX_VALUES} msgpack values (the per-frame value limit)"
+            ),
+            Reject::Depth => write!(f, "nests past the {MAX_DEPTH}-unit depth limit"),
+            Reject::Payload => write!(
+                f,
+                "declares a str/bin/ext payload over the {MAX_FRAME}-byte frame limit"
+            ),
+        }
+    }
 }
 
 /// Resumable state of a frame scan, carried by the reader across reads. A scan
@@ -530,7 +557,7 @@ fn scan_frame(buf: &[u8], state: &mut Option<FrameScan>) -> Scan {
 
         st.seen += 1;
         if st.seen > MAX_VALUES {
-            return Scan::TooLarge;
+            return Scan::TooLarge(Reject::Values);
         }
         let value_start = st.pos;
         let Some(&marker) = buf.get(st.pos) else {
@@ -564,7 +591,7 @@ fn scan_frame(buf: &[u8], state: &mut Option<FrameScan>) -> Scan {
             _ => 1, // scalars: the value's entry alone
         };
         if st.budget[st.depth - 1] < charge {
-            return Scan::TooLarge;
+            return Scan::TooLarge(Reject::Depth);
         }
 
         // A value whose marker was claimed (and counted) but whose bytes were
@@ -596,7 +623,7 @@ fn scan_frame(buf: &[u8], state: &mut Option<FrameScan>) -> Scan {
             ($count:expr) => {{
                 let count: u64 = $count;
                 if st.seen.saturating_add(count) > MAX_VALUES {
-                    return Scan::TooLarge;
+                    return Scan::TooLarge(Reject::Values);
                 }
                 st.budget[st.depth] = st.budget[st.depth - 1] - 2;
                 st.stack[st.depth] = count;
@@ -609,7 +636,7 @@ fn scan_frame(buf: &[u8], state: &mut Option<FrameScan>) -> Scan {
             ($len:expr) => {{
                 let len: u64 = $len;
                 if len > MAX_FRAME as u64 {
-                    return Scan::TooLarge;
+                    return Scan::TooLarge(Reject::Payload);
                 }
                 len
             }};
@@ -724,7 +751,9 @@ where
             let n = match scan_frame(&buf[consumed..], &mut scan) {
                 Scan::Complete(n) => n,
                 Scan::Incomplete => break,
-                Scan::TooLarge => return,
+                Scan::TooLarge(why) => {
+                    return refuse_peer(&pending, &format!("inbound frame {why}"));
+                }
             };
             let mut cur = Cursor::new(&buf[consumed..consumed + n]);
             let val = match rmpv::decode::read_value_with_max_depth(&mut cur, MAX_DEPTH) {
@@ -732,7 +761,7 @@ where
                 // `scan_frame` already vetted completeness, budget and depth, so
                 // rmpv should not fail here; if it nonetheless does, treat the
                 // frame as malformed and drop the connection rather than spin.
-                Err(_) => return,
+                Err(e) => return refuse_peer(&pending, &format!("undecodable inbound frame: {e}")),
             };
             consumed += n;
             if dispatch(val, &in_tx, &pending).await.is_err() {
@@ -748,12 +777,30 @@ where
         // abusively large; refuse it rather than buffer without bound. `buf` now
         // holds only the incomplete tail, so this bounds a single pending frame.
         if buf.len() > MAX_FRAME {
-            return;
+            return refuse_peer(
+                &pending,
+                &format!("inbound frame grew past the {MAX_FRAME}-byte frame limit"),
+            );
         }
 
         match reader.read(&mut chunk).await {
             Ok(0) | Err(_) => break, // peer closed
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+/// Tear the connection down over a frame the reader refuses — loudly: a stderr
+/// line naming the broken limit, and every in-flight [`Rpc::request`] fails with
+/// that reason instead of a bare "connection closed". Taking the pending map here
+/// (rather than leaving it to [`connect`]'s cleanup) is what lets the reason reach
+/// the waiting callers; the cleanup's later `take` then finds it already gone.
+fn refuse_peer(pending: &Pending, why: &str) {
+    let msg = format!("bemtvi-rpc: closing the connection: {why}");
+    eprintln!("{msg}");
+    if let Some(map) = pending.lock().unwrap().take() {
+        for (_, tx) in map {
+            let _ = tx.send(Err(Value::from(msg.as_str())));
         }
     }
 }
@@ -837,35 +884,60 @@ fn encode(val: &Value) -> Vec<u8> {
     buf
 }
 
-/// Encode `val` as one RPC frame, refusing (`None`) any frame the peer's reader
-/// would reject: the reader's budget check ([`reader_task`], `buf.len() >
-/// MAX_FRAME`) tears the **whole connection** down on an oversized frame, taking
-/// unrelated in-flight requests with it. The per-method refusal is loud — an
-/// error reply for [`respond`](Rpc::respond), an `Err` for
-/// [`request`](Rpc::request), a stderr line for the notifications — so a sender
-/// that produced an over-large payload hears about it instead of silently
+/// Encode `val` as one RPC frame, refusing (`Err`, with the reason) any frame
+/// the peer's reader would reject: the reader ([`reader_task`] / [`scan_frame`])
+/// tears the **whole connection** down on a frame over [`MAX_FRAME`] bytes or
+/// [`MAX_VALUES`] values, taking unrelated in-flight requests with it. The
+/// per-method refusal is loud — an error reply for [`respond`](Rpc::respond), an
+/// `Err` for [`request`](Rpc::request), a stderr line for the notifications — so a
+/// sender that produced an over-large payload hears about it instead of silently
 /// killing the link.
 ///
-/// Residual gap: the byte cap is the only dimension checked here. The reader
-/// additionally rejects on [`MAX_VALUES`] and [`MAX_DEPTH`] (`scan_frame`), and
-/// a byte-passing frame can still trip the depth one (a path nested past
-/// `MAX_DEPTH / 2` containers) — the value cap cannot, since a frame's values
-/// cost it at least one wire byte each. A sender that builds such a frame still
-/// tears the link; mirroring the reader's per-descending-path depth charge here
-/// would duplicate rmpv's budget arithmetic and drift with it, so this is
-/// documented rather than encoded. Deep nesting only arises from a hostile or
-/// pathological local sender, unlike an oversized payload which any bug can
-/// produce.
-fn encode_checked(val: &Value) -> Option<Vec<u8>> {
+/// Residual gap: the reader additionally rejects on [`MAX_DEPTH`], which is not
+/// checked here — a path nested past `MAX_DEPTH / 2` containers still tears the
+/// link. Mirroring the reader's per-descending-path depth charge here would
+/// duplicate rmpv's budget arithmetic and drift with it, so this is documented
+/// rather than encoded. Deep nesting only arises from a hostile or pathological
+/// local sender, unlike an oversized payload which any bug can produce.
+fn encode_checked(val: &Value) -> std::result::Result<Vec<u8>, String> {
+    let mut budget = MAX_VALUES;
+    if !within_value_budget(val, &mut budget) {
+        return Err(format!(
+            "holds more than {MAX_VALUES} msgpack values (the per-frame value limit)"
+        ));
+    }
     let buf = encode(val);
-    (buf.len() <= MAX_FRAME).then_some(buf)
+    if buf.len() > MAX_FRAME {
+        return Err(format!(
+            "encodes to {} bytes, over the {MAX_FRAME}-byte frame limit",
+            buf.len()
+        ));
+    }
+    Ok(buf)
+}
+
+/// Charge `val`'s values (every node, as [`scan_frame`] counts them) against
+/// `budget`; `false` as soon as it runs out. Stops early, so an over-budget
+/// payload costs at most [`MAX_VALUES`] steps.
+fn within_value_budget(val: &Value, budget: &mut u64) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    match val {
+        Value::Array(items) => items.iter().all(|v| within_value_budget(v, budget)),
+        Value::Map(entries) => entries
+            .iter()
+            .all(|(k, v)| within_value_budget(k, budget) && within_value_budget(v, budget)),
+        _ => true,
+    }
 }
 
 /// Build and encode a notification frame `[2, method, params]`. Shared by
 /// [`Rpc::notify`] and [`Rpc::notify_stream`], which differ only in the channel
 /// the encoded bytes are handed to.
-fn notification(method: &str, params: Vec<Value>) -> Vec<u8> {
-    encode(&Value::Array(vec![
+fn notification(method: &str, params: Vec<Value>) -> std::result::Result<Vec<u8>, String> {
+    encode_checked(&Value::Array(vec![
         Value::from(2u64),
         Value::from(method),
         Value::Array(params),

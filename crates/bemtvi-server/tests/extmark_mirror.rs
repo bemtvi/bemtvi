@@ -555,3 +555,31 @@ async fn an_extmark_added_after_an_edit_survives_undo() {
         "undo must not wipe a mark placed after the edit"
     );
 }
+
+/// `clear_namespace(buf, ns, start, -1)` clears from `start` to the END — it must keep
+/// the marks above `start`, in the same chunk (the mirror the read answers from) and
+/// after the server has applied the clear.
+#[tokio::test]
+async fn clear_namespace_to_the_end_keeps_marks_above_the_start() {
+    let (rpc, _inc) = open(&sample(20)).await;
+    ns(&rpc).await;
+    mark(&rpc, 0, 0, "").await;
+    mark(&rpc, 8, 0, "").await;
+    let same_chunk = exec_lua(
+        &rpc,
+        "btv.buf.clear_namespace(0, _G.ns, 5, -1)\n\
+         return #btv.buf.extmarks(0, _G.ns, 0, -1, {})",
+    )
+    .await;
+    assert_eq!(
+        same_chunk.as_i64(),
+        Some(1),
+        "the row-0 mark survives in the mirror"
+    );
+    let later = exec_lua(&rpc, "return #btv.buf.extmarks(0, _G.ns, 0, -1, {})").await;
+    assert_eq!(
+        later.as_i64(),
+        Some(1),
+        "and after the server applied the clear"
+    );
+}

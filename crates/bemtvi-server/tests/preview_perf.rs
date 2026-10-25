@@ -131,7 +131,7 @@ async fn navigating_the_picker_never_pays_the_preview_parse() {
     {
         eprintln!(
             "skip: lua grammar not installed under {} (set BEMTVI_DATA_DIR or :TSInstall lua)",
-            bemtvi_ts::data_dir().display()
+            bemtvi_ts::data_dir().unwrap_or_default().display()
         );
         return;
     }

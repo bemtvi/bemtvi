@@ -247,13 +247,43 @@ fn an_empty_variable_counts_as_unset() {
     );
 }
 
+/// The XDG Base Directory spec: "All paths set in these environment variables must
+/// be absolute. If an implementation encounters a relative path in any of these
+/// variables it should consider the path invalid and ignore it." A relative value
+/// falls through to the platform default instead of resolving against the cwd.
+#[test]
+fn a_relative_xdg_variable_is_ignored() {
+    let env = Env::cleared();
+    set_home(&env, a_home());
+    env.set("XDG_CONFIG_HOME", "rel/config");
+    env.set("XDG_DATA_HOME", "rel/data");
+    env.set("XDG_STATE_HOME", "./rel/state");
+    env.set("XDG_CACHE_HOME", "rel/cache");
+    for (name, dir) in all_dirs() {
+        let dir = dir.unwrap_or_else(|| panic!("{name}: a dir despite the relative var"));
+        assert!(
+            dir.is_absolute() && dir.starts_with(a_home()),
+            "{name}: a relative XDG value must be ignored (got {dir:?})"
+        );
+    }
+}
+
 #[test]
 fn no_home_and_no_bases_resolves_to_nothing_rather_than_a_relative_path() {
     let _env = Env::cleared();
     // The contract that lets each caller decide *loudly* what to do (the remote
     // config cache errors; `btv.stdpath` falls back to a documented `.bemtvi`).
     // Returning a relative path here is what silently scattered state into the cwd.
+    // On Unix the passwd entry stands in for an unset `$HOME`, so a dir may still
+    // resolve — but only ever to an absolute one.
     for (what, dir) in all_dirs() {
+        #[cfg(unix)]
+        assert!(
+            dir.as_ref().is_none_or(|d| d.is_absolute()),
+            "with no `$HOME` and no platform base, stdpath::{what}_dir() must resolve to \
+             nothing or the passwd home, never a cwd-relative path (got {dir:?})",
+        );
+        #[cfg(not(unix))]
         assert_eq!(
             dir, None,
             "with no home and no platform base, stdpath::{what}_dir() must resolve to \

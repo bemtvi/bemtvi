@@ -42,6 +42,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { existsSync, globSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { APPROVALS_KEY, approvalEntry, daemonIdentity } from "./daemon-trust.mjs";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const PORT = 8143;
@@ -211,6 +212,9 @@ try {
   page.on("console", (m) => { if (m.type() === "error") console.log("  [page error]", m.text()); });
   page.on("pageerror", (e) => console.log("  [pageerror]", e.message));
 
+  // The page asks before dialing a `?daemon=` link; pre-approve this daemon (as a user
+  // who approved it earlier would have) so the run connects without the prompt.
+  await page.addInitScript(([k, v]) => localStorage.setItem(k, JSON.stringify([v])), [APPROVALS_KEY, approvalEntry(daemonIdentity(uri))]);
   const pageUrl = `http://localhost:${PORT}/web/?daemon=${encodeURIComponent(uri)}`;
   await page.goto(pageUrl);
 
@@ -466,6 +470,34 @@ try {
   );
   check("lsp: a workspace edit's `delete` removes the file on the daemon",
     !existsSync(doomedFile), `still present=${existsSync(doomedFile)}`);
+
+  // ── 9. the code-action CHOOSER applies the row you pick ───────────────────────────────
+  //    Every check above is a one-shot (`apply = true`, one survivor). With two survivors
+  //    the chooser opens, and confirming a row must apply THAT action — the browser has to
+  //    route the menu's pick to the action, not drop it. The picked action is a bare
+  //    `command`, so its proof is the `workspace/executeCommand` the mock records.
+  const rewrites = () =>
+    readFileSync(mockRecord, "utf8").split("\n")
+      .filter((l) => l.includes("workspace/executeCommand") && l.includes("mock.rewrite")).length;
+  const before = rewrites();
+  await page.evaluate(() => window.__bemtvi.execLua(
+    '_G.ca_done = false\n' +
+    'btv.lsp.code_action({ context = { only = { "refactor.rewrite", "refactor.move" } } })' +
+    ':next(function() _G.ca_done = true end)'));
+  const menuOpen = await until(page,
+    () => window.__bemtvi.execLua("return _G.ca_done").then((r) => r.result),
+    () => true, 2000);
+  check("lsp: the chooser's promise waits for the pick (not settled on open)",
+    /false/.test(String(menuOpen)), `ca_done=${JSON.stringify(menuOpen)}`);
+  await sleep(300);
+  await page.evaluate(() => window.__bemtvi.feed("j<CR>"));
+  let after = before;
+  for (let i = 0; i < 100 && after === before; i++) {
+    await sleep(50);
+    after = rewrites();
+  }
+  check("lsp: confirming a chooser row applies that code action",
+    after === before + 1, `executeCommand mock.rewrite before=${before} after=${after}`);
 
   await browser.close();
 } catch (e) {

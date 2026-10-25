@@ -960,10 +960,10 @@ end
 -- `btv._o_store` catch-all), `btv.g`, the named registers, every sandbox
 -- expression surface (from `btv._sandbox_srcs`, which the setters write
 -- themselves — see the note there on why this is not a list kept here), the
--- quickfix list, and any keymap, user command or `btv.decor` provider a test
--- *added*. What is not: a keymap, command or provider a test *deleted* (there is
--- no spec to rebuild it from), autocmds, the window layout, and buffers other
--- than the one `enew!` replaces.
+-- quickfix list, the global keymaps and user commands (one a test added, redefined
+-- or deleted), and any `btv.decor` provider a test *added*. What is not: a provider
+-- a test *deleted* (there is no spec to rebuild it from), buffer-local keymaps,
+-- autocmds, the window layout, and buffers other than the one `enew!` replaces.
 
 local REGISTERS = 'abcdefghijklmnopqrstuvwxyz0123456789"-'
 
@@ -1026,13 +1026,16 @@ local function snapshot()
     local ok, v = pcall(btv.reg.get, name)
     regs[name] = ok and v or nil
   end
+  -- The GLOBAL mappings, whole: each entry (with its own copy of the mode list) and
+  -- the function a Lua RHS runs, so a mapping a test redefined — or deleted — is put
+  -- back exactly. Buffer-local ones go with their buffer.
   local maps = {}
-  for _, mode in ipairs({ "n", "i", "v", "x", "s", "o", "c", "t" }) do
-    local seen = {}
-    for _, m in ipairs(btv.keymap.get(mode) or {}) do
-      seen[m.lhs] = true
+  for _, e in ipairs(btv._keymaps or {}) do
+    if e.buffer == nil or e.buffer == 0 then
+      local copy = shallow_copy(e)
+      copy.modes = shallow_copy(e.modes)
+      maps[#maps + 1] = { entry = copy, fn = btv._keymap_fns[e.id] }
     end
-    maps[mode] = seen
   end
   return {
     options = opts,
@@ -1103,19 +1106,57 @@ local function restore(b)
     end
   end
 
-  -- Only additions are undone: a mapping a test *deleted* cannot be rebuilt
-  -- from a snapshot of its left-hand sides.
-  for mode, seen in pairs(b.maps) do
-    for _, m in ipairs(btv.keymap.get(mode) or {}) do
-      if not seen[m.lhs] then
-        pcall(btv.keymap.del, mode, m.lhs)
-      end
+  -- Mappings: the baseline's global entries come back verbatim (a redefined or
+  -- deleted one included); the buffer-local ones a test's buffers hold stay.
+  local function maps_sig(list)
+    local parts = {}
+    for _, e in ipairs(list) do
+      parts[#parts + 1] = e.id .. ":" .. table.concat(e.modes, "")
+    end
+    return table.concat(parts, ",")
+  end
+  local now_global, kept_maps = {}, {}
+  for _, e in ipairs(btv._keymaps or {}) do
+    if e.buffer == nil or e.buffer == 0 then
+      now_global[#now_global + 1] = e
+    else
+      kept_maps[#kept_maps + 1] = e
     end
   end
-  for name in pairs(btv._user_commands or {}) do
-    if b.commands[name] == nil then
-      btv._user_commands[name] = nil
+  local want_global = {}
+  for _, m in ipairs(b.maps) do
+    want_global[#want_global + 1] = m.entry
+  end
+  if maps_sig(now_global) ~= maps_sig(want_global) then
+    local baseline_ids = {}
+    for _, m in ipairs(b.maps) do
+      baseline_ids[m.entry.id] = true
     end
+    for _, e in ipairs(now_global) do
+      if not baseline_ids[e.id] then
+        btv._keymap_fns[e.id] = nil
+      end
+    end
+    for _, m in ipairs(b.maps) do
+      local copy = shallow_copy(m.entry)
+      copy.modes = shallow_copy(m.entry.modes)
+      kept_maps[#kept_maps + 1] = copy
+      btv._keymap_fns[copy.id] = m.fn
+    end
+    btv._keymaps = kept_maps
+    btv._keymaps_version = btv._keymaps_version + 1
+  end
+  -- User commands: every name either side knows goes back to its baseline body
+  -- (nil for one a test added).
+  local cmd_names = {}
+  for name in pairs(b.commands) do
+    cmd_names[name] = true
+  end
+  for name in pairs(btv._user_commands or {}) do
+    cmd_names[name] = true
+  end
+  for name in pairs(cmd_names) do
+    btv._user_commands[name] = b.commands[name]
   end
 
   -- The sandbox surfaces: every key either side knows, so a surface a *test*

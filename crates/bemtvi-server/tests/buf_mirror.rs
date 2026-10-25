@@ -398,3 +398,38 @@ async fn changedtick_never_goes_backwards_across_a_reload() {
         "changedtick went backwards across a reload ({before} -> {after})",
     );
 }
+
+/// `vim.fn.getbufline` takes vim's `"$"` (the last line) for either bound and a
+/// `bufnr()`-style buffer expression (`"%"`), instead of raising on the string.
+#[tokio::test]
+async fn getbufline_accepts_dollar_and_buffer_expressions() {
+    let (rpc, _inc) = open("a\nb\nc\n").await;
+    let got = exec_lua(
+        &rpc,
+        "return table.concat(vim.fn.getbufline('%', 2, '$'), ',') .. '|' \
+           .. table.concat(vim.fn.getbufline(0, '$'), ',')",
+    )
+    .await;
+    assert_eq!(got.as_str(), Some("b,c|c"));
+}
+
+/// `btv.buf.offset` / `btv.buf.text` reject an out-of-range row LOUD, as neovim's
+/// `nvim_buf_get_offset` / `nvim_buf_get_text` do — instead of looping to a row number
+/// a caller passed (`2^53` spun the server thread forever) and padding with phantom
+/// empty lines.
+#[tokio::test]
+async fn buf_offset_and_text_reject_out_of_range_rows() {
+    let (rpc, _inc) = open("ab\ncd\n").await;
+    let got = exec_lua(
+        &rpc,
+        "local function ok(f, ...) return tostring((pcall(f, ...))) end\n\
+         return table.concat({\n\
+           btv.buf.offset(0, 2), ok(btv.buf.offset, 0, 3), ok(btv.buf.offset, 0, 2^53),\n\
+           ok(btv.buf.offset, 0, -1),\n\
+           table.concat(btv.buf.text(0, 0, 1, 1, 1), '|'),\n\
+           ok(btv.buf.text, 0, 0, 0, 2^53, 0), ok(btv.buf.text, 0, -1, 0, 0, 0),\n\
+         }, ' ')",
+    )
+    .await;
+    assert_eq!(got.as_str(), Some("6 false false false b|c false false"));
+}

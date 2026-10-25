@@ -328,3 +328,38 @@ async fn colorscheme_no_arg_reports_the_active_scheme() {
         "the query should report the loaded scheme, got {after:?}"
     );
 }
+
+/// `:sleep` is interruptible like vim's: `<C-c>` wakes the editor early, so even an
+/// absurdly long `:sleep 18446744073709551615m` cannot wedge the session.
+#[tokio::test]
+async fn ctrl_c_interrupts_sleep() {
+    let dir = temp_dir("excmd_sleep_interrupt");
+    let (rpc, _incoming) = start(&dir).await;
+
+    feed(&rpc, ":sleep 18446744073709551615m<CR>");
+    feed(&rpc, "<C-c>");
+    feed(&rpc, "ihello<Esc>");
+    let got = tokio::time::timeout(std::time::Duration::from_secs(5), lines(&rpc)).await;
+    assert_eq!(
+        got.expect("`<C-c>` must wake the editor from `:sleep`"),
+        vec!["hello"]
+    );
+}
+
+/// An uninterrupted `:sleep` still holds input for its span, then applies everything
+/// typed meanwhile in order.
+#[tokio::test]
+async fn sleep_buffers_input_until_it_wakes() {
+    let dir = temp_dir("excmd_sleep_buffers");
+    let (rpc, _incoming) = start(&dir).await;
+
+    let t0 = std::time::Instant::now();
+    feed(&rpc, ":sleep 300m<CR>");
+    feed(&rpc, "iab<Esc>");
+    feed(&rpc, "Acd<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["abcd"]);
+    assert!(
+        t0.elapsed() >= std::time::Duration::from_millis(250),
+        "the sleep held the input"
+    );
+}

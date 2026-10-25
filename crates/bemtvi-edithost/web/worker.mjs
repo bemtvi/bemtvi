@@ -15,6 +15,7 @@
 //     this mode (no run loop to wake them); input still works.
 import createModule from "../dist/eh.mjs";
 import { dialDaemon } from "./rpc.mjs";
+import { shadaPathFor } from "./daemon-trust.mjs";
 // Build-time feature flags. The standard editor build ships `localHost: false`; only the
 // python-demo build (build-demo.sh) flips it true, which makes this Worker install the local
 // in-browser process host (see the boot tail). The demo module is dynamic-imported, so the
@@ -901,9 +902,36 @@ async function opfsCopy(src, dst, recursive) {
   await opfsWriteBytes(dst, await opfsReadBytes(src), false);
 }
 
+// A session born from a daemon runs that daemon's config in this VM, and `btv.fs_local` reaches
+// OPFS directly even then — so the shada blobs (the local session's and every daemon's) are off
+// limits to Lua fs ops in such a session: no reading or writing inside them, and no moving,
+// copying or removing a directory that holds them. The session's own shada still flows through
+// the core (`eh_load_shada` / `eh_export_shada`); this only closes the side door.
+const SHADA_ROOTS = [[".bemtvi", "shada"], [".bemtvi", "remote-shada"]];
+function shadaStorageDenied(req) {
+  if (!bootDaemonUri) return null;
+  const tree = req.op === "rename" || req.op === "copy" || req.op === "remove";
+  for (const p of [req.path, req.from, req.to, req.src, req.dst]) {
+    if (p === undefined || p === null) continue;
+    const parts = [];
+    for (const seg of splitPath(p)) {
+      if (seg === "..") parts.pop();
+      else parts.push(seg);
+    }
+    for (const root of SHADA_ROOTS) {
+      const inside = root.every((r, i) => parts[i] === r);
+      const ancestor = parts.length < root.length && parts.every((s, i) => s === root[i]);
+      if (inside || (tree && ancestor)) return `${p}: shada storage is private to its session`;
+    }
+  }
+  return null;
+}
+
 // Run one high-level `btv.fs` op against OPFS, returning the `["ok"|"err", …]` reply envelope.
 // The serverless twin of the daemon's `serve_fs_op` → `run_fs_job`.
 async function opfsFsOp(req) {
+  const denied = shadaStorageDenied(req);
+  if (denied) return ["err", "EACCES", denied];
   try {
     switch (req.op) {
       // OPFS has no symlinks, so lstat is stat (never a "link" kind).
@@ -968,8 +996,8 @@ async function opfsFsOp(req) {
 // transport that answers `eh_take_fs_requests` differs. This is the browser twin of the
 // native `connect_quic` fs leg (Phase 3d/3e): editing stays in the Worker, only fs crosses
 // the wire. The watch (Phase 6c), async-proc (6d), and terminal (Phase 7) legs ride this
-// same `RpcClient` too; lsp/sys_run/luafs are later slices. Config + shada stay LOCAL
-// (OPFS) even in daemon mode — the thesis.
+// same `RpcClient` too; lsp/sys_run/luafs are later slices. The config comes from the daemon
+// (born remote); shada stays in OPFS, in that daemon's own blob (`SHADA_PATH`).
 //
 // `daemonUri` rides the Worker's own URL (`?daemon=…`), so the Worker self-configures with
 // no boot-message race. In daemon mode fs NEVER silently falls back to OPFS: a dial failure
@@ -980,6 +1008,10 @@ async function opfsFsOp(req) {
 // see `runtimeConnect`. Its truthiness is what switches the off-tick fs/watch seam from the
 // serverless OPFS sandbox onto the wire (`fulfillFsRequests` / `drainWatchRequests`).
 let daemonUri = new URL(self.location.href).searchParams.get("daemon");
+// The daemon this session was BORN from (its config runs here), fixed for the session's life —
+// it picks the shada namespace (`SHADA_PATH`) and gates `shadaStorageDenied`. A later runtime
+// `:connect` re-points the fs seam but runs no remote config, so it changes neither.
+const bootDaemonUri = daemonUri;
 let daemon = null; // an RpcClient once connected
 let daemonError = null; // a dial failure reason (daemon mode requested but not connected)
 
@@ -1098,7 +1130,10 @@ async function dialOnce(reconnected) {
 // (`startDaemonSupervisor`); this drives every dial *after* it.
 async function serveDaemonLink(myGen) {
   while (myGen === daemonGen && daemon) {
-    await daemon.dead.catch(() => {}); // wait for THIS connection to die
+    const why = await daemon.dead.catch(() => null); // wait for THIS connection to die
+    // A frame the wire refused (over a decode cap) is the daemon misbehaving, not a network
+    // blip — surface it, so the drop isn't only a status change.
+    if (why && why.protocol) postMessage({ type: "config_error", error: why.message });
     if (myGen !== daemonGen) return; // an intentional replace/teardown won the race
     // The link is down: drop the dead client so the seams read "not connected" (fail loud)
     // rather than a closed `RpcClient`, and forget the per-connection live state. Keep the run
@@ -1149,7 +1184,7 @@ async function startDaemonSupervisor() {
 // Replaces any existing link (a prior `?daemon=` boot or an earlier `:connect`): the old wire is
 // torn down (retiring its supervisor via `daemonGen`), its watches forgotten (the new daemon
 // knows none of them), and future `:e`/`:w` route to the new daemon. Posts a `connected` status
-// the UI flashes. Config + shada stay LOCAL (OPFS) regardless, exactly as in `?daemon=` mode.
+// the UI flashes. No remote config runs, and shada keeps the blob the session booted with.
 async function runtimeConnect(uri) {
   daemonGen++; // retire any running supervisor (and its serve loop) for the prior link
   if (daemon) {
@@ -2156,13 +2191,15 @@ async function fulfillFsRequests() {
 //
 // The editor's cross-session state (registers, marks, search/ex history, jumplist,
 // changelist) is the pure snapshot the core hands out; we serialize it to a single JSON
-// blob at SHADA_PATH in OPFS and restore it at boot (`bootWithConfig`). This is the
+// blob at SHADA_PATH in OPFS and restore it at boot (`bootWithConfig`). The local session
+// keeps `/.bemtvi/shada`; a session born from a `?daemon=` gets that daemon's own blob (see
+// daemon-trust.mjs), so a daemon's config never sees another session's registers/history. This is the
 // browser analogue of the native redb store — minus the multi-instance merge a single tab
 // doesn't need. Durability is the *debounced checkpoint* (write after a quiet period),
 // exactly as native treats it as the primary mechanism; a flush-with-exit-cursor on tab
 // hide seeds `'0` for next launch (best-effort — the debounce already captured the rest).
 // =============================================================================
-const SHADA_PATH = "/.bemtvi/shada";
+const SHADA_PATH = shadaPathFor(bootDaemonUri);
 const SHADA_DEBOUNCE_MS = 1200;
 let shadaBaseline = null; // last-written no-exit JSON, for change detection (skip no-op writes)
 let shadaDirty = false; // input arrived since the last checkpoint
@@ -2173,15 +2210,30 @@ let shadaFlushRequested = false; // a flush-with-exit was asked for (tab hidden 
 // change-detection baseline (pure cursor moves don't churn it); `includeExit` additionally
 // persists the clean-exit cursor so `'0` seeds next launch. Posts `shada_written` on a real
 // write (the UI's flush hook awaits it). Returns whether it wrote.
-async function checkpointShada(includeExit, force) {
+//
+// Checkpoints run one at a time: the message handler is async, so a hide-flush and a
+// throttled checkpoint can overlap, and OPFS refuses a second access handle on the file
+// while the first is open. The baseline moves only once a write lands, so a failed write
+// is retried at the next checkpoint instead of being mistaken for "already saved".
+let shadaChain = Promise.resolve();
+function checkpointShada(includeExit, force) {
+  const run = shadaChain.then(() => writeShada(includeExit, force));
+  shadaChain = run.catch(() => {});
+  return run;
+}
+async function writeShada(includeExit, force) {
   shadaDirty = false;
   const canonical = readStr(eh_export_shada(h, 0));
   if (!canonical) return false; // serialization failed — write nothing rather than a bad blob
   if (!force && canonical === shadaBaseline) return false;
-  shadaBaseline = canonical;
   const json = includeExit ? readStr(eh_export_shada(h, 1)) : canonical;
   const res = await opfsWrite(SHADA_PATH, new TextEncoder().encode(json));
-  if (res.ok) postMessage({ type: "shada_written", bytes: json.length });
+  if (res.ok) {
+    shadaBaseline = canonical;
+    postMessage({ type: "shada_written", bytes: json.length });
+  } else {
+    console.error(`bemtvi: shada checkpoint failed: ${res.error}`);
+  }
   return res.ok;
 }
 

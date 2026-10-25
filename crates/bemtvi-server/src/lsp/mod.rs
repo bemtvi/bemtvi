@@ -25,8 +25,8 @@ use bemtvi_lsp::lsp_types::{
     TextDocumentContentChangeEvent, TextDocumentSyncKind, TextEdit, Url,
 };
 use bemtvi_lsp::{
-    CodeActionData, PositionEncoding, ProviderCaps, SemanticLegend, ServerKey, ServerSpawn,
-    SignatureInfo, SymbolData,
+    CodeActionData, DocShadow, PositionEncoding, ProviderCaps, SemanticLegend, ServerKey,
+    ServerSpawn, SignatureInfo, SymbolData,
 };
 use bemtvi_lua::{DiagnosticData, LspServerCapabilities};
 
@@ -224,7 +224,7 @@ pub(crate) struct LspServerDoc {
     /// journaled edits over this to compute correct per-encoding positions, then it
     /// matches the buffer again; a full/resync push resets it to the whole text.
     /// (neovim's `prev_lines`.) See [`incremental_changes_against`].
-    shadow: String,
+    shadow: DocShadow,
     /// The buffer's `'endofline'` as of the last push — i.e. whether `shadow` is the
     /// whole rope (`true`) or the rope minus its phantom trailing `\n` (`false`).
     /// Kept per server because each advances its own shadow, and consulted rather than
@@ -908,61 +908,90 @@ pub(crate) fn lsp_range_to_bytes_in(
     range: &Range,
     encoding: PositionEncoding,
 ) -> std::ops::Range<usize> {
-    let start = lsp_pos_to_byte_in(buffer, range.start, encoding);
-    let end = lsp_pos_to_byte_in(buffer, range.end, encoding);
     // A well-formed LSP range has `start <= end`, but the server is untrusted: a
     // reversed range yields `start > end`, and downstream consumers compute
     // **unsigned** deltas over it — the cursor-shift planner in
     // [`Editor::apply_edits_to`](bemtvi_core::Editor) (`e_row - s_row`) and the
     // completion-accept's `r.end - r.start` — which underflow and panic the server
     // thread on a malformed reply (the same one-line-DoS class the row clamp in
-    // [`lsp_pos_to_byte_in`] already guards). Clamp `end` up to `start` so a
+    // [`LspPosResolver::pos`] already guards). Clamp `end` up to `start` so a
     // reversed range degrades to an empty (insert-only) edit instead of crashing;
     // a valid forward range round-trips unchanged.
-    start..end.max(start)
+    LspPosResolver::new(buffer).range(range, encoding)
 }
 
-/// Absolute byte offset of an LSP [`Position`] (in `encoding`) within `buffer`:
-/// the character offset converted against its line, the row added as a line start.
-///
-/// The `row` is **clamped** to the last row of the *document*: a server's
-/// `Position.line` is untrusted, and an out-of-range row would otherwise reach
-/// `buffer.line_start(row)` → ropey's `assert!(line_idx <= len_lines)` and panic
-/// the server thread (a one-line malformed-reply DoS). Clamping mirrors the
-/// column clamp `byte_col` already applies — a past-end position lands at the end
-/// of the document rather than crashing the editor.
-///
-/// The bound is the *document's* last row, not the rope's. The rope's phantom final
-/// row — the empty one after its trailing `\n` — is a real, addressable row of the
-/// document only when `'endofline'` says that newline is genuinely there; in a buffer
-/// read without a final newline it is bemtvi bookkeeping the server has never been told
-/// about, and a position resolved onto it would land one byte past the document's end.
-pub(crate) fn lsp_pos_to_byte_in(
-    buffer: &Buffer,
-    pos: Position,
-    encoding: PositionEncoding,
-) -> usize {
-    // `line_count` is the number of editable lines; a valid line index is
-    // `0..=line_count` (the count itself addresses the phantom row, i.e. the end of
-    // the document) — one less when the document doesn't end with a newline.
-    let last_row = buffer
-        .line_count()
-        .saturating_sub(usize::from(!buffer.options.endofline));
-    // Past the last row, the position is the document's **end** — not the start of the
-    // last row, which is what clamping the row and then resolving `character` against it
-    // gives. On a terminated document the two coincide (the clamp lands on the empty
-    // phantom row, whose start *is* the end), which is why clamping the row alone read as
-    // correct; on an unterminated one they are a whole line apart. That gap corrupted the
-    // single most ordinary LSP edit there is: a formatter's whole-document range ends at
-    // `{ line: <line count>, character: 0 }` — past the last row of a file with no
-    // trailing newline — so `:LspFormat` on such a file replaced only its *first* line
-    // with the whole formatted document and left the rest appended to it.
-    if pos.line as usize > last_row {
-        return buffer.document_len_bytes();
+/// [`lsp_range_to_bytes_in`] for many positions against one
+/// buffer — a publish's worth of diagnostics — sharing the column converter of the
+/// line it last resolved on. Converting each endpoint on its own copied and walked
+/// its whole line, so ten thousand diagnostics on a minified file's one long line
+/// were O(diagnostics x line length).
+pub(crate) struct LspPosResolver<'b> {
+    buffer: &'b Buffer,
+    line: Option<(usize, semantic::LineCols)>,
+}
+
+impl<'b> LspPosResolver<'b> {
+    pub(crate) fn new(buffer: &'b Buffer) -> Self {
+        Self { buffer, line: None }
     }
-    let row = pos.line as usize;
-    let line = buffer.line(row);
-    buffer.line_start(row) + byte_col(encoding, &line, pos.character as usize)
+
+    /// Absolute byte offset of an LSP [`Position`] (in `encoding`) within `buffer`:
+    /// the character offset converted against its line, the row added as a line start.
+    ///
+    /// The `row` is **clamped** to the last row of the *document*: a server's
+    /// `Position.line` is untrusted, and an out-of-range row would otherwise reach
+    /// `buffer.line_start(row)` → ropey's `assert!(line_idx <= len_lines)` and panic
+    /// the server thread (a one-line malformed-reply DoS). Clamping mirrors the
+    /// column clamp `byte_col` already applies — a past-end position lands at the end
+    /// of the document rather than crashing the editor.
+    ///
+    /// The bound is the *document's* last row, not the rope's. The rope's phantom final
+    /// row — the empty one after its trailing `\n` — is a real, addressable row of the
+    /// document only when `'endofline'` says that newline is genuinely there; in a buffer
+    /// read without a final newline it is bemtvi bookkeeping the server has never been told
+    /// about, and a position resolved onto it would land one byte past the document's end.
+    pub(crate) fn pos(&mut self, pos: Position, encoding: PositionEncoding) -> usize {
+        let buffer = self.buffer;
+        // `line_count` is the number of editable lines; a valid line index is
+        // `0..=line_count` (the count itself addresses the phantom row, i.e. the end of
+        // the document) — one less when the document doesn't end with a newline.
+        let last_row = buffer
+            .line_count()
+            .saturating_sub(usize::from(!buffer.options.endofline));
+        // Past the last row, the position is the document's **end** — not the start of the
+        // last row, which is what clamping the row and then resolving `character` against it
+        // gives. On a terminated document the two coincide (the clamp lands on the empty
+        // phantom row, whose start *is* the end), which is why clamping the row alone read as
+        // correct; on an unterminated one they are a whole line apart. That gap corrupted the
+        // single most ordinary LSP edit there is: a formatter's whole-document range ends at
+        // `{ line: <line count>, character: 0 }` — past the last row of a file with no
+        // trailing newline — so `:LspFormat` on such a file replaced only its *first* line
+        // with the whole formatted document and left the rest appended to it.
+        if pos.line as usize > last_row {
+            return buffer.document_len_bytes();
+        }
+        let row = pos.line as usize;
+        let cols = match &mut self.line {
+            Some((at, cols)) if *at == row => cols,
+            slot => {
+                &mut slot
+                    .insert((row, semantic::LineCols::new(buffer.line(row))))
+                    .1
+            }
+        };
+        buffer.line_start(row) + cols.byte(encoding, pos.character as usize)
+    }
+
+    /// Absolute byte range of `range`, exactly as [`lsp_range_to_bytes_in`] documents.
+    pub(crate) fn range(
+        &mut self,
+        range: &Range,
+        encoding: PositionEncoding,
+    ) -> std::ops::Range<usize> {
+        let start = self.pos(range.start, encoding);
+        let end = self.pos(range.end, encoding);
+        start..end.max(start)
+    }
 }
 
 /// Convert LSP `(range, new_text)` edits into the byte edits
@@ -1074,25 +1103,34 @@ pub(crate) fn lsp_position_in(
 /// a recomputed diff, so it stays incremental in every encoding. The caller keeps
 /// `shadow` across syncs (seeded at `didOpen`, reset on a full/resync push).
 pub(crate) fn incremental_changes_against(
-    shadow: &mut String,
+    shadow: &mut DocShadow,
     edits: &[BufferEdit],
     encoding: PositionEncoding,
-) -> Vec<TextDocumentContentChangeEvent> {
+) -> Option<Vec<TextDocumentContentChangeEvent>> {
     let mut changes = Vec::with_capacity(edits.len());
     for e in edits {
         let start = e.start_byte.min(shadow.len());
         let end = e.old_end_byte.min(shadow.len()).max(start);
+        // Checked before resolving the endpoints: a mid-character offset can't be
+        // converted to a UTF-16/32 column (the rope slice would panic).
+        if !shadow.is_char_boundary(start) || !shadow.is_char_boundary(end) {
+            return None;
+        }
         changes.push(TextDocumentContentChangeEvent {
             range: Some(Range {
-                start: shadow_position(shadow, start, encoding),
-                end: shadow_position(shadow, end, encoding),
+                start: shadow.position(start, encoding),
+                end: shadow.position(end, encoding),
             }),
             range_length: None,
             text: e.text.clone(),
         });
-        shadow.replace_range(start..end, &e.text);
+        // A delta that doesn't fit the shadow (mid-character, past its end) means it
+        // no longer mirrors the journal: give up on deltas and resend the document.
+        if !shadow.replace(start..end, &e.text) {
+            return None;
+        }
     }
-    changes
+    Some(changes)
 }
 
 /// [`incremental_changes_against`] for a buffer whose document is not the whole rope
@@ -1119,11 +1157,11 @@ pub(crate) fn incremental_changes_against(
 /// A `'fixendofline'` write flipping the buffer to `endofline` therefore syncs as a
 /// lone "append the newline" change.
 ///
-/// `None` when the replayed shadow doesn't end in `\n` — the rope invariant would have
-/// to have been violated for that, so rather than emit a delete of some other byte the
-/// caller falls back to pushing the whole document.
+/// `None` when the replayed shadow doesn't end in `\n`, or a journaled delta doesn't fit
+/// it — the shadow no longer mirrors the journal, so rather than emit a delete of some
+/// other byte the caller falls back to pushing the whole document.
 pub(crate) fn incremental_changes_bridging_eol(
-    shadow: &mut String,
+    shadow: &mut DocShadow,
     edits: &[BufferEdit],
     encoding: PositionEncoding,
     was_short: bool,
@@ -1135,62 +1173,51 @@ pub(crate) fn incremental_changes_bridging_eol(
     }
     let mut changes = Vec::with_capacity(edits.len() + 2);
     if was_short {
-        let at = shadow_position(shadow, shadow.len(), encoding);
+        let len = shadow.len();
+        let at = shadow.position(len, encoding);
         changes.push(TextDocumentContentChangeEvent {
             range: Some(Range { start: at, end: at }),
             range_length: None,
             text: "\n".to_string(),
         });
-        shadow.push('\n');
+        shadow.replace(len..len, "\n");
     }
-    changes.extend(incremental_changes_against(shadow, edits, encoding));
+    changes.extend(incremental_changes_against(shadow, edits, encoding)?);
     if is_short {
-        let cut = shadow.strip_suffix('\n')?.len();
+        if !shadow.ends_with_newline() {
+            return None;
+        }
+        let len = shadow.len();
+        let cut = len - 1;
         changes.push(TextDocumentContentChangeEvent {
             range: Some(Range {
-                start: shadow_position(shadow, cut, encoding),
-                end: shadow_position(shadow, shadow.len(), encoding),
+                start: shadow.position(cut, encoding),
+                end: shadow.position(len, encoding),
             }),
             range_length: None,
             text: String::new(),
         });
-        shadow.truncate(cut);
+        shadow.replace(cut..len, "");
     }
     Some(changes)
-}
-
-/// An absolute byte offset in `shadow` as an LSP [`Position`] in `encoding` — the
-/// shadow-addressed sibling of [`lsp_position_in`], used by
-/// [`incremental_changes_against`]. Resolves the line, then the column the chosen
-/// encoding wants from the line's own text (UTF-8 byte = identity).
-fn shadow_position(shadow: &str, byte: usize, encoding: PositionEncoding) -> Position {
-    let byte = byte.min(shadow.len());
-    let prefix = &shadow[..byte];
-    let line = prefix.bytes().filter(|b| *b == b'\n').count();
-    let line_start = prefix.rfind('\n').map_or(0, |i| i + 1);
-    let line_end = shadow[line_start..]
-        .find('\n')
-        .map_or(shadow.len(), |i| line_start + i);
-    let col = byte - line_start;
-    let line_text = &shadow[line_start..line_end];
-    let character = match encoding {
-        PositionEncoding::Utf8 => col,
-        PositionEncoding::Utf16 => unicode::byte_to_utf16(line_text, col),
-        PositionEncoding::Utf32 => line_text[..col.min(line_text.len())].chars().count(),
-    };
-    Position {
-        line: line as u32,
-        character: character as u32,
-    }
 }
 
 /// Byte offset of LSP `character` on `line`, the inverse of [`EditHost::lsp_position`]
 /// (Decision 4): UTF-8 is the identity (a character *is* a byte offset, clamped
 /// to the line), UTF-16/UTF-32 need column math. Clamped to the line length so a
 /// past-end character (a diagnostic whose range runs to EOL) lands at the end.
+/// A UTF-8 `character` naming a byte *inside* a multibyte character (the server is
+/// untrusted) snaps down to that character's start, so the result is always a `str`
+/// index into `line`.
 pub(crate) fn byte_col(encoding: PositionEncoding, line: &str, character: usize) -> usize {
     match encoding {
-        PositionEncoding::Utf8 => character.min(line.len()),
+        PositionEncoding::Utf8 => {
+            let mut byte = character.min(line.len());
+            while !line.is_char_boundary(byte) {
+                byte -= 1;
+            }
+            byte
+        }
         PositionEncoding::Utf16 => unicode::utf16_to_byte(line, character),
         PositionEncoding::Utf32 => line
             .char_indices()
@@ -1296,6 +1323,7 @@ pub(crate) fn provider_caps_to_lua(p: &ProviderCaps) -> LspServerCapabilities {
         signature_help: p.signature_help,
         completion: p.completion,
         document_formatting: p.document_formatting,
+        document_range_formatting: p.document_range_formatting,
         rename: p.rename,
         code_action: p.code_action,
         semantic_tokens: p.semantic_tokens,

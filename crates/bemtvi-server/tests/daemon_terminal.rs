@@ -199,3 +199,120 @@ async fn terminal_echoes_interactive_input_and_honors_kill() {
         "term_kill must terminate the child and surface its exit"
     );
 }
+
+/// Stand up a `serve_term_daemon_on` whose inbound stream the test feeds directly, so the
+/// test can end the leg (drop the sender — what a dropped daemon link does to its demuxed
+/// `incoming`) and observe what happens to the children it spawned. Returns the sender
+/// that drives the leg, and the client side of the reply wire to read `term_data` from.
+#[cfg(target_os = "linux")]
+fn spawn_term_daemon_fed() -> (
+    tokio::sync::mpsc::UnboundedSender<Incoming>,
+    UnboundedReceiver<Incoming>,
+    Rpc,
+) {
+    let (client_end, daemon_end) = tokio::io::duplex(1 << 16);
+    let (dr, dw) = tokio::io::split(daemon_end);
+    let (daemon_rpc, _ignored_inbound) = connect(dr, dw);
+    let (feed_tx, feed_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let _keep = _ignored_inbound;
+        let _ = bemtvi_server::serve_term_daemon_on(daemon_rpc, feed_rx).await;
+    });
+    let (cr, cw) = tokio::io::split(client_end);
+    let (client_rpc, client_incoming) = connect(cr, cw);
+    (feed_tx, client_incoming, client_rpc)
+}
+
+#[cfg(target_os = "linux")]
+fn fed_open(feed: &tokio::sync::mpsc::UnboundedSender<Incoming>, buf: u64, argv: &[&str]) {
+    feed.send(Incoming::Notification {
+        method: "term_open".into(),
+        params: vec![
+            Value::from(buf),
+            Value::Array(argv.iter().map(|s| Value::from(*s)).collect()),
+            Value::Nil,
+            Value::from(24u64),
+            Value::from(80u64),
+        ],
+    })
+    .unwrap();
+}
+
+/// A shell that reports its pid and then parks forever, so only an explicit kill (or a
+/// hangup) can end it.
+#[cfg(target_os = "linux")]
+const PARKED: &[&str] = &["sh", "-c", "echo PID=$$; exec sleep 300"];
+
+/// Read the `PID=<n>` line a [`PARKED`] child printed.
+#[cfg(target_os = "linux")]
+async fn parked_pid(incoming: &mut UnboundedReceiver<Incoming>, buf: u64) -> u32 {
+    let (text, seen) = await_text(incoming, buf, "\n").await;
+    assert!(seen.is_some(), "the parked child never reported: {text:?}");
+    let digits: String = text
+        .split("PID=")
+        .nth(1)
+        .unwrap_or("")
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits
+        .parse()
+        .unwrap_or_else(|_| panic!("no pid in {text:?}"))
+}
+
+/// Whether `pid` is still a live (non-zombie) process.
+#[cfg(target_os = "linux")]
+fn alive(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .is_some_and(|state| state != "Z" && state != "X"),
+        Err(_) => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn await_dead(pid: u32) -> bool {
+    for _ in 0..250 {
+        if !alive(pid) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// When the edit-host's link drops, the terminal leg ends — and it must take its PTY
+/// children with it. The daemon outlives its connections, so a shell left behind keeps
+/// running (and its reader thread stays parked on the PTY) for every disconnect.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_dropped_link_reaps_its_terminal_children() {
+    let (feed, mut incoming, _client) = spawn_term_daemon_fed();
+    fed_open(&feed, 3, PARKED);
+    let pid = parked_pid(&mut incoming, 3).await;
+    assert!(alive(pid), "the parked child should be running");
+
+    drop(feed); // the link is gone
+    assert!(
+        await_dead(pid).await,
+        "the terminal child {pid} outlived the connection that spawned it"
+    );
+}
+
+/// Re-opening a terminal on a buffer id that already has one replaces the session — the
+/// previous child must be ended, not leaked behind the new one.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn reopening_a_terminal_id_ends_the_previous_child() {
+    let (feed, mut incoming, _client) = spawn_term_daemon_fed();
+    fed_open(&feed, 4, PARKED);
+    let first = parked_pid(&mut incoming, 4).await;
+    fed_open(&feed, 4, PARKED);
+    assert!(
+        await_dead(first).await,
+        "the replaced terminal child {first} was leaked"
+    );
+    drop(feed);
+}

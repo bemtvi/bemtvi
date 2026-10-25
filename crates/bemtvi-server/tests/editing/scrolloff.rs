@@ -185,3 +185,24 @@ async fn ctrl_e_stops_at_the_scrolloff_margin_past_the_last_line() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_count_on_ctrl_e_scrolls_that_many_lines() {
+    let (rpc, _incoming) = start(None).await;
+    let text: Vec<String> = (1..=30).map(|n| format!("line {n}")).collect();
+    let text: Vec<&str> = text.iter().map(String::as_str).collect();
+    edit_probe(&rpc, &text, (1, 0), ":set scrolloff=0<CR>5<C-e>").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.win.saveview().topline").await,
+        Value::from(6)
+    );
+    assert_eq!(cursor(&rpc).await, (6, 0));
+    // Past the end, vim scrolls as far as it can: the last line at the top.
+    edit_probe(&rpc, &["a", "b", "c"], (1, 0), "5<C-e>").await;
+    assert_eq!(cursor(&rpc).await, (3, 0));
+    feed(&rpc, "2<C-y>");
+    assert_eq!(
+        exec_lua(&rpc, "return btv.win.saveview().topline").await,
+        Value::from(1)
+    );
+}

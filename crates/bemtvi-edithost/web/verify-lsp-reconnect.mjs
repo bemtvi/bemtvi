@@ -36,6 +36,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { globSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { APPROVALS_KEY, approvalEntry, daemonIdentity } from "./daemon-trust.mjs";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const PORT = 8146; // disjoint from verify-lsp (8143) / verify-reconnect (8141) / drop-failures (8144)
@@ -194,6 +195,9 @@ try {
   });
   page.on("pageerror", (e) => console.log("  [pageerror]", e.message));
 
+  // The page asks before dialing a `?daemon=` link; pre-approve this daemon (as a user
+  // who approved it earlier would have) so the run connects without the prompt.
+  await page.addInitScript(([k, v]) => localStorage.setItem(k, JSON.stringify([v])), [APPROVALS_KEY, approvalEntry(daemonIdentity(uri))]);
   await page.goto(`http://localhost:${PORT}/web/?daemon=${encodeURIComponent(uri)}`);
   await page.waitForFunction(() => window.__bemtvi !== undefined, null, { timeout: 15000 });
   await page.evaluate(() => window.__bemtvi.ready);

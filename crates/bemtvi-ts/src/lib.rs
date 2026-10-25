@@ -27,12 +27,14 @@ pub use loader::{Grammar, LoadedLanguage};
 /// `$BEMTVI_DATA_DIR` overrides everything (used by tests); otherwise
 /// `stdpath("data")` — [`bemtvi_core::stdpath`] owns that policy, so the grammar
 /// root is the same directory `btv.stdpath("data")` reports and plugins install
-/// under, on every platform.
-pub fn data_dir() -> PathBuf {
+/// under, on every platform. `None` for a process with no home and no XDG or
+/// platform base: grammars are native libraries, and loading them from a directory
+/// relative to the working directory (a checked-out project) is not an option.
+pub fn data_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("BEMTVI_DATA_DIR") {
-        return PathBuf::from(dir);
+        return Some(PathBuf::from(dir));
     }
-    bemtvi_core::stdpath::data_dir().unwrap_or_else(|| PathBuf::from(".bemtvi"))
+    bemtvi_core::stdpath::data_dir()
 }
 
 /// One installed grammar discovered on the search path (what `:TSInstallInfo`
@@ -55,7 +57,7 @@ pub struct InstalledParser {
 /// [`Engine`] loads them: a grammar present in several roots is reported once,
 /// from the first root that has it. Sorted by language. Used by `:TSInstallInfo`.
 pub fn installed_parsers() -> Vec<InstalledParser> {
-    let mut roots = vec![data_dir()];
+    let mut roots: Vec<PathBuf> = data_dir().into_iter().collect();
     roots.extend(extra_roots());
 
     let mut seen = HashSet::new();
@@ -115,6 +117,14 @@ fn query_names_in(root: &Path, lang: &str) -> Vec<String> {
     names
 }
 
+/// `$XDG_DATA_HOME` when set to an absolute path. Empty or relative values are
+/// ignored (the XDG spec), so a grammar is never loaded from a cwd-relative dir.
+fn xdg_data_home() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute())
+}
+
 /// Extra, **read-only** roots searched after bemtvi's own [`data_dir`] when
 /// resolving a grammar — currently an existing **neovim** install's
 /// `site/` (`parser/<lang>.*` + `queries/<lang>/`), so a user who already ran
@@ -137,16 +147,16 @@ pub fn extra_roots() -> Vec<PathBuf> {
     // config and data share the one `%LOCALAPPDATA%` root.
     #[cfg(windows)]
     {
-        if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-            push(PathBuf::from(dir).join("nvim-data").join("site"));
+        if let Some(dir) = xdg_data_home() {
+            push(dir.join("nvim-data").join("site"));
         } else if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
             push(PathBuf::from(dir).join("nvim-data").join("site"));
         }
     }
     #[cfg(not(windows))]
     {
-        if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-            push(PathBuf::from(dir).join("nvim").join("site"));
+        if let Some(dir) = xdg_data_home() {
+            push(dir.join("nvim").join("site"));
         } else if let Some(home) = bemtvi_core::stdpath::home_dir() {
             push(home.join(".local").join("share").join("nvim").join("site"));
         }

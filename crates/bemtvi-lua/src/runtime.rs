@@ -1511,9 +1511,16 @@ fn git_value_to_lua(lua: &Lua, value: GitValue) -> mlua::Result<mlua::Value> {
             t.set("hunks", list)?;
             mlua::Value::Table(t)
         }
-        GitValue::Status { dirty, entries } => {
+        GitValue::Status {
+            dirty,
+            entries,
+            notice,
+        } => {
             let t = lua.create_table()?;
             t.set("dirty", dirty)?;
+            if let Some(n) = notice {
+                t.set("notice", n)?;
+            }
             let list = lua.create_table()?;
             for e in entries {
                 let et = lua.create_table()?;
@@ -1778,8 +1785,10 @@ impl LuaRuntime {
     /// Run a Lua chunk read from a file, naming it `name` (use `@<path>`) so an
     /// error/traceback points at the source file — the entry for sourcing the
     /// package `plugin/` scripts at startup.
-    pub fn exec_named(&self, chunk: &str, name: &str) -> mlua::Result<()> {
-        self.lua.load(chunk).set_name(name).exec()
+    /// The chunk is bytes, not `&str`: Lua source is byte-clean, so a script saved in a
+    /// non-UTF-8 encoding runs as it would under `require`.
+    pub fn exec_named(&self, chunk: impl AsRef<[u8]>, name: &str) -> mlua::Result<()> {
+        self.lua.load(chunk.as_ref()).set_name(name).exec()
     }
 
     /// Evaluate a Lua chunk and convert its return value to an RPC [`rmpv::Value`]
@@ -1924,6 +1933,10 @@ impl LuaRuntime {
         caps.set("signatureHelpProvider", c.signature_help)?;
         caps.set("completionProvider", c.completion)?;
         caps.set("documentFormattingProvider", c.document_formatting)?;
+        caps.set(
+            "documentRangeFormattingProvider",
+            c.document_range_formatting,
+        )?;
         caps.set("renameProvider", c.rename)?;
         caps.set("codeActionProvider", c.code_action)?;
         caps.set("semanticTokensProvider", c.semantic_tokens)?;
@@ -2982,6 +2995,15 @@ impl LuaRuntime {
         run.call::<()>((arg, mode, self.resume_keys_seq(resume_keys)?))
     }
 
+    /// Cancel the active picker because another widget replaced its menu: the same
+    /// `btv._picker_result(nil)` an `<Esc>` delivers, minus the resume snapshot (the
+    /// core captured none, so the previous resumable picker is kept).
+    pub fn run_picker_cancel(&self) -> mlua::Result<()> {
+        let btv = self.btv()?;
+        let run: mlua::Function = btv.get("_picker_result")?;
+        run.call::<()>((mlua::Value::Nil, "current", mlua::Value::Nil))
+    }
+
     /// Deliver the picker's "send these results to a list" outcome: the matched item
     /// `keys` (in display order) and the live `query` go to `btv._picker_send`, which
     /// maps the keys back to the source item tables and builds a named list keyed
@@ -3523,38 +3545,23 @@ impl LuaRuntime {
         let mut out = Vec::with_capacity(list.raw_len());
         for entry in list.sequence_values::<Table>() {
             let entry = entry?;
-            let modes = entry
-                .get::<Option<Vec<String>>>("modes")?
-                .unwrap_or_default();
-            let lhs: String = entry.get("lhs")?;
-            let noremap = entry.get::<Option<bool>>("noremap")?.unwrap_or(true);
-            let buffer = entry.get::<Option<u64>>("buffer")?;
-            let desc = entry.get::<Option<String>>("desc")?;
-            let nowait = entry.get::<Option<bool>>("nowait")?.unwrap_or(false);
-            let silent = entry.get::<Option<bool>>("silent")?.unwrap_or(false);
-            let expr = entry.get::<Option<bool>>("expr")?.unwrap_or(false);
-            let default = entry.get::<Option<bool>>("default")?.unwrap_or(false);
-            let seq = entry.get::<Option<u64>>("id")?.unwrap_or(0);
-            let rhs_tbl: Table = entry.get("rhs")?;
-            let kind: String = rhs_tbl.get("kind")?;
-            let rhs = if kind == "lua" {
-                RawRhs::Lua(rhs_tbl.get::<u64>("id")?)
-            } else {
-                RawRhs::Str(rhs_tbl.get::<String>("str")?)
-            };
-            out.push(RawKeymap {
-                modes,
-                lhs,
-                rhs,
-                noremap,
-                buffer,
-                desc,
-                nowait,
-                silent,
-                expr,
-                default,
-                seq,
-            });
+            // One entry the bridge cannot read is skipped and reported, never allowed
+            // to fail the whole snapshot: that would silently drop every *other* user
+            // mapping along with it.
+            match read_keymap(&entry) {
+                Ok(km) => out.push(km),
+                Err(err) => {
+                    let lhs = entry
+                        .get::<Option<String>>("lhs")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    self.shared.borrow_mut().output.push(OutputLine {
+                        text: format!("btv.keymap: mapping `{lhs}` ignored: {err}"),
+                        error: true,
+                    });
+                }
+            }
         }
         Ok(out)
     }
@@ -4383,7 +4390,7 @@ impl LuaRuntime {
             match value {
                 OptionValue::Bool(b) => entries.set(name.as_str(), *b)?,
                 OptionValue::Number(n) => {
-                    entries.set(name.as_str(), crate::convert::lua_int(*n))?
+                    entries.set(name.as_str(), crate::convert::lua_number(*n))?
                 }
                 OptionValue::String(s) => entries.set(name.as_str(), s.as_str())?,
             }
@@ -4669,28 +4676,27 @@ impl LuaRuntime {
 
     /// Invoke the user command `name` (resolved for buffer `bufnr`) with `args`
     /// (the text after the name). A function command is called with an opts table
-    /// (`name`, `args`, `fargs`, `bang`); a string command is queued as an
-    /// ex-command. Effects land in [`Shared`] and are drained by the server like
-    /// any other chunk.
+    /// (`name`, `args`, `fargs`, `bang`, `line1`, `line2`, `range`); a string command
+    /// is queued as an ex-command. Effects land in [`Shared`] and are drained by the
+    /// server like any other chunk.
     ///
-    /// The bang-less wire shape, kept so the server call site keeps compiling
-    /// until it migrates; forwards with `bang = false`. New callers should use
-    /// [`Self::run_user_command_bang`] and pass the invocation's parsed `!`.
-    pub fn run_user_command(&self, name: &str, args: &str, bufnr: u64) -> mlua::Result<()> {
-        self.run_user_command_bang(name, args, bufnr, false)
-    }
-
-    /// [`Self::run_user_command`], with the invocation's `!` threaded through:
     /// `bang` is whether the typed command carried a trailing bang (`:Name!`),
     /// surfaced to a function command as `opts.bang` — so a command registered
     /// with `bang = true` can actually branch on it. (A string command is queued
     /// unchanged; its body spells its own bangs.)
+    ///
+    /// `range` is the invocation's explicit 0-based inclusive line range (`None` when it
+    /// carried no address) and `cursor_line` the 0-based cursor line; the callback's
+    /// `opts` gets neovim's 1-based `line1`/`line2` and the address count `range`
+    /// (`0` without one, when both lines are the cursor's).
     pub fn run_user_command_bang(
         &self,
         name: &str,
         args: &str,
         bufnr: u64,
         bang: bool,
+        range: Option<(usize, usize)>,
+        cursor_line: usize,
     ) -> mlua::Result<()> {
         match self.user_command(name, bufnr)? {
             mlua::Value::Function(f) => {
@@ -4703,6 +4709,13 @@ impl LuaRuntime {
                 }
                 opts.set("fargs", fargs)?;
                 opts.set("bang", bang)?;
+                let (line1, line2, count) = match range {
+                    Some((lo, hi)) => (lo, hi, if lo == hi { 1 } else { 2 }),
+                    None => (cursor_line, cursor_line, 0),
+                };
+                opts.set("line1", line1 + 1)?;
+                opts.set("line2", line2 + 1)?;
+                opts.set("range", count)?;
                 f.call::<()>(opts)?;
                 Ok(())
             }
@@ -4724,4 +4737,40 @@ impl LuaRuntime {
         let resolve: mlua::Function = self.btv()?.get("_resolve_user_command")?;
         resolve.call((name, bufnr))
     }
+}
+
+/// Read one `btv._keymaps` entry into a [`RawKeymap`].
+fn read_keymap(entry: &Table) -> mlua::Result<RawKeymap> {
+    let modes = entry
+        .get::<Option<Vec<String>>>("modes")?
+        .unwrap_or_default();
+    let lhs: String = entry.get("lhs")?;
+    let noremap = entry.get::<Option<bool>>("noremap")?.unwrap_or(true);
+    let buffer = entry.get::<Option<u64>>("buffer")?;
+    let desc = entry.get::<Option<String>>("desc")?;
+    let nowait = entry.get::<Option<bool>>("nowait")?.unwrap_or(false);
+    let silent = entry.get::<Option<bool>>("silent")?.unwrap_or(false);
+    let expr = entry.get::<Option<bool>>("expr")?.unwrap_or(false);
+    let default = entry.get::<Option<bool>>("default")?.unwrap_or(false);
+    let seq = entry.get::<Option<u64>>("id")?.unwrap_or(0);
+    let rhs_tbl: Table = entry.get("rhs")?;
+    let kind: String = rhs_tbl.get("kind")?;
+    let rhs = if kind == "lua" {
+        RawRhs::Lua(rhs_tbl.get::<u64>("id")?)
+    } else {
+        RawRhs::Str(rhs_tbl.get::<String>("str")?)
+    };
+    Ok(RawKeymap {
+        modes,
+        lhs,
+        rhs,
+        noremap,
+        buffer,
+        desc,
+        nowait,
+        silent,
+        expr,
+        default,
+        seq,
+    })
 }

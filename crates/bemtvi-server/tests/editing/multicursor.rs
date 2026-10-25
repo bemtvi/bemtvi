@@ -1050,6 +1050,28 @@ async fn each_window_keeps_its_own_secondary_cursors() {
     );
 }
 
+/// A window's stashed cursor set is byte offsets: when the *other* window onto
+/// the same buffer deletes the text they pointed into, refocusing must not
+/// restore a cursor past the end of the buffer (the frame used to panic placing it).
+#[tokio::test]
+async fn a_stashed_cursor_set_survives_the_other_window_deleting_its_text() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "iaaa<CR>bbb<CR>ccc<Esc>gg");
+    // Place the set, *then* split: the original window stashes a copy of it.
+    feed(&rpc, "G<A-c>ggc<Esc>");
+    feed(&rpc, "<C-w>v");
+    feed(&rpc, ":%d<CR>");
+    let map = redraw_after(&rpc, &mut incoming, "<C-w>w").await;
+    assert_eq!(lines(&rpc).await, vec![""]);
+    assert!(
+        focused_secondary_cursors(&map)
+            .iter()
+            .all(|&(row, _)| row == 0),
+        "every restored cursor lies inside the one remaining line: {:?}",
+        focused_secondary_cursors(&map)
+    );
+}
+
 /// The per-buffer undo tree is shared between two windows onto the same buffer,
 /// but a multi-cursor set is window-local: undoing *another* window's
 /// multi-cursor edit reverts the text without importing that window's cursors

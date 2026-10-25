@@ -473,3 +473,27 @@ async fn an_open_insert_that_typed_nothing_shows_no_pending_state() {
     let seq = exec_lua(&rpc, "return btv.undotree.get().seq_last").await;
     assert_eq!(seq.as_u64(), Some(1));
 }
+
+/// `i_CTRL-G_u` closes the undo step mid-word, so `u` takes back only what was
+/// typed after it.
+#[tokio::test]
+async fn ctrl_g_u_breaks_the_undo_step_inside_a_word() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo<C-g>ubar<Esc>");
+    assert_eq!(lines(&rpc).await, v(&["foobar"]));
+    assert_eq!(undo(&rpc).await, v(&["foo"]));
+    assert_eq!(undo(&rpc).await, v(&[""]));
+}
+
+/// An `i_CTRL-G_*` command bemtvi lacks says so instead of eating the key.
+#[tokio::test]
+async fn unimplemented_ctrl_g_command_fails_loud() {
+    let (rpc, mut incoming) = start(None).await;
+    let msg = message_after(&rpc, &mut incoming, "ifoo<C-g>j").await;
+    assert!(
+        msg.contains("i_CTRL-G_j is not implemented"),
+        "message: {msg:?}"
+    );
+    feed(&rpc, "x<Esc>");
+    assert_eq!(lines(&rpc).await, v(&["foox"]));
+}

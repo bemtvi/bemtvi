@@ -95,7 +95,16 @@ impl LspLog {
                 sink: None,
             };
         }
-        let path = log_path();
+        let Some(path) = log_path() else {
+            eprintln!(
+                "bemtvi: LSP log disabled — no state directory (no home, $XDG_STATE_HOME \
+                 or platform default); set BEMTVI_LSP_LOG_FILE to log"
+            );
+            return LspLog {
+                threshold,
+                sink: None,
+            };
+        };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -146,19 +155,13 @@ impl LspLog {
 /// `:LspInfo` can report the path the log *actually* goes to rather than reciting a
 /// hard-coded Unix one that is wrong on Windows.
 #[cfg_attr(not(feature = "native"), allow(dead_code))]
-pub fn log_path() -> PathBuf {
+/// `None` when neither is available (no home and no XDG or platform base): the log is
+/// then off rather than written into the working directory.
+pub fn log_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("BEMTVI_LSP_LOG_FILE") {
-        return PathBuf::from(path);
+        return Some(PathBuf::from(path));
     }
-    state_dir().join("lsp.log")
-}
-
-/// bemtvi's per-user state directory — `stdpath("state")`, the same one shada
-/// writes to. [`bemtvi_core::stdpath`] owns the policy across every crate; the
-/// relative last resort is for a process with no home and no platform base.
-#[cfg_attr(not(feature = "native"), allow(dead_code))]
-fn state_dir() -> PathBuf {
-    bemtvi_core::stdpath::state_dir().unwrap_or_else(|| PathBuf::from(".bemtvi"))
+    bemtvi_core::stdpath::state_dir().map(|dir| dir.join("lsp.log"))
 }
 
 /// Format a `SystemTime` as `YYYY-MM-DD HH:MM:SS` in **UTC**, dependency-free

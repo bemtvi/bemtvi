@@ -234,9 +234,9 @@ impl Editor {
     /// a number for `tabstop`/`shiftwidth`/`softtabstop`/the `fold*` knobs/
     /// `undolevels` (booleans arrive through [`Editor::set_buffer_option_bool`]). It
     /// is clamped to each option's valid range (`tabstop ≥ 1`, `shiftwidth ≥ 0`,
-    /// `softtabstop ≥ -1`, `undolevels ≥ -1`). Unknown options
-    /// and unknown buffers are ignored (the Lua side only forwards the wired set,
-    /// and the buffer is mirror-guarded).
+    /// `softtabstop ≥ -1`, `undolevels ≥ -1`). An unknown buffer is ignored (it is
+    /// mirror-guarded); a number written to an option that isn't numeric fails loud
+    /// (`E474`) rather than being dropped.
     pub fn set_buffer_option_num(&mut self, id: BufferId, name: &str, value: i64) {
         // Every arm below writes a `bo` mirror row (`tabstop`/`shiftwidth`/
         // `softtabstop`/the `fold*` knobs) — see `bump_options_generation`. The
@@ -271,7 +271,10 @@ impl Editor {
                 ob.buffer.options.undolevels = value.max(-1);
                 return;
             }
-            _ => return,
+            _ => {
+                self.reject_bridge_option(name, value, "not a number option");
+                return;
+            }
         }
         // `shiftwidth`/`tabstop` change the indent scale and the two `fold*` knobs the
         // computed structure, so a buffer the focused window shows must re-fold.
@@ -323,15 +326,17 @@ impl Editor {
             // block `:q` with E37 — the `btv.view` `set_view_lines` clear, reached via
             // the public option surface for a plugin-filled ordinary buffer.
             ob.buffer.modified = value;
+        } else {
+            self.reject_bridge_option(name, value, "not a boolean option");
         }
     }
 
     /// Set a string buffer-local option (`regexsyntax` / `fileencoding`) on buffer
     /// `id` — the `vim.bo` string companion to [`Editor::set_buffer_option_num`]. An
-    /// unknown option, an unknown buffer, or an invalid value (a `regexsyntax` other
-    /// than `"pcre"`/`"vim"`, an unknown `fileencoding` label) is ignored; the
-    /// `:set` ex path is where a bad value fails loud (`E474`), so a raw `vim.bo`
-    /// write of garbage leaves the option untouched.
+    /// unknown buffer is ignored; an invalid value (a `regexsyntax` other than
+    /// `"pcre"`/`"vim"`, an unknown `fileencoding` label) or a string written to a
+    /// non-string option fails loud (`E474`) like the `:set` path, leaving the option
+    /// untouched.
     pub fn set_buffer_option_str(&mut self, id: BufferId, name: &str, value: &str) {
         // Every arm below writes a `bo` mirror row (`filetype`/`commentstring`/
         // `foldexpr`/`foldmarker`/`regexsyntax`/`fileencoding`/`fileformat`); the
@@ -369,8 +374,8 @@ impl Editor {
         // per-buffer string (not a `Copy` `BufferOptions` slot). Like `foldexpr`,
         // `set_foldmarker` operates on the focused buffer, so only a write for that
         // buffer applies (the focused-window fold model). A malformed value (not a
-        // `start,end` pair) is ignored here — the `:set` ex path is the loud one;
-        // an empty value resets to vim's default markers.
+        // `start,end` pair) fails loud, as on the `:set` path; an empty value
+        // resets to vim's default markers.
         if name == "foldmarker" {
             if id == self.current_buffer_id() {
                 let parts: Vec<&str> = value.split(',').collect();
@@ -382,6 +387,8 @@ impl Editor {
                     && parts[0] != parts[1]
                 {
                     self.set_foldmarker(parts[0], parts[1]);
+                } else {
+                    self.reject_bridge_option(name, value, "");
                 }
             }
             return;
@@ -393,38 +400,64 @@ impl Editor {
             ob.buffer.options.regexsyntax = match value {
                 "pcre" => crate::options::RegexSyntax::Pcre,
                 "vim" => crate::options::RegexSyntax::Vim,
-                _ => return,
+                _ => return self.reject_bridge_option(name, value, ""),
             };
         } else if name == "fileencoding" {
-            // Like `regexsyntax`: a raw `vim.bo` write of an unknown label is
-            // ignored (the buffer keeps its encoding); the `:set` ex path is where
-            // a bad value fails loud (E474). Empty means UTF-8.
+            // Like `regexsyntax`: an unknown label fails loud (E474) and the buffer
+            // keeps its encoding. Empty means UTF-8.
             ob.buffer.options.fileencoding = if value.is_empty() {
                 crate::encoding::Encoding::UTF8
             } else {
                 match crate::encoding::Encoding::from_label(value) {
                     Some(e) => e,
-                    None => return,
+                    None => return self.reject_bridge_option(name, value, ""),
                 }
             };
         } else if name == "fileformat" {
             // The line-ending convention (`btv.bo.fileformat = "dos"`), the `vim.bo`
-            // companion to the enumerated `:set fileformat` path. An unknown label is
-            // ignored, like `fileencoding` above.
+            // companion to the enumerated `:set fileformat` path. An unknown label
+            // fails loud, like `fileencoding` above.
             ob.buffer.options.fileformat = match crate::options::FileFormat::from_label(value) {
                 Some(ff) => ff,
-                None => return,
+                None => return self.reject_bridge_option(name, value, ""),
             };
         } else if name == "foldmethod" {
             // `btv.bo.foldmethod = "indent"`, the `vim.bo` companion to the enumerated
-            // `:set foldmethod` path. An unknown or not-yet-implemented value is
-            // ignored here (the `:set` ex path is the loud one); a recognized value
-            // rebuilds the fold structure for the new source.
+            // `:set foldmethod` path, refusing an unknown or not-yet-implemented value
+            // the same way; a recognized value rebuilds the fold structure.
             match crate::options::FoldMethod::from_label(value) {
                 Ok(fdm) => ob.buffer.options.foldmethod = fdm,
-                Err(_) => return,
+                Err(crate::options::FoldMethodErr::Unknown) => {
+                    return self.reject_bridge_option(name, value, "");
+                }
+                Err(crate::options::FoldMethodErr::Unimplemented) => {
+                    return self.echo(format!("foldmethod={value} is not supported yet"));
+                }
             }
             self.refresh_folds();
+        } else if let Some(n) = crate::options::coerce_num_option_str(name, value) {
+            // A number option written as a string (`btv.bo.tabstop = "4"`) is coerced,
+            // as neovim configs often spell it.
+            self.set_buffer_option_num(id, name, n);
+        } else {
+            self.reject_bridge_option(name, value, "not a string option");
+        }
+    }
+
+    /// Refuse a `vim.bo` / `vim.wo` bridge write the option can't take — an unknown
+    /// enumerated label, a malformed spec, or a value of the wrong Lua type — with the
+    /// same `E474` the `:set` path gives, instead of dropping it while the config line
+    /// appears to have worked. `why` (when non-empty) says what kind of value was wrong.
+    pub(crate) fn reject_bridge_option(
+        &mut self,
+        name: &str,
+        value: impl std::fmt::Display,
+        why: &str,
+    ) {
+        if why.is_empty() {
+            self.echo(format!("E474: Invalid argument: {name}={value}"));
+        } else {
+            self.echo(format!("E474: Invalid argument: {name}={value} ({why})"));
         }
     }
 
@@ -1402,6 +1435,25 @@ impl Editor {
         ob.buffer.stamp_disk(Some(stat));
     }
 
+    /// Mark `id` as a *new file* after an off-tick read found nothing at its path (a
+    /// `:e new-file`, or a reload of a file deleted underneath it): no disk baseline, as
+    /// a local [`Buffer::from_file`] of a missing path leaves it. No-op for a gone buffer.
+    pub fn mark_replica_new_file(&mut self, id: BufferId) {
+        if let Some(ob) = self.buffers.map.get_mut(&id) {
+            ob.buffer.stamp_disk(None);
+        }
+    }
+
+    /// Record that the remote watch (daemon / web) reported `id`'s bound file changed on
+    /// disk, so a later off-tick `:w` refuses to clobber it the way a local `:w` does
+    /// after re-statting. Cleared when the baseline is re-taken (a reload landing, a
+    /// write ack). No-op for a gone buffer.
+    pub fn note_remote_disk_change(&mut self, id: BufferId) {
+        if let Some(ob) = self.buffers.map.get_mut(&id) {
+            ob.buffer.note_disk_drift();
+        }
+    }
+
     /// Re-snapshot `id`'s disk baseline from the filesystem *as it is now*, leaving the
     /// buffer's content and its `modified` flag alone. The baseline is only ever "the
     /// state we last saw the file in", so this says: whatever is there now, we know about
@@ -1608,13 +1660,21 @@ impl Editor {
     ) {
         let fileencodings = force_enc.unwrap_or(&self.options.fileencodings);
         let (text, fileencoding, bomb) = crate::encoding::decode_to_rope(bytes, fileencodings);
-        self.load_str_into(buffer, name, &text);
+        // The off-tick twin of `Buffer::from_file`'s line-ending pass: detect
+        // `'fileformat'` and hand the rope `\n`-only text.
+        let fileformat = crate::buffer::detect_fileformat(&text);
+        self.load_str_into(
+            buffer,
+            name,
+            &crate::buffer::normalize_eol(&text, fileformat),
+        );
         // `load_str_into` no-ops on a closed buffer; mirror its guard before stamping
         // the encoding so a late fetch onto a gone buffer doesn't panic.
         if self.buffers.map.contains_key(&buffer) {
             let ob = self.buffers.get_mut(buffer);
             ob.buffer.options.fileencoding = fileencoding;
             ob.buffer.options.bomb = bomb;
+            ob.buffer.options.fileformat = fileformat;
             // Whether the landed bytes terminated their last line (`'endofline'`) — the
             // off-tick twin of the detection in `Buffer::from_file`, so a remote or wasm
             // read round-trips a no-eol file exactly like a local one.
@@ -3036,7 +3096,7 @@ impl Editor {
         let ids = self.buffers_in_layer(self.focused_layer);
         let len = ids.len();
         if let Some(i) = ids.iter().position(|id| *id == self.cur_buffer()) {
-            self.switch_buffer_as_jump(ids[(i + count) % len]);
+            self.switch_buffer_as_jump(ids[(i + count % len) % len]);
         }
     }
 

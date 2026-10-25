@@ -1204,3 +1204,248 @@ btv.picker.source {
         );
     }
 }
+
+/// A per-file mark restored from shada can point past the end of a file that
+/// shrank on disk between sessions. Jumping to it must clamp onto the file (vim
+/// lands on the last line), never index the rope past its end — that was a
+/// server panic for both the exact `` `a `` and the linewise `'a` forms.
+#[tokio::test]
+async fn restored_mark_past_a_shrunken_files_end_clamps_instead_of_panicking() {
+    let dir = temp_dir("shada_stale_mark");
+    let file = write_temp(
+        "shada_stale_mark",
+        "txt",
+        "1\nten ten ten\n3\n4\n5\n6\n7\n8\n9\n10\n",
+    );
+    {
+        let (rpc, incoming) =
+            start_attached(init_with_store(&dir, Some(file.clone())), 80, 25).await;
+        feed(&rpc, "8Gma2G$mb");
+        assert_eq!(cursor(&rpc).await, (2, 10));
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+    std::fs::write(&file, "one\ntwo\nthree\n").expect("shrink file");
+    {
+        let (rpc, _incoming) = start_attached(init_with_store(&dir, Some(file)), 80, 25).await;
+        feed(&rpc, "`a");
+        assert_eq!(cursor(&rpc).await, (3, 0));
+        feed(&rpc, "gg'a");
+        assert_eq!(cursor(&rpc).await, (3, 0));
+        // A column past a shortened line lands on that line, not a later one.
+        feed(&rpc, "`b");
+        assert_eq!(cursor(&rpc).await, (2, 2));
+    }
+}
+
+/// The store holds registers (pasted passwords, tokens), command history and file paths,
+/// so — like vim's viminfo and neovim's shada — it must be readable by its owner only,
+/// whatever the process umask lets a fresh file default to.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_store_file_is_private_to_its_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("shada_private");
+    let mut store = RedbFileStore::new(dir.clone());
+    store.load().expect("load");
+    store.flush(&PersistState::default(), false).expect("flush");
+    let files = store_files(&dir);
+    assert_eq!(files.len(), 1, "one instance store: {files:?}");
+    let mode = std::fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode & 0o077,
+        0,
+        "the shada store must not be group/world accessible (mode {mode:o})"
+    );
+}
+
+/// A store whose every write fails — a full disk, a revoked permission.
+struct FailingStore;
+
+impl ShadaStore for FailingStore {
+    fn load(&mut self) -> std::io::Result<PersistState> {
+        Ok(PersistState::default())
+    }
+    fn flush(&mut self, _state: &PersistState, _compact: bool) -> std::io::Result<()> {
+        Err(std::io::Error::other("disk full"))
+    }
+    fn reload(&mut self) -> std::io::Result<PersistState> {
+        Ok(PersistState::default())
+    }
+}
+
+/// A failed live checkpoint used to go only to stderr — behind the TUI's screen — so
+/// the session's history, marks and registers silently stopped persisting. It is now
+/// reported on the message line (once per run of failures, not on every debounce).
+#[tokio::test]
+async fn a_failed_live_checkpoint_is_reported() {
+    let file = write_temp("shada_failing", "txt", "hello world\n");
+    let (rpc, mut incoming) = start_attached(
+        ServerInit {
+            file: Some(file),
+            shada: Some(Box::new(FailingStore)),
+            ..Default::default()
+        },
+        80,
+        25,
+    )
+    .await;
+    feed(&rpc, "\"ayiw");
+    assert_eq!(lines(&rpc).await, vec!["hello world"]);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = bemtvi_test_harness::drain_to_latest_redraw(&mut incoming, |m| {
+        bemtvi_test_harness::message(m).contains("disk full")
+    });
+    assert!(
+        frame.is_some(),
+        "the failed checkpoint must reach the message line"
+    );
+
+    // A second failing checkpoint in the same run doesn't repaint the error over
+    // whatever the user did since.
+    feed(&rpc, ":echo 'later'<CR>");
+    assert_eq!(lines(&rpc).await, vec!["hello world"]);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame =
+        bemtvi_test_harness::drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw");
+    assert_eq!(bemtvi_test_harness::message(&frame), "later");
+}
+
+/// A store that hands back one fixed snapshot — what a damaged or hostile shada file
+/// decodes to — and discards every flush.
+struct FixedStore(Option<PersistState>);
+
+impl ShadaStore for FixedStore {
+    fn load(&mut self) -> std::io::Result<PersistState> {
+        Ok(self.0.take().unwrap_or_default())
+    }
+    fn flush(&mut self, _state: &PersistState, _compact: bool) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn reload(&mut self) -> std::io::Result<PersistState> {
+        Ok(PersistState::default())
+    }
+}
+
+/// Every position a store carries is untrusted: a damaged file can decode to any number.
+/// Jumping to such a mark, walking such a jumplist or changelist, or reopening a file with
+/// such folds must clamp onto the text instead of panicking the server.
+#[tokio::test]
+async fn absurd_restored_positions_clamp_instead_of_panicking() {
+    use bemtvi_server::{FileChangelist, GlobalMarkEntry, JumpPos, NumberedMark};
+    let file = write_temp("shada_absurd", "txt", "one\ntwo\nthree\n");
+    let path = PathBuf::from(&file);
+    let big = usize::MAX;
+    let state = PersistState {
+        registers: ['\0', '=', ':', '_', '%', '#', '.', '~', '/', '+', 'é']
+            .into_iter()
+            .map(|name| bemtvi_server::RegisterEntry {
+                name,
+                text: "x".into(),
+                linewise: false,
+            })
+            .collect(),
+        global_marks: vec![GlobalMarkEntry {
+            name: 'A',
+            path: path.clone(),
+            line: big,
+            col: big,
+        }],
+        file_marks: vec![bemtvi_server::FileMarkEntry {
+            path: path.clone(),
+            name: 'a',
+            line: big,
+            col: big,
+        }],
+        numbered_marks: vec![NumberedMark {
+            digit: '0',
+            path: path.clone(),
+            line: big,
+            col: big,
+        }],
+        file_changelists: vec![FileChangelist {
+            path: path.clone(),
+            entries: vec![(big, big), (1, big)],
+        }],
+        file_folds: vec![bemtvi_core::FileFolds {
+            path: path.clone(),
+            folds: vec![(big, big, true), (1, big, true), (big, 0, false)],
+        }],
+        jumplist: vec![
+            JumpPos {
+                path: path.clone(),
+                line: big,
+                col: big,
+            },
+            JumpPos {
+                path: path.clone(),
+                line: 1,
+                col: big,
+            },
+        ],
+        ..Default::default()
+    };
+    let (rpc, _incoming) = start_attached(
+        ServerInit {
+            file: Some(file.clone()),
+            shada: Some(Box::new(FixedStore(Some(state)))),
+            ..Default::default()
+        },
+        80,
+        25,
+    )
+    .await;
+    assert_eq!(lines(&rpc).await, vec!["one", "two", "three"]);
+    for keys in [
+        "`a", "gg'a", "`A", "gg`0", "g;", "g;", "zj", "zR", "<C-o>", "<C-o>",
+    ] {
+        feed(&rpc, keys);
+        let (line, col) = cursor(&rpc).await;
+        assert!(
+            (1..=3).contains(&line) && col <= 4,
+            "after {keys}: cursor ({line}, {col}) is on the text"
+        );
+    }
+    feed(&rpc, "G");
+    assert_eq!(cursor(&rpc).await.0, 3);
+}
+
+/// A store file damaged on disk (a crash mid-write, a truncated copy, plain garbage)
+/// must not take the session down: the readable siblings still restore, and the editor
+/// starts and persists as usual.
+#[tokio::test]
+async fn a_damaged_sibling_store_is_skipped_not_fatal() {
+    let dir = temp_dir("shada_damaged");
+    let file = write_temp("shada_damaged", "txt", "hello world\n");
+    {
+        let (rpc, incoming) = start_attached(init_with_store(&dir, Some(file)), 80, 25).await;
+        feed(&rpc, "\"ayiw");
+        assert_eq!(lines(&rpc).await, vec!["hello world"]);
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+    let good = store_files(&dir);
+    assert_eq!(good.len(), 1, "{good:?}");
+    let bytes = std::fs::read(&good[0]).expect("read store");
+    // Every flavour of damage next to the good store.
+    for (i, cut) in [0usize, 1, 64, 512, 4096, bytes.len() / 2, bytes.len() - 1]
+        .into_iter()
+        .enumerate()
+    {
+        let cut = cut.min(bytes.len());
+        std::fs::write(dir.join(format!("trunc{i}.redb")), &bytes[..cut]).unwrap();
+    }
+    let mut flipped = bytes.clone();
+    for b in flipped.iter_mut().skip(32).step_by(97) {
+        *b ^= 0xA5;
+    }
+    std::fs::write(dir.join("flipped.redb"), &flipped).unwrap();
+    std::fs::write(dir.join("garbage.redb"), vec![0xFFu8; 8192]).unwrap();
+    {
+        let (rpc, _incoming) = start_attached(init_with_store(&dir, None), 80, 25).await;
+        feed(&rpc, "\"ap");
+        assert_eq!(lines(&rpc).await, vec!["hello"]);
+    }
+}

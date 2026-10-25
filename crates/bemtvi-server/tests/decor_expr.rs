@@ -740,3 +740,42 @@ async fn a_steady_screen_does_not_re_evaluate_the_paint() {
          {baseline:?} baseline, one pass costing {one_pass:?}"
     );
 }
+
+/// The wrapper the block is spliced into runs once when it is compiled, and source
+/// can close the wrapper early and put a loop in *that* run. Compiling is subject
+/// to the same budget as calling, so it cannot wedge the editor either.
+#[tokio::test]
+async fn a_block_that_spins_while_compiling_is_abandoned() {
+    let init = r#"btv.decor.expr([[ end, (function() while true do end end)(), function() ]])"#;
+    let run = async {
+        let (rpc, mut inc) = start("paint_compile_spin", "x\n", init).await;
+        message_after(&rpc, &mut inc, "j").await
+    };
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(10), run)
+        .await
+        .expect("compiling a spinning block must not hang the editor");
+    assert!(
+        msg.contains("btv.decor.expr") && msg.contains("budget"),
+        "the deadline should be reported where the block is configured, got {msg:?}"
+    );
+}
+
+/// Columns are the block's own integers, so the extremes must convert without
+/// arithmetic overflow (a panic in a debug build).
+#[tokio::test]
+async fn extreme_span_columns_do_not_panic() {
+    let init =
+        r#"btv.decor.expr([[ return { { math.mininteger, 2, "Todo" }, { -5, -3, "Todo" } } ]])"#;
+    let (rpc, mut inc) = start("paint_extreme_cols", "abcd\n", init).await;
+    let spans = painted(&rpc, &mut inc, 0, "Todo").await;
+    assert_eq!(
+        spans,
+        vec![(0, 2)],
+        "a minimum-integer start clamps to the line start; an all-negative range is empty"
+    );
+    assert_eq!(lines_of(&rpc).await, vec!["abcd"]);
+}
+
+async fn lines_of(rpc: &Rpc) -> Vec<String> {
+    bemtvi_test_harness::lines(rpc).await
+}

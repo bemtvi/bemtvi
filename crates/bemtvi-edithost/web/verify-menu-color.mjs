@@ -47,16 +47,6 @@ const SEL = "rgb(49, 50, 68)";      // #313244  TelescopeSelection / PmenuSel bg
 const MATCH = "rgb(249, 226, 175)"; // #f9e2af  TelescopeMatching / CmpItemAbbrMatch fg
 const PBG = "rgb(30, 30, 46)";      // #1e1e2e  Pmenu bg
 
-// Resolve the installed Chromium the way every other verifier here does: this checkout's
-// Playwright is in the npx cache, so its default headless-shell path does not exist and a
-// bare `chromium.launch()` throws "Executable doesn't exist".
-function chromiumPath() {
-  if (process.env.PW_CHROMIUM) return process.env.PW_CHROMIUM;
-  const home = process.env.HOME || "";
-  const found = globSync(`${home}/.cache/ms-playwright/chromium-*/chrome-linux*/chrome`).sort();
-  return found.length ? found[found.length - 1] : undefined;
-}
-
 try {
   for (let i = 0; i < 50; i++) {
     try { await fetch(`http://localhost:${PORT}/web/index.html`); break; } catch { await sleep(100); }

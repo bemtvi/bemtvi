@@ -19,6 +19,13 @@
 //! ([`same_origin`]); cross-site fetches and form posts always carry `Origin`, so the
 //! mutation-capable requests are closed off before any route lookup runs.
 //!
+//! **Every route sits behind a per-session secret.** The `Origin`/`Host` gates only stop
+//! *browsers*; any other local process (another user on a shared machine included) can talk
+//! to `127.0.0.1` directly. So every mounted path lives under an unguessable segment minted
+//! once per server session (`http://127.0.0.1:<port>/<token>/plugin/<name>/`), handed out
+//! only through the mount promise (`mount:url()`). A request without it is a bare `404`
+//! before any other work, so a scan cannot even tell what is listening.
+//!
 //! **Nothing starts until a plugin asks.** [`HttpMounts`] holds no listener until the first
 //! `HttpMount` command; a config with no HTTP plugin opens no port and spawns no task.
 //!
@@ -30,7 +37,8 @@
 //! is what joins the two.
 //!
 //! ```text
-//! GET /plugin/example/  ─► axum handler (actor task)
+//! GET /<token>/plugin/example/  ─► axum handler (actor task)
+//!                            ├─ token check (a miss is a bare 404)
 //!                            ├─ route lookup: name → mount id (a miss is a 404, no Lua)
 //!                            ├─ pending[req_id] = oneshot::Sender
 //!                            ├─ LoopEvent::HttpServerRequest ──► server thread
@@ -123,6 +131,10 @@ struct Shared {
     /// checks every request's `Origin` against it ([`same_origin`]); set at each bind so
     /// a rebind moves the gate with the origin.
     bound_addr: Mutex<Option<SocketAddr>>,
+    /// The per-session secret every mounted path sits under (`/<token>/plugin/…`). Minted
+    /// once, so it survives a rebind; the base URL the mount promise resolves with carries
+    /// it, and [`handle`] refuses any request without it.
+    token: String,
 }
 
 /// The actor's `btv.http.mount` state: the routes, and the listener once something has
@@ -152,20 +164,23 @@ impl HttpMounts {
                 next_req_id: AtomicU64::new(1),
                 event_tx,
                 bound_addr: Mutex::new(None),
+                token: crate::quic::mint_token(),
             }),
             bound: None,
         }
     }
 
-    /// The origin mounts are served on (`http://127.0.0.1:53124`), or `None` when nothing
-    /// has bound yet.
-    fn origin(&self) -> Option<String> {
-        self.bound.as_ref().map(|b| origin_of(b.addr))
+    /// The base URL mounts hang off — the origin plus the session token
+    /// (`http://127.0.0.1:53124/<token>`) — or `None` when nothing has bound yet.
+    fn base(&self) -> Option<String> {
+        self.bound
+            .as_ref()
+            .map(|b| base_of(b.addr, &self.shared.token))
     }
 
     /// Add a route, binding the listener first if this is the first mount. Sends the
     /// [`LoopEvent::HttpMountResult`] that settles the plugin's promise — with the bound
-    /// origin, or the bind / duplicate-name error.
+    /// base URL (origin + session token), or the bind / duplicate-name error.
     pub(crate) async fn mount(
         &mut self,
         id: u64,
@@ -203,8 +218,8 @@ impl HttpMounts {
                 backstop: timeout + BACKSTOP_GRACE,
             },
         );
-        let origin = self.origin().expect("bound above");
-        self.send_mount_result(id, Ok(origin));
+        let base = self.base().expect("bound above");
+        self.send_mount_result(id, Ok(base));
     }
 
     /// Retire the route owned by callback `id` (`mount:close()`), and drop any of its
@@ -251,7 +266,7 @@ impl HttpMounts {
             Ok(bound) => {
                 // Only now that the replacement is accepting do we stop the old listener,
                 // so the origin is never down in between.
-                let origin = origin_of(bound.addr);
+                let origin = base_of(bound.addr, &self.shared.token);
                 if let Some(old) = self.bound.replace(bound) {
                     let _ = old.shutdown.send(());
                 }
@@ -334,9 +349,22 @@ impl HttpMounts {
     }
 }
 
-/// `http://host:port` for `addr` — the origin string mounts hang off.
-fn origin_of(addr: SocketAddr) -> String {
-    format!("http://{addr}")
+/// `http://host:port/<token>` — the base URL mounts hang off. The Lua side splits it back
+/// into the origin and the path prefix.
+fn base_of(addr: SocketAddr, token: &str) -> String {
+    format!("http://{addr}/{token}")
+}
+
+/// Strip this session's `/<token>` segment off `path`, returning the rest (`/plugin/…`), or
+/// `None` when the segment is missing or wrong. Constant-time in the token, so a timing
+/// probe learns nothing about how much of a guess was right.
+fn strip_token<'a>(path: &'a str, token: &str) -> Option<&'a str> {
+    let rest = path.strip_prefix('/')?;
+    let (presented, rest) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    crate::quic::constant_time_eq(presented.as_bytes(), token.as_bytes()).then_some(rest)
 }
 
 /// Is the request's declared `Origin` this listener's own? A page on a foreign site must
@@ -395,21 +423,55 @@ fn same_origin(bound: Option<SocketAddr>, headers: &HeaderMap) -> bool {
     }
 }
 
+/// Does the request's `Host` name this machine by address or as `localhost`? The `Origin`
+/// gate cannot see a DNS-rebinding *read*: the attacker's page re-points its own domain at
+/// this listener and `fetch()`es it same-origin, a GET that carries no `Origin` and whose
+/// response the page may read. Its `Host` still names the attacker's domain, though, and a
+/// rebinding attack always arrives under a name — so a `Host` that is not an address literal
+/// or `localhost` is refused. The port is not checked: a forwarded tunnel
+/// (`ssh -L 9000:localhost:<port>`) legitimately reaches the listener under another one.
+/// A request with no `Host` (HTTP/1.0) passes; a browser always sends one.
+fn host_is_local(headers: &HeaderMap) -> bool {
+    let Some(host) = headers.get("host") else {
+        return true;
+    };
+    let Ok(host) = host.to_str() else {
+        return false;
+    };
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inner, _)) => return inner.parse::<std::net::Ipv6Addr>().is_ok(),
+            None => return false,
+        }
+    } else {
+        host.rsplit_once(':').map_or(host, |(name, _)| name)
+    };
+    name.parse::<IpAddr>().is_ok() || name.eq_ignore_ascii_case("localhost")
+}
+
 /// The single axum handler behind every mount: route by name, park on the plugin's answer.
 async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
 
+    // The session token runs FIRST: a request without it gets a bare 404 that names
+    // nothing, so a local scan cannot learn that a bemtvi listener is here, let alone
+    // which mounts it has.
+    let Some(path) = strip_token(parts.uri.path(), &shared.token) else {
+        return text_response(StatusCode::NOT_FOUND, "Not Found\n");
+    };
+    let path = path.to_string();
+
     // The origin gate runs before ANY route work — a foreign page gets a 403 whether the
     // path is a live mount, a 404, or the root redirect, so a cross-site probe can't even
     // learn which mount names exist.
-    if !same_origin(*shared.bound_addr.lock().unwrap(), &parts.headers) {
+    if !same_origin(*shared.bound_addr.lock().unwrap(), &parts.headers)
+        || !host_is_local(&parts.headers)
+    {
         return text_response(
             StatusCode::FORBIDDEN,
             "bemtvi: request is not same-origin with the mount listener\n",
         );
     }
-
-    let path = parts.uri.path().to_string();
 
     // Split `/plugin/<name>/<rest>`. Everything outside the reserved prefix, and every
     // unmounted name, is a 404 the editor answers itself — Lua is never entered, so an
@@ -431,9 +493,10 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
     // slash form, so a page served there resolves its relative URLs against the mount rather
     // than against `/plugin/`. The query rides along. (Shared with the browser path.)
     if let Some(location) = bemtvi_lua::mount_root_redirect(&path) {
+        let token = &shared.token;
         let location = match parts.uri.query() {
-            Some(q) => format!("{location}?{q}"),
-            None => location,
+            Some(q) => format!("/{token}{location}?{q}"),
+            None => format!("/{token}{location}"),
         };
         return Response::builder()
             .status(StatusCode::PERMANENT_REDIRECT)

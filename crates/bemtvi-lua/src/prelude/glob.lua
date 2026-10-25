@@ -40,11 +40,12 @@ btv.glob = btv.glob or {}
 --     `"**/*.lua"`, or pass `basename = true` to match the path's last component.
 --     This is shell / gitignore / LSP semantics. Pass `literal_separator = false`
 --     for vim's autocmd rule, where `*` does cross `/`.
---   * **Path style is explicit, not the host's.** A pattern and its candidates are
---     unix-style (`/` separates, `\` escapes) unless you pass `style = "windows"`,
---     which makes `\` a separator too. It is deliberately NOT derived from the
---     machine bemtvi runs on: a daemon or remote session can hand a Unix-hosted
---     editor Windows paths, so the convention belongs to the *path*, not the build.
+--   * **Path style defaults to the host's, so pass it when you know the path's.** A
+--     pattern and its candidates are unix-style (`/` separates, `\` escapes) on a
+--     Unix build and windows-style (`\` separates too) on a Windows build, unless you
+--     pass `style = "unix"` / `style = "windows"`. Pass it whenever the path's origin
+--     is known: a daemon or remote session can hand a Unix-hosted editor Windows
+--     paths, so the convention belongs to the *path*, not the build.
 --
 -- An invalid pattern raises. The one exception is an unclosed class (`foo[bar`),
 -- which is taken as literal text — a filename may genuinely contain a bracket.

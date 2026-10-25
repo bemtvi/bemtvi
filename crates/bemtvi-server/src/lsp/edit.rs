@@ -1337,8 +1337,7 @@ impl EditHost {
             return;
         }
         // One-shot: exactly one action survived a filter the caller asked to auto-apply.
-        // Apply it directly — no menu, so this works headlessly (a save action) and on
-        // the wasm edit-host, which has no confirm→apply path at all.
+        // Apply it directly — no menu, so this works headlessly (a save action).
         if opts.apply && actions.len() == 1 {
             self.lsp_code_actions = actions;
             // A chooser still awaiting a pick is superseded by this apply; settle its
@@ -1349,10 +1348,7 @@ impl EditHost {
             if prev != 0 {
                 self.settle_lsp_promise(prev, serde_json::Value::Null);
             }
-            #[cfg(feature = "native")]
-            {
-                self.pending_code_action = false;
-            }
+            self.pending_code_action = false;
             self.apply_code_action(0);
             return;
         }
@@ -1360,24 +1356,16 @@ impl EditHost {
         self.lsp_code_actions = actions;
         self.editor
             .open_menu(lines, bemtvi_core::MenuPlacement::Cursor, 0);
-        // The select-menu → `apply_code_action` routing is native-only (the field and its
-        // consumer in `effects.rs` are `#[cfg(feature = "native")]`), so the flag it sets
-        // is too — keeps the wasm edit-host build (`--no-default-features`) compiling.
-        #[cfg(feature = "native")]
-        {
-            self.pending_code_action = true;
-            // Take over the promise stash. A prior chooser still awaiting confirm is
-            // superseded (a second `code_action` before picking) — settle its promise
-            // `nil` so it can't hang.
-            let prev = std::mem::replace(&mut self.code_action_cb, cb_id);
-            if prev != 0 {
-                self.settle_lsp_promise(prev, serde_json::Value::Null);
-            }
+        self.cancel_pending_ui_select();
+        self.cancel_active_picker();
+        self.pending_code_action = true;
+        // Take over the promise stash. A prior chooser still awaiting confirm is
+        // superseded (a second `code_action` before picking) — settle its promise `nil`
+        // so it can't hang.
+        let prev = std::mem::replace(&mut self.code_action_cb, cb_id);
+        if prev != 0 {
+            self.settle_lsp_promise(prev, serde_json::Value::Null);
         }
-        // On the wasm edit-host there is no confirm→apply path, so the promise would
-        // never settle — resolve it `nil` now rather than leave it hanging.
-        #[cfg(not(feature = "native"))]
-        self.settle_lsp_promise(cb_id, serde_json::Value::Null);
     }
 
     /// Apply the code action selected (by index) in the code-action panel: apply

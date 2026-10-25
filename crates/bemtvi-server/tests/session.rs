@@ -2260,3 +2260,90 @@ async fn session_restores_the_scroll_position_over_off_tick_fs() {
         );
     }
 }
+
+/// A store that hands back one fixed snapshot — the shape a corrupted or hostile shada
+/// file decodes to — and discards every flush.
+struct FixedStore(Option<bemtvi_server::PersistState>);
+
+impl bemtvi_server::ShadaStore for FixedStore {
+    fn load(&mut self) -> std::io::Result<bemtvi_server::PersistState> {
+        Ok(self.0.take().unwrap_or_default())
+    }
+    fn flush(&mut self, _: &bemtvi_server::PersistState, _: bool) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn reload(&mut self) -> std::io::Result<bemtvi_server::PersistState> {
+        Ok(Default::default())
+    }
+}
+
+/// A session decoded from a damaged store can carry any number in its split weights,
+/// dock sizes and saved views. Restoring one must not panic (overflowing the layout
+/// arithmetic) or wedge the editor; the files still open, in a usable layout.
+#[tokio::test]
+async fn a_session_with_absurd_sizes_and_positions_restores_without_panicking() {
+    use bemtvi_core::editor::{SessionLayout, SessionWindow};
+    use bemtvi_core::{SessionDock, SessionState, SessionTab};
+    let file_a = write_temp("session_absurd_a", "txt", "a1\na2\n");
+    let file_b = write_temp("session_absurd_b", "txt", "b1\nb2\n");
+    let leaf = |path: &str, active: bool| {
+        SessionLayout::Leaf(SessionWindow {
+            path: path.into(),
+            line: usize::MAX,
+            col: usize::MAX,
+            top: usize::MAX,
+            active,
+            ..Default::default()
+        })
+    };
+    let session = SessionState {
+        tabs: vec![SessionTab {
+            layout: SessionLayout::Split {
+                vertical: true,
+                sizes: vec![usize::MAX, usize::MAX],
+                children: vec![leaf(&file_a, false), leaf(&file_b, true)],
+            },
+        }],
+        active_tab: usize::MAX,
+        docks: vec![SessionDock {
+            side: "left".into(),
+            size: usize::MAX,
+            size_pct: Some(usize::MAX),
+            hidden: false,
+            layout: None,
+        }],
+        hidden_buffers: Vec::new(),
+        focus_layer: String::new(),
+    };
+    let state = bemtvi_server::PersistState {
+        session: Some(session),
+        ..Default::default()
+    };
+    let (rpc, _incoming) = start_attached(
+        ServerInit {
+            shada: Some(Box::new(FixedStore(Some(state)))),
+            workspace_session: true,
+            restore_session: true,
+            ..Default::default()
+        },
+        80,
+        25,
+    )
+    .await;
+    let names = window_buffer_names(&rpc).await;
+    assert!(
+        names.contains(&file_a) && names.contains(&file_b),
+        "both files restored: {names}"
+    );
+    let total = exec_lua(
+        &rpc,
+        "local t = 0 for _, w in ipairs(btv.win.list()) do t = t + btv.win.width(w) end return t",
+    )
+    .await
+    .as_i64()
+    .unwrap_or(-1);
+    assert!((2..=80).contains(&total), "widths fit the screen: {total}");
+    assert_eq!(cursor(&rpc).await.0, 2, "the cursor clamps onto the file");
+    feed(&rpc, "gg");
+    assert_eq!(lines(&rpc).await, vec!["b1", "b2"]);
+}

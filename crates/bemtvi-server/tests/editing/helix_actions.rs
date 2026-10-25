@@ -159,3 +159,31 @@ async fn bracket_d_navigates_diagnostics_in_helix() {
     feed(&rpc, "[d");
     assert_eq!(cursor(&rpc).await.0, 2, "`[d` -> back to the first");
 }
+
+/// The plugin's `i` reaches Insert through the action drain, not the key
+/// dispatcher, so it must still open a fresh insert session: `<C-u>` stops at
+/// where *this* insert began (a stale start from the earlier `c` sat inside the
+/// 4-byte emoji and panicked the server), and `".` holds only this session's text.
+#[tokio::test]
+async fn plugin_insert_entry_opens_a_fresh_insert_session() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ihello world<Esc>0:helix<CR>");
+    feed(&rpc, ">c<Esc>i\u{1f469}<C-u><Esc>");
+    assert_eq!(lines(&rpc).await, vec!["\tello world"]);
+    feed(&rpc, "ifoo<Esc>ibar<Esc>");
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getreg('.')").await.as_str(),
+        Some("bar")
+    );
+}
+
+/// An undo in Helix select mode can take away the line the selection's anchor sat
+/// on; the anchor must come back inside the buffer, or the next verb (`a` here)
+/// reads a byte past the end and the server panics.
+#[tokio::test]
+async fn undo_in_select_mode_keeps_the_anchor_in_the_buffer() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "iab<CR>cd<Esc>:helix<CR>");
+    feed(&rpc, "oxyz<Esc>vua<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["ab", "cd"]);
+}

@@ -249,3 +249,31 @@ async fn a_failing_resolver_surfaces_loud_and_does_not_swap() {
         "a claimed-but-failed URL must not fall back to the client either",
     );
 }
+
+// A resolver that rejects with the `{ code, message }` table every `btv.fs` / `btv.git` /
+// `btv.run` failure uses must have its MESSAGE reported, not `table: 0x…`.
+#[tokio::test]
+async fn a_rejected_error_table_reports_its_message() {
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    exec_lua(
+        &rpc,
+        "_G.notes = {}\n\
+         btv.notify = function(m) _G.notes[#_G.notes + 1] = tostring(m) end\n\
+         btv.connect.register('tbl', function() \
+           return btv.promise.reject({ code = 'ENOENT', message = 'no such image' }) end)\n\
+         btv.connect.connect('tbl://x')",
+    )
+    .await;
+    let mut got = None;
+    for _ in 0..150 {
+        barrier(&rpc).await;
+        let v = exec_lua(&rpc, "return _G.notes[1]").await;
+        if let Some(s) = v.as_str() {
+            got = Some(s.to_string());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let got = got.expect("the failure is reported");
+    assert!(got.contains("no such image"), "report: {got}");
+}

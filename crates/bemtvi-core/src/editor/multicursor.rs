@@ -280,7 +280,17 @@ impl Editor {
     /// top of them would duplicate or leak cursors across the windows.
     pub(crate) fn restore_secondary_cursors(&mut self, positions: Vec<usize>) {
         self.clear_secondary_cursors();
-        for at in positions {
+        // The stash is plain byte offsets: another window onto the same buffer may
+        // have edited it since, so a position past the end is dropped and one now
+        // inside a character snaps back to its start.
+        let last = self.last_char_idx();
+        let mut kept: Vec<usize> = positions
+            .into_iter()
+            .filter(|&at| at <= last)
+            .map(|at| self.buffer().text.floor_char_boundary(at))
+            .collect();
+        kept.dedup();
+        for at in kept {
             self.set_cursor_mark(None, at);
         }
     }

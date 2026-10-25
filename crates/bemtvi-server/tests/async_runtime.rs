@@ -296,6 +296,29 @@ async fn btv_run_stream_iterates_batches_via_await_each() {
     );
 }
 
+/// A streamed line that is not valid UTF-8 (a grep hit in a latin-1 file) arrives
+/// lossily decoded, and the lines after it keep streaming — the stream used to stop
+/// dead at the first such line, silently dropping the rest of the output.
+#[tokio::test]
+async fn btv_run_stream_survives_a_non_utf8_line() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "_G.lines = {}\n\
+         _G.done = false\n\
+         btv.async(function()\n\
+           for batch in btv.await_each(btv.run_stream({ cmd = 'sh', args = { '-c', [[printf 'a\\n\\377b\\nc\\n']] } })) do\n\
+             for _, l in ipairs(batch) do _G.lines[#_G.lines + 1] = l end\n\
+           end\n\
+           _G.done = true\n\
+         end)()",
+    )
+    .await;
+    poll_true(&rpc, "return _G.done").await;
+    let joined = exec_lua(&rpc, "return table.concat(_G.lines, ',')").await;
+    assert_eq!(joined.as_str(), Some("a,\u{FFFD}b,c"));
+}
+
 #[tokio::test]
 async fn btv_run_stream_exit_carries_stderr() {
     let (rpc, _incoming) = start().await;

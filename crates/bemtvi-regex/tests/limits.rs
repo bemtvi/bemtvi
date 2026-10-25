@@ -164,3 +164,26 @@ fn an_ordinary_pattern_on_a_long_line_does_not_time_out() {
         .expect("it is there");
     assert_eq!(m.start, 200_000);
 }
+
+/// A line past the NFA engine's `NFA_MAX_STATES` makes automatic engine selection
+/// free the NFA program and recompile the pattern with the backtracking engine
+/// *inside* the exec call. When that backtracking retry then hits the deadline, the
+/// replacement program must still be adopted: keeping the freed NFA pointer is a
+/// use-after-free on the next exec and a double free when the regex is dropped.
+#[test]
+fn a_timeout_after_the_nfa_fallback_keeps_a_valid_program() {
+    let re = VimRegex::compile("\\(a\\|aa\\)\\+b").expect("compile");
+    let line = "a".repeat(200_000);
+    let err = re
+        .exec_line_timed(&line, 0, false, Some(100))
+        .expect_err("the backtracking retry must be cut off by the deadline");
+    assert!(
+        err.to_string().contains("timed out"),
+        "the error should name the timeout, got {err:?}"
+    );
+    // The program must still be the live (backtracking) one: it matches, and
+    // dropping it afterwards frees it exactly once.
+    let m = re.exec_line("xaab", 0, false).unwrap().expect("a match");
+    assert_eq!((m.start, m.end), (1, 4));
+    drop(re);
+}

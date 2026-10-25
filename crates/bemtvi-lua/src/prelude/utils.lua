@@ -381,7 +381,9 @@ end
 -- holding a space, a `#` or a non-ASCII character is otherwise a malformed URI the
 -- server silently misreads (it truncates at the `#`, or fails to match the document
 -- it already has open under the encoded spelling). The path is normalized first, so
--- the same file always produces the same URI and a server's document map hits.
+-- the same file always produces the same URI and a server's document map hits, and a
+-- RELATIVE path (a buffer name as typed) is resolved against the editor's cwd, since a
+-- `file://` URI can only name an absolute path.
 --
 -- A Windows path takes the shape every LSP server (and the `url` crate's
 -- `Url::from_file_path`) expects: `C:\Users\x\a.py` → `file:///C:/Users/x/a.py`, the
@@ -390,6 +392,9 @@ end
 function btv.utils.uri_from_path(path)
   if type(path) ~= "string" then
     error("btv.utils.uri_from_path: path must be a string, got " .. type(path), 2)
+  end
+  if not btv.utils.is_absolute(path) then
+    path = btv.fname.modify(path, ":p")
   end
   local root = btv.utils.path_root(path)
   local drive = root:match("^(%a:)[/\\]$")

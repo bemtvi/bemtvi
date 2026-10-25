@@ -985,3 +985,77 @@ async fn typing_a_fold_marker_does_not_fold_the_line_being_typed() {
         "the typed lines land where they were typed"
     );
 }
+
+#[tokio::test]
+async fn manual_folds_follow_lines_inserted_and_deleted_above_them() {
+    // vim's foldMarkAdjust: a manual fold rides the text it was made on.
+    let (rpc, mut incoming) = six_lines().await;
+    // Fold L4-L5 (closed), then open a line above L1.
+    feed(&rpc, "4Gzfj");
+    let map = redraw_after(&rpc, &mut incoming, "ggOnew<Esc>").await;
+    assert_eq!(
+        visible_numbers(&map),
+        vec![1, 2, 3, 4, 5, 7],
+        "the fold moved down with L4-L5 (now lines 5-6)"
+    );
+    // Delete two lines above it: the fold moves up by two.
+    let map = redraw_after(&rpc, &mut incoming, "gg2dd").await;
+    assert_eq!(visible_numbers(&map), vec![1, 2, 3, 5]);
+    let rendered = view_lines(&map);
+    assert!(
+        rendered[2].contains("L4"),
+        "the fold row still shows its own first line, got {rendered:?}"
+    );
+    // Deleting the whole folded range removes the fold.
+    feed(&rpc, "3Gzo2dd");
+    let map = redraw_after(&rpc, &mut incoming, "ggOx<Esc>").await;
+    assert_eq!(visible_numbers(&map), vec![1, 2, 3, 4]);
+}
+
+#[tokio::test]
+async fn undoing_a_line_insert_moves_a_manual_fold_back() {
+    let (rpc, mut incoming) = six_lines().await;
+    feed(&rpc, "4Gzfj");
+    let map = redraw_after(&rpc, &mut incoming, "ggOnew<Esc>").await;
+    assert_eq!(visible_numbers(&map), vec![1, 2, 3, 4, 5, 7]);
+    let map = redraw_after(&rpc, &mut incoming, "u").await;
+    assert_eq!(
+        visible_numbers(&map),
+        vec![1, 2, 3, 4, 6],
+        "the undo took the line back out, so the fold is on L4-L5 again"
+    );
+    let map = redraw_after(&rpc, &mut incoming, "<C-r>").await;
+    assert_eq!(visible_numbers(&map), vec![1, 2, 3, 4, 5, 7]);
+}
+
+#[tokio::test]
+async fn ctrl_e_scrolls_past_a_closed_fold_at_the_top() {
+    // vim scrolls a closed fold as one line: `<C-e>` off a top-row fold lands the
+    // view on the line after it. It used to set `top` inside the fold, whose
+    // placeholder row then sat *above* the view's base — the frame panicked.
+    let (rpc, mut incoming) = indent_fixture(&["    a", "    b", "    c", "d", "e"]).await;
+    feed(&rpc, ":set foldmethod=indent<CR>");
+    let map = redraw_after(&rpc, &mut incoming, "<C-e>").await;
+    assert_eq!(visible_numbers(&map), vec![4, 5]);
+    // …and `<C-y>` back brings the whole fold into view, not its middle line.
+    let map = redraw_after(&rpc, &mut incoming, "<C-y>").await;
+    assert_eq!(visible_numbers(&map), vec![1, 4, 5]);
+}
+
+#[tokio::test]
+async fn manual_folds_belong_to_the_buffer_a_window_shows() {
+    // vim keeps a window's folds per buffer: `:e` onto another file shows that
+    // file's folds (none here), and coming back brings the first file's back.
+    let text = "L1\nL2\nL3\nL4\nL5\nL6\n";
+    let a = write_temp("folds_per_buffer_a", "txt", text);
+    let b = write_temp("folds_per_buffer_b", "txt", text);
+    let (rpc, _incoming) = start(None).await;
+    command(&rpc, &format!("e {a}")).await;
+    feed(&rpc, "2Gzf2j");
+    command(&rpc, &format!("e {b}")).await;
+    feed(&rpc, "2Gj");
+    assert_eq!(cursor(&rpc).await.0, 3, "the other buffer has no fold");
+    command(&rpc, &format!("e {a}")).await;
+    feed(&rpc, "2Gj");
+    assert_eq!(cursor(&rpc).await.0, 5, "the first buffer's fold came back");
+}

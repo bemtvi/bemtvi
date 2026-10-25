@@ -2063,3 +2063,271 @@ async fn changing_background_reloads_the_colorscheme() {
         "background=dark"
     );
 }
+
+/// `vim.opt`'s `:append` / `:remove` take every argument shape neovim does: a map
+/// option (`fillchars`) appended as its own `key:value` string, a flag option
+/// (`shortmess` / `formatoptions`) given a set or a list of flags, and a list option
+/// removed by a comma string. Before, the map form raised (aborting the config at that
+/// line) and the flag forms mutated by the characters of `"table: 0x…"`.
+#[tokio::test]
+async fn vim_opt_append_and_remove_accept_every_argument_shape() {
+    let (rpc, _incoming) = start().await;
+    let got = exec_lua(
+        &rpc,
+        r#"
+        vim.o.fillchars = "vert:|"
+        vim.opt.fillchars:append("eob: ")
+        local fc = vim.opt.fillchars:get()
+        vim.o.shortmess = "a"
+        vim.opt.shortmess:append({ c = true, I = true })
+        local sm = vim.opt.shortmess:get()
+        vim.o.formatoptions = "jcroql"
+        vim.opt.formatoptions:remove({ "c", "r", "o" })
+        vim.o.wildignore = "*.a,*.b,*.c"
+        vim.opt.wildignore:remove("*.a,*.c")
+        return table.concat({
+          tostring(fc.vert) .. "|" .. tostring(fc.eob) .. "|",
+          tostring(sm.a and sm.c and sm.I and not sm.t),
+          vim.o.formatoptions:gsub(".", function(c) return c end):len() .. ":"
+            .. tostring(vim.o.formatoptions:find("[cro]") == nil),
+          vim.o.wildignore,
+        }, " ")
+        "#,
+    )
+    .await;
+    assert_eq!(got.as_str(), Some("|| | true 3:true *.b"));
+}
+
+/// `'foldcolumn'` above 12 and `'numberwidth'` above 20 are vim's E474: accepting
+/// `fdc=99999999` made every row paint (and ship) that many gutter cells, freezing
+/// the editor. Both the `:set` and the `btv.wo` setters refuse, keeping the value.
+#[tokio::test]
+async fn oversized_foldcolumn_and_numberwidth_are_refused() {
+    let (rpc, mut incoming) = start().await;
+    let msg = set_message(&rpc, &mut incoming, "foldcolumn=99999999").await;
+    assert!(msg.contains("E474"), "got {msg:?}");
+    let msg = set_message(&rpc, &mut incoming, "numberwidth=21").await;
+    assert!(msg.contains("E474"), "got {msg:?}");
+    command(&rpc, "set foldcolumn=12").await;
+    exec_lua(
+        &rpc,
+        "btv.wo.foldcolumn = 99999999 btv.wo.numberwidth = 99999999",
+    )
+    .await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let v = exec_lua(&rpc, "return { btv.wo.foldcolumn, btv.wo.numberwidth }").await;
+    assert_eq!(
+        v,
+        rmpv::Value::Array(vec![12.into(), 4.into()]),
+        "the oversized writes were refused"
+    );
+}
+
+/// Run a Lua option write, then return the latest frame's message — the seam a
+/// loud bridge rejection surfaces through.
+async fn lua_write_message(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    chunk: &str,
+) -> String {
+    exec_lua(rpc, chunk).await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(incoming, |_| true).expect("a redraw arrived");
+    message(&frame)
+}
+
+/// A `btv.bo` write of a value the option can't take (an unknown enumerated label,
+/// or the wrong Lua type) used to be dropped without a word: the config line ran,
+/// the mirror briefly read back the garbage, and the buffer silently kept its old
+/// value. It now fails loud with E474 naming the option, and the value is kept.
+#[tokio::test]
+async fn invalid_btv_bo_values_fail_loud_and_keep_the_old_value() {
+    let (rpc, mut incoming) = start().await;
+    let read = "return { btv.bo.foldmethod, btv.bo.fileformat, btv.bo.tabstop, btv.bo.expandtab }";
+    let before = exec_lua(&rpc, read).await;
+    for (chunk, needle) in [
+        ("btv.bo.foldmethod = 'bogus'", "foldmethod=bogus"),
+        (
+            "btv.bo.fileencoding = 'no-such-charset'",
+            "fileencoding=no-such-charset",
+        ),
+        ("btv.bo.fileformat = 'amiga'", "fileformat=amiga"),
+        ("btv.bo.regexsyntax = 'perl'", "regexsyntax=perl"),
+        ("btv.bo.foldmarker = 'only-one'", "foldmarker=only-one"),
+        ("btv.bo.tabstop = 'four'", "tabstop=four"),
+        ("btv.bo.expandtab = 1", "expandtab"),
+    ] {
+        let msg = lua_write_message(&rpc, &mut incoming, chunk).await;
+        assert!(
+            msg.contains("E474") && msg.contains(needle),
+            "`{chunk}` must fail loud naming {needle:?}, got {msg:?}"
+        );
+    }
+    assert_eq!(
+        exec_lua(&rpc, read).await,
+        before,
+        "the rejected writes left the options as they were"
+    );
+}
+
+/// The `btv.wo` twin: an invalid enumerated value or a wrong-typed write fails loud
+/// (E474) instead of being silently ignored.
+#[tokio::test]
+async fn invalid_btv_wo_values_fail_loud_and_keep_the_old_value() {
+    let (rpc, mut incoming) = start().await;
+    let read = "return { btv.wo.signcolumn, btv.wo.number, btv.wo.scrolloff }";
+    let before = exec_lua(&rpc, read).await;
+    for (chunk, needle) in [
+        ("btv.wo.signcolumn = 'sometimes'", "signcolumn=sometimes"),
+        ("btv.wo.fillchars = 'nonsense'", "fillchars=nonsense"),
+        ("btv.wo.padding = 'x y z w v'", "padding=x y z w v"),
+        ("btv.wo.number = 1", "number"),
+        ("btv.wo.scrolloff = 'lots'", "scrolloff"),
+    ] {
+        let msg = lua_write_message(&rpc, &mut incoming, chunk).await;
+        assert!(
+            msg.contains("E474") && msg.contains(needle),
+            "`{chunk}` must fail loud naming {needle:?}, got {msg:?}"
+        );
+    }
+    assert_eq!(
+        exec_lua(&rpc, read).await,
+        before,
+        "the rejected writes left the options as they were"
+    );
+}
+
+/// A valid write through the same bridges stays silent — the loud path must not
+/// fire on a good value.
+#[tokio::test]
+async fn valid_btv_bo_and_wo_writes_stay_silent() {
+    let (rpc, mut incoming) = start().await;
+    let msg = lua_write_message(
+        &rpc,
+        &mut incoming,
+        "btv.bo.foldmethod = 'indent' btv.bo.tabstop = 4 btv.bo.expandtab = true \
+         btv.bo.fileformat = 'dos' btv.wo.signcolumn = 'yes' btv.wo.number = true \
+         btv.wo.scrolloff = 3 btv.bo.commentstring = '# %s'",
+    )
+    .await;
+    assert!(
+        !msg.contains("E474"),
+        "a valid write must not error, got {msg:?}"
+    );
+}
+
+/// The global-option twin of the `btv.bo`/`btv.wo` rejection: `btv.o` writes of a
+/// wired global used to store an enumerated string unchecked (`regexsyntax = "perl"`
+/// read back as if it took) or drop a wrong-typed value without a word. Both now fail
+/// loud like `:set`, and the old value is kept.
+#[tokio::test]
+async fn invalid_btv_o_global_values_fail_loud_and_keep_the_old_value() {
+    let (rpc, mut incoming) = start().await;
+    let read = "return { btv.o.regexsyntax, btv.o.guiglyphoverflow, btv.o.persisthistory, \
+                btv.o.hlsearch, btv.o.laststatus }";
+    let before = exec_lua(&rpc, read).await;
+    for (chunk, needle) in [
+        ("btv.o.regexsyntax = 'perl'", "regexsyntax=perl"),
+        ("btv.o.guiglyphoverflow = 'alway'", "guiglyphoverflow=alway"),
+        ("btv.o.persisthistory = 'nowhere'", "persisthistory=nowhere"),
+        ("btv.o.hlsearch = 'yes'", "hlsearch"),
+        ("btv.o.laststatus = true", "laststatus"),
+    ] {
+        let msg = lua_write_message(&rpc, &mut incoming, chunk).await;
+        assert!(
+            msg.contains("E474") && msg.contains(needle),
+            "`{chunk}` must fail loud naming {needle:?}, got {msg:?}"
+        );
+    }
+    assert_eq!(
+        exec_lua(&rpc, read).await,
+        before,
+        "the rejected writes left the options as they were"
+    );
+    command(&rpc, "echo 'clean'").await;
+    let msg = lua_write_message(
+        &rpc,
+        &mut incoming,
+        "btv.o.regexsyntax = 'vim' btv.o.hlsearch = false btv.o.laststatus = 3",
+    )
+    .await;
+    assert_eq!(msg, "clean", "valid writes stay silent");
+}
+
+/// neovim configs spell some numeric options as strings — `'foldcolumn'` is a string
+/// option there (`"1"`, `"auto"`, `"auto:3"`), and `"4"` for `tabstop` is common. The
+/// Lua write paths coerce those instead of refusing them; a string that spells no
+/// number is still `E474`. The `'signcolumn'` shapes (`"auto:2"`, `"yes:2"`) keep
+/// working.
+#[tokio::test]
+async fn neovim_string_spellings_of_numeric_options_are_coerced() {
+    let (rpc, mut incoming) = start().await;
+    command(&rpc, "echo 'clean'").await;
+    for (chunk, read, want) in [
+        (
+            "vim.wo.foldcolumn = '1'",
+            "return btv.wo.foldcolumn",
+            rmpv::Value::from(1),
+        ),
+        (
+            "vim.wo.foldcolumn = 'auto:3'",
+            "return btv.wo.foldcolumn",
+            rmpv::Value::from(3),
+        ),
+        (
+            "vim.wo.foldcolumn = 'auto'",
+            "return btv.wo.foldcolumn",
+            rmpv::Value::from(1),
+        ),
+        (
+            "vim.opt.foldcolumn = '2'",
+            "return btv.wo.foldcolumn",
+            rmpv::Value::from(2),
+        ),
+        (
+            "vim.wo.scrolloff = '5'",
+            "return btv.wo.scrolloff",
+            rmpv::Value::from(5),
+        ),
+        (
+            "vim.bo.tabstop = '4'",
+            "return btv.bo.tabstop",
+            rmpv::Value::from(4),
+        ),
+        (
+            "vim.o.shiftwidth = '3'",
+            "return btv.bo.shiftwidth",
+            rmpv::Value::from(3),
+        ),
+        (
+            "vim.o.laststatus = '3'",
+            "return btv.o.laststatus",
+            rmpv::Value::from(3),
+        ),
+        (
+            "vim.wo.signcolumn = 'auto:2'",
+            "return btv.wo.signcolumn",
+            rmpv::Value::from("auto:2"),
+        ),
+        (
+            "vim.wo.signcolumn = 'yes:2'",
+            "return btv.wo.signcolumn",
+            rmpv::Value::from("yes:2"),
+        ),
+    ] {
+        let msg = lua_write_message(&rpc, &mut incoming, chunk).await;
+        assert_eq!(msg, "clean", "`{chunk}` must be accepted silently");
+        assert_eq!(exec_lua(&rpc, read).await, want, "`{chunk}` took effect");
+    }
+    for (chunk, needle) in [
+        ("vim.wo.foldcolumn = 'auto:x'", "foldcolumn=auto:x"),
+        ("vim.wo.foldcolumn = 'wide'", "foldcolumn=wide"),
+        ("vim.o.laststatus = 'all'", "laststatus=all"),
+    ] {
+        let msg = lua_write_message(&rpc, &mut incoming, chunk).await;
+        assert!(
+            msg.contains("E474") && msg.contains(needle),
+            "`{chunk}` must still fail loud naming {needle:?}, got {msg:?}"
+        );
+    }
+}

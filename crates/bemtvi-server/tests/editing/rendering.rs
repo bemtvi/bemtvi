@@ -53,6 +53,60 @@ async fn nowrap_scrolls_horizontally_to_keep_cursor_visible() {
     assert_eq!(view_u64(&back, "leftcol"), 0);
 }
 
+/// Under `nowrap` a window row ships only the part of its line the window can
+/// show — the text up to `leftcol + width`, never the rest of a huge line — so a
+/// frame's wire cost is bounded by the viewport, not by the line length. Varying the
+/// line length at a fixed viewport leaves the shipped row the same size, and what is
+/// shipped is still an exact prefix of the line that reaches past the right edge.
+#[tokio::test]
+async fn nowrap_row_ships_only_the_visible_span_of_a_long_line() {
+    let (rpc, mut incoming) = start(None).await;
+    let mut shipped = Vec::new();
+    for n in [20_000usize, 400_000] {
+        exec_lua(
+            &rpc,
+            &format!(
+                "btv.buf.set_lines(0, 0, -1, false, {{ string.rep('0123456789', {}), string.rep('\\t', {}) }})",
+                n / 10,
+                n / 4
+            ),
+        )
+        .await;
+        let line = "0123456789".repeat(n / 10);
+        let view = redraw_after(&rpc, &mut incoming, "gg0").await;
+        let text_width = (80 - view_u64(&view, "number_width")) as usize;
+        let rows = view_lines(&view);
+        assert!(line.starts_with(&rows[0]), "row 0 is a prefix of the line");
+        assert!(rows[0].len() >= text_width, "row 0 reaches the right edge");
+        assert!(rows[1].chars().all(|c| c == '\t'));
+        assert!(
+            rows[1].len() * 4 >= text_width,
+            "the tab row reaches the right edge"
+        );
+        shipped.push((rows[0].len(), rows[1].len()));
+
+        // Scrolled far right: the shipped text still covers through the right edge.
+        let view = redraw_after(&rpc, &mut incoming, "$").await;
+        let leftcol = view_u64(&view, "leftcol") as usize;
+        assert!(leftcol > 0, "the view scrolled right");
+        let rows = view_lines(&view);
+        assert!(line.starts_with(&rows[0]), "row 0 is a prefix of the line");
+        assert!(
+            rows[0].len() >= leftcol + text_width,
+            "row 0 reaches the right edge"
+        );
+        assert!(
+            rows[0].len() <= leftcol + 80 + 64,
+            "row 0 ships {} bytes of a {n}-byte line at leftcol {leftcol}",
+            rows[0].len()
+        );
+    }
+    assert_eq!(
+        shipped[0], shipped[1],
+        "a longer line ships the same row at the same viewport"
+    );
+}
+
 /// Widening the window pulls a horizontally-scrolled view back: `leftcol` only ever
 /// grows to keep the cursor visible, so a scroll computed for a narrow text area used to
 /// survive the window getting wide enough for the whole line — painting the buffer panned
@@ -2102,4 +2156,107 @@ async fn linebreak_hard_breaks_a_word_too_long_for_a_row() {
         &format!("    {}", "z".repeat(76)),
         "the indent keeps its row; the word breaks at the edge"
     );
+}
+
+/// Time `frames` one-row cursor moves over a window whose every row is a `len`-byte
+/// line (tabs in it, so no all-ASCII shortcut applies).
+async fn time_frames_over_long_lines(len: usize, frames: usize) -> std::time::Duration {
+    let (rpc, mut incoming) = start(None).await;
+    exec_lua(
+        &rpc,
+        &format!(
+            "local t = {{}} for i = 1, 30 do t[i] = string.rep('ab\\tc', {}) end \
+             btv.buf.set_lines(0, 0, -1, false, t)",
+            len / 4
+        ),
+    )
+    .await;
+    let _ = redraw_after(&rpc, &mut incoming, "gg0").await;
+    let started = std::time::Instant::now();
+    for _ in 0..frames {
+        let view = redraw_after(&rpc, &mut incoming, "j").await;
+        assert!(!view_lines(&view).is_empty(), "the frame painted rows");
+    }
+    started.elapsed()
+}
+
+/// A frame's cost follows the viewport, not the length of the lines in it: the
+/// per-row overlay projections (highlights, diagnostics, inlay hints, virtual text)
+/// each copied and walked the whole of every visible line, so a screen of
+/// megabyte lines took most of a second per keystroke. The viewport is fixed and
+/// only the line length grows 100x; a ratio, so both halves share the machine load.
+#[tokio::test]
+async fn a_frame_does_not_scale_with_the_length_of_its_lines() {
+    let short = time_frames_over_long_lines(10_000, 20).await;
+    let long = time_frames_over_long_lines(1_000_000, 20).await;
+    let ratio = long.as_secs_f64() / short.as_secs_f64().max(0.001);
+    assert!(
+        ratio < 8.0,
+        "20 frames over 1MB lines cost {ratio:.1}x the same over 10kB lines \
+         ({long:?} vs {short:?}) — a per-row projection is walking whole lines again",
+    );
+}
+
+/// `W` across a fixed 5000-character word (non-ASCII, so every step segments
+/// graphemes), on a line that is just the word or the word plus a megabyte.
+async fn time_word_motion(filler: usize) -> std::time::Duration {
+    let (rpc, mut incoming) = start(None).await;
+    exec_lua(
+        &rpc,
+        &format!(
+            "btv.buf.set_lines(0, 0, -1, false, {{ string.rep('é', 5000) .. ' ' .. string.rep('x', {filler}) }})"
+        ),
+    )
+    .await;
+    let _ = redraw_after(&rpc, &mut incoming, "gg0").await;
+    let started = std::time::Instant::now();
+    let _ = redraw_after(&rpc, &mut incoming, "W").await;
+    let took = started.elapsed();
+    assert_eq!(
+        cursor(&rpc).await.1,
+        10_001,
+        "W lands on the word after the run"
+    );
+    took
+}
+
+/// A word motion steps one grapheme at a time, and each step used to copy and
+/// segment the whole line, so `W` across a long word on a huge line was quadratic
+/// (minutes on a minified file). The word is fixed and only the rest of the line
+/// grows; a ratio, so both halves share the machine load.
+#[tokio::test]
+async fn a_word_motion_does_not_scale_with_the_rest_of_the_line() {
+    let short = time_word_motion(1).await;
+    let long = time_word_motion(2_000_000).await;
+    let ratio = long.as_secs_f64() / short.as_secs_f64().max(0.001);
+    assert!(
+        ratio < 5.0,
+        "W across the same word cost {ratio:.1}x on a 2MB line ({long:?} vs {short:?}) \
+         — a grapheme step is materializing the line again",
+    );
+}
+
+/// Grapheme steps answered straight off the rope agree with segmenting the whole
+/// line: a combining cluster and a pair of flags far into a long non-ASCII line
+/// (well past the first rope chunk) are each one step, forward and back.
+#[tokio::test]
+async fn grapheme_steps_on_a_long_line_keep_clusters_whole() {
+    let (rpc, _incoming) = start(None).await;
+    exec_lua(
+        &rpc,
+        "btv.buf.set_lines(0, 0, -1, false, { string.rep('é', 3000) .. 'xe\u{301}\u{1F1E7}\u{1F1F7}\u{1F1E7}\u{1F1F7}y' })",
+    )
+    .await;
+    feed(&rpc, "0");
+    feed(&rpc, "3000l");
+    assert_eq!(cursor(&rpc).await.1, 6000, "on the x");
+    let forward = [6001, 6004, 6012, 6020];
+    for want in forward {
+        feed(&rpc, "l");
+        assert_eq!(cursor(&rpc).await.1, want, "l steps one cluster");
+    }
+    for want in [6012, 6004, 6001, 6000] {
+        feed(&rpc, "h");
+        assert_eq!(cursor(&rpc).await.1, want, "h steps one cluster");
+    }
 }

@@ -31,7 +31,8 @@ end
 local function brackets(t, row)
   local text, out = t:screen()[row] or "", {}
   for _, span in ipairs(t:highlights(row)) do
-    if span[3]:find("^Rainbow") then
+    -- A span past the row's painted text is off the window's right edge.
+    if span[3]:find("^Rainbow") and span[1] < #text then
       out[#out + 1] = { text:sub(span[1] + 1, span[2]), span[3] }
     end
   end

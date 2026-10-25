@@ -123,3 +123,41 @@ async fn restart_forgets_the_client_it_replaced() {
     eventually(&rpc, "#btv.lsp.clients()", 1, "exactly one live handle").await;
     std::env::remove_var("BEMTVI_LSP_CMD");
 }
+
+/// The built-in LSP keymaps the first attach installs are removed again when the last
+/// server leaves the buffer — but ONLY those: a buffer-local `gd` the user bound
+/// themselves (in `on_attach`, a `FileType` handler, …) is theirs and survives the
+/// detach, exactly as it would have with no server at all.
+#[tokio::test]
+async fn detach_removes_only_the_builtin_lsp_keymaps() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-detach-keymaps");
+    arm_mock(dir.as_path());
+    let (rpc, _incoming) = start_demo(dir.as_path()).await;
+
+    let count = |desc: &str| {
+        format!(
+            "(function() local n = 0 \
+               for _, m in ipairs(btv.keymap.buf_get(0, 'n')) do \
+                 if m.lhs == 'gd' and m.desc == '{desc}' then n = n + 1 end \
+               end return n end)()"
+        )
+    };
+    eventually(&rpc, &count("Go to definition"), 1, "built-in gd installed").await;
+    exec_lua(
+        &rpc,
+        "btv.keymap.set('n', 'gd', function() end, { buffer = 0, desc = 'mine' })",
+    )
+    .await;
+
+    exec_lua(&rpc, "btv.lsp.stop('demo')").await;
+    eventually(&rpc, "#_G.detached", 1, "LspDetach fired").await;
+    eventually(&rpc, &count("Go to definition"), 0, "built-in gd removed").await;
+    let mine = exec_lua(&rpc, &format!("return {}", count("mine"))).await;
+    std::env::remove_var("BEMTVI_LSP_CMD");
+    assert_eq!(
+        mine.as_i64(),
+        Some(1),
+        "the user's own buffer-local gd must survive the detach"
+    );
+}

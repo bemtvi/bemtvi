@@ -486,3 +486,72 @@ async fn an_unregistered_capability_drops_its_watches() {
     }
     panic!("the unregistered capability must be dropped, watches and all");
 }
+
+/// A watch that overflowed (the editor dropped change batches nobody pulled in time)
+/// still tells the server something: every matching file still on disk is re-sent as
+/// `Changed`, so the server re-reads them instead of silently missing the gap.
+#[tokio::test]
+async fn an_overflowed_watch_resends_matching_files_as_changed() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_watchfiles");
+    let rec = dir.join("rec.jsonl");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "record": "{}",
+                "register_capability": [
+                    {{ "id": "watch-py", "method": "workspace/didChangeWatchedFiles",
+                       "registerOptions": {{ "watchers": [ {{ "globPattern": "**/*.py" }} ] }} }}
+                ]
+            }}"#,
+            rec.display()
+        ),
+    );
+    // On disk before the watch arms and never touched after: only a rescan reports it.
+    let old = dir.join("old.py");
+    std::fs::write(&old, "y = 2\n").expect("write pre-existing file");
+    let (rpc, _incoming) = open_with_server(&dir).await;
+    await_record(&rec, "_register_response")
+        .await
+        .expect("the registration must be acked before the watch can arm");
+    create_until_reported(&dir, &rec, "seen", "py")
+        .await
+        .expect("the watch must be armed");
+    let uri = format!("file://{}", old.display());
+    assert!(
+        !watched_changes(&rec).iter().any(|(u, _)| *u == uri),
+        "the untouched file has not been reported yet"
+    );
+
+    exec_lua(
+        &rpc,
+        "for _, regs in pairs(btv.lsp._registrations) do\n\
+           for _, entry in pairs(regs) do\n\
+             for _, w in ipairs(entry.watches) do\n\
+               btv._run_fs_watch(w._id, { kind = 'overflow', paths = {} })\n\
+             end\n\
+           end\n\
+         end",
+    )
+    .await;
+    for _ in 0..200 {
+        if watched_changes(&rec)
+            .iter()
+            .any(|(u, t)| *u == uri && *t == 2)
+        {
+            assert!(
+                !watched_changes(&rec)
+                    .iter()
+                    .any(|(u, _)| u.ends_with("a.rs")),
+                "only files the glob names are re-sent"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!(
+        "an overflow must re-send the watched files as Changed; recorded: {:?}",
+        watched_changes(&rec)
+    );
+}

@@ -151,6 +151,30 @@ try {
     `val=${JSON.stringify(pluginVal)}`,
   );
 
+  // ── 'persisthistory'=none keeps history out of the blob, as natively ────────────────
+  await page.evaluate(() => window.__bemtvi.feed(":set persisthistory=none<CR>"));
+  await page.evaluate(() => window.__bemtvi.feed("/NOHIST-SEARCH<CR>"));
+  await page.evaluate(() => window.__bemtvi.feed("<Esc>"));
+  const flushed2 = await page.evaluate(() => window.__bemtvi.shadaFlush().then(() => true).catch((e) => String(e)));
+  check("flush: second shada written", flushed2 === true, `flush=${JSON.stringify(flushed2)}`);
+  const blob2 = await page.evaluate(async () => {
+    try {
+      const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle(".bemtvi");
+      const fh = await dir.getFileHandle("shada");
+      return await (await fh.getFile()).text();
+    } catch (e) { return `ERR:${e}`; }
+  });
+  check(
+    "storage: 'persisthistory'=none keeps search history out of the blob",
+    !blob2.startsWith("ERR:") && !blob2.includes("NOHIST-SEARCH"),
+    `has=${blob2.includes("NOHIST-SEARCH")} blob[0..80]=${JSON.stringify(blob2.slice(0, 80))}`,
+  );
+  check(
+    "storage: 'persisthistory'=none still persists registers",
+    blob2.includes("HELLO-REG-LINE"),
+    `blob[0..80]=${JSON.stringify(blob2.slice(0, 80))}`,
+  );
+
   await browser.close();
 } finally {
   cleanup();

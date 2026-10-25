@@ -67,14 +67,32 @@ impl Registers {
     /// yank. With no explicit register the unnamed register is filled, then the
     /// text is routed: a linewise or multi-line delete shifts the `"1`–`"9`
     /// ring; a small (within-one-line) delete lands in the small-delete `"-`.
-    pub(crate) fn record_delete(&mut self, reg: Option<char>, text: String, kind: RegKind) {
+    ///
+    /// `reg_one` is vim's `use_reg_one`: the motion (`%`, `(`, `` ` ``, `/`, `n`, …)
+    /// puts even a delete within one line in `"1` — and, unnamed, in `"-` too.
+    pub(crate) fn record_delete(
+        &mut self,
+        reg: Option<char>,
+        text: String,
+        kind: RegKind,
+        reg_one: bool,
+    ) {
+        let multiline = kind == RegKind::Line || text.contains('\n');
         match reg {
             Some('_') => {}
-            Some(name) => self.write_named(name, text, kind),
-            None => {
-                if kind == RegKind::Line || text.contains('\n') {
+            Some(name) => {
+                // A delete of more than one line fills `"1` even when it was put
+                // in a named register too (vim's `op_delete`).
+                if name.is_ascii_alphabetic() && (multiline || reg_one) {
                     self.shift_ring(text.clone(), kind);
-                } else {
+                }
+                self.write_named(name, text, kind)
+            }
+            None => {
+                if multiline || reg_one {
+                    self.shift_ring(text.clone(), kind);
+                }
+                if !multiline {
                     self.set('-', text.clone(), kind);
                 }
                 self.set('"', text, kind);
@@ -135,7 +153,16 @@ impl Registers {
             Some(cell) => (cell.text.clone(), cell.kind == RegKind::Line),
             None => (String::new(), false),
         };
+        // Mixing kinds makes the register linewise, so each part becomes whole
+        // lines: a charwise part gets its own line break (vim's append rule).
+        let is_line = kind == RegKind::Line;
+        if !was_line && is_line && !buf.is_empty() {
+            buf.push('\n');
+        }
         buf.push_str(text);
+        if was_line && !is_line {
+            buf.push('\n');
+        }
         let merged = if was_line || kind == RegKind::Line {
             RegKind::Line
         } else {

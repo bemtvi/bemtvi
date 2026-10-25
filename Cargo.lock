@@ -464,6 +464,7 @@ dependencies = [
  "bemtvi-core",
  "futures",
  "lsp-types",
+ "ropey",
  "serde",
  "serde_json",
  "tokio",

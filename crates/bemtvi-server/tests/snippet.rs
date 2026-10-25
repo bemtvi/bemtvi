@@ -196,6 +196,42 @@ async fn snippets_completion_source_expands_on_accept() {
     assert_eq!(lines(&rpc).await, vec!["function () end".to_string()]);
 }
 
+/// Re-registering a trigger for a filetype (a re-sourced config, a plugin's `setup{}`
+/// run twice) REPLACES that snippet rather than offering a duplicate row; the newer
+/// body wins.
+#[tokio::test]
+async fn re_adding_a_trigger_replaces_the_snippet() {
+    let dir = temp_dir("snippet-readd");
+    let init = "btv.snippet.setup{}\n\
+        btv.snippet.add('', { { trigger = 'fn', body = 'old $0' } })\n\
+        btv.snippet.add('', { { trigger = 'fn', body = 'function $1()$0 end' } })\n\
+        btv.complete.setup { sources = { { 'snippets' } } }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+    assert_eq!(
+        exec_lua(&rpc, "return #btv.snippet._byft['']").await,
+        Value::from(1),
+        "the Lua registry must hold one `fn`"
+    );
+
+    feed(&rpc, "ifn");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("snippet menu opened");
+    let kinds = menu_kinds(&map);
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| k.as_deref() == Some("Snippet"))
+            .count(),
+        1,
+        "one `fn` snippet row, got kinds {kinds:?} for rows {:?}",
+        menu_items(&map)
+    );
+    feed(&rpc, "<C-n>");
+    feed(&rpc, "<C-y>");
+    assert_eq!(lines(&rpc).await, vec!["function () end".to_string()]);
+}
+
 /// The `menu.kinds` array (per-row kind labels), or empty when the key is absent.
 fn menu_kinds(map: &[(Value, Value)]) -> Vec<Option<String>> {
     let Some(Value::Map(menu)) = map_get(map, "menu") else {

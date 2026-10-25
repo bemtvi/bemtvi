@@ -56,16 +56,16 @@ impl TrackedDiagnostic<'_> {
     /// row `line_idx` (whose text is `line`), or `None` if it does not reach that row.
     /// A multi-line span is clipped to the row: `0` before its first line, the line
     /// length after its last.
-    fn row_span(&self, buf: &Buffer, line_idx: usize, line: &str) -> Option<(usize, usize)> {
+    fn row_span(&self, buf: &Buffer, line_idx: usize, line_len: usize) -> Option<(usize, usize)> {
         let row_start = buf.byte_at(line_idx, 0);
         // End-inclusive at both edges: a span ending exactly at end-of-line still
         // belongs to that row, and a zero-width one resting there is still shown.
-        let row_end = row_start + line.len();
+        let row_end = row_start + line_len;
         if self.end < row_start || self.start > row_end {
             return None;
         }
-        let start = self.start.saturating_sub(row_start).min(line.len());
-        let end = self.end.saturating_sub(row_start).min(line.len());
+        let start = self.start.saturating_sub(row_start).min(line_len);
+        let end = self.end.saturating_sub(row_start).min(line_len);
         // End-exclusive boundary: a multi-line span ending exactly at this row's
         // start reaches *up to* the row, not onto it — without this, both anchors
         // land on 0 and the row clip widens `(0, 0)` into a phantom 1-cell squiggle
@@ -417,6 +417,7 @@ impl EditHost {
                 })
                 .collect();
         }
+        let mut resolver = super::LspPosResolver::new(buf);
         self.merged_sources(buffer)
             .enumerate()
             .filter_map(|(i, (d, server, encoding))| {
@@ -425,7 +426,7 @@ impl EditHost {
                     .flatten()
                     .map(|m| (m.start, m.end.unwrap_or(m.start)))
                     .unwrap_or_else(|| {
-                        let r = lsp_range_to_bytes_in(buf, &d.range, encoding);
+                        let r = resolver.range(&d.range, encoding);
                         (r.start, r.end)
                     });
                 let (start, end) = (span.0, span.1.max(span.0));
@@ -516,9 +517,10 @@ impl EditHost {
             let Some(buf) = self.editor.buffer_of(buffer) else {
                 return;
             };
+            let mut resolver = super::LspPosResolver::new(buf);
             self.merged_sources(buffer)
                 .map(|(d, _, encoding)| {
-                    let r = lsp_range_to_bytes_in(buf, &d.range, encoding);
+                    let r = resolver.range(&d.range, encoding);
                     (r.start, r.end.max(r.start))
                 })
                 .collect()
@@ -631,14 +633,38 @@ impl EditHost {
                     return Value::Array(Vec::new());
                 };
                 let line_idx = n - 1;
-                let text = buf.line(line_idx);
-                let spans = index
+                // Only the head of the line this row can show (see `RowSeg::text`).
+                let Some(row_text) = seg.text(buf, tabstop) else {
+                    return Value::Array(Vec::new());
+                };
+                let text = &row_text.text;
+                // Each candidate's byte span on this row, dropping the ones that start
+                // past a cut head (off screen) and cutting the rest to it.
+                let hits: Vec<(usize, usize, usize)> = index
                     .candidates_for(line_idx as u32)
                     .filter_map(|&i| {
+                        let (s, e) = diags[i].row_span(buf, line_idx, row_text.full_len)?;
+                        if row_text.clipped() && s > text.len() {
+                            return None;
+                        }
+                        Some((i, s, e.min(text.len())))
+                    })
+                    .collect();
+                // Screen columns for every endpoint from one forward walk of the head:
+                // a per-endpoint `virtcol` re-walked the line from column 0 each time,
+                // O(diagnostics x line length) per row per frame.
+                let mut bytes: Vec<usize> = hits.iter().flat_map(|&(_, s, e)| [s, e]).collect();
+                bytes.sort_unstable();
+                bytes.dedup();
+                let mut vc = unicode::LineVirtcol::new(text, tabstop);
+                let cols: Vec<usize> = bytes.iter().map(|&b| vc.at(b)).collect();
+                let col_of = |b: usize| cols[bytes.partition_point(|&x| x < b)];
+                let spans = hits
+                    .iter()
+                    .filter_map(|&(i, start_byte, end_byte)| {
                         let t = &diags[i];
-                        let (start_byte, end_byte) = t.row_span(buf, line_idx, &text)?;
-                        let start_col = unicode::virtcol(&text, start_byte, tabstop);
-                        let mut end_col = unicode::virtcol(&text, end_byte, tabstop);
+                        let start_col = col_of(start_byte);
+                        let mut end_col = col_of(end_byte);
                         // A zero-width range (e.g. an empty span at end-of-line)
                         // still needs one underlined cell to be visible.
                         if end_col <= start_col {
@@ -906,19 +932,24 @@ impl EditHost {
 
     /// `vim.diagnostic.goto_next`/`goto_prev`: move the cursor to the next
     /// (`forward`) or previous diagnostic in the current buffer, wrapping around
-    /// the ends. `severity` (1=ERROR…4=HINT) restricts the set when set. A no-op
+    /// the ends. `severities` (a bitmask, bit `s - 1` for severity `s`, 1=ERROR…4=HINT)
+    /// restricts the set when set. A no-op
     /// when the buffer has no (matching) diagnostics. Targets each diagnostic's
     /// *tracked* start — where it sits after the edits since it was published — then
     /// `jump_to`s the current file so the move snaps to a valid resting cell (no
     /// file open — same buffer).
-    pub(crate) fn diagnostic_goto(&mut self, forward: bool, severity: Option<u8>) {
+    pub(crate) fn diagnostic_goto(&mut self, forward: bool, severities: Option<u8>) {
         // Resolve every (matching) diagnostic to a 0-based (line, byte col) and
         // sort by position, so "next/previous from the cursor" is a list walk.
         let buf = self.editor.buffer();
         let mut positions: Vec<(usize, usize)> = self
             .current_diagnostics_merged()
             .into_iter()
-            .filter(|t| severity.is_none_or(|s| t.severity() == s))
+            .filter(|t| {
+                severities.is_none_or(|mask| {
+                    (1..=4).contains(&t.severity()) && mask & (1 << (t.severity() - 1)) != 0
+                })
+            })
             .map(|t| {
                 let row = t.start_line(buf);
                 (row, t.start - buf.byte_at(row, 0))
@@ -978,7 +1009,7 @@ impl EditHost {
     ) -> Vec<Diagnostic> {
         let buffer = self.editor.buffer();
         // The rows come from a Lua `opts.range` with no upper bound (unlike the LSP
-        // wire side, which `lsp_pos_to_byte_in` clamps). Clamp them to the document
+        // wire side, which `LspPosResolver::pos` clamps). Clamp them to the document
         // — the phantom row is a valid address, anything past it reads as the
         // document end — or `line_start` asserts past the last line and the server
         // thread panics.

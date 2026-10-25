@@ -109,12 +109,20 @@ impl Editor {
     /// Byte offset one grapheme-cluster forward from `idx` over the whole buffer.
     /// The trailing `\n` of each line is itself a single-byte grapheme.
     pub(crate) fn next_grapheme_idx(&self, idx: usize) -> usize {
-        let line = self.buffer().byte_to_line(idx);
-        let start = self.buffer().line_start(line);
-        let s = self.buffer().line_cow(line);
+        let buf = self.buffer();
+        // Two ASCII bytes always have a boundary between them except a CRLF, so the
+        // common step needs no line lookup at all (word motions take one per char).
+        if idx + 1 < buf.len_bytes() {
+            let (a, b) = (buf.text.byte(idx), buf.text.byte(idx + 1));
+            if a.is_ascii() && b.is_ascii() && !(a == b'\r' && b == b'\n') {
+                return idx + 1;
+            }
+        }
+        let line = buf.byte_to_line(idx);
+        let start = buf.line_start(line);
         let rel = idx - start;
-        if rel < s.len() {
-            start + unicode::next_grapheme(&s, rel)
+        if rel < buf.line_len(line) {
+            start + buf.next_grapheme_in_line(line, rel)
         } else {
             (idx + 1).min(self.buffer().len_bytes())
         }
@@ -125,24 +133,41 @@ impl Editor {
         if idx == 0 {
             return 0;
         }
-        let line = self.buffer().byte_to_line(idx);
-        let start = self.buffer().line_start(line);
-        let s = self.buffer().line_cow(line);
+        let buf = self.buffer();
+        // The mirror of `next_grapheme_idx`'s shortcut: `idx` and `idx - 1` are both
+        // boundaries when the bytes either side of each are ASCII and no CRLF straddles.
+        if idx >= 2 && idx < buf.len_bytes() {
+            let (a, b, c) = (
+                buf.text.byte(idx - 2),
+                buf.text.byte(idx - 1),
+                buf.text.byte(idx),
+            );
+            if a.is_ascii()
+                && b.is_ascii()
+                && c.is_ascii()
+                && !(a == b'\r' && b == b'\n')
+                && !(b == b'\r' && c == b'\n')
+            {
+                return idx - 1;
+            }
+        }
+        let line = buf.byte_to_line(idx);
+        let start = buf.line_start(line);
         let rel = idx - start;
         if rel == 0 {
             idx - 1
         } else {
-            start + unicode::prev_grapheme(&s, rel.min(s.len()))
+            start + buf.prev_grapheme_in_line(line, rel.min(buf.line_len(line)))
         }
     }
 
     /// Snap an absolute byte offset down to a grapheme boundary.
     pub(crate) fn grapheme_floor_abs(&self, idx: usize) -> usize {
-        let line = self.buffer().byte_to_line(idx);
-        let start = self.buffer().line_start(line);
-        let s = self.buffer().line_cow(line);
-        let rel = idx.saturating_sub(start).min(s.len());
-        start + unicode::floor_grapheme(&s, rel)
+        let buf = self.buffer();
+        let line = buf.byte_to_line(idx);
+        let start = buf.line_start(line);
+        let rel = idx.saturating_sub(start).min(buf.line_len(line));
+        start + buf.floor_grapheme_in_line(line, rel)
     }
 
     /// Snap an absolute byte offset up to a grapheme boundary.
@@ -191,8 +216,9 @@ impl Editor {
     /// Snap the cursor column down to the nearest grapheme boundary (a no-op for
     /// ASCII), so byte offsets handed to the rope are always valid.
     pub(crate) fn snap_cursor(&mut self) {
-        let s = self.buffer().line_cow(self.cursor.line);
-        self.cursor.col = unicode::floor_grapheme(&s, self.cursor.col.min(s.len()));
+        let buf = self.buffer();
+        let line = self.cursor.line;
+        self.cursor.col = buf.floor_grapheme_in_line(line, self.cursor.col.min(buf.line_len(line)));
     }
 
     pub(crate) fn last_char_idx(&self) -> usize {
@@ -227,7 +253,9 @@ impl Editor {
     }
 
     pub(crate) fn set_cursor_char_insert(&mut self, idx: usize) {
-        let max = self.buffer().len_bytes();
+        // The past-the-end insert column of the last line is the trailing `\n`
+        // itself; one byte further is the phantom line, never a cursor position.
+        let max = self.buffer().len_bytes().saturating_sub(1);
         self.set_cursor_clamped(idx, max);
     }
 
@@ -236,6 +264,7 @@ impl Editor {
     /// The shared landing tail used by jump/change/mark navigation.
     pub(crate) fn settle_cursor_byte(&mut self, byte: usize) {
         self.set_cursor_char(byte);
+        self.clamp_cursor();
         self.desired_col = self.cursor_virtcol();
         self.desired_eol = false;
         self.ensure_visible();
@@ -330,9 +359,10 @@ impl Editor {
             if self.top >= self.max_scroll_top(self.text_height()) {
                 return false;
             }
-            self.top + 1
+            // A closed fold scrolls as one line: step past its last line.
+            (self.fold_line_end(self.top) + 1).min(self.last_line())
         } else {
-            self.top.saturating_sub(1)
+            self.fold_line_start(self.top.saturating_sub(1))
         };
         if new_top == self.top {
             return false;
@@ -347,8 +377,16 @@ impl Editor {
     /// ([`keep_cursor_in_scroll_margin`](Self::keep_cursor_in_scroll_margin)). Unlike
     /// [`Self::scroll_by`] (`<C-d>`/`<C-f>`), the cursor does *not* travel with the
     /// view while it stays outside the margin.
-    pub(crate) fn scroll_line(&mut self, down: bool) {
-        if !self.scroll_view_line(down) {
+    /// A count scrolls that many lines, stopping where the view can go no further.
+    pub(crate) fn scroll_line(&mut self, down: bool, count: usize) {
+        let mut moved = false;
+        for _ in 0..count.max(1) {
+            if !self.scroll_view_line(down) {
+                break;
+            }
+            moved = true;
+        }
+        if !moved {
             return;
         }
         let th = self.text_height();

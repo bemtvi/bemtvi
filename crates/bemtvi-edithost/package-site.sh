@@ -41,7 +41,8 @@ done
 
 # The page's relative imports require web/ and dist/ as siblings (index.html loads
 # ./worker.mjs and ./width.js — which loads ../dist/bemtvi_width.wasm; worker.mjs loads
-# ../dist/eh.mjs, statically imports ./rpc.mjs, and
+# ../dist/eh.mjs, statically imports ./rpc.mjs + ./daemon-trust.mjs (which index.html imports
+# too), and
 # *dynamically* imports ./ts-indent.js, ./ts-folds.js and ./ts-textobjects.js — the optional
 # tree-sitter indenter / fold runner / text-object runner; highlight.js
 # pulls in ./grammars.js + ./ts-sanitize.js). Copy every runtime file these reach — not
@@ -52,7 +53,7 @@ mkdir -p "$site/web" "$site/dist"
 cp "$here/dist/eh.mjs" "$here/dist/eh.wasm" "$here/dist/bemtvi_width.wasm" "$site/dist/"
 # build-config.js is required: worker.mjs statically imports it (the build-time feature
 # flags). Without it the Worker fails to load.
-cp "$here/web/index.html" "$here/web/worker.mjs" "$here/web/rpc.mjs" \
+cp "$here/web/index.html" "$here/web/worker.mjs" "$here/web/rpc.mjs" "$here/web/daemon-trust.mjs" \
    "$here/web/build-config.js" "$here/web/width.js" "$here/web/highlight.js" \
    "$here/web/grammars.js" "$here/web/ts-sanitize.js" "$here/web/ts-indent.js" \
    "$here/web/ts-folds.js" "$here/web/ts-textobjects.js" "$here/web/serve.mjs" "$site/web/"

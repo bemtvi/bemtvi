@@ -22,6 +22,7 @@
 use bemtvi_core::BufferId;
 use bemtvi_lsp::LspEvent;
 use bemtvi_rpc::Incoming;
+use std::collections::VecDeque;
 use std::io;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 
@@ -47,7 +48,63 @@ const TERM_BATCH_BYTES: usize = 256 * 1024;
 /// storm drains.
 const LOOP_EVENT_BATCH: usize = 256;
 
+/// The next client message: one held back by a `:sleep` first (in arrival order), else
+/// the next off the wire. Cancel-safe — a held message is only popped inside a poll that
+/// returns it.
+pub(crate) async fn next_client_message(
+    incoming: &mut UnboundedReceiver<Incoming>,
+    held: &mut VecDeque<Incoming>,
+) -> Option<Incoming> {
+    if let Some(message) = held.pop_front() {
+        return Some(message);
+    }
+    incoming.recv().await
+}
+
+/// Park the editor for a `:sleep` of `ms` milliseconds. Client messages that arrive
+/// meanwhile are held (applied once it ends); a `<C-c>` ends it early, as in vim, so no
+/// sleep length can wedge the session. A closed client also ends it.
+pub(crate) async fn sleep_interruptible(
+    incoming: &mut UnboundedReceiver<Incoming>,
+    held: &mut VecDeque<Incoming>,
+    ms: u64,
+) {
+    let sleep = tokio::time::sleep(std::time::Duration::from_millis(ms));
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return,
+            message = incoming.recv() => {
+                let Some(message) = message else { return };
+                let interrupt = is_sleep_interrupt(&message);
+                held.push_back(message);
+                if interrupt {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Whether a client message is keyboard input carrying `<C-c>` (vim's interrupt).
+fn is_sleep_interrupt(message: &Incoming) -> bool {
+    let (Incoming::Request { method, params, .. } | Incoming::Notification { method, params }) =
+        message;
+    if method != "btv_input" {
+        return false;
+    }
+    params
+        .first()
+        .and_then(|v| v.as_str())
+        .is_some_and(|keys| keys.contains('\x03') || keys.to_ascii_lowercase().contains("<c-c>"))
+}
+
 impl EditHost {
+    /// Take the span of a `:sleep` the last message ran, for the run loop to park on.
+    pub(crate) fn take_sleep(&mut self) -> Option<u64> {
+        self.editor.take_sleep()
+    }
+
     /// Apply one client message (an `nvim_*` request or notification). Whether it asked the
     /// editor to quit is decided by the run loop's single post-`select!` [`quitting`](Self::quitting)
     /// funnel, not here — a quit may complete *asynchronously* (an `ExitPre`/`VimLeavePre`
@@ -67,11 +124,17 @@ impl EditHost {
     /// Coalesce a burst of language-server events (initialize handshakes, published
     /// diagnostics, replies, exits, log messages) into one settle + repaint. A reply
     /// handled by a Lua callback may defer work via `vim.cmd` / `vim.schedule`, so the
-    /// settle is gated on `lsp_dirty` to drive that to convergence.
+    /// settle is gated on `lsp_dirty` to drive that to convergence. Bounded by
+    /// [`LOOP_EVENT_BATCH`] like the loop arm, so a server that floods events faster
+    /// than they are handled can't hold the editor without a repaint; the run loop's
+    /// `select!` re-fires this arm for the rest.
     pub(crate) fn on_lsp_events(&mut self, first: LspEvent, rx: &mut UnboundedReceiver<LspEvent>) {
         self.on_lsp_event(first);
-        while let Ok(event) = rx.try_recv() {
+        let mut budget = LOOP_EVENT_BATCH - 1;
+        while budget > 0 {
+            let Ok(event) = rx.try_recv() else { break };
             self.on_lsp_event(event);
+            budget -= 1;
         }
         let dirty = std::mem::take(&mut self.lsp_dirty);
         self.settle_events(dirty);

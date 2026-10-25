@@ -2417,6 +2417,11 @@ pub async fn serve_fs_daemon_on(
     mut incoming: UnboundedReceiver<Incoming>,
     fs: Box<dyn HostFs + Send>,
 ) -> anyhow::Result<()> {
+    // Every `HostFs` call is blocking IO (a whole-file read, a write, a stat on a slow
+    // mount); run it on the blocking pool so it never parks the executor thread this task
+    // — and every other leg sharing that runtime — is on. Each call is awaited in turn,
+    // so the leg's ordering (a write's watch-baseline refresh before the next poll) holds.
+    let fs: Arc<Mutex<Box<dyn HostFs + Send>>> = Arc::new(Mutex::new(fs));
     // The watch leg (`HostWatch`): watched path → last-seen stat. The daemon *owns*
     // change detection — the edit-host arms a watch (`fs_watch`) and only reacts to a
     // push, so it never stats the remote disk itself. A coarse poll (the daemon is the
@@ -2429,33 +2434,47 @@ pub async fn serve_fs_daemon_on(
             msg = incoming.recv() => {
                 let Some(msg) = msg else { break }; // the edit-host hung up
                 match msg {
-                    Incoming::Request { id, method, mut params } => {
-                        let reply = match method.as_str() {
-                            FS_READ => serve_read(&*fs, &params),
-                            FS_CHDIR => serve_chdir(&*fs, &params),
-                            FS_MKDIR => serve_mkdir(&*fs, &params),
-                            FS_REMOVE => serve_remove(&*fs, &params),
-                            FS_WRITE => {
-                                let reply = serve_write(&*fs, &mut params);
-                                // Self-suppress: a successful write changed the file, but
-                                // it was the edit-host's *own* `:w` — refresh the watch
-                                // baseline so the poll doesn't push it back as an external
-                                // change. Same task as the poll, so no race (it can't tick
-                                // mid-write). `serve_write` only takes the *bytes* out of
-                                // `params`, so the path is still readable here.
-                                if reply.is_ok() {
-                                    if let Some(path) =
-                                        params.first().and_then(Value::as_str).map(PathBuf::from)
-                                    {
-                                        if let Some(slot) = watches.get_mut(&path) {
-                                            *slot = fs.stat(&path);
+                    Incoming::Request { id, method, params } => {
+                        let watched = params
+                            .first()
+                            .and_then(Value::as_str)
+                            .map(PathBuf::from)
+                            .filter(|p| watches.contains_key(p));
+                        let (reply, restat) = with_fs(&fs, move |fs| {
+                            let mut params = params;
+                            match method.as_str() {
+                                FS_READ => (serve_read(fs, &params), None),
+                                FS_CHDIR => (serve_chdir(fs, &params), None),
+                                FS_MKDIR => (serve_mkdir(fs, &params), None),
+                                FS_REMOVE => (serve_remove(fs, &params), None),
+                                FS_WRITE => {
+                                    let reply = serve_write(fs, &mut params);
+                                    // Self-suppress: a successful write changed the file,
+                                    // but it was the edit-host's *own* `:w` — re-stat a
+                                    // watched path so its baseline is refreshed below and
+                                    // the poll doesn't push it back as an external change.
+                                    // Same task as the poll, so no race (it can't tick
+                                    // mid-write).
+                                    let restat = match (&reply, watched) {
+                                        (Ok(_), Some(path)) => {
+                                            let stat = fs.stat(&path);
+                                            Some((path, stat))
                                         }
-                                    }
+                                        _ => None,
+                                    };
+                                    (reply, restat)
                                 }
-                                reply
+                                other => {
+                                    (Err(Value::from(format!("unknown method: {other}"))), None)
+                                }
                             }
-                            other => Err(Value::from(format!("unknown method: {other}"))),
-                        };
+                        })
+                        .await;
+                        if let Some((path, stat)) = restat {
+                            if let Some(slot) = watches.get_mut(&path) {
+                                *slot = stat;
+                            }
+                        }
                         rpc.respond(id, reply);
                     }
                     // The watch leg's arm/disarm — notifications, not requests (there is
@@ -2467,7 +2486,10 @@ pub async fn serve_fs_daemon_on(
                             {
                                 // Baseline the current stat so the very next poll doesn't
                                 // misfire on a file that hasn't changed since the open.
-                                let now = fs.stat(&path);
+                                let now = {
+                                    let path = path.clone();
+                                    with_fs(&fs, move |fs| fs.stat(&path)).await
+                                };
                                 // The reconnect re-stat: the edit-host passes its own disk
                                 // baseline as `known`. If the live file already differs (it
                                 // changed while the link was down — this fresh daemon never
@@ -2501,8 +2523,22 @@ pub async fn serve_fs_daemon_on(
             // Re-stat the watched paths and push any that drifted from their baseline.
             // Disabled while nothing is watched, so an idle fs daemon does no work.
             _ = poll.tick(), if !watches.is_empty() => {
-                for (path, last) in watches.iter_mut() {
-                    let now = fs.stat(path);
+                let paths: Vec<PathBuf> = watches.keys().cloned().collect();
+                let stats = with_fs(&fs, move |fs| {
+                    paths
+                        .into_iter()
+                        .map(|p| {
+                            let stat = fs.stat(&p);
+                            (p, stat)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+                for (path, now) in stats {
+                    // Disarmed while the stats ran? Nothing to compare against.
+                    let Some(last) = watches.get_mut(&path) else {
+                        continue;
+                    };
                     if now != *last {
                         *last = now;
                         rpc.notify(
@@ -2520,6 +2556,26 @@ pub async fn serve_fs_daemon_on(
     Ok(())
 }
 
+/// Run `f` against the fs leg's [`HostFs`] on the blocking pool and await it — see
+/// [`serve_fs_daemon_on`]. A panicking backend call is re-raised on this task, as it
+/// was when the call ran inline.
+async fn with_fs<T, F>(fs: &Arc<Mutex<Box<dyn HostFs + Send>>>, f: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce(&dyn HostFs) -> T + Send + 'static,
+{
+    let fs = fs.clone();
+    match tokio::task::spawn_blocking(move || {
+        let guard = fs.lock().unwrap_or_else(|e| e.into_inner());
+        f(&**guard)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
+}
+
 /// Serve one `fs_read [path]` against `fs`, projecting [`classify`]'s result onto the
 /// `["file", bytes]` / `["new"]` / `["dir", path, entries]` wire shape (or a loud error
 /// reply).
@@ -2533,10 +2589,12 @@ fn serve_read(fs: &dyn HostFs, params: &[Value]) -> Result<Value, Value> {
             // reader rejects it and tears the connection down (with every other
             // leg). Refuse loudly instead — the open fails with this message.
             if bytes.len() > MAX_FRAME_PAYLOAD {
+                let size = stat
+                    .map(|s| format!("{} bytes", s.size))
+                    .unwrap_or_else(|| format!("over {MAX_FRAME_PAYLOAD} bytes"));
                 return Err(Value::from(format!(
-                    "fs_read: {} is {} bytes — too large for one wire frame ({} limit)",
+                    "fs_read: {} is {size} — too large for one wire frame ({} limit)",
                     path.display(),
-                    bytes.len(),
                     MAX_FRAME_PAYLOAD
                 )));
             }
@@ -2688,9 +2746,13 @@ fn classify(fs: &dyn HostFs, path: &Path) -> io::Result<FsRead> {
         });
     }
     match fs.open_read(path) {
-        Ok(mut reader) => {
+        Ok(reader) => {
+            // Read at most one byte past the frame cap: a larger file is refused anyway
+            // (see `serve_read`), so reading it whole would only allocate it to discard.
             let mut bytes = Vec::new();
-            reader.read_to_end(&mut bytes)?;
+            reader
+                .take(MAX_FRAME_PAYLOAD as u64 + 1)
+                .read_to_end(&mut bytes)?;
             // Stat the file we just read so the edit-host stamps an accurate `disk`
             // baseline (and so an existing file fires `BufReadPost`, not `BufNewFile`).
             Ok(FsRead::File(bytes, fs.stat(path)))
@@ -4282,7 +4344,7 @@ fn encode_config_bundle(
     files: Vec<(PathBuf, Vec<u8>)>,
     ts_languages: Vec<String>,
     cwd: Option<PathBuf>,
-    state_dir: PathBuf,
+    state_dir: Option<PathBuf>,
     home: Option<PathBuf>,
 ) -> Value {
     let path_str = |p: PathBuf| Value::from(p.to_string_lossy().into_owned());
@@ -4297,7 +4359,7 @@ fn encode_config_bundle(
         ),
         Value::Array(ts_languages.into_iter().map(Value::from).collect()),
         cwd.map_or(Value::Nil, path_str),
-        path_str(state_dir),
+        state_dir.map_or(Value::Nil, path_str),
         home.map_or(Value::Nil, path_str),
         // The daemon's own path syntax (this process *is* the daemon), so an edit-host
         // on a different OS tests / joins / URI-encodes every remote path by the daemon's

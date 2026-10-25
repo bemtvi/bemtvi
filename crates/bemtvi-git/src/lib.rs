@@ -374,7 +374,7 @@ fn discover(path: &str) -> Result<GitValue, GitError> {
     // `prefix` = the repo-root→(dir of `path`) relative path, matching `--show-prefix`
     // (empty at the repo root). `path`'s directory is what git's cwd-relative prefix
     // reports; if `path` is itself a directory we use it directly.
-    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+    let abs = canonicalize_existing_prefix(Path::new(path));
     let dir = if abs.is_dir() {
         abs.as_path()
     } else {
@@ -463,6 +463,7 @@ fn diff_file(path: &str, file: &str) -> Result<GitValue, GitError> {
 /// makes this affordable for a file tree that refreshes on every write.
 fn status(path: &str, ignored: bool) -> Result<GitValue, GitError> {
     let repo = open(path)?;
+    let notice = skipped_filters_notice(&repo);
     let mut platform = repo
         .status(gix::progress::Discard)
         .map_err(|e| egit("status", e))?
@@ -509,7 +510,48 @@ fn status(path: &str, ignored: bool) -> Result<GitValue, GitError> {
     Ok(GitValue::Status {
         dirty: !entries.is_empty(),
         entries,
+        notice,
     })
+}
+
+/// The filter drivers (`filter.<name>.clean` / `smudge` / `process`) that `repo`'s own
+/// config defines but gix will not run, because the repository is not trusted — owned
+/// by another user and not named by `safe.directory`, git's rule too. gix drops every
+/// repository-local config section of such a repository from lookups (the
+/// [`gix::config::section::is_trusted`] filter it opens with), so its filters are never
+/// spawned and status compares raw worktree bytes instead. That changes the answer for
+/// a repository that relies on them, so it is reported rather than silent: the message
+/// names the repository and the skipped drivers. `None` for a trusted repository.
+fn skipped_filters_notice(repo: &gix::Repository) -> Option<String> {
+    if repo.git_dir_trust() == gix::sec::Trust::Full {
+        return None;
+    }
+    let config = repo.config_snapshot();
+    let mut names: Vec<String> = config
+        .plumbing()
+        .sections_by_name("filter")
+        .into_iter()
+        .flatten()
+        .filter(|s| !gix::config::section::is_trusted(s.meta()))
+        .filter(|s| {
+            ["clean", "smudge", "process"]
+                .iter()
+                .any(|k| s.value(k).is_some())
+        })
+        .filter_map(|s| s.header().subsection_name().map(|n| n.to_string()))
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    names.sort();
+    names.dedup();
+    let place = repo.workdir().unwrap_or_else(|| repo.git_dir());
+    Some(format!(
+        "git: {} is not trusted (not owned by you, and not in safe.directory), so its \
+         filter driver(s) {} were not run; status compares the files unfiltered",
+        place.display(),
+        names.join(", ")
+    ))
 }
 
 // ----- mutation / network verbs ----------------------------------------------
@@ -873,11 +915,36 @@ fn is_dir_sep(c: char) -> bool {
 /// so a symlinked worktree dir (e.g. macOS `/var` → `/private/var`) still strips
 /// cleanly — the exact breakage the plugins' string-prefix `--show-prefix` math hit.
 fn repo_relative(root: &Path, file: &str) -> Result<String, GitError> {
-    let abs = std::fs::canonicalize(file).unwrap_or_else(|_| PathBuf::from(file));
+    let abs = canonicalize_existing_prefix(Path::new(file));
     let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     abs.strip_prefix(&canon_root)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .map_err(|_| err("ENOENT", format!("{file} is not inside the repository")))
+}
+
+/// Canonicalize `path`, or — when it doesn't exist (a deleted or not-yet-written
+/// file) — its nearest existing ancestor with the missing tail re-appended, so a
+/// path reached through a symlinked directory still resolves to the same place.
+fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    if let Ok(p) = std::fs::canonicalize(path) {
+        return p;
+    }
+    let mut tail = Vec::new();
+    let mut cur = path;
+    while let (Some(parent), Some(name)) = (cur.parent(), cur.file_name()) {
+        tail.push(name);
+        let base = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(mut p) = std::fs::canonicalize(base) {
+            p.extend(tail.iter().rev());
+            return p;
+        }
+        cur = parent;
+    }
+    path.to_path_buf()
 }
 
 /// Join a repo-relative path back onto the worktree root.

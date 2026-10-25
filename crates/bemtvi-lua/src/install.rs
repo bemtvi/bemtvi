@@ -1316,7 +1316,14 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     let func = lua.create_table()?;
     func.set(
         "stdpath",
-        lua.create_function(|_, what: String| Ok(stdpath(&what)))?,
+        lua.create_function(|_, what: String| {
+            stdpath(&what).ok_or_else(|| {
+                mlua::Error::runtime(format!(
+                    "stdpath({what:?}): no such directory — no home, XDG base or platform \
+                     default to put it under"
+                ))
+            })
+        })?,
     )?;
     func.set(
         "has",
@@ -1783,47 +1790,23 @@ pub(crate) fn install_runtime_api(
 
     // `btv.argv()` -> the positional file arguments this process was launched with (a
     // list of strings; empty when none). A launcher / wrapper reads them to forward to a
-    // relaunched editor. Carried through `BEMTVI_ARGV` (newline-joined) so the binary
-    // stays the single source of truth.
+    // relaunched editor. Carried through `BEMTVI_ARGV` (a JSON array of strings, so an
+    // argument containing a newline stays one entry) so the binary stays the single
+    // source of truth.
     btv.set(
         "_argv",
         lua.create_function(|lua, ()| {
-            let joined = std::env::var("BEMTVI_ARGV").unwrap_or_default();
-            let items: Vec<&str> = if joined.is_empty() {
+            let encoded = std::env::var("BEMTVI_ARGV").unwrap_or_default();
+            let items: Vec<String> = if encoded.is_empty() {
                 Vec::new()
             } else {
-                joined.split('\n').collect()
+                serde_json::from_str(&encoded).map_err(|e| {
+                    mlua::Error::runtime(format!(
+                        "btv.argv: $BEMTVI_ARGV is not a JSON array of strings: {e}"
+                    ))
+                })?
             };
             lua.create_sequence_from(items)
-        })?,
-    )?;
-
-    // `btv.reexec(args)` -> replace THIS process with a fresh `bemtvi args…` (the current
-    // executable). A launcher uses it to relaunch the editor with chosen flags (e.g.
-    // `--shada-namespace` + `--restore-session`). On Unix this `execv`s (never returns
-    // on success); elsewhere it spawns + exits with the child's status. Raises if the
-    // exec / spawn itself fails.
-    btv.set(
-        "_reexec",
-        lua.create_function(|_, args: Vec<String>| -> mlua::Result<()> {
-            let exe = std::env::current_exe()
-                .map_err(|e| mlua::Error::RuntimeError(format!("btv.reexec: current_exe: {e}")))?;
-            let mut cmd = std::process::Command::new(exe);
-            cmd.args(&args);
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                // execv: replaces the image; only returns on failure.
-                let err = cmd.exec();
-                Err(mlua::Error::RuntimeError(format!("btv.reexec: {err}")))
-            }
-            #[cfg(not(unix))]
-            {
-                let status = cmd
-                    .status()
-                    .map_err(|e| mlua::Error::RuntimeError(format!("btv.reexec: {e}")))?;
-                std::process::exit(status.code().unwrap_or(1));
-            }
         })?,
     )?;
 
@@ -2975,15 +2958,16 @@ pub(crate) fn install_runtime_api(
         )?,
     )?;
 
-    // `btv._diagnostic_goto(forward, severity)`: queue [`LspOp::DiagnosticGoto`]
-    // — the cursor move `vim.diagnostic.goto_next`/`goto_prev` drive.
+    // `btv._diagnostic_goto(forward, severities)`: queue [`LspOp::DiagnosticGoto`]
+    // — the cursor move `vim.diagnostic.goto_next`/`goto_prev` drive. `severities` is
+    // the wanted-severity bitmask the prelude compiles from `opts.severity`.
     let sh = shared.clone();
     btv.set(
         "_diagnostic_goto",
-        lua.create_function(move |_, (forward, severity): (bool, Option<u16>)| {
+        lua.create_function(move |_, (forward, severities): (bool, Option<u8>)| {
             sh.borrow_mut().lsp_ops.push(LspOp::DiagnosticGoto {
                 forward,
-                severity: severity.map(|s| s as u8),
+                severities,
             });
             Ok(())
         })?,
@@ -4892,6 +4876,12 @@ fn qf_item_from_table(t: &Table) -> mlua::Result<QfItem> {
         |k: &str| -> mlua::Result<String> { Ok(t.get::<Option<String>>(k)?.unwrap_or_default()) };
     let int_or =
         |k: &str, d: i64| -> mlua::Result<i64> { Ok(t.get::<Option<i64>>(k)?.unwrap_or(d)) };
+    let i32_or = |k: &str, d: i64| -> mlua::Result<i32> {
+        let n = int_or(k, d)?;
+        i32::try_from(n).map_err(|_| {
+            mlua::Error::runtime(format!("setqflist: entry `{k}` {n} is out of range"))
+        })
+    };
     let lnum = int_or("lnum", 0)?;
     let valid = match t.get::<Option<bool>>("valid")? {
         Some(v) => v,
@@ -4899,14 +4889,14 @@ fn qf_item_from_table(t: &Table) -> mlua::Result<QfItem> {
     };
     Ok(QfItem {
         filename: t.get::<Option<String>>("filename")?,
-        bufnr: int_or("bufnr", 0)? as i32,
+        bufnr: i32_or("bufnr", 0)?,
         module: str_or("module")?,
         lnum: lnum.max(0) as usize,
         end_lnum: int_or("end_lnum", 0)?.max(0) as usize,
         col: int_or("col", 0)?.max(0) as usize,
         end_col: int_or("end_col", 0)?.max(0) as usize,
         vcol: t.get::<Option<bool>>("vcol")?.unwrap_or(false),
-        nr: int_or("nr", -1)? as i32,
+        nr: i32_or("nr", -1)?,
         pattern: str_or("pattern")?,
         text: str_or("text")?,
         typ: str_or("type")?,

@@ -408,6 +408,17 @@ async fn encode_query_helpers_are_public() {
         .as_str(),
         Some("http://h/p?x=1&y=2")
     );
+    // The query belongs before a `#fragment` (else it is part of the fragment and
+    // never reaches the server), and a `?` inside the fragment is not a query.
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return btv.http.build_url('http://h/p#a?b', { y = 2 })"
+        )
+        .await
+        .as_str(),
+        Some("http://h/p?y=2#a?b")
+    );
 }
 
 #[tokio::test]

@@ -307,9 +307,12 @@ async fn notify_once_shows_each_message_only_once() {
 async fn uri_from_path_resolves_a_relative_path_against_the_cwd() {
     let (rpc, _incoming) = start().await;
     let cwd = eval_str(&rpc, "vim.fn.getcwd()").await;
+    // The resolved path in the platform's own spelling (`D:\…\src\main.rs` on
+    // Windows), and its URI as a server expects it (`file:///D:/…/src/main.rs`).
+    let abs = std::path::Path::new(&cwd).join("src").join("main.rs");
     assert_eq!(
         eval_str(&rpc, "btv.utils.uri_from_path('src/main.rs')").await,
-        format!("file://{cwd}/src/main.rs")
+        bemtvi_test_harness::file_uri(&abs)
     );
     assert_eq!(
         eval_str(
@@ -317,7 +320,7 @@ async fn uri_from_path_resolves_a_relative_path_against_the_cwd() {
             "btv.utils.uri_to_path(btv.utils.uri_from_path('src/main.rs'))"
         )
         .await,
-        format!("{cwd}/src/main.rs")
+        abs.to_string_lossy()
     );
     assert_eq!(
         eval_str(&rpc, "btv.utils.uri_from_path('/abs/x.rs')").await,

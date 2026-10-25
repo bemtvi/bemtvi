@@ -171,10 +171,13 @@ use serde_json::{json, Value};
 /// sends `exit`). Synchronous and self-contained: a dedicated process that does
 /// nothing but answer one editor, so blocking stdio is simplest and correct.
 pub fn run(script_path: &str) {
-    let script: Value = std::fs::read_to_string(script_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(Value::Null);
+    // An unreadable or malformed script dies loud: serving with no script would make
+    // every scripted reply and the `record` log silently vanish (e.g. a Windows path
+    // spliced unescaped into the JSON), failing the test far from the cause.
+    let text = std::fs::read_to_string(script_path)
+        .unwrap_or_else(|e| panic!("lsp mock: read script {script_path}: {e}"));
+    let script: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("lsp mock: parse script {script_path}: {e}"));
 
     // `stderr_noise`: flood stderr with invalid-UTF-8 lines *before* serving (see
     // the module doc). A write failure means the client abandoned the read end —

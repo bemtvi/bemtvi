@@ -5446,7 +5446,7 @@ async fn large_substitute_syncs_incrementally_without_freezing() {
         &dir,
         &format!(
             r#"{{ "record": "{rec}", "position_encoding": "utf-16" }}"#,
-            rec = record.display()
+            rec = q(&record)
         ),
     );
     let lines_n = 20_000;

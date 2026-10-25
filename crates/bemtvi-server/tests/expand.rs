@@ -140,15 +140,17 @@ async fn plain_path_still_expands_env() {
 async fn fnamemodify_p_expands_a_leading_tilde() {
     let (rpc, _incoming) = start().await;
     let home = std::env::var("HOME").expect("HOME set in dev/CI env");
+    // `:p` yields the platform's own spelling (`C:\Users\x\y` on Windows).
+    let native = |rel: &str| std::path::Path::new(&home).join(rel).display().to_string();
     let got = exec_lua(&rpc, "return vim.fn.fnamemodify('~/x/../y', ':p')").await;
-    assert_eq!(got.as_str(), Some(format!("{home}/y").as_str()));
+    assert_eq!(got.as_str(), Some(native("y").as_str()));
     let round = exec_lua(
         &rpc,
         "local p = os.getenv('HOME') .. '/a/b.txt'\n\
          return vim.fn.fnamemodify(vim.fn.fnamemodify(p, ':~'), ':p:h')",
     )
     .await;
-    assert_eq!(round.as_str(), Some(format!("{home}/a").as_str()));
+    assert_eq!(round.as_str(), Some(native("a").as_str()));
 }
 
 // Both env-var spellings expand — bare `$VAR` and the `${VAR}` brace form vim also

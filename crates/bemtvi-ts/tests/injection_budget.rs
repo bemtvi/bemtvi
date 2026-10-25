@@ -175,8 +175,13 @@ fn a_cold_grammar_load_is_deferred_when_the_frame_is_already_over_budget() {
 
     // One load is allowed on a frame (the one it starts under budget); the slack over
     // it covers that frame's own parsing, which the budget already bounds. Paying
-    // them all would take `LANGS.len()` loads.
-    let ceiling = load + std::time::Duration::from_millis(100);
+    // them all would take `LANGS.len()` loads. Both `load` and `worst` are single
+    // wall-clock samples, and under a loaded parallel `cargo test` a descheduled frame
+    // reads as tens of ms slower; a ceiling of one load leaves only one load of margin
+    // between "deferred" and "broken", so it allows two — still far under the
+    // `LANGS.len()` loads (`LANGS.len() >= 4`) the defect it guards against costs.
+    const _: () = assert!(LANGS.len() >= 4);
+    let ceiling = load * 2 + std::time::Duration::from_millis(100);
     assert!(
         worst < ceiling,
         "a frame took {worst:?} (ceiling {ceiling:?}, one cold load is {load:?}): an \

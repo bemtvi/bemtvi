@@ -505,7 +505,7 @@ async fn an_overflowed_watch_resends_matching_files_as_changed() {
                        "registerOptions": {{ "watchers": [ {{ "globPattern": "**/*.py" }} ] }} }}
                 ]
             }}"#,
-            rec.display()
+            bemtvi_test_harness::q(&rec)
         ),
     );
     // On disk before the watch arms and never touched after: only a rescan reports it.
@@ -518,7 +518,7 @@ async fn an_overflowed_watch_resends_matching_files_as_changed() {
     create_until_reported(&dir, &rec, "seen", "py")
         .await
         .expect("the watch must be armed");
-    let uri = format!("file://{}", old.display());
+    let uri = bemtvi_test_harness::file_uri(&old);
     assert!(
         !watched_changes(&rec).iter().any(|(u, _)| *u == uri),
         "the untouched file has not been reported yet"

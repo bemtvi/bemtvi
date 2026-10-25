@@ -574,10 +574,7 @@ async fn ts_install_ignores_an_inherited_name_that_escapes_the_query_dir() {
     std::env::set_var("BEMTVI_DATA_DIR", &data_dir);
     std::env::set_var("BEMTVI_TS_MIRROR", &mirror);
     std::env::set_var("BEMTVI_TS_REF", REF);
-    std::env::set_var(
-        "BEMTVI_CC",
-        std::env::var("CC").unwrap_or_else(|_| "cc".into()),
-    );
+    std::env::set_var("BEMTVI_CC", bemtvi_test_harness::c_compiler_cmd());
 
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, ":TSInstall rust<CR>");

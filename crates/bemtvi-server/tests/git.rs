@@ -1758,7 +1758,10 @@ fn make_filter_repo(tag: &str) -> (PathBuf, PathBuf) {
     let mut config = std::fs::read_to_string(repo.join(".git/config")).unwrap();
     config.push_str(&format!(
         "[filter \"evil\"]\n\tclean = \"touch '{}'; cat\"\n",
-        marker.display()
+        // Forward slashes: a `\` inside a quoted git-config value starts an escape
+        // (`C:\Users` is an invalid `\U`, failing the whole config), while `sh` —
+        // which runs the filter, Git for Windows' too — takes `C:/Users/…` as-is.
+        marker.to_string_lossy().replace('\\', "/")
     ));
     std::fs::write(repo.join(".git/config"), config).unwrap();
     std::thread::sleep(Duration::from_millis(20));

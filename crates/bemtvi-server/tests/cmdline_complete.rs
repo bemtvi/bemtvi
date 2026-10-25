@@ -14,7 +14,7 @@ use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
     attach, barrier, drain_latest_redraw, drain_to_latest_redraw, exec_lua, feed, lines, map_get,
-    menu_of, message_of, poll_menu, poll_no_menu, spawn, temp_dir, wait_redraw,
+    menu_of, message_of, poll_menu, poll_no_menu, serial_lock, spawn, temp_dir, wait_redraw,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -1389,6 +1389,9 @@ async fn modifier_completes_the_nested_command_name() {
 
 #[tokio::test]
 async fn modifier_hands_the_nested_file_argument_to_the_picker() {
+    // `:cd` moves the process-wide cwd, shared by every test in this binary: hold
+    // the lock so a parallel test's `:cd` cannot land between ours and the listing.
+    let _cwd = serial_lock().lock().await;
     let dir = temp_dir("cmdcomplete_wrap_file");
     let tree = dir.join("tree");
     std::fs::create_dir_all(&tree).unwrap();
@@ -1522,6 +1525,9 @@ async fn poll_preview_eq(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>, 
 
 #[tokio::test]
 async fn file_command_arg_pastes_the_chosen_path_into_the_open_cmdline() {
+    // `:cd` moves the process-wide cwd, shared by every test in this binary: hold
+    // the lock so a parallel test's `:cd` cannot land between ours and the listing.
+    let _cwd = serial_lock().lock().await;
     let dir = temp_dir("cmdcomplete_files");
     // A known tree under a dedicated dir so the listing is deterministic.
     let tree = dir.join("tree");
@@ -1574,6 +1580,9 @@ async fn file_command_arg_pastes_the_chosen_path_into_the_open_cmdline() {
 
 #[tokio::test]
 async fn picker_descends_dirs_previews_them_and_cd_lists_only_dirs() {
+    // `:cd` moves the process-wide cwd, shared by every test in this binary: hold
+    // the lock so a parallel test's `:cd` cannot land between ours and the listing.
+    let _cwd = serial_lock().lock().await;
     let dir = temp_dir("cmdcomplete_descend");
     let tree = dir.join("tree");
     std::fs::create_dir_all(tree.join("sub")).unwrap();
@@ -1624,6 +1633,9 @@ async fn picker_descends_dirs_previews_them_and_cd_lists_only_dirs() {
 
 #[tokio::test]
 async fn user_command_complete_dir_lists_directories_only() {
+    // `:cd` moves the process-wide cwd, shared by every test in this binary: hold
+    // the lock so a parallel test's `:cd` cannot land between ours and the listing.
+    let _cwd = serial_lock().lock().await;
     let dir = temp_dir("cmdcomplete_uc_dir");
     let tree = dir.join("tree");
     std::fs::create_dir_all(tree.join("sub")).unwrap();
@@ -1673,6 +1685,9 @@ async fn user_command_complete_dir_lists_directories_only() {
 
 #[tokio::test]
 async fn client_init_lua_registers_virtual_commands_with_completion() {
+    // `:cd` moves the process-wide cwd, shared by every test in this binary: hold
+    // the lock so a parallel test's `:cd` cannot land between ours and the listing.
+    let _cwd = serial_lock().lock().await;
     let dir = temp_dir("cmdcomplete_client_init");
     let tree = dir.join("tree");
     std::fs::create_dir_all(tree.join("sub")).unwrap();
@@ -1726,6 +1741,9 @@ async fn client_init_lua_registers_virtual_commands_with_completion() {
 
 #[tokio::test]
 async fn user_command_complete_file_lists_files() {
+    // `:cd` moves the process-wide cwd, shared by every test in this binary: hold
+    // the lock so a parallel test's `:cd` cannot land between ours and the listing.
+    let _cwd = serial_lock().lock().await;
     let dir = temp_dir("cmdcomplete_uc_file");
     let tree = dir.join("tree");
     std::fs::create_dir_all(tree.join("sub")).unwrap();
@@ -1815,6 +1833,9 @@ async fn user_command_complete_fn_async_uses_picker() {
 
 #[tokio::test]
 async fn select_directory_row_pastes_the_directory_itself() {
+    // `:cd` moves the process-wide cwd, shared by every test in this binary: hold
+    // the lock so a parallel test's `:cd` cannot land between ours and the listing.
+    let _cwd = serial_lock().lock().await;
     let dir = temp_dir("cmdcomplete_seldir");
     let tree = dir.join("tree");
     std::fs::create_dir_all(tree.join("sub")).unwrap();

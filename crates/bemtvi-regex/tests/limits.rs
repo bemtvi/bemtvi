@@ -13,9 +13,20 @@
 //! Each test names the crash it replaces; reverting the corresponding bound turns
 //! the test into an abort of this binary rather than a failed assertion.
 
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use bemtvi_regex::VimRegex;
+
+/// Serializes the tests that run a match into its deadline. The engine sits behind
+/// one process-wide lock, so a timed test whose clock started after its own
+/// `compile` but before its `exec` could otherwise count a sibling's whole 2 s
+/// default-deadline match as its own elapsed time: a spurious "budget not
+/// honored" failure that only shows under a loaded parallel run.
+fn deadline_lock() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// `a\{2147483647}` — an exact quantifier at the parser's `MAX_LIMIT`. The NFA
 /// engine expands `\{m,n}` into `maxval` copies of the atom, so this asks it for
@@ -110,6 +121,7 @@ fn ordinary_non_capturing_nesting_still_compiles() {
 /// this test instead of hanging the suite.
 #[test]
 fn catastrophic_backtracking_ends_in_a_timeout_not_a_hang() {
+    let _serial = deadline_lock();
     let re = VimRegex::compile("\\%#=1\\(a\\|aa\\)\\+b").expect("compile");
     let line = "a".repeat(36);
     let started = Instant::now();
@@ -133,6 +145,7 @@ fn catastrophic_backtracking_ends_in_a_timeout_not_a_hang() {
 /// to end near the default.
 #[test]
 fn an_explicit_budget_bounds_the_same_match_sooner() {
+    let _serial = deadline_lock();
     let re = VimRegex::compile("\\%#=1\\(a\\|aa\\)\\+b").expect("compile");
     let line = "a".repeat(30);
     let started = Instant::now();
@@ -172,6 +185,7 @@ fn an_ordinary_pattern_on_a_long_line_does_not_time_out() {
 /// use-after-free on the next exec and a double free when the regex is dropped.
 #[test]
 fn a_timeout_after_the_nfa_fallback_keeps_a_valid_program() {
+    let _serial = deadline_lock();
     let re = VimRegex::compile("\\(a\\|aa\\)\\+b").expect("compile");
     let line = "a".repeat(200_000);
     let err = re

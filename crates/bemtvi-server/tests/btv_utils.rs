@@ -80,8 +80,17 @@ async fn ancestors_walks_upward_nearest_first() {
              return table.concat(out, '|')"
         )
     };
-    let abs = exec_lua(&rpc, &walk("/a/b/c.txt")).await;
-    assert_eq!(abs.as_str(), Some("/a/b|/a"), "absolute path walk");
+    // A native absolute path per host: on Windows that is drive-rooted, and the walk
+    // reports native `\`-separated directories (a `/`-rooted path there is
+    // drive-relative, not absolute). The `\\\\` is a Lua-escaped `\\` inside `walk`'s
+    // single-quoted literal.
+    let (abs_path, abs_walk) = if cfg!(windows) {
+        ("C:\\\\a\\\\b\\\\c.txt", "C:\\a\\b|C:\\a")
+    } else {
+        ("/a/b/c.txt", "/a/b|/a")
+    };
+    let abs = exec_lua(&rpc, &walk(abs_path)).await;
+    assert_eq!(abs.as_str(), Some(abs_walk), "absolute path walk");
 
     // The relative walk starts at `<cwd>/a/b` and keeps climbing *through* the cwd
     // into its own ancestors — an absolute chain, not the two bare components.
@@ -93,18 +102,87 @@ async fn ancestors_walks_upward_nearest_first() {
         .split('|')
         .map(str::to_string)
         .collect();
+    let sep = std::path::MAIN_SEPARATOR;
     assert_eq!(
         dirs.iter().take(3).collect::<Vec<_>>(),
-        vec![&format!("{cwd}/a/b"), &format!("{cwd}/a"), &cwd],
+        vec![&format!("{cwd}{sep}a{sep}b"), &format!("{cwd}{sep}a"), &cwd],
         "a relative path resolves against the cwd before walking"
     );
 
-    let top = exec_lua(&rpc, &walk("/top.txt")).await;
+    let top_path = if cfg!(windows) {
+        "C:\\\\top.txt"
+    } else {
+        "/top.txt"
+    };
+    let top = exec_lua(&rpc, &walk(top_path)).await;
     assert_eq!(
         top.as_str(),
         Some(""),
         "a file directly under the root has no ancestors"
     );
+}
+
+// The path-style primitives every path helper reads its platform rules from: under the
+// windows style a drive / UNC share / bare separator is a root and both separators
+// split; under the unix style only a leading `/` roots and `\` is an ordinary byte.
+// `btv.fname.modify` and the `file://` conversion are built on them.
+#[tokio::test]
+async fn path_style_primitives_follow_the_host() {
+    let (rpc, _incoming) = start().await;
+    let cases: &[(&str, &str)] = if cfg!(windows) {
+        &[
+            ("btv.utils.path_style()", "windows"),
+            ("btv.utils.path_sep()", r"\"),
+            (r"btv.utils.path_root([[C:\a]])", r"C:\"),
+            ("btv.utils.path_root('C:/a')", "C:/"),
+            (r"btv.utils.path_root([[\\srv\share\x]])", r"\\srv\share\"),
+            (r"btv.utils.is_absolute([[\a]])", "true"),
+            (r"btv.utils.is_absolute([[a\b]])", "false"),
+            (r"btv.utils.dirname([[C:\a\b]])", r"C:\a"),
+            (r"btv.utils.dirname([[C:\a]])", ""),
+            (
+                r"btv.fname.modify([[C:/x/./y\z.txt]], ':p')",
+                r"C:\x\y\z.txt",
+            ),
+            (r"btv.fname.modify([[C:\x\y.txt]], ':t')", "y.txt"),
+            (r"btv.fname.modify([[C:\x]], ':h')", r"C:\"),
+            (
+                r"btv.utils.path_join([[C:\a]], 'b/c', 'd.txt')",
+                r"C:\a\b\c\d.txt",
+            ),
+            (r"btv.utils.path_join([[C:\a\]], [[\b]])", r"C:\a\b"),
+            (r"btv.utils.path_join('C:/a', nil, '', 'b')", r"C:\a\b"),
+            (r"btv.utils.path_join([[C:\]], 'a')", r"C:\a"),
+            (r"btv.utils.local_path_join([[C:\a]], 'b/c')", r"C:\a\b\c"),
+            (
+                r"btv.utils.uri_from_path([[\\srv\share\a b]])",
+                "file://srv/share/a%20b",
+            ),
+            (
+                "btv.utils.uri_to_path('file://srv/share/a%20b')",
+                r"\\srv\share\a b",
+            ),
+        ]
+    } else {
+        &[
+            ("btv.utils.path_style()", "unix"),
+            ("btv.utils.path_sep()", "/"),
+            ("btv.utils.path_root('/a')", "/"),
+            (r"btv.utils.path_root([[C:\a]])", ""),
+            (r"btv.utils.is_absolute([[\a]])", "false"),
+            ("btv.utils.dirname('/a/b')", "/a"),
+            (r"btv.fname.modify([[/x/a\b.txt]], ':t')", r"a\b.txt"),
+            ("btv.utils.path_join('/a', 'b/c', 'd.txt')", "/a/b/c/d.txt"),
+            ("btv.utils.path_join('/a/', '/b')", "/a/b"),
+            ("btv.utils.path_join('/a', nil, '', 'b')", "/a/b"),
+            ("btv.utils.path_join('/', 'a')", "/a"),
+            (r"btv.utils.path_join('/a', [[b\c]])", r"/a/b\c"),
+            ("btv.utils.local_path_join('/a', 'b')", "/a/b"),
+        ]
+    };
+    for (expr, want) in cases {
+        assert_eq!(eval_str(&rpc, expr).await, *want, "{expr}");
+    }
 }
 
 // argv flattens `{ cmd = string|list, args = list }` — the two spellings the run

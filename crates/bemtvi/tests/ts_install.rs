@@ -107,10 +107,7 @@ fn fixture_rev(tag: &str, revision: &str, archive_top_dir: &str) -> (PathBuf, Pa
     std::env::set_var("BEMTVI_DATA_DIR", &data_dir);
     std::env::set_var("BEMTVI_TS_MIRROR", &mirror);
     std::env::set_var("BEMTVI_TS_REF", REF);
-    std::env::set_var(
-        "BEMTVI_CC",
-        std::env::var("CC").unwrap_or_else(|_| "cc".into()),
-    );
+    std::env::set_var("BEMTVI_CC", bemtvi_test_harness::c_compiler_cmd());
     (data_dir, mirror)
 }
 
@@ -119,12 +116,26 @@ fn write_under(path: &Path, bytes: &[u8]) {
     std::fs::write(path, bytes).unwrap();
 }
 
+/// `cp -R from to`, in-process: no `cp` on a stock Windows `PATH`.
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).expect("read grammar src") {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), &dest).expect("copy grammar src file");
+        }
+    }
+}
+
 /// Pack the cargo-unpacked `tree-sitter-rust` `src/` into a `.tar.gz` whose top
 /// dir is `top_dir/` — exactly what GitHub's archive endpoint serves, so the
 /// installer's untar + `src/parser.c` discovery hit the same layout as
 /// production. `top_dir` is a parameter because GitHub mangles it (a `vX.Y.Z` tag
 /// becomes `…-X.Y.Z`), which the installer must not assume. Uses the system `tar`
-/// (the harness already shells out to `cc`), staging via `cp -R`.
+/// (the harness already shells out to `cc`), staging via [`copy_dir`].
 fn build_source_tarball(out: &Path, top_dir: &str) {
     std::fs::create_dir_all(out.parent().unwrap()).unwrap();
     let stage = out.parent().unwrap().join(format!(
@@ -134,13 +145,7 @@ fn build_source_tarball(out: &Path, top_dir: &str) {
     let _ = std::fs::remove_dir_all(&stage);
     let pkg = stage.join(top_dir);
     std::fs::create_dir_all(&pkg).unwrap();
-    let status = std::process::Command::new("cp")
-        .arg("-R")
-        .arg(grammar_src_dir().join("src"))
-        .arg(pkg.join("src"))
-        .status()
-        .expect("cp -R grammar src");
-    assert!(status.success(), "staging grammar src failed");
+    copy_dir(&grammar_src_dir().join("src"), &pkg.join("src"));
     let status = std::process::Command::new("tar")
         .arg("czf")
         .arg(out)
@@ -518,10 +523,7 @@ async fn ts_install_fetches_inherited_query_sets() {
     std::env::set_var("BEMTVI_DATA_DIR", &data_dir);
     std::env::set_var("BEMTVI_TS_MIRROR", &mirror);
     std::env::set_var("BEMTVI_TS_REF", REF);
-    std::env::set_var(
-        "BEMTVI_CC",
-        std::env::var("CC").unwrap_or_else(|_| "cc".into()),
-    );
+    std::env::set_var("BEMTVI_CC", bemtvi_test_harness::c_compiler_cmd());
 
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, ":TSInstall rust<CR>");
@@ -589,10 +591,7 @@ async fn ts_install_never_uses_a_compiler_from_path() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    std::env::set_var(
-        "BEMTVI_CC",
-        std::env::var("CC").unwrap_or_else(|_| "cc".into()),
-    );
+    std::env::set_var("BEMTVI_CC", bemtvi_test_harness::c_compiler_cmd());
     assert!(
         msg.contains("TSInstall: rust failed") && msg.contains(&stem),
         "expected the build to run the pinned Zig ({stem}), got: {msg:?}"
@@ -641,13 +640,7 @@ fn build_repo_tarball(out: &Path, top_dir: &str, tree_sitter_json: &str) {
     let _ = std::fs::remove_dir_all(&stage);
     let pkg = stage.join(top_dir);
     std::fs::create_dir_all(&pkg).unwrap();
-    let status = std::process::Command::new("cp")
-        .arg("-R")
-        .arg(grammar_src_dir().join("src"))
-        .arg(pkg.join("src"))
-        .status()
-        .expect("cp -R grammar src");
-    assert!(status.success(), "staging grammar src failed");
+    copy_dir(&grammar_src_dir().join("src"), &pkg.join("src"));
     write_under(&pkg.join("tree-sitter.json"), tree_sitter_json.as_bytes());
     write_under(
         &pkg.join("queries/highlights.scm"),
@@ -682,10 +675,7 @@ fn repo_fixture(tag: &str, git_ref: &str, tree_sitter_json: &str) -> PathBuf {
     );
     std::env::set_var("BEMTVI_DATA_DIR", &data_dir);
     std::env::set_var("BEMTVI_TS_MIRROR", &mirror);
-    std::env::set_var(
-        "BEMTVI_CC",
-        std::env::var("CC").unwrap_or_else(|_| "cc".into()),
-    );
+    std::env::set_var("BEMTVI_CC", bemtvi_test_harness::c_compiler_cmd());
     data_dir
 }
 
@@ -830,10 +820,7 @@ async fn ts_install_repo_generates_parser_from_grammar_js_via_cli() {
     );
     std::env::set_var("BEMTVI_DATA_DIR", &data_dir);
     std::env::set_var("BEMTVI_TS_MIRROR", &mirror);
-    std::env::set_var(
-        "BEMTVI_CC",
-        std::env::var("CC").unwrap_or_else(|_| "cc".into()),
-    );
+    std::env::set_var("BEMTVI_CC", bemtvi_test_harness::c_compiler_cmd());
 
     let file = write_temp("tsinstall_gen", "txt", "hello world of demo\n");
     let (rpc, mut incoming) = start(Some(file)).await;

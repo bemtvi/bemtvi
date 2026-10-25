@@ -1326,7 +1326,7 @@ impl EditHost {
             std::collections::HashSet::new();
         let mut first: Option<(Location, PositionEncoding)> = None;
         for (loc, encoding) in &locations {
-            let Some(path) = uri_to_path(&loc.uri) else {
+            let Some(path) = self.uri_path(&loc.uri) else {
                 continue;
             };
             let row = loc.range.start.line as usize;
@@ -1406,7 +1406,7 @@ impl EditHost {
         let mut seen: std::collections::HashSet<(String, PathBuf, usize, usize)> =
             std::collections::HashSet::new();
         for (sym, encoding) in &symbols {
-            let Some(path) = uri_to_path(&sym.location.uri) else {
+            let Some(path) = self.uri_path(&sym.location.uri) else {
                 continue;
             };
             let row = sym.location.range.start.line as usize;
@@ -1461,7 +1461,7 @@ impl EditHost {
     /// **line-0** target, whose clamped cursor agrees with the target line and so used
     /// to take the refinement's column-`0` answer whatever the server asked for.
     pub(crate) fn jump_to_lsp_location(&mut self, loc: &Location, encoding: PositionEncoding) {
-        let Some(path) = uri_to_path(&loc.uri) else {
+        let Some(path) = self.uri_path(&loc.uri) else {
             return;
         };
         let line = loc.range.start.line as usize;

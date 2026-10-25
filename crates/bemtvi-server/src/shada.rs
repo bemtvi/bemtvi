@@ -54,13 +54,17 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bemtvi_core::{
     FileChangelist, FileFolds, FileMarkEntry, GlobalMarkEntry, InputHistoryEntry, JumpPos,
     NumberedMark, PersistState, PluginEntry, PluginNamespace, RegisterEntry,
 };
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableError};
+use redb::backends::FileBackend;
+use redb::{
+    Database, ReadableDatabase, ReadableTable, StorageBackend, TableDefinition, TableError,
+};
 use serde::{Deserialize, Serialize};
 
 /// The per-history entry cap (newest-N kept) applied on merge, mirroring vim's
@@ -104,6 +108,17 @@ pub trait ShadaStore {
     /// default returns `None`: a store that isn't a single local file has nothing to
     /// upload whole.
     fn current_path(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// The committed bytes of this instance's own store — the contents of
+    /// [`current_path`](ShadaStore::current_path) — read through the store's *own*
+    /// handle. The remote-shada sync uploads these after a flush. They can't be read by
+    /// opening the path: the live database holds an exclusive lock on it, which Windows
+    /// enforces against every other handle (`ERROR_LOCK_VIOLATION`), so a plain
+    /// `fs::read` failed there and nothing ever reached the daemon. The default returns
+    /// `None`, like `current_path`.
+    fn read_current(&self) -> Option<std::io::Result<Vec<u8>>> {
         None
     }
 }
@@ -260,6 +275,10 @@ pub struct RedbFileStore {
     /// This instance's database, opened lazily by [`load`](RedbFileStore::load) and
     /// reused by [`flush`](RedbFileStore::flush) / [`reload`](RedbFileStore::reload).
     db: Option<Database>,
+    /// The file backend under `db`, shared with it (see [`SharedFileBackend`]) so
+    /// [`read_current`](ShadaStore::read_current) can read the committed bytes through
+    /// the handle that holds the database's lock.
+    backend: Option<Arc<FileBackend>>,
     /// This instance's own store path, set at [`load`](RedbFileStore::load) so
     /// [`reload`](RedbFileStore::reload) can exclude it from the sibling glob (its
     /// data is read through the live `db` handle, never re-opened — redb's exclusive
@@ -278,6 +297,7 @@ impl RedbFileStore {
         Self {
             dir: dir.into(),
             db: None,
+            backend: None,
             path: None,
             absorbed: Vec::new(),
         }
@@ -288,7 +308,18 @@ impl ShadaStore for RedbFileStore {
     fn load(&mut self) -> std::io::Result<PersistState> {
         std::fs::create_dir_all(&self.dir)?;
         let my_path = self.dir.join(instance_filename());
-        let db = Database::create(&my_path).map_err(std::io::Error::other)?;
+        // `Database::create`'s open, but through a backend we keep a handle to.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&my_path)?;
+        let backend = Arc::new(FileBackend::new(file).map_err(std::io::Error::other)?);
+        let db = Database::builder()
+            .create_with_backend(SharedFileBackend(backend.clone()))
+            .map_err(std::io::Error::other)?;
+        self.backend = Some(backend);
 
         // Open every sibling we can (a live instance holds the lock → `open` fails →
         // skip it, its data simply not visible yet — neovim's contract). Keep the
@@ -395,6 +426,48 @@ impl ShadaStore for RedbFileStore {
 
     fn current_path(&self) -> Option<PathBuf> {
         self.path.clone()
+    }
+
+    fn read_current(&self) -> Option<std::io::Result<Vec<u8>>> {
+        let backend = self.backend.as_ref()?;
+        Some((|| {
+            let len = usize::try_from(backend.len()?).map_err(std::io::Error::other)?;
+            let mut bytes = vec![0; len];
+            backend.read(0, &mut bytes)?;
+            Ok(bytes)
+        })())
+    }
+}
+
+/// A redb [`FileBackend`] shared between the [`Database`] and its [`RedbFileStore`]:
+/// every storage call delegates to the one file (and its lock), and the store keeps
+/// the other `Arc` to read the committed file back for the remote upload.
+#[derive(Debug)]
+struct SharedFileBackend(Arc<FileBackend>);
+
+impl StorageBackend for SharedFileBackend {
+    fn len(&self) -> std::io::Result<u64> {
+        self.0.len()
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        self.0.read(offset, out)
+    }
+
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.0.set_len(len)
+    }
+
+    fn sync_data(&self) -> std::io::Result<()> {
+        self.0.sync_data()
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        self.0.write(offset, data)
+    }
+
+    fn close(&self) -> std::io::Result<()> {
+        self.0.close()
     }
 }
 

@@ -153,8 +153,8 @@ pub fn spawn_workspace_session(dir: PathBuf, config_source: ConfigSource) -> Res
     // expanded against `$HOME` first — the user typed it in the command line, so (unlike a
     // shell argument) it is still literal and `canonicalize` would otherwise fail on it.
     let dir = expand_tilde(dir);
-    let abs =
-        std::fs::canonicalize(&dir).map_err(|e| anyhow!("workspace {}: {e}", dir.display()))?;
+    let abs = bemtvi_core::host::canonicalize(&dir)
+        .map_err(|e| anyhow!("workspace {}: {e}", dir.display()))?;
     if !abs.is_dir() {
         return Err(anyhow!(
             "workspace requires a directory, but {} is not one",
@@ -305,6 +305,9 @@ async fn server_init(
     // The daemon's home, the base a leading `~` in a file argument expands against in a
     // daemon session; `None` for a local session (expands against the local `$HOME`).
     let mut remote_home = None;
+    // The daemon's path syntax (remote paths follow it, not this client's `std::path`);
+    // `None` for a local session.
+    let mut remote_path_style = None;
     // The on-daemon shada sync target for a `Remote`-config session (Approach A); `None`
     // for a local-shada session.
     let mut remote_shada = None;
@@ -356,6 +359,7 @@ async fn server_init(
             ts_autoinstall = resolved.ts_autoinstall;
             remote_cwd = resolved.remote_cwd;
             remote_home = resolved.remote_home;
+            remote_path_style = resolved.remote_path_style;
             // Shada follows the config source: `Remote` keeps it on the daemon
             // (download now over `c.host_fs`, before it is moved below; sync back after
             // each flush), `Local` uses the local store. A download error falls back to
@@ -445,6 +449,7 @@ async fn server_init(
         ts_autoinstall,
         remote_cwd,
         remote_home,
+        remote_path_style,
         // Register the GUI's client-intercepted commands as no-op virtual commands so
         // they get name completion, help, cmdline history, and (for `:workspace`)
         // directory-path completion. The actual session swap is still done client-side

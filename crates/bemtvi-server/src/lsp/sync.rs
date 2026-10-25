@@ -334,7 +334,7 @@ impl EditHost {
         // (`vim.fs.root` in Lua) — and it never *invents* a root either: substituting
         // the file's own directory keyed a separate child per directory and told each
         // one to index it (see `ServerKey::root`).
-        let root = lsp_root_override().or_else(|| root.map(|r| absolutize(Path::new(&r))));
+        let root = lsp_root_override().or_else(|| root.map(|r| self.abs_session_path(&r)));
         let key = ServerKey { name, root };
         // A serverless browser session (no daemon) has no process host to run a
         // language server on, so fail *loud* rather than silently no-op (Phase 6e).
@@ -368,9 +368,12 @@ impl EditHost {
         spawn.cwd = Some(match cmd_cwd.as_deref() {
             // `join` with an absolute `cmd_cwd` yields it unchanged, so this both
             // absolutizes a relative one and passes an absolute one through.
-            Some(dir) => self.session_cwd().join(dir),
+            Some(dir) => self.abs_session_path(dir),
             None => self.session_cwd().to_path_buf(),
         });
+        // A daemon session's root / document paths are the daemon's: the handshake
+        // spells its `rootUri` / `workspaceFolders` by the daemon's path syntax.
+        spawn.path_style = self.remote_paths();
         // Always remember the LATEST spawn for this key — the daemon-reconnect resync
         // and `btv.lsp.restart` both re-`ensure` from it, so it must reflect the config
         // in force now (which may have grown since the server first started), not the
@@ -477,6 +480,7 @@ impl EditHost {
         // Buffers attached to this server, with a display name for the event's
         // `args.file`. Clear `opened` so a later `:bdelete` doesn't re-fire
         // `LspDetach`, and so a respawn re-`didOpen`s.
+        let style = self.remote_paths();
         let detaching: Vec<(BufferId, String)> = self
             .lsp_states
             .iter_mut()
@@ -489,7 +493,7 @@ impl EditHost {
                 let file = s
                     .uri
                     .as_ref()
-                    .and_then(uri_to_path)
+                    .and_then(|u| bemtvi_lsp::uri::uri_to_path(u, style))
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 (*id, file)
@@ -994,10 +998,40 @@ impl EditHost {
     /// on the remote, where the local process cwd means nothing. (Locally the two are
     /// the same: `fix_current_dir` keeps the process cwd on the effective dir.)
     pub(crate) fn abs_buffer_path(&self, path: &Path) -> PathBuf {
+        if let Some(style) = self.remote_paths() {
+            return self.abs_remote_path(style, &path.to_string_lossy());
+        }
         if path.is_absolute() {
             return path.to_path_buf();
         }
         self.session_cwd().join(path)
+    }
+
+    /// `path` absolutized against the **session's** effective dir: by the daemon's path
+    /// syntax in a daemon session, else `std::path` against the process cwd (which a
+    /// local session keeps on the effective dir) — the `absolutize` a local session
+    /// always did.
+    pub(crate) fn abs_session_path(&self, path: &str) -> PathBuf {
+        match self.remote_paths() {
+            Some(style) => self.abs_remote_path(style, path),
+            None => absolutize(Path::new(path)),
+        }
+    }
+
+    /// A daemon path absolutized against the session cwd by the daemon's syntax.
+    fn abs_remote_path(&self, style: bemtvi_core::pathstyle::PathStyle, path: &str) -> PathBuf {
+        if style.is_absolute(path) {
+            PathBuf::from(path)
+        } else {
+            PathBuf::from(style.join(&self.session_cwd_string(), path))
+        }
+    }
+
+    /// The path a `file://` URI names, by the session's path rules (the daemon's in a
+    /// daemon session — see [`remote_paths`](Self::remote_paths)). `None` for a
+    /// non-file URI.
+    pub(crate) fn uri_path(&self, uri: &Url) -> Option<PathBuf> {
+        bemtvi_lsp::uri::uri_to_path(uri, self.remote_paths())
     }
 
     /// The **session's** working directory: the current window's effective dir
@@ -1012,10 +1046,27 @@ impl EditHost {
         self.dirs.effective(win, tab).1
     }
 
+    /// [`session_cwd`](Self::session_cwd) as a string — the form a **remote** path
+    /// operation ([`PathStyle`](bemtvi_core::pathstyle::PathStyle)) takes. A daemon
+    /// session's dirs are the daemon's UTF-8 strings held verbatim in `DirState`, so this
+    /// is lossless there.
+    pub(crate) fn session_cwd_string(&self) -> String {
+        self.session_cwd().to_string_lossy().into_owned()
+    }
+
+    /// The daemon's path syntax when this session's files live **off-tick** (a daemon
+    /// session), or `None` for a local session — whose paths keep `std::path`, the host's
+    /// own rules. Every shared local/remote path site branches on this.
+    pub(crate) fn remote_paths(&self) -> Option<bemtvi_core::pathstyle::PathStyle> {
+        self.editor
+            .host_fs_offtick()
+            .then_some(self.remote_path_style)
+    }
+
     /// The `file://` URI addressing a buffer's document, from its stored path (see
     /// [`abs_buffer_path`](Self::abs_buffer_path)). `None` when no URI can be formed.
     pub(crate) fn buffer_uri(&self, path: &Path) -> Option<Url> {
-        Url::from_file_path(self.abs_buffer_path(path)).ok()
+        bemtvi_lsp::uri::path_to_uri(&self.abs_buffer_path(path), self.remote_paths())
     }
 
     /// Close buffer `id`'s LSP document but **keep its servers**: `didClose` on the URI
@@ -1048,7 +1099,8 @@ impl EditHost {
         }
         for key in opened {
             if let Some(client_id) = self.lsp_servers.get(&key).map(|r| r.client_id) {
-                let file = uri_to_path(&uri)
+                let file = self
+                    .uri_path(&uri)
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 self.fire_lsp_detach(id, &file, client_id);
@@ -1074,7 +1126,8 @@ impl EditHost {
             // Fire `LspDetach` before the close goes out, while the runtime — and so
             // the client id — is still around.
             if let Some(client_id) = self.lsp_servers.get(&key).map(|r| r.client_id) {
-                let file = uri_to_path(&uri)
+                let file = self
+                    .uri_path(&uri)
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 self.fire_lsp_detach(id, &file, client_id);
@@ -1615,7 +1668,9 @@ impl EditHost {
         {
             return Some(id);
         }
-        let target = uri_to_path(uri).and_then(|p| std::fs::canonicalize(p).ok())?;
+        let target = self
+            .uri_path(uri)
+            .and_then(|p| std::fs::canonicalize(p).ok())?;
         self.editor.buffer_ids().into_iter().find(|id| {
             self.editor
                 .buffer_of(*id)

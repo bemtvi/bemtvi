@@ -904,7 +904,7 @@ async fn runtime_file_lookup_speaks_the_full_dialect_and_sorts() {
         "local function tails(name, all)\n\
          \x20 local out = {}\n\
          \x20 for _, p in ipairs(btv.runtime_file(name, all)) do\n\
-         \x20   out[#out + 1] = p:match('[^/]*$')\n\
+         \x20   out[#out + 1] = p:match('[^/\\\\]*$')\n\
          \x20 end\n\
          \x20 table.sort(out)\n\
          \x20 return table.concat(out, ',')\n\
@@ -927,7 +927,7 @@ async fn runtime_file_lookup_speaks_the_full_dialect_and_sorts() {
     let first = exec_lua(
         &rpc,
         "local hits = btv.runtime_file('lsp/*.lua', false)\n\
-         return #hits .. ':' .. hits[1]:match('[^/]*$')",
+         return #hits .. ':' .. hits[1]:match('[^/\\\\]*$')",
     )
     .await;
     assert_eq!(
@@ -943,7 +943,7 @@ async fn runtime_file_lookup_speaks_the_full_dialect_and_sorts() {
         &rpc,
         "local function tail(name)\n\
          \x20 local hits = btv.runtime_file(name, true)\n\
-         \x20 return #hits .. '/' .. (hits[1] and hits[1]:match('[^/]*$') or '-')\n\
+         \x20 return #hits .. '/' .. (hits[1] and hits[1]:match('[^/\\\\]*$') or '-')\n\
          end\n\
          return 'invalid=' .. tail('lsp/b[9-0].lua')\n\
          \x20 .. ' valid=' .. tail('lsp/b[1].lua')",

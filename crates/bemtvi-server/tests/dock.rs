@@ -303,7 +303,8 @@ async fn lone_ctrl_w_in_insert_is_replayed() {
 
 /// The `<C-w><C-w>` dock chord works from **terminal-job** mode: it leaves the
 /// job for Normal and crosses to the dock, instead of forwarding `<C-w>` to the
-/// child. Hermetic — only POSIX `cat` is spawned.
+/// child. Hermetic — only POSIX `cat` is spawned (`cmd`'s `type con`, its line-echoing
+/// twin, on Windows, which has no `cat`).
 #[tokio::test]
 async fn dock_chord_crosses_from_terminal_mode() {
     let _guard = serial_lock().lock().await;
@@ -311,7 +312,12 @@ async fn dock_chord_crosses_from_terminal_mode() {
     exec_lua(&rpc, "btv.dock.open{ side = 'left', size = 20 }").await;
     feed(&rpc, "idock<Esc>");
     feed(&rpc, "<C-w><C-w>l"); // main area
-    command(&rpc, "terminal cat").await; // enters terminal-job mode in main
+    let cat = if cfg!(windows) {
+        "cmd /c type con"
+    } else {
+        "cat"
+    };
+    command(&rpc, &format!("terminal {cat}")).await; // enters terminal-job mode in main
     assert_eq!(mode(&rpc).await, "t", "in terminal-job mode");
 
     feed(&rpc, "<C-w><C-w>h");

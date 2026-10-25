@@ -99,8 +99,9 @@ fn compile_grammar(data_dir: &Path, lang: &str, src_dir: &Path) {
 /// language whose query set differs.
 fn compile_grammar_as(data_dir: &Path, lang: &str, real: &str, src_dir: &Path) {
     let out = data_dir.join("parser").join(format!("{lang}.so"));
-    let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-    let status = std::process::Command::new(compiler)
+    let cc = bemtvi_test_harness::c_compiler();
+    let status = std::process::Command::new(&cc[0])
+        .args(&cc[1..])
         .args(["-shared", "-fPIC", "-O1"])
         .arg(format!("-Dtree_sitter_{real}=tree_sitter_{lang}"))
         .arg("-I")
@@ -424,7 +425,8 @@ async fn the_file_preview_pane_is_syntax_highlighted() {
         &format!(
             "btv.picker.source{{ name='prev', preview='file', \
                items=function(ctx) ctx.push{{ text='f', path='{file}' }} end }}; \
-             btv.picker.open('prev')"
+             btv.picker.open('prev')",
+            file = bemtvi_test_harness::q(Path::new(&file)),
         ),
     )
     .await;

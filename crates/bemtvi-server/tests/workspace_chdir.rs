@@ -43,7 +43,7 @@ async fn workspace_cd_at_boot_resolves_a_relative_file_against_the_root() {
     // A launch parent holding `proj/aaa`. Canonicalise the parent so the cwd the server reads
     // back matches the absolute root exactly, regardless of symlinks in the temp root (e.g.
     // `/tmp` → `/private/tmp` on macOS).
-    let parent = std::fs::canonicalize(temp_dir("ws-cd")).expect("canonicalize parent");
+    let parent = bemtvi_test_harness::canonicalize(temp_dir("ws-cd")).expect("canonicalize parent");
     let proj = parent.join("proj");
     std::fs::create_dir(&proj).expect("create proj dir");
     std::fs::write(proj.join("aaa"), "hello\n").expect("write aaa");
@@ -86,7 +86,8 @@ async fn workspace_no_cwd_keeps_the_launch_cwd() {
     let _g = serial_lock().lock().await;
     let _cwd = CwdGuard(std::env::current_dir().expect("cwd"));
 
-    let parent = std::fs::canonicalize(temp_dir("ws-nocd")).expect("canonicalize parent");
+    let parent =
+        bemtvi_test_harness::canonicalize(temp_dir("ws-nocd")).expect("canonicalize parent");
     let proj = parent.join("proj");
     std::fs::create_dir(&proj).expect("create proj dir");
 
@@ -115,7 +116,8 @@ async fn workspace_session_restores_a_relative_file_against_the_root() {
     let _g = serial_lock().lock().await;
     let _cwd = CwdGuard(std::env::current_dir().expect("cwd"));
 
-    let parent = std::fs::canonicalize(temp_dir("ws-sess")).expect("canonicalize parent");
+    let parent =
+        bemtvi_test_harness::canonicalize(temp_dir("ws-sess")).expect("canonicalize parent");
     let proj = parent.join("proj");
     std::fs::create_dir(&proj).expect("create proj dir");
     std::fs::write(proj.join("aaa"), "hello\n").expect("write aaa");

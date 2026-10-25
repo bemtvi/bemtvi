@@ -1502,7 +1502,7 @@ btv.picker.source({
 local function relpath(path)
   local cwd = vim.fn.getcwd()
   local anchor = cwd:gsub("[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%1")
-  return (path or ""):gsub("^" .. anchor .. "/", "")
+  return (path or ""):gsub("^" .. anchor .. "[" .. btv.utils._sep_class() .. "]", "")
 end
 
 -- The one-letter tag, the standard highlight group, and the private fallback group

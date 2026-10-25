@@ -11,6 +11,14 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// The name the data dir takes under `$XDG_DATA_HOME`: Windows `-data`-suffixes the
+/// managed dirs to keep them apart from config (see `bemtvi_core::stdpath`).
+const DATA_SUFFIX: &str = if cfg!(windows) {
+    "bemtvi-data"
+} else {
+    "bemtvi"
+};
+
 /// A fresh, unique temp directory (created) for one test's config / workspace / cwd.
 fn fresh_dir(tag: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -188,7 +196,7 @@ fn lua_oneshot_statement_code_works() {
     let mut cmd = bemtvi(&cfg);
     cmd.arg("--lua").arg(format!(
         "return btv.fs.write('{}', 'ok')",
-        marker.to_str().unwrap()
+        bemtvi_test_harness::q(&marker)
     ));
     let (status, stderr, elapsed) = run(cmd, Duration::from_secs(45));
     assert!(
@@ -217,7 +225,7 @@ fn lua_oneshot_expression_code_still_works() {
     let mut cmd = bemtvi(&cfg);
     cmd.arg("--lua").arg(format!(
         "btv.fs.write('{}', 'ok')",
-        marker.to_str().unwrap()
+        bemtvi_test_harness::q(&marker)
     ));
     let (status, stderr, _) = run(cmd, Duration::from_secs(45));
     assert!(
@@ -423,7 +431,7 @@ fn extract_lua_runtime_defaults_to_data_dir_and_prints_export() {
         "--extract-lua-runtime must exit 0: {status:?} (stderr: {stderr})"
     );
     let btv = data
-        .join("bemtvi")
+        .join(DATA_SUFFIX)
         .join("runtime")
         .join("prelude")
         .join("btv.lua");
@@ -459,7 +467,7 @@ fn bemtvi_runtime_env_defaults_and_is_visible_to_lua() {
         status.success(),
         "--lua reading $BEMTVI_RUNTIME must exit 0: {status:?} (stderr: {stderr})"
     );
-    let want = data.join("bemtvi").join("runtime");
+    let want = data.join(DATA_SUFFIX).join("runtime");
     assert!(
         stdout.contains(want.to_str().unwrap()),
         "the editor must default $BEMTVI_RUNTIME to <data-dir>/bemtvi/runtime, got stdout: {stdout:?}"

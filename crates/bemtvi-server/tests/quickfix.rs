@@ -239,7 +239,7 @@ async fn enter_in_qf_window_jumps_to_the_entry() {
     exec_lua(
         &rpc,
         &format!(
-            r#"vim.fn.setqflist({{ {{ filename = "{path}", lnum = 2, col = 1, text = "here" }} }}, " ")"#
+            r#"vim.fn.setqflist({{ {{ filename = [[{path}]], lnum = 2, col = 1, text = "here" }} }}, " ")"#
         ),
     )
     .await;
@@ -263,7 +263,7 @@ async fn enter_in_dock_hosted_qf_jumps_into_the_main_layer() {
     exec_lua(
         &rpc,
         &format!(
-            r#"vim.fn.setqflist({{ {{ filename = "{path}", lnum = 2, col = 1, text = "here" }} }}, " ")"#
+            r#"vim.fn.setqflist({{ {{ filename = [[{path}]], lnum = 2, col = 1, text = "here" }} }}, " ")"#
         ),
     )
     .await;
@@ -314,7 +314,7 @@ async fn copen_hosts_the_list_in_the_bottom_dock_by_default() {
     exec_lua(
         &rpc,
         &format!(
-            r#"vim.fn.setqflist({{ {{ filename = "{path}", lnum = 2, col = 1, text = "here" }} }}, " ")"#
+            r#"vim.fn.setqflist({{ {{ filename = [[{path}]], lnum = 2, col = 1, text = "here" }} }}, " ")"#
         ),
     )
     .await;
@@ -359,7 +359,7 @@ async fn send_to_loclist_opens_a_split_and_replaces_the_window_list() {
     exec_lua(
         &rpc,
         &format!(
-            r#"btv.qf.send_to_loclist({{ {{ filename = "{a}", lnum = 2, col = 1, text = "hit a" }} }}, {{ title = "A" }})"#
+            r#"btv.qf.send_to_loclist({{ {{ filename = [[{a}]], lnum = 2, col = 1, text = "hit a" }} }}, {{ title = "A" }})"#
         ),
     )
     .await;
@@ -380,7 +380,7 @@ async fn send_to_loclist_opens_a_split_and_replaces_the_window_list() {
     exec_lua(
         &rpc,
         &format!(
-            r#"btv.qf.send_to_loclist({{ {{ filename = "{b}", lnum = 3, col = 1, text = "hit b" }} }}, {{ title = "B" }})"#
+            r#"btv.qf.send_to_loclist({{ {{ filename = [[{b}]], lnum = 3, col = 1, text = "hit b" }} }}, {{ title = "B" }})"#
         ),
     )
     .await;
@@ -471,7 +471,7 @@ async fn add_to_loclist_appends_to_the_window_list() {
     exec_lua(
         &rpc,
         &format!(
-            r#"btv.qf.send_to_loclist({{ {{ filename = "{path}", lnum = 1, text = "first" }} }}, {{ title = "L" }})"#
+            r#"btv.qf.send_to_loclist({{ {{ filename = [[{path}]], lnum = 1, text = "first" }} }}, {{ title = "L" }})"#
         ),
     )
     .await;
@@ -486,7 +486,7 @@ async fn add_to_loclist_appends_to_the_window_list() {
     exec_lua(
         &rpc,
         &format!(
-            r#"btv.qf.add_to_loclist({{ {{ filename = "{path}", lnum = 2, text = "second" }} }})"#
+            r#"btv.qf.add_to_loclist({{ {{ filename = [[{path}]], lnum = 2, text = "second" }} }})"#
         ),
     )
     .await;
@@ -515,7 +515,7 @@ async fn send_to_loclist_without_qfdock_replaces_and_splits() {
     exec_lua(
         &rpc,
         &format!(
-            r#"btv.qf.send_to_loclist({{ {{ filename = "{path}", lnum = 2, col = 1, text = "hit" }} }}, {{ title = "Results" }})"#
+            r#"btv.qf.send_to_loclist({{ {{ filename = [[{path}]], lnum = 2, col = 1, text = "hit" }} }}, {{ title = "Results" }})"#
         ),
     )
     .await;
@@ -562,7 +562,7 @@ async fn noqfdock_opens_the_classic_bottom_split() {
     exec_lua(
         &rpc,
         &format!(
-            r#"vim.fn.setqflist({{ {{ filename = "{path}", lnum = 3, col = 1, text = "x" }} }}, " ")"#
+            r#"vim.fn.setqflist({{ {{ filename = [[{path}]], lnum = 3, col = 1, text = "x" }} }}, " ")"#
         ),
     )
     .await;
@@ -602,7 +602,7 @@ async fn quickfix_enter_is_rebindable() {
     exec_lua(
         &rpc,
         &format!(
-            r#"vim.fn.setqflist({{ {{ filename = "{path}", lnum = 3, col = 1, text = "x" }} }}, " ")"#
+            r#"vim.fn.setqflist({{ {{ filename = [[{path}]], lnum = 3, col = 1, text = "x" }} }}, " ")"#
         ),
     )
     .await;
@@ -624,8 +624,8 @@ async fn cc_and_cnext_navigate_entries() {
         &rpc,
         &format!(
             r#"vim.fn.setqflist({{
-                 {{ filename = "{path}", lnum = 2, text = "a" }},
-                 {{ filename = "{path}", lnum = 4, text = "b" }},
+                 {{ filename = [[{path}]], lnum = 2, text = "a" }},
+                 {{ filename = [[{path}]], lnum = 4, text = "b" }},
                }}, " ")"#
         ),
     )
@@ -647,7 +647,7 @@ async fn cnext_past_the_end_reports_e553() {
     exec_lua(
         &rpc,
         &format!(
-            r#"vim.fn.setqflist({{ {{ filename = "{path}", lnum = 2, text = "only" }} }}, " ")"#
+            r#"vim.fn.setqflist({{ {{ filename = [[{path}]], lnum = 2, text = "only" }} }}, " ")"#
         ),
     )
     .await;
@@ -905,7 +905,7 @@ async fn make_runs_the_program_populates_and_jumps() {
         &rpc,
         &format!(
             r#"vim.o.errorformat = "%f:%l:%c:%m"
-               vim.o.makeprg = [[printf '{src}:3:5:boom\n']]"#
+               vim.o.makeprg = [[printf '%s:3:5:boom\n' '{src}']]"#
         ),
     )
     .await;
@@ -935,7 +935,7 @@ async fn make_bang_does_not_jump() {
         &rpc,
         &format!(
             r#"vim.o.errorformat = "%f:%l:%c:%m"
-               vim.o.makeprg = [[printf '{src}:2:1: nope\n']]"#
+               vim.o.makeprg = [[printf '%s:2:1: nope\n' '{src}']]"#
         ),
     )
     .await;
@@ -956,7 +956,7 @@ async fn grep_uses_grepprg_and_grepformat() {
     // grepprg output is parsed against grepformat (default `%f:%l:%c:%m,%f:%l:%m,…`).
     exec_lua(
         &rpc,
-        &format!(r#"vim.o.grepprg = [[printf '{src}:2:found\n']]"#),
+        &format!(r#"vim.o.grepprg = [[printf '%s:2:found\n' '{src}']]"#),
     )
     .await;
     message_after(&rpc, &mut incoming, ":grep<CR>").await;
@@ -1094,7 +1094,7 @@ async fn lopen_shows_the_loclist_and_enter_jumps() {
     exec_lua(
         &rpc,
         &format!(
-            r#"vim.fn.setloclist(0, {{ {{ filename = "{path}", lnum = 3, col = 1, text = "here" }} }})"#
+            r#"vim.fn.setloclist(0, {{ {{ filename = [[{path}]], lnum = 3, col = 1, text = "here" }} }})"#
         ),
     )
     .await;
@@ -1121,7 +1121,7 @@ async fn lmake_populates_the_loclist_not_the_quickfix_list() {
         &rpc,
         &format!(
             r#"vim.o.errorformat = "%f:%l:%c:%m"
-               vim.o.makeprg = [[printf '{src}:2:3:oops\n']]"#
+               vim.o.makeprg = [[printf '%s:2:3:oops\n' '{src}']]"#
         ),
     )
     .await;
@@ -1191,10 +1191,10 @@ async fn cnfile_and_cpfile_step_by_file() {
         &rpc,
         &format!(
             r#"vim.fn.setqflist({{
-                 {{ filename = "{a}", lnum = 2, text = "a1" }},
-                 {{ filename = "{a}", lnum = 4, text = "a2" }},
-                 {{ filename = "{b}", lnum = 3, text = "b1" }},
-                 {{ filename = "{b}", lnum = 6, text = "b2" }},
+                 {{ filename = [[{a}]], lnum = 2, text = "a1" }},
+                 {{ filename = [[{a}]], lnum = 4, text = "a2" }},
+                 {{ filename = [[{b}]], lnum = 3, text = "b1" }},
+                 {{ filename = [[{b}]], lnum = 6, text = "b2" }},
                }}, " ")"#
         ),
     )
@@ -1366,7 +1366,7 @@ async fn named_list_shows_in_its_own_tab_without_touching_the_quickfix() {
         &rpc,
         &format!(
             r#"btv.qf.list("panel",
-                 {{ {{ filename = "{path}", lnum = 2, col = 1, text = "hit" }} }},
+                 {{ {{ filename = [[{path}]], lnum = 2, col = 1, text = "hit" }} }},
                  {{ title = "Panel" }})
                btv.qf.show("panel")"#
         ),
@@ -1392,7 +1392,7 @@ async fn named_list_enter_jumps_into_the_main_layer() {
         &rpc,
         &format!(
             r#"btv.qf.list("p",
-                 {{ {{ filename = "{path}", lnum = 3, col = 1, text = "here" }} }})
+                 {{ {{ filename = [[{path}]], lnum = 3, col = 1, text = "here" }} }})
                btv.qf.show("p")"#
         ),
     )
@@ -1422,7 +1422,7 @@ async fn named_list_drop_closes_its_tab_and_forgets_it() {
         &rpc,
         &format!(
             r#"btv.qf.list("d",
-                 {{ {{ filename = "{path}", lnum = 1, text = "z" }} }})
+                 {{ {{ filename = [[{path}]], lnum = 1, text = "z" }} }})
                btv.qf.show("d")"#
         ),
     )
@@ -1479,7 +1479,7 @@ async fn named_list_survives_closing_the_window_it_was_shown_from() {
         &rpc,
         &format!(
             r#"_G.from = btv.win.current()
-               btv.qf.list("s", {{ {{ filename = "{path}", lnum = 2, text = "kept" }} }}, {{ title = "S" }})
+               btv.qf.list("s", {{ {{ filename = [[{path}]], lnum = 2, text = "kept" }} }}, {{ title = "S" }})
                btv.qf.show("s")"#
         ),
     )
@@ -1519,7 +1519,7 @@ async fn two_named_lists_coexist_as_separate_tabs() {
     exec_lua(
         &rpc,
         &format!(
-            r#"btv.qf.list("a", {{ {{ filename = "{pa}", lnum = 1, text = "AAA" }} }}, {{ title = "A" }})
+            r#"btv.qf.list("a", {{ {{ filename = [[{pa}]], lnum = 1, text = "AAA" }} }}, {{ title = "A" }})
                btv.qf.show("a")"#
         ),
     )
@@ -1531,7 +1531,7 @@ async fn two_named_lists_coexist_as_separate_tabs() {
     exec_lua(
         &rpc,
         &format!(
-            r#"btv.qf.list("b", {{ {{ filename = "{pb}", lnum = 1, text = "BBB" }} }}, {{ title = "B" }})
+            r#"btv.qf.list("b", {{ {{ filename = [[{pb}]], lnum = 1, text = "BBB" }} }}, {{ title = "B" }})
                btv.qf.show("b")"#
         ),
     )
@@ -1566,7 +1566,7 @@ async fn named_list_repaints_an_open_tab_in_place() {
     exec_lua(
         &rpc,
         &format!(
-            r#"btv.qf.list("r", {{ {{ filename = "{path}", lnum = 1, text = "first" }} }})
+            r#"btv.qf.list("r", {{ {{ filename = [[{path}]], lnum = 1, text = "first" }} }})
                btv.qf.show("r")"#
         ),
     )
@@ -1579,7 +1579,9 @@ async fn named_list_repaints_an_open_tab_in_place() {
     // place to the new items (action "r" rewrites the current list and re-renders).
     exec_lua(
         &rpc,
-        &format!(r#"btv.qf.list("r", {{ {{ filename = "{path}", lnum = 3, text = "second" }} }})"#),
+        &format!(
+            r#"btv.qf.list("r", {{ {{ filename = [[{path}]], lnum = 3, text = "second" }} }})"#
+        ),
     )
     .await;
     assert!(
@@ -1605,7 +1607,7 @@ async fn a_list_write_precedes_the_command_that_opens_it() {
     exec_lua(
         &rpc,
         &format!(
-            r#"vim.fn.setloclist(0, {{ {{ filename = "{path}", lnum = 2, col = 1, text = "note" }} }},
+            r#"vim.fn.setloclist(0, {{ {{ filename = [[{path}]], lnum = 2, col = 1, text = "note" }} }},
                                  " ", {{ title = "Notes" }})
                vim.cmd("lopen")"#
         ),

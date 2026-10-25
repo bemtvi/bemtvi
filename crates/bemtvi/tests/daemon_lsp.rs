@@ -20,7 +20,9 @@ use std::time::Duration;
 
 use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
-use bemtvi_test_harness::{exec_lua, feed, lines, serial_lock, spawn_with_daemon_lsp, temp_dir};
+use bemtvi_test_harness::{
+    exec_lua, feed, file_uri, lines, q, serial_lock, spawn_with_daemon_lsp, temp_dir,
+};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 const BEMTVI_BIN: &str = env!("CARGO_BIN_EXE_bemtvi");
@@ -197,7 +199,7 @@ async fn a_server_initiated_apply_edit_lands_over_the_daemon_wire() {
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("daemon-lsp-apply-edit");
     let record = dir.join("rec-alpha.jsonl");
-    let uri = format!("file://{}", dir.join("a.rs").display());
+    let uri = file_uri(&dir.join("a.rs"));
     arm_mock_named(
         dir.as_path(),
         "alpha",
@@ -209,7 +211,7 @@ async fn a_server_initiated_apply_edit_lands_over_the_daemon_wire() {
                       "range": {{ "start": {{ "line": 0, "character": 4 }},
                                   "end": {{ "line": 0, "character": 7 }} }},
                       "newText": "bar" }} ] }} }} }}"#,
-            rec = record.display(),
+            rec = q(&record),
         ),
     );
     arm_mock_named(dir.as_path(), "beta", r#"{ "code_action": [] }"#);
@@ -326,7 +328,7 @@ async fn the_spawn_directory_reaches_the_daemon_side_child() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let want = std::fs::canonicalize(&pinned).expect("canonicalize the pinned dir");
+    let want = bemtvi_test_harness::canonicalize(&pinned).expect("canonicalize the pinned dir");
     assert_eq!(
         recorded.trim(),
         format!("CWD={}", want.display()),

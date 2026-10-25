@@ -646,7 +646,7 @@ async fn btv_statusline_custom_segment_tracks_per_window_buffer() {
           name = 'buftail',
           render = function(ctx)
             local name = btv.buf.name(ctx.buf)
-            return { { text = name:match('[^/]+$') or '?' } }
+            return { { text = name:match('[^/\\]+$') or '?' } }
           end,
         }
         btv.statusline.setup{ left = { 'buftail' }, right = {} }
@@ -1025,12 +1025,15 @@ async fn vim_fn_fnamemodify_applies_filename_modifiers() {
 async fn vim_fn_fnamemodify_resolves_against_cwd() {
     let (rpc, _incoming) = start(None).await;
     // The cwd-relative modifiers (:p make absolute, :. make relative) are checked
-    // against the live getcwd() so the test doesn't bake in a path.
+    // against the live getcwd() so the test doesn't bake in a path — nor a separator:
+    // `:p` spells its result natively (`\` on Windows, as vim does), so the expected
+    // join uses the host's separator (`package.config`'s first character).
     let out = exec_lua(
         &rpc,
         r#"local cwd = vim.fn.getcwd()
+           local sep = package.config:sub(1, 1)
            return table.concat({
-             vim.fn.fnamemodify("a/b.txt", ":p") == cwd .. "/a/b.txt" and "p-ok" or "p-bad",
+             vim.fn.fnamemodify("a/b.txt", ":p") == cwd .. sep .. "a" .. sep .. "b.txt" and "p-ok" or "p-bad",
              vim.fn.fnamemodify(cwd .. "/a/b.txt", ":.") == "a/b.txt" and "dot-ok" or "dot-bad",
              vim.fn.fnamemodify("/elsewhere/x", ":.") == "/elsewhere/x" and "abs-ok" or "abs-bad",
            }, "\n")"#,
@@ -1046,15 +1049,20 @@ async fn vim_fn_fnamemodify_p_simplifies_dot_and_dotdot() {
     // `simplify_filename`), so the result is a clean prefix the `:.`/`:~` relativisers can
     // match — a stray `/.` (e.g. from `:p` of `.`) would otherwise survive into every
     // explorer-opened path and defeat the statusline's `:~:.` (the reported bug).
+    // Expectations use the host's separator, since `:p` answers natively; on Windows a
+    // path rooted at a bare `/` lives on the cwd's drive, so its full name carries that
+    // drive (`D:\x\y\z`), as `std::path::absolute` reports it.
     let out = exec_lua(
         &rpc,
         r#"local cwd = vim.fn.getcwd()
            local f = vim.fn.fnamemodify
+           local sep = package.config:sub(1, 1)
+           local abs = sep == "/" and "/x/y/z" or (cwd:sub(1, 2) .. "\\x\\y\\z")
            return table.concat({
              f(".", ":p") == cwd and "dot-ok" or ("dot-bad:" .. f(".", ":p")),
-             f("a/./b.txt", ":p") == cwd .. "/a/b.txt" and "mid-ok" or ("mid-bad:" .. f("a/./b.txt", ":p")),
-             f("a/../b.txt", ":p") == cwd .. "/b.txt" and "up-ok" or ("up-bad:" .. f("a/../b.txt", ":p")),
-             f("/x/y/./z", ":p") == "/x/y/z" and "abs-ok" or ("abs-bad:" .. f("/x/y/./z", ":p")),
+             f("a/./b.txt", ":p") == cwd .. sep .. "a" .. sep .. "b.txt" and "mid-ok" or ("mid-bad:" .. f("a/./b.txt", ":p")),
+             f("a/../b.txt", ":p") == cwd .. sep .. "b.txt" and "up-ok" or ("up-bad:" .. f("a/../b.txt", ":p")),
+             f("/x/y/./z", ":p") == abs and "abs-ok" or ("abs-bad:" .. f("/x/y/./z", ":p")),
              -- the round-trip that broke relativisation: `:p` then `:.` is the bare tail.
              f(f(".", ":p") .. "/sample.txt", ":.") == "sample.txt" and "rt-ok" or "rt-bad",
            }, "\n")"#,

@@ -18,6 +18,16 @@
 
 use std::path::PathBuf;
 
+/// The directory bemtvi's state hangs off under `$XDG_STATE_HOME`: `bemtvi` on unix,
+/// `bemtvi-data` on Windows (the managed-dir suffix documented in
+/// `bemtvi-core/src/stdpath.rs`). The daemon is served in-process, so its state dir
+/// follows this host's layout.
+const STATE_SUBDIR: &str = if cfg!(windows) {
+    "bemtvi-data"
+} else {
+    "bemtvi"
+};
+
 use bemtvi_server::{
     connect_daemon, materialize_remote_config_into, ConfigSource, DaemonClient, RemoteConfig,
     ServerInit,
@@ -62,7 +72,11 @@ fn populate_config(dir: &std::path::Path) -> PathBuf {
     std::fs::create_dir_all(dir.join("lua")).unwrap();
     std::fs::write(dir.join("lua/mymod.lua"), "return 42\n").unwrap();
 
-    let plugin = dir.join("pack/vendor/start/myplugin");
+    let plugin = dir
+        .join("pack")
+        .join("vendor")
+        .join("start")
+        .join("myplugin");
     std::fs::create_dir_all(plugin.join("plugin")).unwrap();
     std::fs::write(plugin.join("plugin/myplugin.lua"), "-- the plugin\n").unwrap();
     // A locally-compiled artifact that must NOT ride the bundle to a remote-arch client.
@@ -142,11 +156,23 @@ async fn config_bundle_ships_the_daemons_config_and_plugins() {
 
     // The bundle also carries the daemon's home, the base a leading `~` in a file
     // argument expands against (`:e ~/x` reads on the daemon). Served in-process, so the
-    // daemon's `$HOME` is this test process's `$HOME`.
+    // daemon's home is this test process's home (`$HOME`, or `%USERPROFILE%` on a Windows
+    // host that leaves `$HOME` unset).
     assert_eq!(
         bundle.home.as_deref(),
-        std::env::var("HOME").ok().as_deref(),
+        bemtvi_core::stdpath::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .as_deref(),
         "the bundle reports the daemon's home (the `~`-expansion base)"
+    );
+
+    // And the daemon's path syntax, so an edit-host on another OS manipulates remote
+    // paths by the daemon's rules. Served in-process: the daemon's OS is this one.
+    let expected_style = if cfg!(windows) { "windows" } else { "posix" };
+    assert_eq!(
+        bundle.path_style.map(|s| s.wire_name()),
+        Some(expected_style),
+        "the bundle announces the daemon's path syntax"
     );
 
     // Look a fetched file up by the path suffix it must carry, asserting its bytes.
@@ -504,7 +530,7 @@ async fn remote_config_session_keeps_shada_on_the_daemon() {
     // The shada landed on the *daemon*, in its remote shada dir — a per-instance `.redb`
     // store under `<shada_dir>/remote/`, not a local store and not in the daemon's own
     // native shada dir.
-    let remote_dir = state.join("bemtvi/shada/remote");
+    let remote_dir = state.join(STATE_SUBDIR).join("shada").join("remote");
     let remote_stores = store_files_in(&remote_dir);
     assert_eq!(
         remote_stores.len(),
@@ -574,7 +600,7 @@ async fn local_config_session_keeps_shada_local() {
     feed(&rpc, ":qa!<CR>");
     drain_until_exit(incoming).await;
 
-    let shada = state.join("bemtvi/shada");
+    let shada = state.join(STATE_SUBDIR).join("shada");
     assert!(
         !shada.join("remote").exists(),
         "a Local-config session must not create a remote shada dir on the daemon"
@@ -617,7 +643,7 @@ async fn remote_shada_compacts_and_merges_across_sessions() {
         "BEMTVI_DATA_DIR",
         Some(&temp_dir("remote_shada_compact_data")),
     );
-    let remote_dir = state.join("bemtvi/shada/remote");
+    let remote_dir = state.join(STATE_SUBDIR).join("shada").join("remote");
 
     // Session 1: yank a line into register `a`, quit.
     {
@@ -676,7 +702,7 @@ async fn remote_shada_namespace_isolates_projects() {
     let _d = EnvGuard::set("BEMTVI_DATA_DIR", Some(&temp_dir("remote_shada_ns_data")));
     // A namespaced remote session lands in the daemon's native `shada/ns/<NS>`, NOT under a
     // `remote/` sibling — that is what lets a local editor on the host share it.
-    let ns_base = state.join("bemtvi/shada/ns");
+    let ns_base = state.join(STATE_SUBDIR).join("shada").join("ns");
 
     // proj-a: store "alpha" in register `a`.
     {
@@ -708,7 +734,11 @@ async fn remote_shada_namespace_isolates_projects() {
     assert_eq!(store_files_in(&ns_base.join("proj-a")).len(), 1);
     assert_eq!(store_files_in(&ns_base.join("proj-b")).len(), 1);
     assert!(
-        !state.join("bemtvi/shada/remote").exists(),
+        !state
+            .join(STATE_SUBDIR)
+            .join("shada")
+            .join("remote")
+            .exists(),
         "a namespaced remote session must not use the isolated remote/ subdir"
     );
 

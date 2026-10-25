@@ -16,7 +16,9 @@
 
 use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
-use bemtvi_test_harness::{exec_lua, lines, message_after, start_attached, temp_dir, write_temp};
+use bemtvi_test_harness::{
+    exec_lua, lines, message_after, q, start_attached, temp_dir, write_temp,
+};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
@@ -58,7 +60,7 @@ async fn explorer_listing_is_read_only_to_ex_command_edits() {
     std::fs::write(dir.join("alpha.txt"), "a\n").expect("write alpha");
     std::fs::write(dir.join("beta.txt"), "b\n").expect("write beta");
     let (rpc, mut incoming) = start().await;
-    exec_lua(&rpc, &format!("btv.cmd('edit {}')", dir.to_string_lossy())).await;
+    exec_lua(&rpc, &format!("btv.cmd('edit {}')", q(&dir))).await;
     // The explorer (a Lua plugin) fills the listing asynchronously (`btv.fs.readdir`
     // settles off the tick), so poll until the entries appear before asserting.
     let mut listed = false;
@@ -110,6 +112,10 @@ async fn image_preview_is_read_only_to_ex_command_edits() {
     let (rpc, mut incoming) = start().await;
     exec_lua(&rpc, "btv.o.imagepreview = true").await;
     let path = write_temp("ro_image", "png", "PNGPLACEHOLDER\n");
-    exec_lua(&rpc, &format!("btv.cmd('edit {path}')")).await;
+    exec_lua(
+        &rpc,
+        &format!("btv.cmd('edit {}')", q(std::path::Path::new(&path))),
+    )
+    .await;
     assert_ex_edits_refused(&rpc, &mut incoming, "image").await;
 }

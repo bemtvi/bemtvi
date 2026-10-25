@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
-    attach, command, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, message,
+    attach, command, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, message, q,
     serial_lock, spawn, temp_dir,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -86,10 +86,9 @@ async fn picker_jump_reuses_a_relatively_opened_buffer() {
     // absolute path. A real LSP hands back already-canonical paths, so to model that
     // (and not the symlink artifact) the ABSOLUTE path we feed must be in the same
     // canonical form the editor's cwd will be.
-    let dir = std::fs::canonicalize(temp_dir("lsp_nav_relative")).unwrap();
+    let dir = bemtvi_test_harness::canonicalize(temp_dir("lsp_nav_relative")).unwrap();
     let file = dir.join("target.txt");
     std::fs::write(&file, "one\ntwo\nthree\nfour\n").unwrap();
-    let abs = file.to_string_lossy().into_owned();
 
     let (rpc, mut incoming) = start(&dir).await;
     // Anchor the working dir to the temp dir, then open the file *relatively* —
@@ -109,7 +108,10 @@ async fn picker_jump_reuses_a_relatively_opened_buffer() {
     // Confirm a located item with the file's ABSOLUTE path (as the LSP would).
     exec_lua(
         &rpc,
-        &format!("btv.picker.edit({{ path = '{abs}', row = 3, col = 2 }})"),
+        &format!(
+            "btv.picker.edit({{ path = \"{}\", row = 3, col = 2 }})",
+            q(&file)
+        ),
     )
     .await;
     bemtvi_test_harness::barrier(&rpc).await;
@@ -165,7 +167,10 @@ async fn picker_jump_into_the_current_modified_buffer_moves_the_cursor() {
 
     exec_lua(
         &rpc,
-        &format!("btv.picker.edit({{ path = '{abs}', row = 5, col = 1 }})"),
+        &format!(
+            "btv.picker.edit({{ path = \"{}\", row = 5, col = 1 }})",
+            q(&file)
+        ),
     )
     .await;
     bemtvi_test_harness::barrier(&rpc).await;

@@ -88,7 +88,8 @@ local function spec_origin(s)
   if owner then
     return "github.com/" .. owner -- the manager's own default for `owner/repo`
   end
-  return (src:gsub("/+$", ""):gsub("/[^/]*$", "")) -- a plain path: its parent
+  -- A plain path: its parent (`btv.utils.dirname`, so a Windows path splits too).
+  return btv.utils.dirname((src:gsub("[" .. btv.utils._sep_class() .. "]+$", "")))
 end
 
 -- The distinct origins of a recommended set, in first-seen order. Recurses into each

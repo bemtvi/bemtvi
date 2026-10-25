@@ -52,6 +52,28 @@ async fn spawn_remote_term(remote_cwd: &str) -> (Rpc, UnboundedReceiver<Incoming
     (rpc, incoming)
 }
 
+/// An interactive shell: POSIX `sh`, or `cmd` on Windows (which has no `sh`).
+const SHELL: &str = if cfg!(windows) { "cmd" } else { "sh" };
+
+/// What to type into [`SHELL`] to print its working directory (`cmd`'s bare `cd`).
+const PWD: &str = if cfg!(windows) { "cd" } else { "pwd" };
+
+/// What to type into [`SHELL`] to print the PTY's size: `stty size` prints `<rows> <cols>`;
+/// Windows has no `stty`, and `mode con` prints the console's `Lines:` / `Columns:`.
+const STTY_SIZE: &str = if cfg!(windows) {
+    "mode con"
+} else {
+    "stty size"
+};
+
+/// A child that echoes each typed line back: `cat`, or `cmd`'s `type con` on Windows (a
+/// cooked console read echoes keystrokes as they are typed, like a tty).
+const CAT: &str = if cfg!(windows) {
+    "cmd /c type con"
+} else {
+    "cat"
+};
+
 /// Poll the current buffer until its text contains `needle`. Matches against the lines
 /// **concatenated** (no separator) so a needle wrapped across the terminal's fixed-width
 /// rows — a long path split at column 80 — is still found.
@@ -76,8 +98,8 @@ async fn terminal_opens_on_the_daemon_in_its_cwd() {
     let (rpc, _incoming) = spawn_remote_term(&dir_str).await;
 
     // Open an interactive shell on the daemon, then ask it where it is.
-    feed(&rpc, ":terminal sh<CR>");
-    feed(&rpc, "pwd<CR>");
+    feed(&rpc, &format!(":terminal {SHELL}<CR>"));
+    feed(&rpc, &format!("{PWD}<CR>"));
     let lines = await_lines_contains(&rpc, &token).await;
     assert!(
         lines.concat().contains(&token),
@@ -96,7 +118,7 @@ async fn terminal_input_round_trips_to_the_daemon_child() {
 
     // `cat` echoes its stdin back through the PTY; opening it leaves us in terminal mode, so
     // the typed word is forwarded as input bytes over the Term leg.
-    feed(&rpc, ":terminal cat<CR>");
+    feed(&rpc, &format!(":terminal {CAT}<CR>"));
     feed(&rpc, "hello<CR>");
     let lines = await_lines_contains(&rpc, "hello").await;
     assert!(
@@ -109,7 +131,12 @@ async fn terminal_input_round_trips_to_the_daemon_child() {
 /// Parse `"<rows> <cols>"` (an `stty size` line) into its rows, ignoring command echoes /
 /// prompts. Requires exactly two integer fields so `sh-3.2$ stty size` (three+ fields) and
 /// the bare `stty size` echo (non-numeric) are skipped.
+///
+/// On Windows the [`STTY_SIZE`] stand-in `mode con` prints the rows as a `Lines: <rows>` line.
 fn parse_stty_rows(line: &str) -> Option<u32> {
+    if cfg!(windows) {
+        return line.trim().strip_prefix("Lines:")?.trim().parse().ok();
+    }
     match line.split_whitespace().collect::<Vec<_>>().as_slice() {
         [r, c] => Some((r.parse::<u32>().ok()?, c.parse::<u32>().ok()?).0),
         _ => None,
@@ -125,7 +152,7 @@ fn parse_stty_rows(line: &str) -> Option<u32> {
 async fn poll_stty_rows(rpc: &Rpc, want_min: u32) -> u32 {
     let mut last = 0;
     for _ in 0..120 {
-        feed(rpc, "stty size<CR>");
+        feed(rpc, &format!("{STTY_SIZE}<CR>"));
         tokio::time::sleep(Duration::from_millis(30)).await;
         if let Some(r) = buf_lines(rpc, 0)
             .await
@@ -155,7 +182,7 @@ async fn remote_terminal_pty_tracks_window_resizes() {
 
     // Open one interactive shell; the initial 24-row attach yields a ~23-row PTY (a row goes
     // to the status line).
-    feed(&rpc, ":terminal sh<CR>");
+    feed(&rpc, &format!(":terminal {SHELL}<CR>"));
     let initial = poll_stty_rows(&rpc, 1).await;
     assert!(
         (20..=24).contains(&initial),

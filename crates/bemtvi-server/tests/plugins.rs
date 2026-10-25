@@ -19,8 +19,8 @@ use std::time::Duration;
 use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
-    attach, barrier, cursor, drain_to_latest_redraw, exec_lua, feed, lines, lua_bool, map_get,
-    message, message_after, poll_true, q, spawn, start_attached, temp_dir,
+    attach, barrier, cursor, drain_to_latest_redraw, exec_lua, feed, file_uri, lines, lua_bool,
+    map_get, message, message_after, poll_true, q, spawn, start_attached, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -818,11 +818,11 @@ async fn welcome_offer_summarizes_instead_of_listing_the_set() {
     exec_lua(
         &rpc,
         &format!(
-            "btv.plugins.recommend({{ {{ \"file://{r1}\", name = \"alpha\" }},\n\
-               {{ \"file://{r2}\", name = \"beta\" }} }})\n\
+            "btv.plugins.recommend({{ {{ \"{r1}\", name = \"alpha\" }},\n\
+               {{ \"{r2}\", name = \"beta\" }} }})\n\
              btv.plugins.bootstrap()",
-            r1 = q(&repo1),
-            r2 = q(&repo2)
+            r1 = file_uri(&repo1),
+            r2 = file_uri(&repo2)
         ),
     )
     .await;
@@ -830,7 +830,9 @@ async fn welcome_offer_summarizes_instead_of_listing_the_set() {
     assert!(poll_true(&rpc, "return vim.bo.filetype == 'btvpluginswelcome'").await);
 
     // The offer names the count and the shared origin (the temp dir both repos sit in).
-    let origin = format!("file://{}", q(&src));
+    // The sources are real `file://` URLs (`file:///C:/...` on Windows, not a
+    // `file://` glued onto a backslashed path), so the origin is the parent's URL.
+    let origin = file_uri(&src);
     let mut summarized = false;
     for _ in 0..200 {
         let ls = lines(&rpc).await;
@@ -861,7 +863,7 @@ async fn welcome_offer_summarizes_instead_of_listing_the_set() {
         feed_until(&rpc, "c", "return vim.bo.filetype == 'btvpluginscustomize'").await,
         "`c` should open the customize checklist"
     );
-    let needle = format!("file://{}", repo1.display());
+    let needle = file_uri(&repo1);
     let mut listed = false;
     for _ in 0..200 {
         if lines(&rpc)

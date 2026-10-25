@@ -12,7 +12,7 @@
 //! clearing a highlights override errored with "no highlights query on disk".
 //!
 //! Hermetic: the grammar is compiled from the cargo registry into a temp
-//! `$XDG_DATA_HOME/nvim/site` (the fallback root [`bemtvi_ts::extra_roots`]
+//! `$XDG_DATA_HOME/nvim/site` (`nvim-data` on Windows; the fallback root [`bemtvi_ts::extra_roots`]
 //! searches); `BEMTVI_DATA_DIR` stays unset so the fallback is consulted. Its own
 //! test binary, since those env vars are process-global.
 
@@ -25,8 +25,10 @@ use fixture::{install_rust_grammar, TempDir};
 #[test]
 fn base_query_reads_from_the_root_the_grammar_loads_from() {
     // The grammar lives ONLY under the neovim-site fallback root.
+    // Neovim's data dir under `$XDG_DATA_HOME` is `nvim`, or `nvim-data` on Windows.
     let xdg = TempDir::new("site_root_xdg");
-    let site = xdg.0.join("nvim").join("site");
+    let nvim_data = if cfg!(windows) { "nvim-data" } else { "nvim" };
+    let site = xdg.0.join(nvim_data).join("site");
     std::fs::create_dir_all(&site).unwrap();
     install_rust_grammar(&site);
 

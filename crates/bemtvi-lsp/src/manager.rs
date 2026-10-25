@@ -410,6 +410,7 @@ async fn run_server_once(
         event_tx.clone(),
         log.clone(),
         spawn.settings.clone(),
+        spawn.path_style,
     );
     let mut mainloop_fut = tokio::spawn(async move {
         // `FramingGuard` validates the server's `Content-Length` announcements

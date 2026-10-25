@@ -3016,14 +3016,15 @@ impl EditHost {
     /// session's process cwd already *is* the effective dir, so callers gate on
     /// [`remote_cwd_seeded`](EditHost::remote_cwd_seeded) — the daemon-fs gate, `false` for a
     /// serverless web (OPFS) session whose paths are root-relative and must not be rebased.
+    ///
+    /// The path is the daemon's, so it is tested and joined by the daemon's announced
+    /// [`PathStyle`](bemtvi_core::pathstyle::PathStyle), never this process's `std::path`.
     fn abs_against_cwd(&self, path: &str) -> String {
-        if std::path::Path::new(path).is_relative() {
-            let win = self.editor.current_window_id();
-            let tab = self.editor.current_tab_id();
-            let (_, base) = self.dirs.effective(win, tab);
-            base.join(path).to_string_lossy().into_owned()
-        } else {
+        let style = self.remote_path_style;
+        if style.is_absolute(path) {
             path.to_string()
+        } else {
+            style.join(&self.session_cwd_string(), path)
         }
     }
 
@@ -3040,12 +3041,9 @@ impl EditHost {
         if local || !self.remote_cwd_seeded {
             return cwd;
         }
-        let win = self.editor.current_window_id();
-        let tab = self.editor.current_tab_id();
-        let (_, base) = self.dirs.effective(win, tab);
         Some(match cwd {
             Some(c) => self.abs_against_cwd(&c),
-            None => base.to_string_lossy().into_owned(),
+            None => self.session_cwd_string(),
         })
     }
 

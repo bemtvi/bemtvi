@@ -381,6 +381,7 @@ name = "bemtvi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bemtvi-core",
  "bemtvi-lsp",
  "bemtvi-lua",
  "bemtvi-rpc",
@@ -557,7 +558,9 @@ dependencies = [
  "bemtvi-core",
  "bemtvi-rpc",
  "bemtvi-server",
+ "bemtvi-ts",
  "libc",
+ "lsp-types",
  "rmpv",
  "tokio",
 ]

@@ -102,10 +102,16 @@ fn ordinary_non_capturing_nesting_still_compiles() {
 /// [`bemtvi_regex::DEFAULT_TIMEOUT_MS`]. The generous assertion window is
 /// deliberate: the claim under test is "bounded", not "bounded to the millisecond"
 /// (this suite runs alongside a loaded `cargo test --workspace`).
+///
+/// The run must outlast the 2 s default on any machine, or the match simply
+/// finishes (`Ok(None)`) before the deadline and the test proves nothing: 30 `a`s
+/// is only ~1.3 s on a fast one. 36 is ~20x that (about 27 s unbounded there) —
+/// far past the deadline everywhere, yet still finite, so a broken deadline fails
+/// this test instead of hanging the suite.
 #[test]
 fn catastrophic_backtracking_ends_in_a_timeout_not_a_hang() {
     let re = VimRegex::compile("\\%#=1\\(a\\|aa\\)\\+b").expect("compile");
-    let line = "a".repeat(30);
+    let line = "a".repeat(36);
     let started = Instant::now();
     let err = re
         .exec_line(&line, 0, false)

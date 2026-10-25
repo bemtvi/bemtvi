@@ -10,17 +10,176 @@ btv = btv or {}
 btv.utils = btv.utils or {}
 
 -- ----- path helpers ----------------------------------------------------------
--- Pure string math over `/`-separated paths — nothing here touches the filesystem
--- (all fs is async `btv.fs`). The one copy of the little path idioms the prelude and
--- plugins otherwise re-derive: strip-the-last-component, last-component, `~`, and
--- the walk-up-the-tree loop.
+-- Pure string math over paths — nothing here touches the filesystem (all fs is async
+-- `btv.fs`). The one copy of the little path idioms the prelude and plugins otherwise
+-- re-derive: strip-the-last-component, last-component, `~`, the walk-up-the-tree loop,
+-- and — the part that differs by platform — what a separator is and where a path's
+-- root ends. Every platform-dependent answer below goes through `btv.utils.path_style`.
+
+-- `btv.utils.path_style()`: the path convention the editor's paths follow — `"windows"`
+-- or `"unix"` (the same spellings `btv.glob`'s `style` option takes).
+--
+-- Under `"windows"`, `/` and `\` both separate when a path is *read*, a path can be
+-- rooted at a drive (`C:\`, `C:/`) or a UNC share (`\\server\share\`), and paths the
+-- editor *produces* use `\`. Under `"unix"`, `/` is the only separator and `\` is an
+-- ordinary character.
+--
+-- This is the single place the path helpers (`btv.utils.path_sep`, `path_root`,
+-- `is_absolute`, `dirname`, and `btv.fname.modify` built on them) decide which
+-- platform's rules apply. It follows the **session's** path syntax, which the server
+-- publishes as `btv._path_style` (`"posix"` or `"windows"`) alongside `btv._cwd`: the
+-- daemon's in a daemon session — a Windows client editing a unix host still sees unix
+-- paths — and the host's otherwise. Before the first publish it answers for the host
+-- (`btv.utils.is_windows`).
+function btv.utils.path_style()
+  local session = rawget(btv, "_path_style")
+  if session == "windows" then
+    return "windows"
+  elseif session == "posix" then
+    return "unix"
+  end
+  return btv.utils.is_windows() and "windows" or "unix"
+end
+
+local function windows_paths()
+  return btv.utils.path_style() == "windows"
+end
+
+-- `btv.utils.path_sep()`: the separator the editor writes paths with — `"\"` under the
+-- `"windows"` path style, `"/"` otherwise. Use it to *build* a path that will be shown
+-- or compared against one the editor reports; when *reading* a path, accept either
+-- separator on Windows (`btv.utils.path_root`, `dirname` and `basename` already do).
+function btv.utils.path_sep()
+  return windows_paths() and "\\" or "/"
+end
+
+-- The separator characters, as the body of a Lua pattern character class
+-- (`"[" .. cls .. "]"` matches one separator, `"[^" .. cls .. "]"` one non-separator).
+-- Private: the path helpers' own building block.
+function btv.utils._sep_class()
+  return windows_paths() and "/\\" or "/"
+end
+
+-- `path` with every separator spelled `/`, for COMPARING two paths that may spell
+-- their separators differently (a runtimepath entry typed with `/` against a chunk
+-- source Lua reports with `\`). Identity under the unix style, where `\` is not a
+-- separator. Private: never hand the folded form back as a path.
+function btv.utils._fold_seps(path)
+  if windows_paths() then
+    return (path:gsub("\\", "/"))
+  end
+  return path
+end
+
+-- Join `...` into one path by the Windows rules (`windows` true: `/` and `\` both
+-- separate, `\` is written) or the unix ones (`/` only). The shared body of
+-- `path_join` / `local_path_join`, which differ only in whose rules apply.
+local function join_paths(windows, ...)
+  local n = select("#", ...)
+  local parts = { ... }
+  local sep = windows and "\\" or "/"
+  local cls = windows and "/\\" or "/"
+  local out
+  for i = 1, n do
+    local seg = parts[i]
+    if seg ~= nil and seg ~= "" then
+      seg = tostring(seg)
+      if windows then
+        seg = (seg:gsub("/", "\\"))
+      end
+      if out == nil then
+        out = seg
+      else
+        seg = (seg:gsub("^[" .. cls .. "]+", ""))
+        if seg ~= "" then
+          if out:find("[" .. cls .. "]$") then
+            out = out .. seg
+          else
+            out = out .. sep .. seg
+          end
+        end
+      end
+    end
+  end
+  return out or ""
+end
+
+-- `btv.utils.path_join(...)`: join path segments into ONE filesystem path spelled with
+-- the session's separator (`btv.utils.path_sep`), so a path built from a directory the
+-- editor reported (`C:\Users\me\data`) never comes out half `\`, half `/`. Under the
+-- `"windows"` style a `/` inside a segment is respelled `\` too, so
+-- `path_join(cfg, "lua/plugins.lua")` is one native path; under `"unix"` a `\` is an
+-- ordinary character and left alone. Separators already at a seam are not doubled,
+-- and `nil` / `""` segments are skipped.
+--
+-- ```lua
+-- btv.utils.path_join("/home/me", "plugins", "foo")   -- "/home/me/plugins/foo"
+-- btv.utils.path_join([[C:\data]], "lua/x.lua")        -- [[C:\data\lua\x.lua]]
+-- ```
+--
+-- It follows the *session's* path style — in a daemon session, the daemon's — so it is
+-- for paths on the session filesystem (`btv.fs`, buffer names, `getcwd()`). A path on
+-- THIS machine (`btv.fs_local`, `stdpath`, `package.path`) is joined with
+-- `btv.utils.local_path_join`. This is for paths handed to the filesystem or shown as
+-- files: `btv.utils.joinpath` stays neovim's `vim.fs.joinpath` (always `/`), and a glob
+-- keeps its own `/`.
+function btv.utils.path_join(...)
+  return join_paths(windows_paths(), ...)
+end
+
+-- `btv.utils.local_path_join(...)`: `btv.utils.path_join`, but by THIS machine's rules
+-- (`btv.utils.is_windows`) whatever the session's — the twin for paths on the local
+-- filesystem (`btv.fs_local`, `stdpath`, the plugin manager's directories, `package.path`),
+-- as `btv.fs_local` is the twin of `btv.fs`. Identical to `path_join` outside a daemon
+-- session.
+function btv.utils.local_path_join(...)
+  return join_paths(btv.utils.is_windows(), ...)
+end
+
+-- `btv.utils.path_root(path)`: the root prefix of `path`, exactly as spelled in it,
+-- or `""` for a relative path. `path:sub(#root + 1)` is then the part below the root.
+--
+-- ```
+-- unix:     "/a/b"                -> "/"
+-- windows:  "C:\a" / "C:/a"       -> "C:\" / "C:/"
+--           "\\srv\share\a"       -> "\\srv\share\"
+--           "\a"                  -> "\"   (rooted on the current drive)
+-- both:     "a/b", ""             -> ""
+-- ```
+--
+-- A drive-relative `C:a` has no root (it is relative to that drive's own cwd).
+function btv.utils.path_root(path)
+  if not windows_paths() then
+    return path:sub(1, 1) == "/" and "/" or ""
+  end
+  return path:match("^[/\\][/\\][^/\\]+[/\\][^/\\]+[/\\]?")
+    or path:match("^%a:[/\\]")
+    or path:match("^[/\\]")
+    or ""
+end
+
+-- `btv.utils.is_absolute(path)`: is `path` rooted — `/…` on Unix; a drive (`C:\…`),
+-- UNC share (`\\server\share\…`) or bare separator (`\…`) on Windows? A relative path
+-- is the one a cwd has to be prepended to (see `btv.fname.modify(path, ":p")`).
+function btv.utils.is_absolute(path)
+  return btv.utils.path_root(path) ~= ""
+end
 
 -- `btv.utils.dirname(path)`: the directory part of `path` — everything before the
--- last `/` (`"/a/b/c.txt"` → `"/a/b"`). `""` for an entry directly under the root
--- (`"/a"` → `""`); a path with no `/` comes back unchanged (there is nothing to
--- strip), which callers walking upward detect as "no parent".
+-- last separator (`"/a/b/c.txt"` → `"/a/b"`). `""` for an entry directly under the
+-- root (`"/a"` → `""`, and on Windows `"C:\a"` → `""`); a path with no separator comes
+-- back unchanged (there is nothing to strip), which callers walking upward detect as
+-- "no parent". On Windows both `/` and `\` separate.
 function btv.utils.dirname(path)
-  return (path:gsub("/[^/]*$", ""))
+  if not windows_paths() then
+    return (path:gsub("/[^/]*$", ""))
+  end
+  local root = btv.utils.path_root(path)
+  local head = path:sub(#root + 1):match("^(.*)[/\\][^/\\]*$")
+  if head then
+    return root .. head
+  end
+  return root ~= "" and "" or path
 end
 
 -- `btv.utils.basename(path)`: the last `/`- or `\`-separated component of `path`,
@@ -207,6 +366,15 @@ end
 -- one back out of a reply crosses this seam. Pure string math — nothing is resolved
 -- against the filesystem.
 
+-- Percent-encode a `/`-separated URI path: everything outside the unreserved set.
+local function encode_uri_path(p)
+  return (
+    p:gsub("[^%w%-%.%_%~/]", function(c)
+      return string.format("%%%02X", string.byte(c))
+    end)
+  )
+end
+
 -- `btv.utils.uri_from_path(path)`: the `file://` URI naming `path`.
 --
 -- Percent-encodes everything outside the URI unreserved set, `/` excepted — a path
@@ -214,14 +382,26 @@ end
 -- server silently misreads (it truncates at the `#`, or fails to match the document
 -- it already has open under the encoded spelling). The path is normalized first, so
 -- the same file always produces the same URI and a server's document map hits.
+--
+-- A Windows path takes the shape every LSP server (and the `url` crate's
+-- `Url::from_file_path`) expects: `C:\Users\x\a.py` → `file:///C:/Users/x/a.py`, the
+-- drive's `:` left unescaped; a UNC path names its server as the URI's host
+-- (`\\srv\share\a` → `file://srv/share/a`).
 function btv.utils.uri_from_path(path)
   if type(path) ~= "string" then
     error("btv.utils.uri_from_path: path must be a string, got " .. type(path), 2)
   end
-  local encoded = btv.utils.normalize(path):gsub("[^%w%-%.%_%~/]", function(c)
-    return string.format("%%%02X", string.byte(c))
-  end)
-  return "file://" .. encoded
+  local root = btv.utils.path_root(path)
+  local drive = root:match("^(%a:)[/\\]$")
+  if drive then
+    return "file:///" .. drive .. encode_uri_path(btv.utils.normalize(path:sub(#drive + 1)))
+  end
+  local server, share = root:match("^[/\\][/\\]([^/\\]+)[/\\]([^/\\]+)")
+  if server then
+    local below = btv.utils.normalize("/" .. share .. "/" .. path:sub(#root + 1))
+    return "file://" .. encode_uri_path(server) .. encode_uri_path(below)
+  end
+  return "file://" .. encode_uri_path(btv.utils.normalize(path))
 end
 
 -- `btv.utils.uri_from_buf(bufnr)`: buffer `bufnr`'s `file://` URI (`0`/nil = the
@@ -238,6 +418,10 @@ end
 -- `nil` rather than the raw string: a `deno:` / `jdt:` / `untitled:` URI names a
 -- document that has no path at all, and treating one as a path creates a buffer for a
 -- file that will never exist. Callers branch on the nil.
+--
+-- Under the Windows path style (`btv.utils.path_style`) the result is a native path:
+-- `file:///C:/x/a.py` → `C:\x\a.py`, and a URI with a host is a UNC path
+-- (`file://srv/share/a` → `\\srv\share\a`).
 function btv.utils.uri_to_path(uri)
   if type(uri) ~= "string" then
     return nil
@@ -246,9 +430,19 @@ function btv.utils.uri_to_path(uri)
   if not path then
     return nil
   end
-  return (path:gsub("%%(%x%x)", function(hex)
+  path = path:gsub("%%(%x%x)", function(hex)
     return string.char(tonumber(hex, 16))
-  end))
+  end)
+  if not windows_paths() then
+    return path
+  end
+  local host, rest = path:match("^([^/]*)(.*)$")
+  if host ~= "" and host ~= "localhost" then
+    return "\\\\" .. host .. (rest:gsub("/", "\\"))
+  end
+  -- `/C:/x` → `C:/x`: the URI path's leading `/` sits before the drive.
+  rest = rest:gsub("^/(%a:)", "%1")
+  return (rest:gsub("/", "\\"))
 end
 
 -- ----- btv.utils.argv ---------------------------------------------------------

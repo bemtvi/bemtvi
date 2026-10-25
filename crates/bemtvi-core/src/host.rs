@@ -137,7 +137,7 @@ impl HostFs for StdHostFs {
     }
 
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
-        std::fs::canonicalize(path)
+        canonicalize(path)
     }
 
     fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
@@ -147,6 +147,31 @@ impl HostFs for StdHostFs {
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
     }
+}
+
+/// [`std::fs::canonicalize`], spelled the way every other surface of the editor spells
+/// a path. On Windows the std call returns a *verbatim* path (`\\?\C:\dir`,
+/// `\\?\UNC\server\share`) — a form no user types, no shell prints, and plenty of
+/// consumers (a plugin's prefix match against its own dir, a printed `export` line, a
+/// runtimepath entry) don't recognise as the same place. It is converted back to the
+/// plain spelling (`C:\dir`, `\\server\share`); Rust's own fs calls re-add the prefix
+/// internally when a path needs it, so nothing is lost. Identity on other platforms.
+pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    {
+        let s = canonical.to_string_lossy();
+        if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+            return Ok(PathBuf::from(format!(r"\\{unc}")));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            let b = rest.as_bytes();
+            if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+                return Ok(PathBuf::from(rest));
+            }
+        }
+    }
+    Ok(canonical)
 }
 
 /// Write `contents` to `path` atomically: stream into a temp file in the same

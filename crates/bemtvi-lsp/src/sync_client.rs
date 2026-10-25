@@ -157,6 +157,9 @@ struct ServerState {
     next_req_id: i64,
     pending: HashMap<i64, Pending>,
     settings: Option<Value>,
+    /// The daemon's path syntax for the root (`ServerSpawn::path_style`), so the
+    /// `workspace/workspaceFolders` pull spells the root as `initialize` did.
+    path_style: Option<bemtvi_core::pathstyle::PathStyle>,
     queued: Vec<Outbound>,
 }
 
@@ -222,6 +225,7 @@ impl SyncLspClient {
                 next_req_id: 1,
                 pending: HashMap::new(),
                 settings: spawn.settings.clone(),
+                path_style: spawn.path_style,
                 queued: Vec::new(),
             },
         );
@@ -760,7 +764,8 @@ impl SyncLspClient {
             // helper that builds the `workspaceFolders` we push at `initialize` — the
             // push and the pull must name one folder, whichever leg a session runs on.
             "workspace/workspaceFolders" => {
-                let folders = workspace_folders(key.root.as_deref());
+                let style = self.servers.get(key).and_then(|s| s.path_style);
+                let folders = workspace_folders(key.root.as_deref(), style);
                 let reply = serde_json::to_value(folders).unwrap_or(Value::Null);
                 self.send_response(key, req_id, reply);
             }

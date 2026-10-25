@@ -18,7 +18,7 @@ use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
     attach, command, cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse, feed_mouse_mod,
-    lines, map_get, menu_items, menu_of, poll_menu, serial_lock, spawn, temp_dir,
+    lines, map_get, menu_items, menu_of, poll_menu, q, serial_lock, spawn, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -417,8 +417,8 @@ btv.picker.source {{
   end,
 }}
 "#,
-        a = a.display(),
-        b = b.display(),
+        a = q(&a),
+        b = q(&b),
     );
     let (rpc, mut incoming) = start(&dir, &src).await;
 
@@ -481,8 +481,8 @@ btv.picker.source {{
   end,
 }}
 "#,
-        a = a.display(),
-        b = b.display(),
+        a = q(&a),
+        b = q(&b),
     );
     let (rpc, mut incoming) = start(&dir, &src).await;
 
@@ -883,14 +883,16 @@ btv.picker.source {
 #[tokio::test]
 async fn streaming_source_appears_as_rows_arrive() {
     // A source that streams via `btv.run_stream` (the async-iterator path):
-    // `printf` (coreutils) emits three lines, which arrive as picker rows. Proves
+    // `printf` (coreutils) emits three lines, which arrive as picker rows. The newlines
+    // are printf's own `\n` escapes, not raw newlines in argv (an MSYS `printf` on
+    // Windows splits its command line at a raw newline and prints only `one`). Proves
     // the streaming primitive end-to-end, not just the synchronous ctx.push path.
     let dir = temp_dir("picker_stream");
     let src = r#"
 btv.picker.source {
   name = "stream",
   items = btv.async(function(ctx)
-    for batch in btv.await_each(btv.run_stream { cmd = "printf", args = { "one\ntwo\nthree\n" } }) do
+    for batch in btv.await_each(btv.run_stream { cmd = "printf", args = { "one\\ntwo\\nthree\\n" } }) do
       for _, l in ipairs(batch) do
         if l ~= "" then ctx.push { text = l } end
       end
@@ -1191,7 +1193,7 @@ async fn edit_helper_opens_a_file_and_jumps_to_the_location() {
         &rpc,
         &format!(
             "btv.picker.edit({{ path = '{}', row = 3, col = 2 }})",
-            file.display()
+            q(&file)
         ),
     )
     .await;
@@ -1228,7 +1230,7 @@ async fn picker_file_open_records_a_jump_so_ctrl_o_returns() {
     // Pick a file in the finder (no location) — a plain open, still a jump.
     exec_lua(
         &rpc,
-        &format!("btv.picker.edit({{ path = '{}' }})", file.display()),
+        &format!("btv.picker.edit({{ path = '{}' }})", q(&file)),
     )
     .await;
     assert_eq!(
@@ -1404,14 +1406,14 @@ async fn buffers_picker_rows_carry_the_ls_buffer_info() {
 
     // alpha first (cursor parked on line 2), then beta — so alpha is the alternate
     // `#` and beta the current `%`. beta is edited and left unwritten: the `+` flag.
-    exec_lua(&rpc, &format!("vim.cmd('edit {}')", alpha.display())).await;
+    exec_lua(&rpc, &format!("vim.cmd('edit {}')", q(&alpha))).await;
     feed(&rpc, "j");
     lines(&rpc).await; // round-trip so the cursor lands before the switch stashes it
-    exec_lua(&rpc, &format!("vim.cmd('edit {}')", beta.display())).await;
+    exec_lua(&rpc, &format!("vim.cmd('edit {}')", q(&beta))).await;
     feed(&rpc, "GA!<Esc>");
     lines(&rpc).await;
 
-    let alpha_nr = exec_lua(&rpc, &format!("return vim.fn.bufnr('{}')", alpha.display()))
+    let alpha_nr = exec_lua(&rpc, &format!("return vim.fn.bufnr('{}')", q(&alpha)))
         .await
         .as_u64()
         .expect("alpha bufnr");
@@ -1453,7 +1455,7 @@ async fn buffers_source_lists_open_buffers() {
     let (rpc, mut incoming) = start(&dir, "").await;
 
     // Open a named buffer so the in-memory source has something to list.
-    exec_lua(&rpc, &format!("vim.cmd('edit {}')", file.display())).await;
+    exec_lua(&rpc, &format!("vim.cmd('edit {}')", q(&file))).await;
     exec_lua(&rpc, "btv.picker.open('buffers')").await;
 
     let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
@@ -1478,7 +1480,7 @@ async fn buffers_picker_lists_unnamed_buffers_like_ls() {
 
     // A named buffer, a scratch buffer, then back to the named one — so the scratch
     // is hidden (`#h`) and reaching it again is exactly what the picker is for.
-    exec_lua(&rpc, &format!("vim.cmd('edit {}')", file.display())).await;
+    exec_lua(&rpc, &format!("vim.cmd('edit {}')", q(&file))).await;
     let named_buf = cur_buf(&rpc).await;
     exec_lua(&rpc, "vim.cmd('enew')").await;
     let scratch = cur_buf(&rpc).await;
@@ -1540,7 +1542,7 @@ async fn buffers_preview_reads_the_in_memory_buffer_not_the_file() {
 
     // Open the file, then edit line 1 in memory WITHOUT saving (a synchronous normal-
     // mode change) — the buffer now diverges from disk.
-    exec_lua(&rpc, &format!("vim.cmd('edit {}')", file.display())).await;
+    exec_lua(&rpc, &format!("vim.cmd('edit {}')", q(&file))).await;
     feed(&rpc, "ccLIVE UNSAVED EDIT<Esc>");
 
     exec_lua(&rpc, "btv.picker.open('buffers')").await;
@@ -1568,13 +1570,13 @@ async fn buffers_picker_is_scoped_to_the_focused_layer() {
     let (rpc, mut incoming) = start(&dir, "").await;
 
     // A named buffer in the MAIN layer.
-    exec_lua(&rpc, &format!("vim.cmd('edit {}')", main_file.display())).await;
+    exec_lua(&rpc, &format!("vim.cmd('edit {}')", q(&main_file))).await;
 
     // Open a bottom dock, focus it, and open a named buffer THERE — so the dock
     // layer owns it (a buffer's home is the layer it was last shown in).
     exec_lua(&rpc, "btv.dock.open({ side = 'bottom', size = 12 })").await;
     exec_lua(&rpc, "btv.dock.focus('bottom')").await;
-    exec_lua(&rpc, &format!("vim.cmd('edit {}')", dock_file.display())).await;
+    exec_lua(&rpc, &format!("vim.cmd('edit {}')", q(&dock_file))).await;
 
     // The buffers picker, focused in the dock, lists the dock's buffer — not main's.
     exec_lua(&rpc, "btv.picker.open('buffers')").await;
@@ -1610,7 +1612,7 @@ btv.picker.source({{
   confirm = function(item, mode, layer) btv.picker.edit(item, mode, layer) end,
 }})
 "#,
-        target.display()
+        q(&target)
     );
     let (rpc, mut incoming) = start(&dir, &init).await;
 
@@ -1658,7 +1660,7 @@ btv.picker.source({{
   confirm = function(item, mode, layer) btv.picker.edit(item, mode, layer) end,
 }})
 "#,
-        target.display()
+        q(&target)
     );
     let (rpc, mut incoming) = start(&dir, &init).await;
 
@@ -1719,7 +1721,7 @@ async fn default_picker_maps_open_with_the_configured_leader() {
     std::fs::write(&file, "hi\n").unwrap();
     let (rpc, mut incoming) = start(&dir, "vim.g.mapleader = ','").await;
 
-    exec_lua(&rpc, &format!("vim.cmd('edit {}')", file.display())).await;
+    exec_lua(&rpc, &format!("vim.cmd('edit {}')", q(&file))).await;
     // Drive the default map by keystroke at the configured leader (`,fb`).
     feed(&rpc, ",fb");
 
@@ -1808,8 +1810,8 @@ btv.picker.source {{
   confirm = function(item) _G.picked = item.path end,
 }}
 "#,
-        a = a.display(),
-        b = b.display(),
+        a = q(&a),
+        b = q(&b),
     );
     let (rpc, mut incoming) = start(&dir, &src).await;
 
@@ -1853,7 +1855,7 @@ btv.picker.source {{
   confirm = function(item) _G.picked = item.path end,
 }}
 "#,
-        t = t.display(),
+        t = q(&t),
     );
     let (rpc, mut incoming) = start(&dir, &src).await;
 
@@ -1887,7 +1889,7 @@ btv.picker.source {{
   confirm = function(item) _G.picked = item.path end,
 }}
 "#,
-        big = big.display(),
+        big = q(&big),
     );
     let (rpc, mut incoming) = start(&dir, &src).await;
 
@@ -1940,9 +1942,9 @@ btv.picker.source {{
   confirm = function(item) _G.picked = item.path end,
 }}
 "#,
-        help = help.display(),
-        plain = plain.display(),
-        code = code.display(),
+        help = q(&help),
+        plain = q(&plain),
+        code = q(&code),
     );
     let (rpc, mut incoming) = start(&dir, &src).await;
 
@@ -1988,7 +1990,7 @@ btv.picker.source {{
   end,
 }}
 "#,
-        tall = tall.display(),
+        tall = q(&tall),
     );
     let (rpc, mut incoming) = start(&dir, &src).await;
 
@@ -2071,8 +2073,8 @@ btv.picker.source {{
   end,
 }}
 "#,
-        one = one.display(),
-        two = two.display(),
+        one = q(&one),
+        two = q(&two),
     );
     let (rpc, mut incoming) = start(&dir, &src).await;
 
@@ -2116,7 +2118,7 @@ btv.picker.source {{
   items = function(ctx) ctx.push {{ text = "a", path = "{a}" }} end,
 }}
 "#,
-        a = a.display(),
+        a = q(&a),
     );
     let (rpc, mut incoming) = start(&dir, &src).await;
     exec_lua(&rpc, "btv.picker.open('geom')").await;
@@ -2157,7 +2159,7 @@ btv.picker.source {{
   items = function(ctx) ctx.push {{ text = "gone", path = "{p}" }} end,
 }}
 "#,
-        p = missing.display(),
+        p = q(&missing),
     );
     let (rpc, mut incoming) = start(&dir, &src).await;
     exec_lua(&rpc, "btv.picker.open('missing')").await;
@@ -2188,7 +2190,7 @@ btv.picker.source {{
   confirm = function(item) _G.picked = item.path end,
 }}
 "#,
-        a = a.display(),
+        a = q(&a),
     );
     let (rpc, mut incoming) = start(&dir, &src).await;
     exec_lua(&rpc, "_G.picked = nil; btv.picker.open('fc')").await;
@@ -2330,7 +2332,7 @@ btv.picker.source {{
   items = function(ctx) ctx.push {{ text = "one.txt", path = "{one}" }} end,
 }}
 "#,
-        one = one.display(),
+        one = q(&one),
     );
     let (rpc, mut incoming) = start(&dir, &src).await;
     command(&rpc, "set nonumber norelativenumber").await;
@@ -2377,7 +2379,7 @@ btv.picker.source {{
   items = function(ctx) ctx.push {{ text = "wide.txt", path = "{p}" }} end,
 }}
 "#,
-        p = wide_path.display(),
+        p = q(&wide_path),
     );
     let (rpc, mut incoming) = start(&dir, &src).await;
     command(&rpc, "set nonumber norelativenumber").await;
@@ -2544,7 +2546,7 @@ btv.picker.source {{
   confirm = function(item) btv.picker.edit(item) end,
 }}
 "#,
-        z = zebra.display(),
+        z = q(&zebra),
     );
     let (rpc, mut incoming) = start(&dir, &src).await;
 
@@ -2611,7 +2613,7 @@ btv.picker.source {{
   confirm = function(item, mode) btv.picker.edit(item, mode) end,
 }}
 "#,
-        f = file.display(),
+        f = q(&file),
     );
     let (rpc, mut incoming) = start(&dir, &src).await;
 
@@ -2646,7 +2648,7 @@ btv.picker.source {{
   confirm = function(item) btv.picker.edit(item) end,
 }}
 "#,
-        f = file.display(),
+        f = q(&file),
     );
     let (rpc, mut incoming) = start(&dir, &src).await;
 
@@ -2761,7 +2763,7 @@ btv.picker.source {{
   confirm = function(item, mode) btv.picker.edit(item, mode) end,
 }}
 "#,
-        f = file.display(),
+        f = q(&file),
     );
     let (rpc, mut incoming) = start(&dir, &src).await;
 
@@ -3840,6 +3842,12 @@ fn filter_project(tag: &str) -> std::path::PathBuf {
     proj
 }
 
+/// A `/`-spelled project-relative path in the platform's native spelling — how the
+/// `files` and `live_grep` sources report a path (`src\main.rs` on Windows).
+fn native(rel: &str) -> String {
+    rel.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
 /// Poll the picker's rows until `want` holds, returning the last set seen.
 ///
 /// A predicate rather than a row count, because a filter edit makes the list *shrink*
@@ -4013,11 +4021,11 @@ async fn editing_a_filter_box_re_runs_a_static_source() {
 
     exec_lua(&rpc, "btv.picker.open('files')").await;
     let rows = rows_until(&rpc, &mut incoming, |r| {
-        r.iter().any(|x| x.starts_with("target/"))
+        r.iter().any(|x| x.starts_with(&native("target/")))
     })
     .await;
     assert!(
-        rows.iter().any(|r| r.starts_with("target/")),
+        rows.iter().any(|r| r.starts_with(&native("target/"))),
         "unfiltered, the build artifact is listed; got {rows:?}"
     );
 
@@ -4026,15 +4034,15 @@ async fn editing_a_filter_box_re_runs_a_static_source() {
     feed(&rpc, "<C-g>");
     feed(&rpc, "target");
     let rows = rows_until(&rpc, &mut incoming, |r| {
-        !r.iter().any(|x| x.starts_with("target/"))
+        !r.iter().any(|x| x.starts_with(&native("target/")))
     })
     .await;
     assert!(
-        !rows.iter().any(|r| r.starts_with("target/")),
+        !rows.iter().any(|r| r.starts_with(&native("target/"))),
         "typing into the exclude-side re-runs the source without it; got {rows:?}"
     );
     assert!(
-        rows.iter().any(|r| r == "src/main.rs"),
+        rows.iter().any(|r| *r == native("src/main.rs")),
         "the rest of the tree is still there; got {rows:?}"
     );
 }
@@ -4051,7 +4059,7 @@ async fn the_filter_boxes_narrow_live_grep_too() {
     exec_lua(&rpc, "btv.picker.open('live_grep', { include = 'src/**' })").await;
     feed(&rpc, "zqxmain");
     let rows = rows_until(&rpc, &mut incoming, |r| {
-        !r.is_empty() && r.iter().all(|x| x.starts_with("src/"))
+        !r.is_empty() && r.iter().all(|x| x.starts_with(&native("src/")))
     })
     .await;
     assert!(
@@ -4059,7 +4067,7 @@ async fn the_filter_boxes_narrow_live_grep_too() {
         "the match inside the included tree is found"
     );
     assert!(
-        rows.iter().all(|r| r.starts_with("src/")),
+        rows.iter().all(|r| r.starts_with(&native("src/"))),
         "and every hit comes from it — the artifact and the vendor copy are filtered; got {rows:?}"
     );
 }

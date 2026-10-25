@@ -1652,6 +1652,35 @@ pub struct UiMirror<'a> {
     pub clipboard: Option<(&'a str, bool)>,
 }
 
+/// Replace PUC Lua's `os.getenv` with one that reads the environment the rest of the
+/// process writes. The stock one calls the C runtime's `getenv`, which on Windows reads
+/// the CRT's private copy of the environment taken at startup — so a variable the
+/// editor exports to its own process later (`$BEMTVI_RUNTIME`, `$BEMTVI_ARGV`, through
+/// `std::env::set_var` → `SetEnvironmentVariableW`) was `nil` to every config and
+/// plugin, while the children they spawn inherited it fine. `std::env::var_os` reads the
+/// live process environment on every platform (on unix the same `environ` libc's
+/// `getenv` reads, so nothing changes there). Same contract as the stock function: a
+/// string (or number, coerced) name in, the value or `nil` out.
+fn install_getenv(lua: &Lua) -> mlua::Result<()> {
+    let getenv = lua.create_function(|lua, name: mlua::LuaString| {
+        #[cfg(unix)]
+        let value = {
+            use std::os::unix::ffi::{OsStrExt, OsStringExt};
+            std::env::var_os(std::ffi::OsStr::from_bytes(&name.as_bytes()))
+                .map(OsStringExt::into_vec)
+        };
+        #[cfg(not(unix))]
+        let value = match name.to_str() {
+            Ok(name) if !name.is_empty() && !name.contains(['=', '\0']) => {
+                std::env::var_os(&*name).map(|v| v.to_string_lossy().into_owned().into_bytes())
+            }
+            _ => None,
+        };
+        value.map(|v| lua.create_string(v)).transpose()
+    })?;
+    lua.globals().get::<Table>("os")?.set("getenv", getenv)
+}
+
 impl LuaRuntime {
     /// Build the VM and point `require` at `runtimepath`: each entry's `lua/`
     /// subdirectory is prepended to `package.path` as `<rt>/lua/?.lua` and
@@ -1672,6 +1701,7 @@ impl LuaRuntime {
         // plugin/colorscheme code that compiles chunks at runtime (e.g. a colorscheme
         // caching itself via `loadstring` + `string.dump`) keeps working.
         lua.load("loadstring = loadstring or load").exec()?;
+        install_getenv(&lua)?;
         // GOTCHA — `require` returns TWO values under 5.4. PUC Lua 5.4 added a second
         // return to `require`: the searcher's *loader data*, which for the file
         // searcher is the resolved FILE PATH (`.../lua/foo.lua`). LuaJIT / 5.1 (the old
@@ -4090,6 +4120,16 @@ impl LuaRuntime {
     /// why `getcwd` reads this mirror rather than `std::env::current_dir`.
     pub fn set_cwd(&self, cwd: &str) -> mlua::Result<()> {
         self.btv()?.set("_cwd", cwd)
+    }
+
+    /// Mirror the path syntax the session's paths (`btv._cwd`, buffer names, `btv.fs`
+    /// paths) are spelled in into `btv._path_style` — `"posix"` or `"windows"`. In a
+    /// daemon session that is the **daemon's** announced syntax, which can differ from
+    /// the platform this Lua VM runs on (a Windows client editing a unix host), so Lua
+    /// path helpers (`fnamemodify`, `btv.fs` joins) should read this rather than sniff
+    /// the local platform. Published alongside every `btv._cwd` update.
+    pub fn set_path_style(&self, style: &str) -> mlua::Result<()> {
+        self.btv()?.set("_path_style", style)
     }
 
     /// Drop the Lua-side state scoped to buffer `bufnr` — its buffer-local user

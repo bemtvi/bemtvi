@@ -94,6 +94,11 @@ pub struct ServerSpawn {
     /// `NO_COLOR`, roslyn's `DOTNET_*`), so dropping it silently starts a server
     /// that misbehaves for no visible reason. Empty when the config sets none.
     pub env: Vec<(String, String)>,
+    /// The path syntax of the filesystem the server runs against when that is a
+    /// **daemon's** (its announced [`PathStyle`](bemtvi_core::pathstyle::PathStyle)), so
+    /// the workspace root's `rootUri` / `workspaceFolders` are spelled by the daemon's
+    /// rules rather than this client's. `None` for a local server (`std::path` rules).
+    pub path_style: Option<bemtvi_core::pathstyle::PathStyle>,
 }
 
 /// The position encoding negotiated at `initialize` (Decision 4). bemtvi columns

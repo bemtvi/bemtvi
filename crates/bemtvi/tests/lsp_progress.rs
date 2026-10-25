@@ -101,7 +101,10 @@ async fn initialize_advertises_window_work_done_progress() {
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp_progress");
     let rec = dir.join("rec.jsonl");
-    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, rec.display()));
+    arm_mock(
+        &dir,
+        &format!(r#"{{ "record": "{}" }}"#, bemtvi_test_harness::q(&rec)),
+    );
     let (rpc, _incoming) = open_with_server(&dir, "").await;
 
     // Wait for the LSP client to attach before reading the recorded wire. The

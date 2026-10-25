@@ -25,6 +25,7 @@ pub mod input;
 pub mod markdown;
 pub mod mode;
 pub mod options;
+pub mod pathstyle;
 pub mod rst;
 pub mod sandbox;
 pub mod search;

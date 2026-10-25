@@ -1330,7 +1330,7 @@ async fn goto_merges_both_servers_places() {
     // names a DIFFERENT line, so a round that reached one server resolves 1 item.
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp-goto-merge");
-    let uri = format!("file://{}", dir.as_path().join("a.rs").display());
+    let uri = bemtvi_test_harness::file_uri(&dir.as_path().join("a.rs"));
     arm_mock_named(dir.as_path(), "alpha", &definition_at(&uri, 1));
     arm_mock_named(dir.as_path(), "beta", &definition_at(&uri, 3));
     let (rpc, _incoming) = open_rust_with(dir.as_path(), "one\ntwo\nthree\nfour\n").await;
@@ -1359,7 +1359,7 @@ async fn goto_still_jumps_when_the_merged_list_holds_one_place() {
     // line, so the dedup (on CONVERTED byte positions) has to collapse them.
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp-goto-jump");
-    let uri = format!("file://{}", dir.as_path().join("a.rs").display());
+    let uri = bemtvi_test_harness::file_uri(&dir.as_path().join("a.rs"));
     arm_mock_named(dir.as_path(), "alpha", &definition_at(&uri, 2));
     arm_mock_named(dir.as_path(), "beta", &definition_at(&uri, 2));
     let (rpc, _incoming) = open_rust_with(dir.as_path(), "one\ntwo\nthree\nfour\n").await;
@@ -1737,7 +1737,7 @@ async fn a_named_formatter_applies_edits_at_its_own_encoding() {
 /// The `file://` URI of the buffer [`open_rust_with`] / [`open_rust`] opens, for a
 /// mock script that must name the document it is answering about.
 fn file_uri(dir: &Path) -> String {
-    format!("file://{}", dir.join("a.rs").display())
+    bemtvi_test_harness::file_uri(&dir.join("a.rs"))
 }
 
 #[tokio::test]
@@ -1983,7 +1983,7 @@ async fn a_code_actions_command_runs_on_the_server_that_offered_it() {
         "alpha",
         &format!(
             r#"{{ "record": "{}", "code_action": [] }}"#,
-            rec("alpha").display()
+            bemtvi_test_harness::q(&rec("alpha"))
         ),
     );
     arm_mock_named(
@@ -1993,7 +1993,7 @@ async fn a_code_actions_command_runs_on_the_server_that_offered_it() {
             r#"{{ "record": "{}",
                   "code_action": [ {{ "title": "BETA-CMD", "kind": "quickfix",
                     "command": {{ "title": "run", "command": "beta.doIt" }} }} ] }}"#,
-            rec("beta").display()
+            bemtvi_test_harness::q(&rec("beta"))
         ),
     );
     let (rpc, _incoming) = open_rust(dir.as_path()).await;
@@ -2050,7 +2050,7 @@ async fn a_registered_command_handler_wins_over_the_server_round_trip() {
                   "code_action": [ {{ "title": "BETA-CMD", "kind": "quickfix",
                     "command": {{ "title": "run", "command": "beta.doIt",
                                   "arguments": [ "ARG-ONE" ] }} }} ] }}"#,
-            rec.display()
+            bemtvi_test_harness::q(&rec)
         ),
     );
     let (rpc, _incoming) = open_rust(dir.as_path()).await;
@@ -2383,7 +2383,7 @@ async fn markerless_buffers_share_one_rootless_server() {
     // current buffer only).
     arm_mock(
         dir.as_path(),
-        &format!(r#"{{ "record": "{}" }}"#, rec.display()),
+        &format!(r#"{{ "record": "{}" }}"#, bemtvi_test_harness::q(&rec)),
     );
     let count = |method: &str| {
         std::fs::read_to_string(&rec)
@@ -2406,7 +2406,11 @@ async fn markerless_buffers_share_one_rootless_server() {
     let second = dir.join("b").join("two.rs");
     std::fs::create_dir_all(second.parent().unwrap()).expect("mkdir b");
     std::fs::write(&second, "let baz = qux()\n").expect("write second file");
-    exec_lua(&rpc, &format!("btv.cmd('e {}')", second.display())).await;
+    exec_lua(
+        &rpc,
+        &format!("btv.cmd('e {}')", bemtvi_test_harness::q(&second)),
+    )
+    .await;
     for _ in 0..200 {
         if count("textDocument/didOpen") == 2 {
             break;
@@ -2450,7 +2454,7 @@ async fn a_rootless_server_is_initialized_without_a_root_uri() {
     let rec = dir.join("rec.jsonl");
     arm_mock(
         dir.as_path(),
-        &format!(r#"{{ "record": "{}" }}"#, rec.display()),
+        &format!(r#"{{ "record": "{}" }}"#, bemtvi_test_harness::q(&rec)),
     );
     let (rpc, _incoming) = open_rust_at(&dir.join("a").join("one.rs")).await;
     enable_markerless_mock(&rpc).await;
@@ -2496,7 +2500,7 @@ async fn a_rooted_server_and_a_rootless_one_are_separate_instances() {
     let rec = dir.join("rec.jsonl");
     arm_mock(
         dir.as_path(),
-        &format!(r#"{{ "record": "{}" }}"#, rec.display()),
+        &format!(r#"{{ "record": "{}" }}"#, bemtvi_test_harness::q(&rec)),
     );
     // `a/` is a project (it holds the marker); `b/` is out of tree.
     let project = dir.join("a");
@@ -2527,7 +2531,11 @@ async fn a_rooted_server_and_a_rootless_one_are_separate_instances() {
     let loose = dir.join("b").join("two.rs");
     std::fs::create_dir_all(loose.parent().unwrap()).expect("mkdir b");
     std::fs::write(&loose, "let baz = qux()\n").expect("write loose file");
-    exec_lua(&rpc, &format!("btv.cmd('e {}')", loose.display())).await;
+    exec_lua(
+        &rpc,
+        &format!("btv.cmd('e {}')", bemtvi_test_harness::q(&loose)),
+    )
+    .await;
 
     let found = inits(2).await;
     std::env::remove_var("BEMTVI_LSP_CMD");
@@ -2545,10 +2553,15 @@ async fn a_rooted_server_and_a_rootless_one_are_separate_instances() {
         roots.iter().any(|r| r.is_none()),
         "the out-of-tree buffer's server is rootless, got {roots:?}"
     );
+    // Suffix-matched on the URI's path part (a temp dir may resolve through a
+    // symlink, `/var` -> `/private/var`), spelled as a URI spells it — `/C:/…/a` with
+    // forward slashes on Windows, not the native backslash-separated path.
+    let project_uri = bemtvi_test_harness::file_uri(&project);
+    let project_uri_path = project_uri.trim_start_matches("file://");
     assert!(
         roots
             .iter()
-            .any(|r| r.is_some_and(|r| r.ends_with(&project.display().to_string()))),
+            .any(|r| r.is_some_and(|r| r.ends_with(project_uri_path))),
         "the project server keeps its own root, got {roots:?}"
     );
 }
@@ -2567,7 +2580,7 @@ async fn a_rootless_server_pulling_workspace_folders_gets_none() {
         dir.as_path(),
         &format!(
             r#"{{ "record": "{}", "workspace_folders_pull": true }}"#,
-            rec.display()
+            bemtvi_test_harness::q(&rec)
         ),
     );
     let (rpc, _incoming) = open_rust_at(&dir.join("a").join("one.rs")).await;

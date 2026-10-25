@@ -17,7 +17,30 @@ use bemtvi_test_harness::{exec_lua, start_attached, temp_dir};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
+    isolate_host_git_config();
     start_attached(ServerInit::default(), 80, 24).await
+}
+
+/// Keep the host's git config out of the editor's in-process gix, exactly as `git()`
+/// keeps it out of the fixture CLI. Without this the two sides of a test read different
+/// configs: e.g. Git for Windows ships `core.autocrlf=true` in its system gitconfig, so
+/// gix checks files out with CRLF while the isolated fixture `git` writes LF. gix reads
+/// these variables through `std::env`, so setting them in-process (once, to the same
+/// values for every test) reaches the server. The stand-in global config carries only
+/// the fixed identity `git()` uses, which gix needs to write reflogs.
+fn isolate_host_git_config() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let global = temp_dir("git_global_config").join("gitconfig");
+        std::fs::write(
+            &global,
+            "[user]\n\tname = bemtvi test\n\temail = test@bemtvi\n",
+        )
+        .expect("write isolated gitconfig");
+        // Every test sets the same values, before its server starts.
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+        std::env::set_var("GIT_CONFIG_GLOBAL", &global);
+    });
 }
 
 /// Block until one of `sentinels` (Lua expressions, typically a `_G.x` a promise arm

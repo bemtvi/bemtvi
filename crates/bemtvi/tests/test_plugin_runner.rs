@@ -363,8 +363,10 @@ fn plugin_scripts_loaded_by_the_spec_join_the_baseline() {
     std::fs::write(
         dir.join("test/pluginload_spec.lua"),
         r#"
-        local root = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
-        btv.plugins({ { name = "vendored", dir = root .. "/vendored" } })
+        -- Either separator: the chunk name is a native path (`\` on Windows).
+        local sep = package.config:sub(1, 1)
+        local root = debug.getinfo(1, "S").source:match("^@(.*)[/\\]test[/\\][^/\\]+$")
+        btv.plugins({ { name = "vendored", dir = root .. sep .. "vendored" } })
 
         local function has_map()
           for _, m in ipairs(btv.keymap.get("n") or {}) do

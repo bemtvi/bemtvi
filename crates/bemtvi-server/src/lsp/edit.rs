@@ -267,7 +267,7 @@ impl EditHost {
                     ignore_if_exists,
                     ..
                 } => {
-                    let Some(path) = uri_to_path(&uri) else {
+                    let Some(path) = self.uri_path(&uri) else {
                         failure = Some((index, format!("could not open {uri}")));
                         break;
                     };
@@ -379,7 +379,7 @@ impl EditHost {
                     ignore_if_exists,
                     ..
                 } => {
-                    let (Some(from), Some(to)) = (uri_to_path(&old_uri), uri_to_path(&new_uri))
+                    let (Some(from), Some(to)) = (self.uri_path(&old_uri), self.uri_path(&new_uri))
                     else {
                         failure = Some((index, format!("could not open {old_uri} → {new_uri}")));
                         break;
@@ -426,7 +426,7 @@ impl EditHost {
                     ignore_if_not_exists,
                     ..
                 } => {
-                    let Some(path) = uri_to_path(&uri) else {
+                    let Some(path) = self.uri_path(&uri) else {
                         failure = Some((index, format!("could not open {uri}")));
                         break;
                     };
@@ -457,14 +457,14 @@ impl EditHost {
             // below finds nothing, opens a fresh buffer for a file that does not exist,
             // applies the edits to it, and the rename then binds a *second* buffer to
             // the same name — the edits silently lost.
-            let uri = rewind_pending_renames(&pending_renames, uri);
+            let uri = rewind_pending_renames(&pending_renames, uri, self.remote_paths());
             // The open buffer for the URI, else bring its file into one. A URI we
             // can't resolve to a buffer aborts the edit here, before anything has been
             // applied — never silently skipped, and never half-applied around.
             let id = match self.buffer_id_for_uri(&uri) {
                 Some(id) => id,
                 None => {
-                    let Some(path) = uri_to_path(&uri) else {
+                    let Some(path) = self.uri_path(&uri) else {
                         failure = Some((index, format!("could not open {uri}")));
                         break;
                     };
@@ -611,6 +611,18 @@ impl EditHost {
         let win = self.editor.current_window_id();
         let tab = self.editor.current_tab_id();
         let (_, base) = self.dirs.effective(win, tab);
+        // A daemon session's path is the daemon's: strip the cwd prefix by its syntax.
+        if let Some(style) = self.remote_paths() {
+            let (path, base) = (path.to_string_lossy(), base.to_string_lossy());
+            let rel = path
+                .strip_prefix(base.as_ref())
+                .filter(|rest| {
+                    base.ends_with(|c| style.is_sep(c)) || rest.starts_with(|c| style.is_sep(c))
+                })
+                .map(|rest| rest.trim_start_matches(|c| style.is_sep(c)))
+                .filter(|rest| !rest.is_empty());
+            return PathBuf::from(rel.unwrap_or(&path));
+        }
         path.strip_prefix(base)
             .map(Path::to_path_buf)
             .unwrap_or_else(|_| path.to_path_buf())
@@ -803,10 +815,12 @@ impl EditHost {
         buffer: BufferId,
         path: &Path,
     ) {
-        let dir = path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
+        // A daemon session's path is the daemon's: take its parent by the daemon's syntax.
+        let parent = match self.remote_paths() {
+            Some(style) => style.parent(&path.to_string_lossy()).map(PathBuf::from),
+            None => path.parent().map(Path::to_path_buf),
+        };
+        let dir = parent.unwrap_or_else(|| PathBuf::from("."));
         self.queue_workspace_fs_job(
             group,
             index,
@@ -1555,11 +1569,17 @@ fn position_encoding(name: &str) -> PositionEncoding {
 /// A URI that isn't a file path, or that no queued rename produced, is returned
 /// unchanged. The walk is bounded by the number of renames, so a cyclic chain
 /// (`a → b` plus `b → a`) terminates instead of spinning.
-fn rewind_pending_renames(renames: &[(PathBuf, PathBuf)], uri: Url) -> Url {
+///
+/// `style` is the session's remote path syntax ([`EditHost::remote_paths`]), `None` locally.
+fn rewind_pending_renames(
+    renames: &[(PathBuf, PathBuf)],
+    uri: Url,
+    style: Option<bemtvi_core::pathstyle::PathStyle>,
+) -> Url {
     if renames.is_empty() {
         return uri;
     }
-    let Some(path) = uri_to_path(&uri) else {
+    let Some(path) = bemtvi_lsp::uri::uri_to_path(&uri, style) else {
         return uri;
     };
     let mut current = path.clone();
@@ -1574,5 +1594,5 @@ fn rewind_pending_renames(renames: &[(PathBuf, PathBuf)], uri: Url) -> Url {
     if current == path {
         return uri;
     }
-    Url::from_file_path(&current).unwrap_or(uri)
+    bemtvi_lsp::uri::path_to_uri(&current, style).unwrap_or(uri)
 }

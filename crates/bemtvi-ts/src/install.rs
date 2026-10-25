@@ -731,7 +731,10 @@ fn zig_target() -> Result<(&'static str, &'static str)> {
 /// path to its `zig` binary, downloading + checksum-verifying it on first use.
 /// Both archive shapes unpack to a single `<stem>/` dir holding `zig`
 /// (`zig.exe` on Windows).
-fn ensure_zig(data_dir: &Path) -> Result<PathBuf> {
+///
+/// Public so the test suites can build their grammar fixtures with the same
+/// pinned toolchain on hosts with no system `cc` (Windows).
+pub fn ensure_zig(data_dir: &Path) -> Result<PathBuf> {
     let (archive, sha) = zig_target()?;
     let is_zip = archive.ends_with(".zip");
     let stem = archive

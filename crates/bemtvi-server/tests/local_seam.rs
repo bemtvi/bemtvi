@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
-use bemtvi_test_harness::{exec_lua, lua_bool, start_attached, temp_dir};
+use bemtvi_test_harness::{exec_lua, lua_bool, q, start_attached, temp_dir};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
@@ -187,7 +187,7 @@ async fn fs_local_read_text_honors_the_encoding_option() {
              \x20 local ok = pcall(btv.await, btv.fs_local.read_text('{p}'))\n\
              \x20 _G.bare = ok and 'decoded' or 'rejected'\n\
              end)()",
-            p = path.display()
+            p = q(&path)
         ),
     )
     .await;

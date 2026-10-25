@@ -1083,6 +1083,84 @@ pub fn q(path: &std::path::Path) -> String {
         .replace('"', "\\\"")
 }
 
+/// [`std::fs::canonicalize`], spelled the way the editor reports a path. On Windows
+/// the std call returns a verbatim path (`\\?\C:\dir`) that no user-facing surface
+/// uses, so a drive-letter result has that prefix stripped (`C:\dir`); a verbatim
+/// UNC path, which has no plain spelling, is left alone. Identity elsewhere.
+pub fn canonicalize(path: impl AsRef<std::path::Path>) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    {
+        let s = canonical.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            if rest.as_bytes().get(1) == Some(&b':') {
+                return Ok(PathBuf::from(rest));
+            }
+        }
+    }
+    Ok(canonical)
+}
+
+/// The `file://` URI of `path`, spelled the way the editor's LSP layer puts it on
+/// the wire (`Url::from_file_path`): `file:///tmp/a.rs` on unix,
+/// `file:///C:/Users/.../a.rs` on Windows.
+pub fn file_uri(path: &std::path::Path) -> String {
+    lsp_types::Url::from_file_path(path)
+        .unwrap_or_else(|()| panic!("not an absolute path: {}", path.display()))
+        .to_string()
+}
+
+/// The C compiler, as an argv prefix, that tests build their tree-sitter grammar
+/// fixtures with: `$CC` (split on whitespace) when set, else `cc` on unix. Windows
+/// has no system `cc`, so there it is the editor's own pinned Zig (`zig cc`),
+/// fetched and checksum-verified once by [`bemtvi_ts::install::ensure_zig`] into a
+/// cache in the system temp dir that outlives the run, so later runs reuse it.
+pub fn c_compiler() -> Vec<String> {
+    if let Ok(cc) = std::env::var("CC") {
+        if !cc.trim().is_empty() {
+            return cc.split_whitespace().map(str::to_string).collect();
+        }
+    }
+    if cfg!(windows) {
+        vec![pinned_zig().to_string_lossy().into_owned(), "cc".into()]
+    } else {
+        vec!["cc".into()]
+    }
+}
+
+/// [`c_compiler`] as one whitespace-separated string — the `$BEMTVI_CC` spelling.
+pub fn c_compiler_cmd() -> String {
+    c_compiler().join(" ")
+}
+
+/// The pinned Zig, unpacked (once per machine) under
+/// `<temp>/bemtvi-test-toolchain/`. Concurrent test binaries may race to fetch it,
+/// so each stages into its own dir and renames the finished tree into place; the
+/// loser of the rename discards its copy and uses the winner's.
+fn pinned_zig() -> PathBuf {
+    static ZIG: OnceLock<PathBuf> = OnceLock::new();
+    ZIG.get_or_init(|| {
+        let cache = std::env::temp_dir().join("bemtvi-test-toolchain");
+        let shared = cache.join("zig");
+        if shared.exists() {
+            return bemtvi_ts::install::ensure_zig(&cache)
+                .unwrap_or_else(|e| panic!("cached zig in {}: {e:#}", cache.display()));
+        }
+        let stage = cache.join(format!("stage-{}", unique()));
+        let staged = bemtvi_ts::install::ensure_zig(&stage)
+            .unwrap_or_else(|e| panic!("fetch the pinned zig: {e:#}"));
+        let _ = std::fs::rename(stage.join("zig"), &shared);
+        if shared.exists() {
+            let _ = std::fs::remove_dir_all(&stage);
+            bemtvi_ts::install::ensure_zig(&cache)
+                .unwrap_or_else(|e| panic!("cached zig in {}: {e:#}", cache.display()))
+        } else {
+            staged
+        }
+    })
+    .clone()
+}
+
 /// A fresh, uniquely-named `.txt` temp file path (not created), inside this
 /// run's [`temp_root`].
 pub fn temp_path(tag: &str) -> PathBuf {
@@ -1396,6 +1474,12 @@ pub async fn spawn_with_daemon_fs_init(
         host_reader,
         host_writer,
     )));
+    // The fake daemon fs serves unix-style `/virtual/...` paths — it models a **unix**
+    // daemon, so announce that syntax as a real daemon's `config_bundle` handshake would
+    // (on a Windows test host this is the cross-OS case: remote paths must not follow the
+    // client's `std::path`). A test that models another daemon sets it explicitly.
+    init.remote_path_style
+        .get_or_insert(bemtvi_core::pathstyle::PathStyle::Posix);
     let (rpc, incoming) = spawn(init);
     // `attach` returning proves startup did not block on the (deferred) file fetch.
     attach(&rpc, 80, 24).await;

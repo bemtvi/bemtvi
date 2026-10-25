@@ -13,7 +13,7 @@ use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
     buf_lines, buf_name_of, command, cursor, drain_to_latest_redraw, exec_lua, feed, field, lines,
-    map_get, start_attached, write_temp,
+    map_get, q, start_attached, write_temp,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -1127,7 +1127,7 @@ async fn the_mirror_carries_the_alternate_handle_and_each_buffers_line() {
     feed(&rpc, "G"); // b (current) sits on line 3
     lines(&rpc).await;
 
-    let a_nr = exec_lua(&rpc, &format!("return vim.fn.bufnr('{}')", name(&a)))
+    let a_nr = exec_lua(&rpc, &format!("return vim.fn.bufnr('{}')", q(&a)))
         .await
         .as_u64()
         .expect("a's bufnr");

@@ -13,7 +13,8 @@
 //! Faithful, not a no-op: the child is a real `sh`/`cat` spawned on the daemon side, and the
 //! bytes asserted on are its actual PTY output crossing the wire — a stub that echoed the
 //! request back could not produce a shell's `hello` or echo interactive input. POSIX commands
-//! keep it hermetic. PTY output is async, so each assertion polls the pushed notifications with
+//! keep it hermetic (on Windows, which has neither, the always-present `cmd` stands in). PTY
+//! output is async, so each assertion polls the pushed notifications with
 //! a bounded timeout rather than sleeping a fixed amount.
 
 use std::time::Duration;
@@ -141,7 +142,13 @@ async fn await_exit(incoming: &mut UnboundedReceiver<Incoming>, buf: u64) -> Opt
 #[tokio::test]
 async fn terminal_output_streams_over_the_daemon_wire() {
     let (rpc, mut incoming) = spawn_term_daemon();
-    term_open(&rpc, 1, &["sh", "-c", "printf 'hello\\n'"], 24, 80);
+    // Windows has no `sh`; `cmd /c echo` is its always-present one-shot printer.
+    let argv: &[&str] = if cfg!(windows) {
+        &["cmd", "/c", "echo hello"]
+    } else {
+        &["sh", "-c", "printf 'hello\\n'"]
+    };
+    term_open(&rpc, 1, argv, 24, 80);
 
     let (text, exit) = await_text(&mut incoming, 1, "hello").await;
     assert!(
@@ -166,7 +173,13 @@ async fn terminal_output_streams_over_the_daemon_wire() {
 #[tokio::test]
 async fn terminal_echoes_interactive_input_and_honors_kill() {
     let (rpc, mut incoming) = spawn_term_daemon();
-    term_open(&rpc, 7, &["cat"], 24, 80);
+    // Windows has no `cat`; `cmd`'s `type con` echoes console input line by line the same way.
+    let argv: &[&str] = if cfg!(windows) {
+        &["cmd", "/c", "type con"]
+    } else {
+        &["cat"]
+    };
+    term_open(&rpc, 7, argv, 24, 80);
 
     // `cat` echoes its input back through the PTY; the bytes we write must come back out.
     rpc.notify(

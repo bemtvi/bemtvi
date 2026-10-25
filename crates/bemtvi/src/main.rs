@@ -161,7 +161,8 @@ impl ShadaOpts {
 /// for a *local* session; a daemon session resolves its root from the daemon's cwd instead.
 fn resolve_workspace_dir(dir: Option<&str>) -> Result<PathBuf> {
     let raw = dir.unwrap_or(".");
-    let abs = std::fs::canonicalize(raw).map_err(|e| anyhow!("--workspace {raw:?}: {e}"))?;
+    let abs = bemtvi_core::host::canonicalize(raw.as_ref())
+        .map_err(|e| anyhow!("--workspace {raw:?}: {e}"))?;
     if !abs.is_dir() {
         bail!("--workspace requires a directory, but {raw:?} is not one");
     }
@@ -506,7 +507,7 @@ fn extract_lua_runtime(dir_arg: String) -> Result<()> {
         .map_err(|e| anyhow!("--extract-lua-runtime: writing to {}: {e}", dir.display()))?;
 
     // Absolute path so the printed export line works from any cwd.
-    let abs = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let abs = bemtvi_core::host::canonicalize(&dir).unwrap_or(dir);
     let already_set = std::env::var_os(RUNTIME_ENV).is_some();
     std::env::set_var(RUNTIME_ENV, &abs);
 
@@ -805,6 +806,8 @@ fn main() -> Result<()> {
         remote_cwd: None,
         // Local session: a leading `~` expands against this process's own `$HOME`.
         remote_home: None,
+        // Local session: paths follow this process's own `std::path` rules.
+        remote_path_style: None,
         // The TUI handles `:connect`/`:workspace` only at startup (flags), not as live
         // client-intercepted commands, so it registers no virtual commands.
         client_init_lua: None,
@@ -1239,6 +1242,8 @@ where
         remote_cwd: resolved.remote_cwd,
         // A leading `~` in a file argument expands against the daemon's home.
         remote_home: resolved.remote_home,
+        // Remote paths follow the daemon's announced path syntax, not this client's.
+        remote_path_style: resolved.remote_path_style,
         // The TUI registers no client-intercepted virtual commands.
         client_init_lua: None,
         // The reconnecting daemon link (ssh/stdio) — its status flows into

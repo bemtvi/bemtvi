@@ -716,7 +716,7 @@ async fn an_unknown_config_key_is_reported_rather_than_silently_dropped() {
 /// difference between what the test built and what the shell's `pwd` reported can't
 /// make a correct path comparison fail.
 fn canonical(path: &str) -> String {
-    std::fs::canonicalize(path.trim())
+    bemtvi_test_harness::canonicalize(path.trim())
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.trim().to_string())
 }

@@ -67,8 +67,14 @@ impl vt100::Callbacks for TermSink {
                 }
                 _ => {}
             },
-            // Primary Device Attributes: identify as a VT102.
-            ('c', None) => self.replies.extend_from_slice(b"\x1b[?6c"),
+            // Primary Device Attributes, in the modern `61+` form: conformance level 1
+            // (the VT100 family — what this vt100 screen model emulates) plus `22`
+            // (ANSI color, which it projects). Nothing more is claimed: no sixel (4),
+            // no rectangular editing (28), no VT220+ level. The modern form matters on
+            // Windows — ConPTY asks every session's terminal for DA1 and holds all
+            // output until the reply names a level of 61 or more, so the legacy VT102
+            // answer (`?6c`, like libvterm's `?1;2c`) stalled each `:terminal` ~3 s.
+            ('c', None) => self.replies.extend_from_slice(b"\x1b[?61;22c"),
             // Secondary Device Attributes.
             ('c', Some(b'>')) => self.replies.extend_from_slice(b"\x1b[>0;0;0c"),
             _ => {}
@@ -908,6 +914,7 @@ impl EditHost {
 pub(crate) mod native {
     use std::collections::HashMap;
     use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
 
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use tokio::sync::mpsc::{
@@ -1004,8 +1011,27 @@ pub(crate) mod native {
     /// killer cloned off the child (the child itself is moved into its wait thread).
     struct Session {
         writer: Box<dyn Write + Send>,
-        master: Box<dyn portable_pty::MasterPty + Send>,
+        master: MasterSlot,
         killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    }
+
+    impl Drop for Session {
+        /// Forgetting a session closes its master, exactly as owning the master
+        /// outright did — the slot only exists so the Windows waiter can close it
+        /// *earlier*, never to keep it alive longer.
+        fn drop(&mut self) {
+            drop(take_master(&self.master));
+        }
+    }
+
+    /// The PTY master, shared between its [`Session`] (resize) and — on Windows —
+    /// the child's waiter thread, which must be able to close it (see [`open_pty`]).
+    /// `None` once closed; whichever side gets there first takes and drops it.
+    type MasterSlot = Arc<Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>>;
+
+    /// Take the master out of its slot (closing it when the returned box drops).
+    fn take_master(slot: &MasterSlot) -> Option<Box<dyn portable_pty::MasterPty + Send>> {
+        slot.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     /// The actor's run loop: own the live PTYs, service commands, and let each PTY's
@@ -1052,12 +1078,15 @@ pub(crate) mod native {
                 }
                 TermCommand::Resize { buf, rows, cols } => {
                     if let Some(s) = sessions.get(&buf) {
-                        let _ = s.master.resize(PtySize {
-                            rows,
-                            cols,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        });
+                        let master = s.master.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(master) = master.as_ref() {
+                            let _ = master.resize(PtySize {
+                                rows,
+                                cols,
+                                pixel_width: 0,
+                                pixel_height: 0,
+                            });
+                        }
                     }
                 }
                 TermCommand::Kill { buf } => {
@@ -1084,6 +1113,16 @@ pub(crate) mod native {
     /// master (Linux `EIO`-after-drain, macOS `EOF`-after-drain), so by the time the loop
     /// breaks every byte has already been sent. The thread ends when the child exits or
     /// the event channel closes (server shutdown).
+    ///
+    /// **Windows (ConPTY) adds a waiter thread.** There the output pipe belongs to the
+    /// pseudoconsole host (conhost), not to the child, so it reaches EOF only once the
+    /// pseudoconsole is *closed* — which the session doesn't do, so a child that exits
+    /// on its own would leave the reader blocked and its exit never reported. The
+    /// waiter reaps the child, hands its code to the reader, then closes the
+    /// pseudoconsole (drops the master): conhost flushes what it hasn't rendered yet
+    /// and closes the pipe, the reader drains that to EOF, and only then sends `Exit` —
+    /// the same `Data`-before-`Exit` ordering as unix, with the exit observed
+    /// independently of the output stream.
     fn open_pty(
         buf: BufferId,
         argv: Vec<String>,
@@ -1109,6 +1148,16 @@ pub(crate) mod native {
         if let Some(dir) = cwd {
             builder.cwd(dir);
         }
+        // The child inherits bemtvi's own environment, as a neovim `:terminal` does.
+        // On Windows `portable-pty` seeds the builder from the *registry* (machine +
+        // user `Environment` keys) on top of the process env, so a variable the user's
+        // shell set or changed — a `PATH` extended in a profile, an activated venv — was
+        // silently replaced by its persisted value, and `:terminal cat` could not find a
+        // `cat` that bemtvi itself can run. Re-assert the live environment over it.
+        #[cfg(windows)]
+        for (key, value) in std::env::vars_os() {
+            builder.env(key, value);
+        }
         // Advertise a terminal type describing bemtvi's own vt100 emulator (which projects
         // indexed AND 24-bit `Rgb` color), overriding whatever `TERM` bemtvi inherited. This
         // matters most in a daemon session: the `--daemon` is launched over ssh *without a
@@ -1129,8 +1178,26 @@ pub(crate) mod native {
         let killer = child.clone_killer();
         let writer = pair.master.take_writer()?;
         let mut reader = pair.master.try_clone_reader()?;
+        let master: MasterSlot = Arc::new(Mutex::new(Some(pair.master)));
+
+        #[cfg(windows)]
+        let exit_code = {
+            let (code_tx, code_rx) = std::sync::mpsc::channel::<i32>();
+            let slot = master.clone();
+            let mut child = child;
+            std::thread::spawn(move || {
+                let code = child.wait().map(|s| s.exit_code() as i32).unwrap_or(-1);
+                let _ = code_tx.send(code);
+                // Close the pseudoconsole so conhost flushes and closes the output
+                // pipe; the reader then reaches EOF and reports the exit. (A killed
+                // session already emptied the slot when it was forgotten.)
+                drop(take_master(&slot));
+            });
+            code_rx
+        };
 
         let event_tx = event_tx.clone();
+        #[cfg(not(windows))]
         let mut child = child;
         std::thread::spawn(move || {
             let mut chunk = [0u8; 8192];
@@ -1158,13 +1225,18 @@ pub(crate) mod native {
             }
             // Output fully drained (EOF/EIO on the master ⇒ the child has closed its end);
             // reap it for the real exit code and report the exit *after* every `Data`.
+            #[cfg(not(windows))]
             let code = child.wait().map(|s| s.exit_code() as i32).unwrap_or(-1);
+            // Windows: the waiter reaped it, then closed the pseudoconsole — which is
+            // what produced this EOF.
+            #[cfg(windows)]
+            let code = exit_code.recv().unwrap_or(-1);
             let _ = event_tx.blocking_send(TermEvent::Exit { buf, code });
         });
 
         Ok(Session {
             writer,
-            master: pair.master,
+            master,
             killer,
         })
     }

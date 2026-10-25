@@ -564,7 +564,7 @@ local run_before_init = btv.async(function(name, cfg, root)
   start_cfg.root_dir = root
   local init_params = {
     initializationOptions = start_cfg.init_options,
-    rootUri = root and ("file://" .. root) or nil,
+    rootUri = root and btv.utils.uri_from_path(root) or nil,
   }
   local ok, ret = pcall(cfg.before_init, init_params, start_cfg)
   if ok then
@@ -1894,7 +1894,9 @@ btv.lsp.locations_to_items = btv.async(function(locations, opts)
     local path = btv.utils.uri_to_path(uri)
     local range = loc.range or loc.targetSelectionRange or loc.targetRange
     if path and type(range) == "table" then
-      path = btv.utils.normalize(path)
+      -- `:p`, the same canonical form `location_lines` matches open buffers by (and the
+      -- native spelling on Windows — `normalize` would fold it to `/`).
+      path = btv.fname.modify(path, ":p")
       if not by_path[path] then
         by_path[path] = {}
         order[#order + 1] = path
@@ -2090,7 +2092,7 @@ local function absolute_glob(pattern, root)
   if type(relative) ~= "string" or relative == "" then
     return nil, "unreadable file-watch pattern in a didChangeWatchedFiles registration"
   end
-  if relative:sub(1, 1) == "/" or relative:match("^%a:[/\\]") then
+  if btv.utils.is_absolute(relative) then
     return relative -- already absolute; the base is not ours to impose
   end
   if type(base) ~= "string" or base == "" then
@@ -2099,7 +2101,9 @@ local function absolute_glob(pattern, root)
         .. relative
         .. "' is relative to a workspace, and this server has no root"
   end
-  return (base:gsub("/$", "")) .. "/" .. relative
+  -- Joined with `/` whatever the platform: this is a GLOB, whose separator an LSP
+  -- pattern always spells `/`, and `btv.glob` reads a Windows base's `\` as one too.
+  return (base:gsub("[" .. btv.utils._sep_class() .. "]+$", "")) .. "/" .. relative
 end
 
 -- The directory to actually watch for an absolute glob: its longest literal prefix.
@@ -2107,8 +2111,9 @@ end
 -- `/p/pyproject.toml` watches `/p` (watching the file itself would arm on a path
 -- that may not exist yet, and would miss its re-creation).
 local function watch_root(glob)
+  local root = btv.utils.path_root(glob)
   local dir, globbed = {}, false
-  for _, part in ipairs(btv.str.split(glob, "/", { plain = true })) do
+  for part in glob:sub(#root + 1):gmatch("[^" .. btv.utils._sep_class() .. "]+") do
     if part:find("[%*%?%[{]") then
       globbed = true
       break
@@ -2118,13 +2123,11 @@ local function watch_root(glob)
   -- No glob character anywhere: the pattern names one file, so watch its directory.
   -- (Watching the file itself would arm on a path that may not exist yet, and would
   -- miss its re-creation.)
-  if not globbed and #dir > 1 then
+  if not globbed and #dir > 0 then
     table.remove(dir)
   end
-  -- The leading component of an absolute path is empty, so `{"", "p"}` concatenates
-  -- back to `/p` and a root-level watch (`{""}`) to `/`.
-  local path = table.concat(dir, "/")
-  return path ~= "" and path or "/"
+  -- A pattern globbing straight under its root watches the root itself (`/`, `C:\`).
+  return root .. table.concat(dir, btv.utils.path_sep())
 end
 
 -- Pump one armed watch: for every coalesced change batch, work out which paths the
@@ -2213,11 +2216,9 @@ local function arm_file_watches(client_id, root, entry, options)
     -- A pattern whose literal prefix is the filesystem root would arm a recursive
     -- watch over every mounted filesystem — minutes of walking and an event storm
     -- with the editor waiting behind it. No server means that; refuse it loudly.
-    if dir == "/" then
-      btv.notify(
-        "btv.lsp: refusing a file watch rooted at / (pattern '" .. specs[1].glob .. "')",
-        vim.log.levels.WARN
-      )
+    if btv.utils.path_root(dir) == dir then
+      local pattern = " (pattern '" .. specs[1].glob .. "')"
+      btv.notify("btv.lsp: refusing a file watch rooted at " .. dir .. pattern, vim.log.levels.WARN)
     else
       local watch = btv.fs.watch(dir, { recursive = true })
       entry.watches[#entry.watches + 1] = watch

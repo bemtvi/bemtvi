@@ -428,7 +428,7 @@ local function colorscheme_candidates()
     add(name)
   end
   for _, path in ipairs(btv.runtime_file("colors/*.lua", true)) do
-    add(path:match("([^/]+)%.lua$"))
+    add((btv.utils.basename(path) or ""):match("^(.+)%.lua$"))
   end
   table.sort(names)
   local out = {}
@@ -808,11 +808,13 @@ local pending = nil
 local pending_fn = nil
 
 -- Split a typed path token into `(base, leaf)`: `base` is everything up to and
--- including the last `"/"` (kept verbatim so the spliced command stays in the user's
--- relative/absolute/`~` style), `leaf` is the partial name after it. No `"/"` ⇒ the
--- whole token is the leaf and the base is empty (list the cwd).
+-- including the last separator (kept verbatim so the spliced command stays in the user's
+-- relative/absolute/`~` style), `leaf` is the partial name after it. No separator ⇒ the
+-- whole token is the leaf and the base is empty (list the cwd). On Windows `\` separates
+-- as well as `/` (`btv.utils.path_style`).
 local function split_path(token)
-  local base, leaf = token:match("^(.*/)([^/]*)$")
+  local cls = btv.utils._sep_class()
+  local base, leaf = token:match("^(.*[" .. cls .. "])([^" .. cls .. "]*)$")
   if base then
     return base, leaf
   end
@@ -826,13 +828,15 @@ local function resolve_dir(base, cwd)
   if base == "" then
     return cwd
   end
+  local cls = btv.utils._sep_class()
   local p = btv.utils.expanduser(base)
-  if p:sub(1, 1) ~= "/" then
-    p = (cwd:gsub("/$", "")) .. "/" .. p
+  if not btv.utils.is_absolute(p) then
+    p = (cwd:gsub("[" .. cls .. "]$", "")) .. btv.utils.path_sep() .. p
   end
-  -- Strip the trailing "/" the typed base carries (`sub/`) so `btv.fs.readdir` gets a
-  -- bare directory path; keep a lone root "/".
-  return (p:gsub("(.)/+$", "%1"))
+  -- Strip the trailing separator the typed base carries (`sub/`) so `btv.fs.readdir`
+  -- gets a bare directory path; keep a lone root (`/`, `C:\`).
+  local root = btv.utils.path_root(p)
+  return root .. (p:sub(#root + 1):gsub("[" .. cls .. "]+$", ""))
 end
 
 -- A case-insensitive subsequence test (`pat`'s chars appear in order in `s`) — the

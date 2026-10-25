@@ -14,7 +14,7 @@ use std::path::Path;
 
 use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
-use bemtvi_test_harness::{attach, command, exec_lua, lines, spawn, temp_dir};
+use bemtvi_test_harness::{attach, command, exec_lua, file_uri, lines, spawn, temp_dir};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 // The `incoming` receiver must be kept alive for the test's whole body: the
@@ -39,7 +39,7 @@ async fn start(dir: &Path) -> (Rpc, UnboundedReceiver<Incoming>) {
 /// insert-only edit and the server stays alive.
 #[tokio::test]
 async fn reversed_workspace_edit_range_does_not_crash_the_server() {
-    let dir = std::fs::canonicalize(temp_dir("lsp_malformed_reversed")).unwrap();
+    let dir = bemtvi_test_harness::canonicalize(temp_dir("lsp_malformed_reversed")).unwrap();
     let file = dir.join("target.txt");
     std::fs::write(&file, "one\ntwo\nthree\nfour\n").unwrap();
     let abs = file.to_string_lossy().into_owned();
@@ -57,11 +57,12 @@ async fn reversed_workspace_edit_range_does_not_crash_the_server() {
         &rpc,
         &format!(
             "local ok, err = pcall(function() \
-               btv._lsp_apply_workspace_edit({{ changes = {{ ['file://{abs}'] = {{ \
+               btv._lsp_apply_workspace_edit({{ changes = {{ ['{uri}'] = {{ \
                  {{ range = {{ start = {{ line = 2, character = 0 }}, \
                                ['end'] = {{ line = 0, character = 0 }} }}, \
                     newText = 'X' }} }} }} }}) \
-             end); return tostring(ok)"
+             end); return tostring(ok)",
+            uri = file_uri(&file)
         ),
     )
     .await;

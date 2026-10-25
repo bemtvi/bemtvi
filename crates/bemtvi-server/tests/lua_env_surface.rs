@@ -35,11 +35,19 @@ async fn cwd_is_the_editors_working_directory_and_follows_cd() {
 
     let cwd = lua_str(&rpc, "return btv.cwd()").await;
     assert!(
-        cwd.starts_with('/'),
+        std::path::Path::new(&cwd).is_absolute(),
         "btv.cwd() must be absolute, got {cwd:?}"
     );
+    // The filesystem root (`/`, or a drive root like `D:\` on Windows) is the one
+    // directory whose spelling ends in a separator.
+    let root = std::path::Path::new(&cwd)
+        .ancestors()
+        .last()
+        .expect("an absolute path has a root")
+        .to_string_lossy()
+        .into_owned();
     assert!(
-        !cwd.ends_with('/') || cwd == "/",
+        !cwd.ends_with(std::path::MAIN_SEPARATOR) || cwd == root,
         "btv.cwd() must not carry a trailing separator, got {cwd:?}"
     );
 
@@ -47,7 +55,7 @@ async fn cwd_is_the_editors_working_directory_and_follows_cd() {
     // a config resolving a fallback root after a `:cd` has to see the new one.
     exec_lua(&rpc, "btv.cmd('cd /')").await;
     let after = lua_str(&rpc, "return btv.cwd()").await;
-    assert_eq!(after, "/", "btv.cwd() must follow `:cd`");
+    assert_eq!(after, root, "btv.cwd() must follow `:cd`");
 }
 
 #[tokio::test]
@@ -57,11 +65,11 @@ async fn stdpath_names_the_xdg_directories() {
     for what in ["config", "data", "cache", "state"] {
         let dir = lua_str(&rpc, &format!("return btv.stdpath('{what}')")).await;
         assert!(
-            dir.starts_with('/'),
+            std::path::Path::new(&dir).is_absolute(),
             "btv.stdpath({what:?}) must be an absolute path, got {dir:?}"
         );
         assert!(
-            !dir.ends_with('/'),
+            !dir.ends_with(std::path::MAIN_SEPARATOR),
             "btv.stdpath({what:?}) must not carry a trailing separator, got {dir:?}"
         );
     }

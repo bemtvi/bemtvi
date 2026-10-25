@@ -43,6 +43,9 @@ const CTRL_A: char = '\u{01}';
 async fn a_control_char_in_a_file_name_reaches_the_client_as_its_caret_token() {
     let dir = temp_dir("display_scrub_name");
     let file = dir.join(format!("a{CTRL_A}b.txt"));
+    // Windows forbids control chars in file names; there the buffer is a new-file
+    // buffer, which carries the very same name to the client.
+    #[cfg(unix)]
     std::fs::write(&file, "x\n").expect("write the oddly-named file");
 
     let init = ServerInit {
@@ -223,6 +226,9 @@ async fn a_completion_rows_match_spans_are_translated_through_the_scrub() {
 async fn printables_and_tabs_pass_through_untouched() {
     let dir = temp_dir("display_scrub_passthrough");
     let file = dir.join("plain\tname é.txt");
+    // Windows forbids a tab in a file name; there the buffer is a new-file buffer,
+    // which carries the very same name to the client.
+    #[cfg(unix)]
     std::fs::write(&file, "x\n").expect("write");
 
     let init = ServerInit {

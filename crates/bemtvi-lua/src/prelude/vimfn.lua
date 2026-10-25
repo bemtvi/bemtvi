@@ -569,6 +569,61 @@ function btv.stdpath(what)
   return vim.fn.stdpath(what)
 end
 
+-- Lexically simplify an absolute path the way vim's `:p` does (its `simplify_filename`
+-- half): collapse `//`, drop `.` components, and resolve each `..` against the preceding
+-- component (a `..` at the root is dropped — you can't ascend past `/`). Pure string math,
+-- no symlink resolution — so `fnamemodify(".", ":p")` is the cwd (not `<cwd>/.`) and
+-- `"a/./b"`/`"a/../b"` collapse, matching neovim and keeping the result a clean prefix for
+-- the `:.` / `:~` relativisers (a stray `/.` would defeat their literal cwd-prefix match).
+-- The result is spelled with the native separator (`btv.utils.path_sep`), root included
+-- (`C:/x` -> `C:\x` on Windows, as vim reports a full name there).
+local function simplify_abs(path)
+  local root = btv.utils.path_root(path)
+  local sep = btv.utils.path_sep()
+  local parts = {}
+  for comp in path:sub(#root + 1):gmatch("[^" .. btv.utils._sep_class() .. "]+") do
+    if comp == ".." then
+      if #parts > 0 then
+        table.remove(parts)
+      end
+    elseif comp ~= "." then
+      parts[#parts + 1] = comp
+    end
+  end
+  root = root:gsub("[" .. btv.utils._sep_class() .. "]", sep)
+  if root:sub(-1) ~= sep then
+    root = root .. sep -- a UNC root spelled without its trailing separator
+  end
+  return root .. table.concat(parts, sep)
+end
+
+-- Make `fname` absolute against the cwd (the `:p` half before simplification). On
+-- Windows a path rooted at a bare separator (`\x`) is on the cwd's drive, so it takes
+-- that drive (or UNC share) as its prefix.
+local function absolute(fname)
+  local cwd = vim.fn.getcwd()
+  if fname == "" then
+    return cwd
+  end
+  local root = btv.utils.path_root(fname)
+  if root == "" then
+    return cwd .. btv.utils.path_sep() .. fname
+  end
+  local cwd_root = btv.utils.path_root(cwd)
+  if #root == 1 and #cwd_root > 1 then
+    -- Rooted at a bare separator while the cwd's root is a drive / share: Windows.
+    return cwd_root:gsub("[" .. btv.utils._sep_class() .. "]$", "") .. fname
+  end
+  return fname
+end
+
+-- Is the byte at position `i` of `s` a path separator?
+local function sep_at(s, i)
+  return s:sub(i, i):find("[" .. btv.utils._sep_class() .. "]") ~= nil
+end
+
+btv.fname = btv.fname or {}
+
 -- `btv.fname.modify(fname, mods)` [alias `vim.fn.fnamemodify`]: apply vim's filename
 -- modifiers left to right. A pure path-string helper (no I/O beyond reading cwd),
 -- so it lives with the `vim.fn` read builtins — `expand('%:t')` / `'%:h'` and a
@@ -578,44 +633,24 @@ end
 -- one), `:e` (extension; consecutive `:e` widen it to the last k dot-components,
 -- vim's quirk). An unsupported modifier errors loud rather than silently passing
 -- the name through. Cases match real neovim's `vim.fn.fnamemodify`.
--- Lexically simplify an absolute path the way vim's `:p` does (its `simplify_filename`
--- half): collapse `//`, drop `.` components, and resolve each `..` against the preceding
--- component (a `..` at the root is dropped — you can't ascend past `/`). Pure string math,
--- no symlink resolution — so `fnamemodify(".", ":p")` is the cwd (not `<cwd>/.`) and
--- `"a/./b"`/`"a/../b"` collapse, matching neovim and keeping the result a clean prefix for
--- the `:.` / `:~` relativisers (a stray `/.` would defeat their literal cwd-prefix match).
-local function simplify_abs(path)
-  local parts = {}
-  for comp in path:gmatch("[^/]+") do
-    if comp == ".." then
-      if #parts > 0 then
-        table.remove(parts)
-      end
-    elseif comp ~= "." then
-      parts[#parts + 1] = comp
-    end
-  end
-  return "/" .. table.concat(parts, "/")
-end
-
-btv.fname = btv.fname or {}
+--
+-- Separators and roots follow `btv.utils.path_style`: on Windows `/` and `\` both
+-- split components, `C:\` and `\\server\share\` are roots, and `:p` spells its result
+-- with the native `\` (as vim reports a full name there).
 function btv.fname.modify(fname, mods)
   fname = fname or ""
   mods = mods or ""
+  local cls = btv.utils._sep_class()
   local i, n = 1, #mods
   while i <= n do
     local m = mods:sub(i, i + 1)
     if m == ":p" then
-      if fname == "" then
-        fname = vim.fn.getcwd()
-      elseif fname:sub(1, 1) ~= "/" then
-        fname = vim.fn.getcwd() .. "/" .. fname
-      end
-      fname = simplify_abs(fname)
+      fname = simplify_abs(absolute(fname))
       i = i + 2
     elseif m == ":~" then
       local home = os.getenv("HOME") or ""
-      if home ~= "" and (fname == home or fname:sub(1, #home + 1) == home .. "/") then
+      local under_home = fname:sub(1, #home) == home and sep_at(fname, #home + 1)
+      if home ~= "" and (fname == home or under_home) then
         fname = "~" .. fname:sub(#home + 1)
       end
       i = i + 2
@@ -625,26 +660,32 @@ function btv.fname.modify(fname, mods)
         -- The cwd itself reduces to ".", as in vim; the prefix test below needs one
         -- more character than the path has, so it can't catch the exact match.
         fname = "."
-      elseif cwd ~= "" and fname:sub(1, #cwd + 1) == cwd .. "/" then
-        fname = fname:sub(#cwd + 2)
+      elseif cwd ~= "" and fname:sub(1, #cwd) == cwd then
+        if sep_at(cwd, #cwd) then
+          fname = fname:sub(#cwd + 1) -- a cwd at a root (`/`, `C:\`) carries its separator
+        elseif sep_at(fname, #cwd + 1) then
+          fname = fname:sub(#cwd + 2)
+        end
       end
       i = i + 2
     elseif m == ":h" then
-      local head = fname:match("^(.*)/[^/]*$")
-      if head == nil then
-        fname = "."
-      elseif head == "" then
-        fname = "/"
+      local root = btv.utils.path_root(fname)
+      local head = fname:sub(#root + 1):match("^(.*)[" .. cls .. "][^" .. cls .. "]*$")
+      if head ~= nil then
+        fname = root .. head
+      elseif root ~= "" then
+        fname = root
       else
-        fname = head
+        fname = "."
       end
       i = i + 2
     elseif m == ":t" then
-      fname = fname:match("[^/]*$") or ""
+      local root = btv.utils.path_root(fname)
+      fname = fname:sub(#root + 1):match("[^" .. cls .. "]*$") or ""
       i = i + 2
     elseif m == ":r" then
       -- Strip the last extension of the tail component (a leading dot isn't one).
-      local dir, tail = fname:match("^(.*/)([^/]*)$")
+      local dir, tail = fname:match("^(.*[" .. cls .. "])([^" .. cls .. "]*)$")
       if not tail then
         dir, tail = "", fname
       end
@@ -664,7 +705,7 @@ function btv.fname.modify(fname, mods)
         k = k + 1
         i = i + 2
       end
-      local tail = fname:match("[^/]*$") or ""
+      local tail = fname:match("[^" .. cls .. "]*$") or ""
       local dots = {}
       for p = 2, #tail do
         if tail:sub(p, p) == "." then

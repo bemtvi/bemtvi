@@ -513,6 +513,13 @@ pub struct ServerInit {
     /// [`remote_cwd`](Self::remote_cwd)), `~` resolves on the **daemon**, where the file
     /// read lands even though the core runs on the client.
     pub remote_home: Option<PathBuf>,
+    /// The path syntax the **daemon's** filesystem uses (announced over the `config_bundle`
+    /// handshake, like [`remote_cwd`](Self::remote_cwd)). Every remote path the edit-host
+    /// manipulates — absolute?, join, normalize, `file://` URI — follows these rules rather
+    /// than this process's `std::path`, so a Windows client handles a unix daemon's
+    /// `/srv/x` correctly. `None` (the default: a local session, or an older daemon that
+    /// announced nothing) assumes this process's own syntax.
+    pub remote_path_style: Option<bemtvi_core::pathstyle::PathStyle>,
     /// A Lua chunk the **client** wants run at startup, after the prelude/built-in
     /// opt-ins and *before* `init.lua` — so a config can still override it. `None` (the
     /// default) for the TUI and tests. The GUI uses it to register its client-handled
@@ -696,6 +703,8 @@ pub struct ResolvedConfig {
     /// The daemon's home directory, the base a leading `~` in a file argument expands
     /// against (`None` = expand `~` against the edit-host's own `$HOME`).
     pub remote_home: Option<PathBuf>,
+    /// The daemon's path syntax (`None` = an older daemon that didn't announce it).
+    pub remote_path_style: Option<bemtvi_core::pathstyle::PathStyle>,
     /// The daemon's installed tree-sitter parser languages, auto-installed locally.
     pub ts_autoinstall: Vec<String>,
     /// The daemon's shada base dir, where a `Remote`-config session stages + syncs its
@@ -1805,6 +1814,14 @@ pub struct EditHost {
     /// Set where `DirState` is seeded from a daemon cwd (`run_server` native / `apply_remote_config`
     /// wasm); this is the correct daemon-fs gate, unlike `host_fs_offtick()` (true for OPFS too).
     remote_cwd_seeded: bool,
+    /// The path syntax of the session's **off-tick** filesystem — the daemon's announced
+    /// [`PathStyle`](bemtvi_core::pathstyle::PathStyle) in a daemon session, this process's
+    /// own otherwise. Every remote path the edit-host manipulates (absolutizing a relative
+    /// open / `btv.fs` path / spawn cwd against `DirState`, `:cd`'s join + normalize, the
+    /// LSP `file://` URIs) goes through it instead of `std::path`, whose rules are the
+    /// *client's*: a Windows client must not treat a unix daemon's `/srv/x` as relative.
+    /// Read through [`EditHost::remote_paths`]; a local session never consults it.
+    remote_path_style: bemtvi_core::pathstyle::PathStyle,
     /// The `'httphost'`/`'httpport'` values as of the last successful bind, or `None` until
     /// a plugin mounts (nothing binds before that).
     ///
@@ -2147,6 +2164,7 @@ impl EditHost {
             next_chdir_token: 0,
             published_cwd: None,
             remote_cwd_seeded: false,
+            remote_path_style: bemtvi_core::pathstyle::PathStyle::native(),
             #[cfg(feature = "native")]
             http_serving: None,
             #[cfg(feature = "native")]
@@ -2412,6 +2430,7 @@ impl EditHost {
         let ts_languages = bundle.ts_languages.clone();
         let remote_cwd = bundle.cwd.clone().map(PathBuf::from);
         let remote_home = bundle.home.clone().map(PathBuf::from);
+        let remote_path_style = bundle.path_style;
         let (config_dir, runtimepath) =
             materialize_remote_config_into(Path::new(WASM_REMOTE_CACHE_ROOT), bundle)
                 .map_err(|e| format!("staging remote config failed: {e}"))?;
@@ -2430,6 +2449,10 @@ impl EditHost {
         // A leading `~` in a file argument expands against the daemon's home over the wire.
         if let Some(home) = remote_home {
             self.editor.set_remote_home(home);
+        }
+        // Remote paths follow the daemon's announced syntax (absent: assume our own).
+        if let Some(style) = remote_path_style {
+            self.remote_path_style = style;
         }
 
         // Point `require` / runtime-file lookup at the staged copy: each rebased entry's
@@ -3983,10 +4006,11 @@ impl EditHost {
     /// is off, the store has no backing file, or the read fails (logged, never fatal).
     fn staged_shada_upload(&self) -> Option<(String, Vec<u8>)> {
         let sync = self.remote_shada.as_ref()?;
-        let path = self.shada.as_ref()?.current_path()?;
+        let store = self.shada.as_ref()?;
+        let path = store.current_path()?;
         let name = path.file_name()?.to_str()?;
         let target = format!("{}/{}", sync.remote_dir, name);
-        match std::fs::read(&path) {
+        match store.read_current()? {
             Ok(bytes) => Some((target, bytes)),
             Err(e) => {
                 eprintln!("shada: could not read staged store for remote upload: {e}");
@@ -4570,6 +4594,11 @@ where
     // `config_bundle` handshake that carried the cwd above.
     if let Some(home) = init.remote_home {
         host.editor.set_remote_home(home);
+    }
+    // Remote paths follow the daemon's announced syntax (an older daemon that announced
+    // nothing keeps this process's own — the pre-handshake-field behavior).
+    if let Some(style) = init.remote_path_style {
+        host.remote_path_style = style;
     }
     // Publish the seeded effective dir into the `btv._cwd` mirror so `vim.fn.getcwd`
     // reads the authoritative cwd from the very first config line (a remote session's

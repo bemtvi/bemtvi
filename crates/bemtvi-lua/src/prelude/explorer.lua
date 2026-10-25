@@ -176,7 +176,8 @@ function btv.explorer._open(buf)
   end
   local dir = listing_dir(buf)
   local name = line:gsub("/$", "") -- a sub-directory row carries a trailing `/`
-  local target = (dir == "/" and "/" or dir .. "/") .. name
+  -- `:p` folds the seam (`/` + `/name` at the root) and spells the path natively.
+  local target = vim.fn.fnamemodify(btv.utils.path_join(dir, name), ":p")
   replace_with(buf, target)
 end
 

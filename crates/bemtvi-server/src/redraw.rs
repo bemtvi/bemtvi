@@ -2741,7 +2741,17 @@ impl EditHost {
     /// dir (window-local → tab-local → global, like `:edit`). An already-absolute path is
     /// returned unchanged. Keeps `rg`/`grep`/btv.fs cwd-relative results readable through
     /// the off-tick fs seam, which has no session cwd of its own.
+    ///
+    /// A daemon session's target is the daemon's path, so it is tested and joined by the
+    /// daemon's announced path syntax rather than this process's `std::path`.
     fn resolve_preview_path(&self, path: &str) -> std::path::PathBuf {
+        if let Some(style) = self.remote_paths() {
+            return if style.is_absolute(path) {
+                path.into()
+            } else {
+                style.join(&self.session_cwd_string(), path).into()
+            };
+        }
         let p = std::path::Path::new(path);
         if p.is_absolute() {
             return p.to_path_buf();

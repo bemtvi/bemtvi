@@ -4,7 +4,8 @@
 //! `btv_input` and asserts on the buffer the child's output is mirrored into. PTY
 //! output is asynchronous (a reader thread streams it back and the server settles
 //! off-tick), so assertions poll the buffer until the expected text lands rather
-//! than reading once. Hermetic: only POSIX `cat` is spawned (present on macOS/Linux).
+//! than reading once. Hermetic: only POSIX `cat` / `sh` are spawned on macOS/Linux, and
+//! only the always-present `cmd` / `powershell` on Windows (see [`CAT`]).
 
 use std::time::Duration;
 
@@ -19,6 +20,60 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
     start_attached(ServerInit::default(), 80, 24).await
+}
+
+/// The `:terminal` command line of a child that echoes each typed line back and otherwise
+/// blocks reading input: POSIX `cat`. Windows has no `cat`; `cmd`'s `type con` reads the
+/// console in cooked mode — the console echoes keystrokes as they are typed, as a tty's
+/// line discipline does — and writes each completed line back out.
+const CAT: &str = if cfg!(windows) {
+    "cmd /c type con"
+} else {
+    "cat"
+};
+
+/// The command line that prints the working directory and exits: `pwd`, or `cmd`'s bare
+/// `cd` on Windows.
+const PWD: &str = if cfg!(windows) { "cmd /c cd" } else { "pwd" };
+
+/// The keystrokes that end [`CAT`]'s input: `^D` on a POSIX tty, `^Z` + Enter at a Windows
+/// console.
+const EOF_KEYS: &str = if cfg!(windows) { "<C-z><CR>" } else { "<C-d>" };
+
+/// The `:terminal` command line that prints the file at `path`, then exits (`cat <path>`).
+fn cat_file(path: &str) -> String {
+    if cfg!(windows) {
+        format!("cmd /c type {path}")
+    } else {
+        format!("cat {path}")
+    }
+}
+
+/// The `:terminal` command line that prints the file at `path` and then keeps reading
+/// stdin (`cat <path> -`), so the terminal stays *live* after the output. The path must
+/// have no spaces (the `:terminal` argument is whitespace-split).
+fn cat_file_then_stdin(path: &str) -> String {
+    if cfg!(windows) {
+        format!("cmd /c type {path} & type con")
+    } else {
+        format!("cat {path} -")
+    }
+}
+
+/// Windows stand-in for a `sh -c` child: the `btv.terminal.open{ ... }` call running
+/// `script` in PowerShell (no profile). `script` is spliced into a Lua long string, so
+/// it may contain quotes verbatim; `[char]27` spells ESC.
+fn open_powershell(script: &str) -> String {
+    format!("btv.terminal.open{{ cmd = {{'powershell', '-NoProfile', '-Command', [[{script}]]}} }}")
+}
+
+/// Pick the POSIX or the Windows spelling of a child for the same scenario.
+fn per_os(posix: &str, windows: String) -> String {
+    if cfg!(windows) {
+        windows
+    } else {
+        posix.to_string()
+    }
 }
 
 /// Poll the current buffer until `pred` holds, or panic after ~10s. PTY output is
@@ -82,7 +137,7 @@ async fn terminal_echoes_input_and_reports_exit() {
     let _guard = serial_lock().lock().await;
     let (rpc, _incoming) = start().await;
 
-    command(&rpc, "terminal cat").await;
+    command(&rpc, &format!("terminal {CAT}")).await;
     // `:terminal` enters terminal-job mode; keystrokes go to the child.
     assert_eq!(
         mode(&rpc).await,
@@ -95,7 +150,7 @@ async fn terminal_echoes_input_and_reports_exit() {
     wait_lines(&rpc, "cat to echo 'hello'", |ls| has_line(ls, "hello")).await;
 
     // `<C-d>` at the start of a line sends EOF; `cat` exits 0.
-    feed(&rpc, "<C-d>");
+    feed(&rpc, EOF_KEYS);
     wait_lines(&rpc, "the process-exit notice", |ls| {
         ls.iter().any(|l| l.contains("[Process exited 0]"))
     })
@@ -105,6 +160,27 @@ async fn terminal_echoes_input_and_reports_exit() {
         mode(&rpc).await,
         "n",
         "should leave terminal mode when the child exits"
+    );
+}
+
+/// A child's first output shows up promptly — there is no startup stall. On Windows
+/// the pseudoconsole host opens every session by asking the terminal for its primary
+/// device attributes and holds *all* output until it gets an answer it recognizes (a
+/// VT conformance level of 61+); answering as a bare VT102 (`CSI ? 6 c`) left every
+/// `:terminal` blank for ~3 s while it timed out. Elsewhere this is just a fast path.
+#[tokio::test]
+async fn terminal_output_arrives_without_a_startup_stall() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+
+    let path = write_temp("term_prompt", "txt", "ready\n");
+    let started = std::time::Instant::now();
+    command(&rpc, &format!("terminal cat {path}")).await;
+    wait_lines(&rpc, "the child's output", |ls| has_line(ls, "ready")).await;
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_millis(1500),
+        "the child's first output took {took:?} to reach the buffer"
     );
 }
 
@@ -143,10 +219,17 @@ async fn alternate_screen_fills_the_window_after_scrolling() {
     // (`ALTBOT`, via a row index that clamps to the bottom), leaving the cursor at
     // the bottom — exactly where `less` parks it on its status line. `\027` is Lua's
     // *decimal* escape for ESC (0x1b); `\033` would be byte 33, a literal `!`.
-    let script = r#"btv.terminal.open{ cmd = {'sh','-c',
+    let script = per_os(
+        r#"btv.terminal.open{ cmd = {'sh','-c',
         'i=0; while [ $i -lt 60 ]; do i=$((i+1)); echo main$i; done; '
-        .. 'printf "\027[?1049h\027[HALTTOP\027[99;1HALTBOT"; sleep 30'} }"#;
-    exec_lua(&rpc, script).await;
+        .. 'printf "\027[?1049h\027[HALTTOP\027[99;1HALTBOT"; sleep 30'} }"#,
+        open_powershell(
+            "1..60 | ForEach-Object { 'main' + $_ }; \
+             [Console]::Write([char]27 + '[?1049h' + [char]27 + '[HALTTOP' + [char]27 + '[99;1HALTBOT'); \
+             Start-Sleep 30",
+        ),
+    );
+    exec_lua(&rpc, &script).await;
 
     // Wait until the alternate-screen page has rendered into the viewport.
     let map = wait_redraw(&mut incoming, |m| {
@@ -176,7 +259,7 @@ async fn ctrl_backslash_ctrl_n_leaves_terminal_mode() {
     let _guard = serial_lock().lock().await;
     let (rpc, _incoming) = start().await;
 
-    command(&rpc, "terminal cat").await;
+    command(&rpc, &format!("terminal {CAT}")).await;
     feed(&rpc, "hi<CR>");
     wait_lines(&rpc, "cat to echo 'hi'", |ls| has_line(ls, "hi")).await;
 
@@ -205,7 +288,7 @@ async fn cursor_sits_after_the_last_typed_char() {
     let _guard = serial_lock().lock().await;
     let (rpc, _incoming) = start().await;
 
-    command(&rpc, "terminal cat").await;
+    command(&rpc, &format!("terminal {CAT}")).await;
     feed(&rpc, "hello");
     // The PTY echoes typed chars immediately, so "hello" lands on row 1.
     let ls = wait_lines(&rpc, "the echoed 'hello'", |ls| has_line(ls, "hello")).await;
@@ -232,7 +315,7 @@ async fn cursor_column_accounts_for_multibyte_chars_before_it() {
     let _guard = serial_lock().lock().await;
     let (rpc, mut incoming) = start().await;
 
-    command(&rpc, "terminal cat").await;
+    command(&rpc, &format!("terminal {CAT}")).await;
     feed(&rpc, "│hi");
     let ls = wait_lines(&rpc, "cat to echo '│hi'", |ls| has_line(ls, "│hi")).await;
     let row = ls.iter().position(|l| l.trim_end() == "│hi").unwrap();
@@ -267,7 +350,7 @@ async fn ctrl_4_is_accepted_as_ctrl_backslash() {
     let _guard = serial_lock().lock().await;
     let (rpc, _incoming) = start().await;
 
-    command(&rpc, "terminal cat").await;
+    command(&rpc, &format!("terminal {CAT}")).await;
     feed(&rpc, "<C-4><C-n>");
     assert_eq!(
         mode(&rpc).await,
@@ -286,7 +369,29 @@ async fn answers_cursor_position_report() {
     let _guard = serial_lock().lock().await;
     let (rpc, _incoming) = start().await;
 
-    command(&rpc, "terminal cat").await;
+    if cfg!(windows) {
+        // A Windows console never hands a child raw input bytes: ConPTY decodes what the
+        // terminal writes into key events (and `<Esc>` clears a cooked input line), so
+        // `type con` can't echo a request or its reply back. The child emits the request
+        // itself and reports the first key event it then receives. Nothing is typed, so
+        // the only input is bemtvi's reply — which the console decodes as `F3`, the key
+        // that `ESC[1;<mods>R` also spells (the classic CPR/F3 ambiguity). No reply, no
+        // key: the read blocks and the line never appears.
+        exec_lua(
+            &rpc,
+            &open_powershell(
+                "[Console]::Write([char]27 + '[6n'); $k = [Console]::ReadKey($true); \
+                 [Console]::WriteLine('reply ' + $k.Key); Start-Sleep 30",
+            ),
+        )
+        .await;
+        wait_lines(&rpc, "a cursor-position-report reply", |ls| {
+            has_line(ls, "reply F3")
+        })
+        .await;
+        return;
+    }
+    command(&rpc, &format!("terminal {CAT}")).await;
     // Type ESC[6n then <CR>: cat writes the line back raw, so the emulator sees a real
     // cursor-position request (not the caret-echoed input).
     feed(&rpc, "<Esc>[6n<CR>");
@@ -308,7 +413,7 @@ async fn ctrl_backslash_ctrl_r_pastes_a_register() {
     feed(&rpc, "\"ayy");
 
     // Open a terminal and paste register a into it via the `<C-\><C-r>` chord.
-    command(&rpc, "terminal cat").await;
+    command(&rpc, &format!("terminal {CAT}")).await;
     feed(&rpc, "<C-\\><C-r>a");
     wait_lines(&rpc, "register paste to reach cat", |ls| {
         has_line(ls, "hello")
@@ -323,7 +428,7 @@ async fn reentering_snaps_cursor_to_the_input_position() {
     let _guard = serial_lock().lock().await;
     let (rpc, _incoming) = start().await;
 
-    command(&rpc, "terminal cat").await;
+    command(&rpc, &format!("terminal {CAT}")).await;
     feed(&rpc, "hello");
     wait_lines(&rpc, "the echoed 'hello'", |ls| has_line(ls, "hello")).await;
 
@@ -348,12 +453,24 @@ async fn terminal_buffer_name_tracks_the_window_title() {
     let _guard = serial_lock().lock().await;
     let (rpc, _incoming) = start().await;
 
-    command(&rpc, "terminal cat").await;
-    assert_eq!(buf_name(&rpc).await, "cat", "name seeded from the command");
+    // A Windows console decodes typed escape sequences into key events, so `type con`
+    // can't echo an OSC back: there the child emits it itself, once a line is entered.
+    let cmd = if cfg!(windows) {
+        "powershell -NoProfile -Command $null = [Console]::ReadLine(); \
+         [Console]::Write([char]27 + ']2;my-title' + [char]7); Start-Sleep 30"
+    } else {
+        "cat"
+    };
+    command(&rpc, &format!("terminal {cmd}")).await;
+    assert_eq!(buf_name(&rpc).await, cmd, "name seeded from the command");
 
     // `cat` echoes its input, so feeding an OSC title sequence makes the emulator see
     // it (as if the child had emitted it): ESC ] 2 ; my-title BEL.
-    feed(&rpc, "<Esc>]2;my-title<C-g><CR>");
+    if cfg!(windows) {
+        feed(&rpc, "<CR>");
+    } else {
+        feed(&rpc, "<Esc>]2;my-title<C-g><CR>");
+    }
     for _ in 0..200 {
         if buf_name(&rpc).await == "my-title" {
             break;
@@ -375,7 +492,7 @@ async fn live_terminal_buffer_is_read_only() {
     let _guard = serial_lock().lock().await;
     let (rpc, _incoming) = start().await;
 
-    command(&rpc, "terminal cat").await;
+    command(&rpc, &format!("terminal {CAT}")).await;
     feed(&rpc, "hello<CR>");
     wait_lines(&rpc, "cat to echo 'hello'", |ls| has_line(ls, "hello")).await;
 
@@ -390,7 +507,7 @@ async fn live_terminal_buffer_is_read_only() {
     );
 
     // End the child (EOF); the buffer becomes editable.
-    feed(&rpc, "i<C-d>");
+    feed(&rpc, &format!("i{EOF_KEYS}"));
     wait_lines(&rpc, "the process-exit notice", |ls| {
         ls.iter().any(|l| l.contains("[Process exited 0]"))
     })
@@ -412,7 +529,7 @@ async fn triple_esc_quick_succession_leaves() {
     let (rpc, clock, _incoming) = start_clocked().await;
 
     clock.set_ms(1000);
-    command(&rpc, "terminal cat").await;
+    command(&rpc, &format!("terminal {CAT}")).await;
     clock.set_ms(1000);
     feed(&rpc, "<Esc>");
     assert_eq!(mode(&rpc).await, "t", "one escape stays");
@@ -432,7 +549,7 @@ async fn slow_escapes_stay_in_terminal_mode() {
     let (rpc, clock, _incoming) = start_clocked().await;
 
     clock.set_ms(0);
-    command(&rpc, "terminal cat").await;
+    command(&rpc, &format!("terminal {CAT}")).await;
     for t in [1000u64, 2000, 3000] {
         clock.set_ms(t);
         feed(&rpc, "<Esc>");
@@ -452,7 +569,7 @@ async fn btv_terminal_open_runs_a_command_programmatically() {
     let _guard = serial_lock().lock().await;
     let (rpc, _incoming) = start().await;
 
-    exec_lua(&rpc, "btv.terminal.open{ cmd = 'cat' }").await;
+    exec_lua(&rpc, &format!("btv.terminal.open{{ cmd = '{CAT}' }}")).await;
     assert_eq!(
         mode(&rpc).await,
         "t",
@@ -470,13 +587,23 @@ async fn btv_terminal_open_list_cmd_preserves_argument_spaces() {
     let _guard = serial_lock().lock().await;
     let (rpc, _incoming) = start().await;
 
-    exec_lua(
-        &rpc,
-        r"btv.terminal.open{ cmd = {'printf', 'hello world\n'} }",
-    )
-    .await;
+    // Windows has no `printf`: `cmd /c` runs its one argument as a command line, and
+    // `echo` repeats it verbatim — the doubled space survives only if the argument
+    // reached `cmd` as one word (a whitespace split would rejoin it with one space).
+    let (lua, want) = if cfg!(windows) {
+        (
+            "btv.terminal.open{ cmd = {'cmd', '/c', 'echo hello  world'} }",
+            "hello  world",
+        )
+    } else {
+        (
+            r"btv.terminal.open{ cmd = {'printf', 'hello world\n'} }",
+            "hello world",
+        )
+    };
+    exec_lua(&rpc, lua).await;
     wait_lines(&rpc, "printf to emit 'hello world'", |ls| {
-        has_line(ls, "hello world")
+        has_line(ls, want)
     })
     .await;
 }
@@ -488,6 +615,11 @@ async fn btv_terminal_open_list_cmd_preserves_argument_spaces() {
 /// child here turns the mode on with `printf`, then `cat -v` echoes input with control bytes
 /// made visible (`ESC` → `^[`), so a pressed `<Home>` must show as `^[OH`, not `^[[H`.
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "unobservable under ConPTY: conhost decodes the terminal's input bytes into key \
+              events, so the child sees conhost's re-encoding of <Home>, not the bytes bemtvi sent"
+)]
 async fn cursor_keys_use_application_mode_when_the_child_enables_it() {
     let _guard = serial_lock().lock().await;
     let (rpc, _incoming) = start().await;
@@ -526,13 +658,13 @@ async fn btv_terminal_open_respects_an_explicit_cwd() {
     let (rpc, _incoming) = start().await;
 
     let dir = temp_dir("btv_term_cwd");
-    let want = std::fs::canonicalize(&dir)
+    let want = bemtvi_test_harness::canonicalize(&dir)
         .expect("canonicalize temp dir")
         .to_string_lossy()
         .into_owned();
     exec_lua(
         &rpc,
-        &format!("btv.terminal.open{{ cmd = 'pwd', cwd = {dir:?} }}"),
+        &format!("btv.terminal.open{{ cmd = '{PWD}', cwd = {dir:?} }}"),
     )
     .await;
     // A long path wraps across grid rows at the terminal width, so rejoin the rows
@@ -555,7 +687,13 @@ async fn terminal_inherits_the_parent_environment() {
     std::env::set_var("BEMTVI_TERM_ENV_TEST", "hello-from-parent");
     let (rpc, _incoming) = start().await;
 
-    command(&rpc, "terminal printenv BEMTVI_TERM_ENV_TEST").await;
+    // `printenv` has no Windows twin; `cmd` expands `%VAR%` from its environment.
+    let printenv = if cfg!(windows) {
+        "cmd /c echo %BEMTVI_TERM_ENV_TEST%"
+    } else {
+        "printenv BEMTVI_TERM_ENV_TEST"
+    };
+    command(&rpc, &format!("terminal {printenv}")).await;
     wait_lines(&rpc, "the child to see the inherited env var", |ls| {
         has_line(ls, "hello-from-parent")
     })
@@ -582,7 +720,14 @@ async fn terminal_advertises_its_emulator_term_over_a_bogus_ambient_one() {
 
     // `env` prints every variable as `KEY=value`; the child must see bemtvi's values, not
     // the bogus `unknown` / absent ones it would have inherited.
-    command(&rpc, "terminal env").await;
+    // On Windows, `cmd`'s `set NAME` prints `NAME=value` (for every variable with that
+    // prefix); asking for just the two keeps them on screen.
+    let env = if cfg!(windows) {
+        "cmd /c set TERM & set COLORTERM"
+    } else {
+        "env"
+    };
+    command(&rpc, &format!("terminal {env}")).await;
     wait_lines(
         &rpc,
         "the child to see bemtvi's emulator TERM/COLORTERM",
@@ -600,19 +745,19 @@ async fn terminal_starts_in_the_working_directory() {
     let _guard = serial_lock().lock().await;
     let (rpc, _incoming) = start().await;
 
-    let expect = std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+    let expect = bemtvi_test_harness::canonicalize(std::env::current_dir().expect("cwd"))
         .expect("canonicalize cwd")
         .to_string_lossy()
         .into_owned();
 
-    command(&rpc, "terminal pwd").await;
+    command(&rpc, &format!("terminal {PWD}")).await;
     // `pwd` prints the working directory then exits; match it against the
     // editor's cwd (canonicalizing both, so a symlinked path still compares).
     wait_lines(&rpc, "pwd to print the editor's cwd", |ls| {
         ls.iter().any(|l| {
             let t = l.trim();
             !t.is_empty()
-                && std::fs::canonicalize(t)
+                && bemtvi_test_harness::canonicalize(t)
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned())
                     .as_deref()
@@ -638,7 +783,7 @@ async fn terminal_projects_ansi_color_into_highlight_spans() {
     // argv (`cat <path> -`) stays three words. The trailing `-` makes `cat` read
     // stdin after the file, so it blocks open instead of exiting.
     let path = write_temp("term_color", "txt", "\x1b[31mred\x1b[0m\n");
-    command(&rpc, &format!("terminal cat {path} -")).await;
+    command(&rpc, &format!("terminal {}", cat_file_then_stdin(&path))).await;
     // The escapes are consumed by the emulator, so the buffer text is just `red`.
     wait_lines(&rpc, "cat to emit 'red'", |ls| has_line(ls, "red")).await;
 
@@ -667,7 +812,7 @@ async fn exited_terminal_keeps_its_colors() {
     let (rpc, mut incoming) = start().await;
 
     let path = write_temp("term_color_exit", "txt", "\x1b[31mred\x1b[0m\n");
-    command(&rpc, &format!("terminal cat {path}")).await;
+    command(&rpc, &format!("terminal {}", cat_file(&path))).await;
     // `cat` finishes the file and exits with no input waiting.
     wait_lines(&rpc, "the process-exit notice", |ls| {
         ls.iter().any(|l| l.contains("[Process exited 0]"))
@@ -706,7 +851,7 @@ async fn scrollback_preserves_lines_that_scrolled_off_the_screen() {
 
     let body: String = (1..=50).map(|i| format!("line{i}\n")).collect();
     let path = write_temp("term_scroll", "txt", &body);
-    command(&rpc, &format!("terminal cat {path} -")).await;
+    command(&rpc, &format!("terminal {}", cat_file_then_stdin(&path))).await;
     wait_lines(&rpc, "the last line to print", |ls| has_line(ls, "line50")).await;
 
     // Leave terminal-job mode to browse: the scrollback is materialized, so the
@@ -743,7 +888,7 @@ async fn scrollback_rows_keep_their_color_when_browsed() {
         body.push_str(&format!("line{i}\n"));
     }
     let path = write_temp("term_scroll_color", "txt", &body);
-    command(&rpc, &format!("terminal cat {path} -")).await;
+    command(&rpc, &format!("terminal {}", cat_file_then_stdin(&path))).await;
     wait_lines(&rpc, "the last line to print", |ls| has_line(ls, "line40")).await;
 
     // Browse and scroll to the top so the red history row is rendered this frame.
@@ -781,7 +926,7 @@ async fn heavy_output_stays_bounded_and_does_not_freeze() {
     const CAP: usize = 10_000; // mirrors terminal.rs SCROLLBACK_CAP
     let body: String = (1..=N).map(|i| format!("line{i}\n")).collect();
     let path = write_temp("term_flood", "txt", &body);
-    command(&rpc, &format!("terminal cat {path} -")).await;
+    command(&rpc, &format!("terminal {}", cat_file_then_stdin(&path))).await;
 
     // Live output: the buffer mirrors the screen, so the last line shows up fast.
     wait_lines(&rpc, "the last line of a 40k-line flood", |ls| {
@@ -830,9 +975,27 @@ async fn scrollback_option_caps_the_history() {
 
     // Configure a small scrollback before opening the terminal.
     exec_lua(&rpc, "vim.o.scrollback = 50").await;
-    let body: String = (1..=500).map(|i| format!("line{i}\n")).collect();
-    let path = write_temp("term_scbk", "txt", &body);
-    command(&rpc, &format!("terminal cat {path} -")).await;
+    if cfg!(windows) {
+        // ConPTY renders the child's output in frames and forwards only what is on its
+        // screen at each one, so a child that scrolls more than a screenful between
+        // frames (a `type` of 500 lines does) reaches bemtvi with the middle missing —
+        // and too few lines arrive to ever reach the cap. Pace the same 500 lines (≤5
+        // per beat, far under the 24-row screen) so the whole stream comes through and
+        // it's bemtvi's scrollback that has to drop the old lines. Then keep reading
+        // input, like `cat <file> -`, so the terminal stays live.
+        exec_lua(
+            &rpc,
+            &open_powershell(
+                "foreach ($i in 1..500) { \"line$i\"; if ($i % 5 -eq 0) { Start-Sleep -Milliseconds 20 } }; \
+                 [Console]::In.ReadLine()",
+            ),
+        )
+        .await;
+    } else {
+        let body: String = (1..=500).map(|i| format!("line{i}\n")).collect();
+        let path = write_temp("term_scbk", "txt", &body);
+        command(&rpc, &format!("terminal {}", cat_file_then_stdin(&path))).await;
+    }
     wait_lines(&rpc, "the last line", |ls| has_line(ls, "line500")).await;
 
     feed(&rpc, "<C-\\><C-n>G");
@@ -868,11 +1031,14 @@ async fn ctrl_c_trims_a_flooding_terminal_and_marks_the_cut() {
 
     // Flood 1000 lines (far past the 200-line keep window), then `trap "" INT; cat`
     // keeps the child alive (and ignoring SIGINT) so the terminal stays live.
-    exec_lua(
-        &rpc,
+    // (PowerShell: `TreatControlCAsInput` is the console's "ignore ^C".)
+    let open = per_os(
         r#"btv.terminal.open{ cmd = {'sh','-c','seq 1000; trap "" INT; cat'} }"#,
-    )
-    .await;
+        open_powershell(
+            "1..1000; [Console]::TreatControlCAsInput = $true; $null = [Console]::ReadLine()",
+        ),
+    );
+    exec_lua(&rpc, &open).await;
     wait_lines(&rpc, "the full flood (line 1000)", |ls| {
         has_line(ls, "1000")
     })
@@ -914,7 +1080,7 @@ async fn ctrl_c_at_an_idle_prompt_does_not_trim() {
     let (rpc, _incoming) = start().await;
 
     // `cat` echoes input; no flood. Type a line so there is some recent output.
-    exec_lua(&rpc, "btv.terminal.open{ cmd = 'cat' }").await;
+    exec_lua(&rpc, &format!("btv.terminal.open{{ cmd = '{CAT}' }}")).await;
     feed(&rpc, "marker-line<CR>");
     wait_lines(&rpc, "cat to echo the typed line", |ls| {
         has_line(ls, "marker-line")
@@ -971,7 +1137,7 @@ async fn live_terminal_is_not_marked_modified() {
     let _guard = serial_lock().lock().await;
     let (rpc, mut incoming) = start().await;
 
-    command(&rpc, "terminal cat").await;
+    command(&rpc, &format!("terminal {CAT}")).await;
     feed(&rpc, "hello<CR>");
     wait_lines(&rpc, "cat to echo 'hello'", |ls| has_line(ls, "hello")).await;
 
@@ -1008,13 +1174,13 @@ async fn exited_terminal_buffer_is_marked_modified() {
     let _guard = serial_lock().lock().await;
     let (rpc, _incoming) = start().await;
 
-    command(&rpc, "terminal cat").await;
+    command(&rpc, &format!("terminal {CAT}")).await;
     feed(&rpc, "hello<CR>");
     wait_lines(&rpc, "cat to echo 'hello'", |ls| has_line(ls, "hello")).await;
 
     // `<C-d>` at the start of a line sends EOF; `cat` exits 0 and the buffer
     // becomes an ordinary scratch buffer.
-    feed(&rpc, "<C-d>");
+    feed(&rpc, EOF_KEYS);
     wait_lines(&rpc, "the process-exit notice", |ls| {
         ls.iter().any(|l| l.contains("[Process exited 0]"))
     })
@@ -1037,11 +1203,22 @@ async fn exited_terminal_buffer_is_marked_modified() {
 }
 
 /// Whether `pid` currently exists (`kill -0`). A reaped process (no zombie) fails.
+#[cfg(not(windows))]
 fn pid_alive(pid: u32) -> bool {
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// Whether `pid` is a running process (Windows has no `kill -0`): `tasklist` filtered to
+/// that pid lists it, as a `"name","pid",…` CSV row, only while it runs.
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&format!(",\"{pid}\",")))
 }
 
 /// Wiping a **live** terminal buffer must kill its PTY child. `:bd!` on a running
@@ -1053,12 +1230,13 @@ async fn deleting_a_live_terminal_buffer_kills_the_child() {
     let _guard = serial_lock().lock().await;
     let (rpc, _incoming) = start().await;
 
-    // The child prints its own pid, then `exec`s into a long sleep (same pid).
-    exec_lua(
-        &rpc,
+    // The child prints its own pid, then `exec`s into a long sleep (same pid). (PowerShell
+    // prints its own `$PID` and sleeps in-process.)
+    let open = per_os(
         "btv.terminal.open{ cmd = {'sh', '-c', 'echo $$; exec sleep 600'} }",
-    )
-    .await;
+        open_powershell("$PID; Start-Sleep 600"),
+    );
+    exec_lua(&rpc, &open).await;
     let ls = wait_lines(&rpc, "the child to print its pid", |ls| {
         ls.first().is_some_and(|l| l.trim().parse::<u32>().is_ok())
     })
@@ -1103,15 +1281,20 @@ async fn ctrl_c_does_not_trim_after_a_repainting_child_that_never_scrolled() {
     // NOTE the doubled backslash: Lua's `\ddd` escape is DECIMAL, so a single
     // `\033` would be char 33 (`!`) and nothing would home the cursor. The shell's
     // `printf` wants the literal `\033` (octal ESC).
-    exec_lua(
-        &rpc,
+    let open = per_os(
         r#"btv.terminal.open{ cmd = {'sh','-c',
              'seq 1000; read _; '
              .. 'for i in $(seq 1 60); do printf "\\033[H"; '
              .. '  for j in $(seq 1 20); do printf "row $j frame $i\\n"; done; '
              .. 'done; trap "" INT; cat'} }"#,
-    )
-    .await;
+        open_powershell(
+            "1..1000; $null = [Console]::ReadLine(); \
+             foreach ($i in 1..60) { [Console]::Write([char]27 + '[H'); \
+               foreach ($j in 1..20) { [Console]::Write('row ' + $j + ' frame ' + $i + [char]10) } }; \
+             [Console]::TreatControlCAsInput = $true; $null = [Console]::ReadLine()",
+        ),
+    );
+    exec_lua(&rpc, &open).await;
 
     // A real flood first: 1000 lines into the scrollback, the history a wrong trim
     // would destroy.

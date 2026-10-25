@@ -765,7 +765,11 @@ local function opt_seed_require(name, entries)
   end
   for _, e in ipairs(entries) do
     e = tostring(e)
-    package.path = package.path .. ";" .. e .. "/lua/?.lua;" .. e .. "/lua/?/init.lua"
+    package.path = package.path
+      .. ";"
+      .. btv.utils.local_path_join(e, "lua", "?.lua")
+      .. ";"
+      .. btv.utils.local_path_join(e, "lua", "?", "init.lua")
   end
 end
 
@@ -1577,7 +1581,7 @@ vim.env = setmetatable({}, {
       return v
     end
     if k == "VIMRUNTIME" then
-      return vim.fn.stdpath("data") .. "/runtime"
+      return btv.utils.local_path_join(vim.fn.stdpath("data"), "runtime")
     end
     return nil
   end,

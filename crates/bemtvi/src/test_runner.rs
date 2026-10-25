@@ -29,7 +29,7 @@ const SUITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Entry point for the `--test-plugin` role. `dir` is the plugin repo root (defaults
 /// to the cwd at the call site). Returns `Ok(true)` when every test passed.
 pub fn run_test_plugin(dir: PathBuf) -> Result<bool> {
-    let dir = dir.canonicalize().unwrap_or(dir);
+    let dir = bemtvi_core::host::canonicalize(&dir).unwrap_or(dir);
     let test_dir = dir.join("test");
     let mut files = Vec::new();
     discover(&test_dir, &mut files)
@@ -141,6 +141,8 @@ fn spawn_server(plugin_dir: PathBuf) -> (Rpc, UnboundedReceiver<Incoming>) {
             remote_cwd: None,
             // No daemon: a leading `~` expands against the local process's `$HOME`.
             remote_home: None,
+            // No daemon: paths follow the local `std::path` rules.
+            remote_path_style: None,
             // The plugin-test runner is not an interactive client — no virtual commands.
             client_init_lua: None,
             // No daemon link in the plugin-test runner.

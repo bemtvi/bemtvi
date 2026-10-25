@@ -356,7 +356,8 @@ impl LuaFs for StdLuaFs {
     }
 
     fn realpath(&self, path: &str) -> io::Result<String> {
-        std::fs::canonicalize(path).map(|p| p.to_string_lossy().into_owned())
+        bemtvi_core::host::canonicalize(std::path::Path::new(path))
+            .map(|p| p.to_string_lossy().into_owned())
     }
 
     fn read_file(&self, path: &str) -> io::Result<Vec<u8>> {

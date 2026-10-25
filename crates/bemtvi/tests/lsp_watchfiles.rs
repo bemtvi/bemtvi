@@ -61,7 +61,7 @@ async fn open_with_server(dir: &Path) -> (Rpc, UnboundedReceiver<Incoming>) {
             }})
             btv.lsp.enable({{ "mock" }})
             "#,
-            dir.display()
+            bemtvi_test_harness::q(dir)
         ),
     )
     .await;
@@ -121,7 +121,7 @@ async fn create_until_reported(dir: &Path, rec: &Path, stem: &str, ext: &str) ->
     for attempt in 0..40 {
         let path = dir.join(format!("{stem}{attempt}.{ext}"));
         std::fs::write(&path, "x = 1\n").expect("write watched file");
-        let uri = format!("file://{}", path.display());
+        let uri = bemtvi_test_harness::file_uri(&path);
         for _ in 0..8 {
             tokio::time::sleep(Duration::from_millis(25)).await;
             if watched_changes(rec)
@@ -146,13 +146,16 @@ async fn initialize_advertises_workspace_folders_and_dynamic_registration() {
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp_watchfiles");
     let rec = dir.join("rec.jsonl");
-    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, rec.display()));
+    arm_mock(
+        &dir,
+        &format!(r#"{{ "record": "{}" }}"#, bemtvi_test_harness::q(&rec)),
+    );
     let (_rpc, _incoming) = open_with_server(&dir).await;
 
     let init = await_record(&rec, "initialize")
         .await
         .expect("the client must send `initialize`");
-    let want_uri = Value::from(format!("file://{}", dir.display()));
+    let want_uri = Value::from(bemtvi_test_harness::file_uri(&dir));
     assert_eq!(
         init.pointer("/params/workspaceFolders/0/uri"),
         Some(&want_uri),
@@ -194,7 +197,7 @@ async fn the_workspace_folders_pull_is_answered_with_the_root() {
         &dir,
         &format!(
             r#"{{ "record": "{}", "workspace_folders_pull": true }}"#,
-            rec.display()
+            bemtvi_test_harness::q(&rec)
         ),
     );
     let (_rpc, _incoming) = open_with_server(&dir).await;
@@ -204,7 +207,7 @@ async fn the_workspace_folders_pull_is_answered_with_the_root() {
         .expect("the client must answer workspace/workspaceFolders");
     assert_eq!(
         reply.pointer("/params/0/uri"),
-        Some(&Value::from(format!("file://{}", dir.display()))),
+        Some(&Value::from(bemtvi_test_harness::file_uri(&dir))),
         "the pull must answer with the workspace root; got: {reply}"
     );
     assert_eq!(
@@ -234,7 +237,7 @@ async fn a_dynamic_registration_is_acked_not_errored() {
                     {{ "id": "r1", "method": "workspace/didChangeConfiguration" }}
                 ]
             }}"#,
-            rec.display()
+            bemtvi_test_harness::q(&rec)
         ),
     );
     let (_rpc, _incoming) = open_with_server(&dir).await;
@@ -270,7 +273,7 @@ async fn a_registered_glob_reports_a_file_created_on_disk() {
                        "registerOptions": {{ "watchers": [ {{ "globPattern": "**/*.py" }} ] }} }}
                 ]
             }}"#,
-            rec.display()
+            bemtvi_test_harness::q(&rec)
         ),
     );
     let (_rpc, _incoming) = open_with_server(&dir).await;
@@ -291,7 +294,7 @@ async fn a_registered_glob_reports_a_file_created_on_disk() {
     assert!(
         watched_changes(&rec)
             .iter()
-            .any(|(u, t)| *u == format!("file://{}", created.display()) && *t == 1),
+            .any(|(u, t)| *u == bemtvi_test_harness::file_uri(&created) && *t == 1),
         "the creation must be reported with FileChangeType.Created"
     );
     assert!(
@@ -322,7 +325,7 @@ async fn a_deleted_file_is_reported_as_deleted() {
                        "registerOptions": {{ "watchers": [ {{ "globPattern": "**/*.py" }} ] }} }}
                 ]
             }}"#,
-            rec.display()
+            bemtvi_test_harness::q(&rec)
         ),
     );
     let (_rpc, _incoming) = open_with_server(&dir).await;
@@ -335,7 +338,7 @@ async fn a_deleted_file_is_reported_as_deleted() {
     let created = create_until_reported(&dir, &rec, "doomed", "py")
         .await
         .expect("the watch must report the creation first");
-    let uri = format!("file://{}", created.display());
+    let uri = bemtvi_test_harness::file_uri(&created);
     std::fs::remove_file(&created).expect("remove watched file");
     for _ in 0..200 {
         if watched_changes(&rec)
@@ -377,7 +380,7 @@ async fn the_watch_chain_works_over_a_daemon_session() {
                        "registerOptions": {{ "watchers": [ {{ "globPattern": "**/*.py" }} ] }} }}
                 ]
             }}"#,
-            rec.display()
+            bemtvi_test_harness::q(&rec)
         ),
     );
 
@@ -412,7 +415,7 @@ async fn the_watch_chain_works_over_a_daemon_session() {
             }})
             btv.lsp.enable({{ "mock" }})
             "#,
-            dir.display()
+            bemtvi_test_harness::q(&dir)
         ),
     )
     .await;
@@ -431,7 +434,7 @@ async fn the_watch_chain_works_over_a_daemon_session() {
     assert!(
         watched_changes(&rec)
             .iter()
-            .any(|(u, t)| *u == format!("file://{}", created.display()) && *t == 1),
+            .any(|(u, t)| *u == bemtvi_test_harness::file_uri(&created) && *t == 1),
         "the remote creation must be reported with FileChangeType.Created"
     );
 }
@@ -455,7 +458,7 @@ async fn an_unregistered_capability_drops_its_watches() {
                        "registerOptions": {{ "watchers": [ {{ "globPattern": "**/*.py" }} ] }} }}
                 ]
             }}"#,
-            rec.display()
+            bemtvi_test_harness::q(&rec)
         ),
     );
     let (rpc, _incoming) = open_with_server(&dir).await;

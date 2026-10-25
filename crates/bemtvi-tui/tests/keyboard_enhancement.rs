@@ -49,6 +49,10 @@ fn pop_sequence() -> Vec<u8> {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "crossterm has no kitty keyboard protocol on Windows: its Push/Pop flags always error Unsupported"
+)]
 fn pushes_disambiguate_flag_on_enable() {
     let buf = SharedBuf::default();
     let _guard = KeyboardEnhancement::push(buf.clone());
@@ -60,6 +64,10 @@ fn pushes_disambiguate_flag_on_enable() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "crossterm has no kitty keyboard protocol on Windows: its Push/Pop flags always error Unsupported"
+)]
 fn pops_flags_on_normal_drop() {
     let buf = SharedBuf::default();
     {
@@ -73,6 +81,10 @@ fn pops_flags_on_normal_drop() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "crossterm has no kitty keyboard protocol on Windows: its Push/Pop flags always error Unsupported"
+)]
 fn pops_flags_on_panic_unwind() {
     let buf = SharedBuf::default();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

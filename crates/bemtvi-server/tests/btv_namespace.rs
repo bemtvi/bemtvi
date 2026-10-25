@@ -11,7 +11,7 @@
 use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
-    cursor_u64, drain_to_latest_redraw, exec_lua, feed, field_str, map_get, start_attached,
+    cursor_u64, drain_to_latest_redraw, exec_lua, feed, field_str, map_get, q, start_attached,
     wait_redraw, window0_field,
 };
 use rmpv::Value;
@@ -1139,7 +1139,7 @@ async fn bufnr_prefers_an_exact_name_over_a_suffix_match() {
 
     // Open the suffix-matching buffer FIRST so it holds the lower bufnr (the one a
     // first-match-wins scan would return), then the exactly-named one.
-    exec_lua(&rpc, &format!("vim.cmd('cd {}')", dir.display())).await;
+    exec_lua(&rpc, &format!("vim.cmd('cd {}')", q(&dir))).await;
     exec_lua(&rpc, "vim.cmd('edit sub/init.lua')").await;
     exec_lua(&rpc, "vim.cmd('edit init.lua')").await;
 
@@ -1339,7 +1339,7 @@ async fn runtime_file_globs_with_the_full_dialect() {
         let code = format!(
             "local out = {{}}\n\
              for _, p in ipairs(btv.runtime_file({pattern:?}, true)) do\n\
-             \x20 out[#out + 1] = p:match('[^/]+$')\n\
+             \x20 out[#out + 1] = p:match('[^/\\\\]+$')\n\
              end\n\
              table.sort(out)\n\
              return table.concat(out, ',')"

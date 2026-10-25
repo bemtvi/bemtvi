@@ -14,20 +14,22 @@ use std::time::Duration;
 
 use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
-use bemtvi_test_harness::{exec_lua, lua_bool, start_attached, temp_dir};
+use bemtvi_test_harness::{exec_lua, lua_bool, q, start_attached, temp_dir};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
     start_attached(ServerInit::default(), 80, 24).await
 }
 
-/// Override `btv._ui_opener` so the "opener" is `sh -c 'printf %s "$1" > out' sh`.
-/// The wrapper appends the uri as the next argv element, which becomes `$1`, so
-/// the recorded file ends up holding exactly the uri the opener received.
+/// Override `btv._ui_opener` so the "opener" is `sh -c 'printf %s "$2" > "$1"' sh out`.
+/// The wrapper appends the uri as the next argv element, which becomes `$2`, so
+/// the recorded file ends up holding exactly the uri the opener received. The out
+/// path rides as its own argv element (`$1`) rather than spliced into the script, so
+/// a Windows path's backslashes reach the shell intact.
 fn record_opener_into(out: &std::path::Path) -> String {
     format!(
-        "btv._ui_opener = function() return {{ 'sh', '-c', 'printf %s \"$1\" > {}', 'sh' }} end",
-        out.display()
+        "btv._ui_opener = function() return {{ 'sh', '-c', 'printf %s \"$2\" > \"$1\"', 'sh', \"{}\" }} end",
+        q(out)
     )
 }
 

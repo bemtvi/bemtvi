@@ -15,6 +15,8 @@ publish = false
 libc.workspace = true
 bemtvi-core.workspace = true
 bemtvi-rpc.workspace = true
+# `install::ensure_zig` — the pinned Zig `c_compiler` falls back to on Windows.
+bemtvi-ts.workspace = true
 # The harness uses `bemtvi_server::{run, ServerInit}`, both gated behind the
 # server's `native` feature. The workspace pins `bemtvi-server` with
 # `default-features = false` (so the wasm edit-host can opt out), which leaves
@@ -23,5 +25,9 @@ bemtvi-rpc.workspace = true
 # explicitly here: a no-op for the real consumer builds (feature unification
 # already turns it on) that also lets the harness compile/lint standalone.
 bemtvi-server = { workspace = true, features = ["native"] }
+# `Url::from_file_path` (re-exported by lsp-types) for `file_uri`: the same
+# serializer the editor's LSP layer uses, so a test-built URI matches the wire
+# spelling on every platform (`file:///C:/...` on Windows).
+lsp-types.workspace = true
 rmpv.workspace = true
 tokio.workspace = true

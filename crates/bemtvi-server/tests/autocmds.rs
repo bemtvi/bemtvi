@@ -1783,7 +1783,7 @@ async fn malformed_glob_class_does_not_abort_the_event_fire() {
 const BWE_INIT: &str = "_G.bwe = {}\n\
      vim.api.nvim_create_autocmd('BufWinEnter', { callback = function(a)\n\
      \x20 local f = a.file\n\
-     \x20 _G.bwe[#_G.bwe+1] = (f ~= nil and f ~= '') and f:match('[^/]+$') or 'noname'\n\
+     \x20 _G.bwe[#_G.bwe+1] = (f ~= nil and f ~= '') and f:match('[^/\\\\]+$') or 'noname'\n\
      end })\n";
 
 #[tokio::test]
@@ -2015,7 +2015,7 @@ async fn bufwinenter_fires_with_the_displaying_window_current() {
          btv.on('BufWinEnter', function(a)\n\
          \x20 _G.seen[#_G.seen+1] = tostring(btv.win.current()) .. '/cc=' ..\n\
          \x20   tostring(btv.wo.colorcolumn) .. '/' ..\n\
-         \x20   ((a.file ~= nil and a.file ~= '') and a.file:match('[^/]+$') or '(noname)')\n\
+         \x20   ((a.file ~= nil and a.file ~= '') and a.file:match('[^/\\\\]+$') or '(noname)')\n\
          end)\n",
     )
     .await;

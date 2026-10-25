@@ -148,8 +148,9 @@ fn fixture_data_dir() -> &'static Path {
         // every OS, which our loader tries first), via the system C compiler.
         let src = grammar_src_dir().join("src");
         let out = parser_dir.join("rust.so");
-        let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-        let status = std::process::Command::new(compiler)
+        let cc = bemtvi_test_harness::c_compiler();
+        let status = std::process::Command::new(&cc[0])
+            .args(&cc[1..])
             .args(["-shared", "-fPIC", "-O1"])
             .arg("-I")
             .arg(&src)

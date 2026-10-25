@@ -52,6 +52,11 @@ fn make_repo(tag: &str) -> PathBuf {
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
     std::fs::write(repo.join("file.txt"), "a\nb\nc\n").unwrap();
+    // Pin the checkout to the committed bytes. The daemon's git runs with the host's
+    // config, and Git for Windows ships `core.autocrlf=true` in its *system* gitconfig,
+    // so without this a clone's worktree would hold `a\r\nb\r\n...` — the host's
+    // line-ending policy, not anything the wire did.
+    std::fs::write(repo.join(".gitattributes"), "* -text\n").unwrap();
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "initial"]);
     repo

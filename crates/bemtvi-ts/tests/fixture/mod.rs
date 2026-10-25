@@ -48,8 +48,9 @@ pub fn compile_grammar_as(root: &Path, lang: &str, real: &str, src_dir: &Path) {
     let dir = root.join("parser");
     std::fs::create_dir_all(&dir).unwrap();
     let out = dir.join(format!("{lang}.so"));
-    let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-    let status = std::process::Command::new(compiler)
+    let cc = c_compiler();
+    let status = std::process::Command::new(&cc[0])
+        .args(&cc[1..])
         .args(["-shared", "-fPIC", "-O1"])
         .arg(format!("-Dtree_sitter_{real}=tree_sitter_{lang}"))
         .arg("-I")
@@ -61,6 +62,36 @@ pub fn compile_grammar_as(root: &Path, lang: &str, real: &str, src_dir: &Path) {
         .status()
         .expect("run C compiler");
     assert!(status.success(), "compiling {lang} grammar fixture failed");
+}
+
+/// The C compiler argv prefix: `$CC` when set, else `cc` on unix, else (Windows
+/// has no system `cc`) the editor's pinned Zig as `zig cc`, cached under the
+/// system temp dir across runs. Mirrors `bemtvi_test_harness::c_compiler`, which
+/// this crate can't depend on without pulling the whole server into its tests.
+fn c_compiler() -> Vec<String> {
+    if let Ok(cc) = std::env::var("CC") {
+        if !cc.trim().is_empty() {
+            return cc.split_whitespace().map(str::to_string).collect();
+        }
+    }
+    if !cfg!(windows) {
+        return vec!["cc".into()];
+    }
+    static ZIG: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let zig = ZIG.get_or_init(|| {
+        let cache = std::env::temp_dir().join("bemtvi-test-toolchain");
+        let shared = cache.join("zig");
+        if !shared.exists() {
+            // Stage then rename, so concurrent test binaries never see a
+            // half-unpacked tree; the loser of the rename uses the winner's.
+            let stage = cache.join(format!("stage-ts-{}", std::process::id()));
+            bemtvi_ts::install::ensure_zig(&stage).expect("fetch the pinned zig");
+            let _ = std::fs::rename(stage.join("zig"), &shared);
+            let _ = std::fs::remove_dir_all(&stage);
+        }
+        bemtvi_ts::install::ensure_zig(&cache).expect("cached zig")
+    });
+    vec![zig.to_string_lossy().into_owned(), "cc".into()]
 }
 
 /// Write `<root>/queries/<lang>/<name>.scm`.
@@ -77,8 +108,12 @@ pub fn registry_crate_dir(crate_dir: &str) -> PathBuf {
     let cargo_home = std::env::var("CARGO_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").expect("HOME or CARGO_HOME must be set"))
-                .join(".cargo")
+            PathBuf::from(
+                std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .expect("HOME, USERPROFILE or CARGO_HOME must be set"),
+            )
+            .join(".cargo")
         });
     let registry = cargo_home.join("registry").join("src");
     for index in std::fs::read_dir(&registry).expect("read cargo registry src") {

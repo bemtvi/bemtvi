@@ -121,7 +121,7 @@ M._opts = M._opts
 -- before first use without depending on the host's data dir.
 local function root()
   if not M._opts.root then
-    M._opts.root = vim.fn.stdpath("data") .. "/plugins"
+    M._opts.root = btv.utils.local_path_join(vim.fn.stdpath("data"), "plugins")
   end
   return M._opts.root
 end
@@ -143,7 +143,7 @@ end
 -- a cache `:PluginClean` prunes; a lockfile there would be lost with it.) Overridable via
 -- setup_manager{ lockfile = }, mirroring `root` / `config` / `system`.
 local function lockfile_path()
-  return M._opts.lockfile or (config_dir() .. "/bemtvi-lock.json")
+  return M._opts.lockfile or btv.utils.local_path_join(config_dir(), "bemtvi-lock.json")
 end
 
 -- The client-owned SYSTEM-PLUGIN DIR: `stdpath("data")/system`, one plugin repo per
@@ -153,7 +153,7 @@ end
 -- (a test points it at a temp dir), mirroring `root` / `config`.
 local function system_dir()
   if not M._opts.system then
-    M._opts.system = vim.fn.stdpath("data") .. "/system"
+    M._opts.system = btv.utils.local_path_join(vim.fn.stdpath("data"), "system")
   end
   return M._opts.system
 end
@@ -330,7 +330,7 @@ local function normalize(spec)
     -- Resolved install directory: an explicit `dir` (a local/dev checkout, never
     -- cloned; `~` already expanded) or root()/name.
     dir = dir, -- local-dev marker (nil for a managed clone)
-    _dir = dir or (root() .. "/" .. name),
+    _dir = dir or btv.utils.local_path_join(root(), name),
     enabled = spec.enabled,
     config = as_fn(spec.config, "config"),
     init = as_fn(spec.init, "init"),
@@ -382,7 +382,7 @@ local function collect_lua(dir)
         return a.name < b.name
       end)
       for _, e in ipairs(entries) do
-        local p = d .. "/" .. e.name
+        local p = btv.utils.local_path_join(d, e.name)
         if e.type == "directory" then
           walk(p)
         elseif e.name:sub(-4) == ".lua" then
@@ -404,7 +404,7 @@ end
 local function source_runtime(dir)
   return btv.async(function()
     for _, sub in ipairs({ "plugin", "after/plugin" }) do
-      local files = btv.await(collect_lua(dir .. "/" .. sub))
+      local files = btv.await(collect_lua(btv.utils.local_path_join(dir, sub)))
       for _, f in ipairs(files) do
         local content = btv.await(lfs.read_text(f))
         local chunk, lerr = loadstring(content, "@" .. f)
@@ -442,7 +442,7 @@ end
 -- `…/foo` and `…/foo/` match.
 function M._namespace_for(dir)
   local trim = function(p)
-    return (p:gsub("[/\\]+$", ""))
+    return btv.utils._fold_seps((p:gsub("[/\\]+$", "")))
   end
   local target = trim(dir)
   for name, spec in pairs(M._specs) do
@@ -1652,8 +1652,8 @@ function M.lock(opts)
       return resolved
     end
     local path = lockfile_path()
-    local dir = path:match("^(.*)/[^/]*$")
-    if dir and dir ~= "" then
+    local dir = btv.utils.dirname(path)
+    if dir ~= path and dir ~= "" then
       btv.await(lfs.mkdir(dir, { recursive = true }))
     end
     -- An empty Lua table is ambiguous in JSON and `btv.json` picks the ARRAY form, so an
@@ -1940,7 +1940,7 @@ local function clean_named(want)
           0
         )
       end
-      local dir = spec and spec._dir or (root() .. "/" .. name)
+      local dir = spec and spec._dir or btv.utils.local_path_join(root(), name)
       if btv.await(lfs.exists(dir)) then
         set_task(name, "clean", "running", "removing")
         btv.await(lfs.remove(dir, { recursive = true }))
@@ -1991,7 +1991,7 @@ function M.clean(opts)
     local removed = {}
     for _, e in ipairs(btv.await(lfs.readdir(r))) do
       if e.type == "directory" and not declared[e.name] then
-        btv.await(lfs.remove(r .. "/" .. e.name, { recursive = true }))
+        btv.await(lfs.remove(btv.utils.local_path_join(r, e.name), { recursive = true }))
         removed[#removed + 1] = e.name
         -- Forget the plugin's shada namespace too, so an uninstalled plugin doesn't
         -- leave its cross-session data orphaned in the store forever. A managed
@@ -2121,7 +2121,7 @@ end
 -- Returns a promise of the plugin's name. Callable form for `init.lua`.
 function M.system(spec)
   local s = normalize(spec)
-  local target = system_dir() .. "/" .. s.name
+  local target = btv.utils.local_path_join(system_dir(), s.name)
   return btv.async(function()
     btv.await(clone_into_system(s.name, s.url, s.dir, target))
     btv.await(activate_system(s.name, target, s.config))
@@ -2140,7 +2140,7 @@ function M.promote(name)
       message = "btv.plugins.promote: unknown plugin '" .. tostring(name) .. "'",
     })
   end
-  local target = system_dir() .. "/" .. name
+  local target = btv.utils.local_path_join(system_dir(), name)
   return btv.async(function()
     -- Clone from the plugin's on-disk checkout (a dev `dir` or the managed clone) so the
     -- exact installed state moves into the tier, offline.
@@ -2374,9 +2374,11 @@ function M._persist_recommended(specs)
   specs = specs or M._recommended
   return btv.async(function()
     local cfg = config_dir()
-    btv.await(lfs.mkdir(cfg .. "/lua", { recursive = true }))
-    btv.await(lfs.write(cfg .. "/lua/plugins.lua", serialize_recommended(specs)))
-    local init = cfg .. "/init.lua"
+    btv.await(lfs.mkdir(btv.utils.local_path_join(cfg, "lua"), { recursive = true }))
+    btv.await(
+      lfs.write(btv.utils.local_path_join(cfg, "lua", "plugins.lua"), serialize_recommended(specs))
+    )
+    local init = btv.utils.local_path_join(cfg, "init.lua")
     local existing = ""
     if btv.await(lfs.exists(init)) then
       existing = btv.await(lfs.read_text(init))

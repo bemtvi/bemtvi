@@ -5,7 +5,7 @@
 use crate::cwd::CdScope;
 use crate::lsp::LspReqKind;
 use crate::EditHost;
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 
 impl EditHost {
     pub(crate) fn run_command(&mut self, cmd: &str) {
@@ -335,8 +335,11 @@ impl EditHost {
         // or reverts on `E344`. `-` (previous) and a relative path resolve against the
         // edit-host's `DirState` and so can move optimistically; `""` (→ the daemon's
         // `$HOME`) and `~…` expand against the *daemon's* home, which we can't predict, so
-        // they install only on the ack. See `docs/plans/2026-06-23-remote-cwd.md`.
+        // they install only on the ack. See `docs/plans/2026-06-23-remote-cwd.md`. Every
+        // path here is the daemon's, so it is tested / joined / normalized by the daemon's
+        // announced path syntax, never this process's `std::path`.
         if self.editor.host_fs_offtick() {
+            let style = self.remote_path_style;
             let (wire, optimistic): (String, Option<PathBuf>) = match arg {
                 "-" => match self.dirs.prev(scope, win, tab) {
                     Some(p) => {
@@ -351,17 +354,13 @@ impl EditHost {
                 "" => (String::new(), None),
                 _ if arg.starts_with('~') => (arg.to_string(), None),
                 _ => {
-                    let joined = if Path::new(arg).is_absolute() {
-                        PathBuf::from(arg)
-                    } else {
-                        let (_, base) = self.dirs.effective(win, tab);
-                        base.join(arg)
-                    };
+                    let (_, base) = self.dirs.effective(win, tab);
+                    let joined = style.join(&base.to_string_lossy(), arg);
                     // Lexically normalize so the optimistic dir is clean and matches the
                     // daemon's canonical form when no symlink is in play (a symlink
                     // difference is reconciled on the ack).
-                    let abs = lexical_normalize(&joined);
-                    (abs.to_string_lossy().into_owned(), Some(abs))
+                    let abs = style.normalize(&joined);
+                    (abs.clone(), Some(PathBuf::from(abs)))
                 }
             };
             let undo = optimistic.map(|dir| self.dirs.set_optimistic(scope, win, tab, dir));
@@ -926,27 +925,6 @@ fn is_command_def(base: &str) -> bool {
 /// does not set `$HOME`.
 fn home_dir() -> Option<PathBuf> {
     bemtvi_core::stdpath::home_dir()
-}
-
-/// Lexically normalize an **absolute** path — collapse `.` and `..` components without
-/// touching the filesystem. Used for the optimistic remote `:cd` dir: the daemon
-/// canonicalizes for real on its side, but this keeps the dir `getcwd` shows clean and
-/// makes it match the daemon's canonical form whenever no symlink is involved (a symlink
-/// difference is reconciled on the ack). `..` never climbs above the root.
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut out: Vec<Component> = Vec::new();
-    for comp in path.components() {
-        match comp {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if matches!(out.last(), Some(Component::Normal(_))) {
-                    out.pop();
-                }
-            }
-            c => out.push(c),
-        }
-    }
-    out.iter().collect()
 }
 
 /// Expand a `:cd` path argument: a leading `~` / `~/` resolves against `$HOME`,

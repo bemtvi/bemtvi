@@ -73,7 +73,14 @@ fn empty_data_dir() -> PathBuf {
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = bemtvi_test_harness::temp_root()
         .join(format!("bemtvi_term_data_{}_{n}", std::process::id()));
-    let plugins = dir.join("bemtvi").join("plugins");
+    // `stdpath("data")` is `$XDG_DATA_HOME/bemtvi` — `bemtvi-data` on Windows, where the
+    // managed dirs are named apart from the config dir (`bemtvi-core/src/stdpath.rs`).
+    let suffix = if cfg!(windows) {
+        "bemtvi-data"
+    } else {
+        "bemtvi"
+    };
+    let plugins = dir.join(suffix).join("plugins");
     std::fs::create_dir_all(&plugins).expect("create empty data dir");
     std::fs::write(plugins.join(".recommended-prompted"), b"1\n").expect("pre-mark first run");
     dir
@@ -113,7 +120,6 @@ impl FakeTerminal {
         // talk to, so the server has to fall back to the terminal's own OSC 52.
         cmd.env("DISPLAY", "");
         cmd.env("WAYLAND_DISPLAY", "");
-
         let child = pair.slave.spawn_command(cmd).expect("spawn bemtvi");
         let mut reader = pair.master.try_clone_reader().expect("reader");
         let writer: Arc<Mutex<Box<dyn Write + Send>>> =
@@ -148,20 +154,41 @@ impl FakeTerminal {
                 // Answer in arrival order, so the status report's reply really does
                 // come back last — the property the client relies on to know that
                 // every question ahead of it has been answered or never will be.
-                let mut reply = Vec::new();
+                let mut answered: Vec<(usize, &[u8])> = Vec::new();
                 for (query, answer) in [
                     // XTVERSION: tmux names itself, exactly as tmux 3.x does.
                     (&b"\x1b[>q"[..], &b"\x1bP>|tmux 3.7b\x1b\\"[..]),
-                    // Device attributes describe *tmux*, and never mention 52.
-                    (&b"\x1b[c"[..], &b"\x1b[?1;2;4c"[..]),
+                    // Device attributes describe *tmux*, and never mention 52. Under
+                    // ConPTY the only bare `CSI c` that reaches here is the console
+                    // host's own startup handshake (see `CONPTY_HANDSHAKE`), and a reply
+                    // below VT level 61 makes it stall ~3 s before forwarding any output.
+                    (
+                        &b"\x1b[c"[..],
+                        if cfg!(windows) {
+                            &b"\x1b[?61;4c"[..]
+                        } else {
+                            &b"\x1b[?1;2;4c"[..]
+                        },
+                    ),
                     (&b"\x1b[5n"[..], &b"\x1b[0n"[..]),
-                ] {
+                ]
+                .into_iter()
+                .chain(CONPTY_HANDSHAKE.iter().copied())
+                {
                     let mut from = 0;
                     while let Some(at) = find(&pending[from..], query) {
-                        reply.extend_from_slice(answer);
+                        answered.push((from + at, answer));
                         from += at + query.len();
                     }
                 }
+                // Sort by where each query sat in the stream: one read can carry
+                // several (ConPTY's `CSI 6n` and `CSI c` arrive together), and an
+                // answer out of order is one no real terminal sends.
+                answered.sort_by_key(|&(at, _)| at);
+                let reply: Vec<u8> = answered
+                    .iter()
+                    .flat_map(|(_, a)| a.iter().copied())
+                    .collect();
                 if round_closed {
                     late_sink.lock().unwrap().extend(
                         CAPABILITY_QUERIES
@@ -260,6 +287,18 @@ const CAPABILITY_QUERIES: &[(&str, &[u8])] = &[
     ("XTGETTCAP", b"\x1bP+q"),
 ];
 
+/// The queries a Windows pty (ConPTY) itself sends the terminal hosting it on startup, with
+/// the answers every such terminal gives. On Windows the console host sits between the
+/// child and this terminal: it answers the child's bare device-attribute / status queries
+/// itself and asks the hosting terminal for the cursor position (`CSI 6n`) before it
+/// forwards output. (Its `CSI c` is answered by the shared table above.) Not a POSIX pty
+/// thing, so empty there.
+const CONPTY_HANDSHAKE: &[(&[u8], &[u8])] = if cfg!(windows) {
+    &[(b"\x1b[6n", b"\x1b[1;1R")]
+} else {
+    &[]
+};
+
 /// Delete every `DCS tmux; … ST` passthrough sequence from `buf`, contents and all.
 fn strip_tmux_passthrough(buf: &mut Vec<u8>) {
     const START: &[u8] = b"\x1bPtmux;";
@@ -281,6 +320,11 @@ fn sample_file(name: &str, body: &str) -> PathBuf {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "unobservable under ConPTY: the console host answers the client's bare capability \
+              queries itself, so they never reach the terminal this test plays"
+)]
 fn the_terminal_is_asked_everything_once() {
     // The fix, stated as a property the terminal can see: every question goes out in
     // one burst ended by a status report, and once that report is answered the
@@ -342,6 +386,12 @@ fn no_keystroke_after_startup_is_swallowed() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "unreproducible under ConPTY: the console host answers the client's XTVERSION / \
+              device-attribute queries itself, so the client never learns it is inside the \
+              multiplexer this test plays"
+)]
 fn a_yank_inside_a_multiplexer_still_reaches_the_clipboard() {
     // tmux answers the clipboard questions itself and its answers describe *tmux*:
     // its device attributes never list 52 and it ignores XTGETTCAP. Reading that

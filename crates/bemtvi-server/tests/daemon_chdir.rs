@@ -80,6 +80,48 @@ async fn getcwd_reports_the_daemon_cwd() {
         "/virtual/proj",
         "getcwd() reports the daemon's seeded cwd, not the local process cwd"
     );
+    assert_eq!(
+        exec_lua(&rpc, "return btv._path_style").await.as_str(),
+        Some("posix"),
+        "Lua sees the (unix) daemon's path syntax alongside its cwd, whatever this client's OS"
+    );
+}
+
+/// The Lua path helpers follow the *session's* path syntax — the daemon's — not the
+/// client's OS: against a unix daemon, `/virtual/x` is absolute, `\` is an ordinary
+/// character, and `:p` joins onto the remote cwd with `/`, even on a Windows client.
+#[tokio::test]
+async fn lua_path_helpers_follow_the_daemons_syntax() {
+    let (rpc, _incoming) =
+        spawn_remote(fixture(), "/virtual/proj", "/virtual/proj/README.md").await;
+    await_getcwd(&rpc, "/virtual/proj").await;
+    let got = exec_lua(
+        &rpc,
+        "return table.concat({ \
+           btv.utils.path_style(), \
+           tostring(btv.utils.is_absolute('/virtual/x')), \
+           vim.fn.fnamemodify('/virtual/a/b.txt', ':t'), \
+           vim.fn.fnamemodify('/virtual/a/b.txt', ':h'), \
+           vim.fn.fnamemodify('notes.txt', ':p'), \
+           vim.fn.fnamemodify([[a\\b]], ':t'), \
+           btv.utils.path_join(btv._cwd, 'a', 'b.txt'), \
+           btv.utils.local_path_join('x', 'y') }, '|')",
+    )
+    .await;
+    // A path on the daemon joins by the daemon's rules; one on THIS machine by its own.
+    let local = std::path::Path::new("x").join("y");
+    assert_eq!(
+        got.as_str(),
+        Some(
+            format!(
+                r"unix|true|b.txt|/virtual/a|/virtual/proj/notes.txt|a\b|/virtual/proj/a/b.txt|{}",
+                local.display()
+            )
+            .as_str()
+        ),
+        "path_style | is_absolute | :t | :h | :p | `\\` is not a separator | path_join | \
+         local_path_join"
+    );
 }
 
 /// `:pwd` prints the daemon's cwd in a remote session (it reads `DirState`, the seeded
@@ -268,5 +310,73 @@ async fn focus_switch_fires_dirchanged_over_the_wire() {
     assert_eq!(
         last, "/virtual/proj",
         "switching back to the global-dir window fires DirChanged with that cwd"
+    );
+}
+
+/// A **Windows** daemon's paths follow the syntax it announced, not the client's
+/// `std::path`: from `C:\proj`, `:cd src` lands in `C:\proj\src` (joined with `\`), a
+/// relative `:e` there fetches `C:\proj\src\main.rs`, and `:cd ..` normalizes back to
+/// `C:\proj`. On a unix client `std::path` reads `C:\proj` as *relative* and joins with
+/// `/`, so this is the cross-OS case a unix CI exercises — the mirror of the `/virtual`
+/// suites above (a unix daemon), which a Windows client exercises.
+#[tokio::test]
+async fn a_windows_daemons_paths_follow_its_announced_syntax() {
+    let fs = DaemonFs::default();
+    fs.dir(r"C:\proj", &[(true, "src"), (false, "README.md")])
+        .dir(r"C:\proj\src", &[(false, "main.rs")])
+        .set(r"C:\proj\README.md", "# Readme\n")
+        .set(r"C:\proj\src\main.rs", "fn main() {}\n");
+    let (rpc, _incoming) = spawn_with_daemon_fs_init(
+        fs,
+        ServerInit {
+            file: Some(r"C:\proj\README.md".to_string()),
+            remote_cwd: Some(PathBuf::from(r"C:\proj")),
+            remote_path_style: Some(bemtvi_core::pathstyle::PathStyle::Windows),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        await_lines(&rpc, &["# Readme"]).await,
+        vec!["# Readme"],
+        "the absolute Windows startup path is fetched verbatim"
+    );
+    await_getcwd(&rpc, r"C:\proj").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv._path_style").await.as_str(),
+        Some("windows"),
+        "Lua sees the daemon's path syntax, whatever this client's OS"
+    );
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return btv.utils.path_style() .. '|' \
+               .. vim.fn.fnamemodify([[C:\\proj\\a.txt]], ':t') .. '|' \
+               .. vim.fn.fnamemodify('a.txt', ':p')",
+        )
+        .await
+        .as_str(),
+        Some(r"windows|a.txt|C:\proj\a.txt"),
+        "the Lua path helpers follow the daemon's Windows syntax, whatever this client's OS"
+    );
+
+    feed(&rpc, ":cd src<CR>");
+    assert_eq!(
+        await_getcwd(&rpc, r"C:\proj\src").await,
+        r"C:\proj\src",
+        "a relative `:cd` joins by the daemon's (Windows) syntax"
+    );
+    feed(&rpc, ":edit main.rs<CR>");
+    assert_eq!(
+        await_lines(&rpc, &["fn main() {}"]).await,
+        vec!["fn main() {}"],
+        "a relative `:edit` resolves under the new Windows cwd over the wire"
+    );
+
+    feed(&rpc, ":cd ..<CR>");
+    assert_eq!(
+        await_getcwd(&rpc, r"C:\proj").await,
+        r"C:\proj",
+        "`..` normalizes by the daemon's syntax"
     );
 }

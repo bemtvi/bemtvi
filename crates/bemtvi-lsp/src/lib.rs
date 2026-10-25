@@ -27,6 +27,7 @@ mod client;
 mod convert;
 pub mod log;
 mod protocol;
+pub mod uri;
 
 // The async client surface — tokio + `async-lsp`. Gated to `native`; absent in the
 // browser build (`wasm32-unknown-emscripten`), which uses the sync client below.

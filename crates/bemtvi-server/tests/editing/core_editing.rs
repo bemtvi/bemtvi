@@ -987,7 +987,7 @@ async fn lua_vim_cmd_drives_the_editor() {
     std::fs::write(&path, "alpha\nbeta\n").unwrap();
 
     let (rpc, _incoming) = start(None).await;
-    let chunk = format!("lua vim.cmd(\"edit {}\")", path.to_string_lossy());
+    let chunk = format!("lua vim.cmd(\"edit {}\")", q(&path));
     rpc.request("btv_command", vec![Value::from(chunk.as_str())])
         .await
         .expect("lua command");

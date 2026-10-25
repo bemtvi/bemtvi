@@ -167,7 +167,7 @@ async fn assigning_offset_encoding_renegotiates_the_live_client() {
         dir.as_path(),
         &format!(
             r#"{{ "record": "{}", "position_encoding": "utf-16" }}"#,
-            rec.display()
+            bemtvi_test_harness::q(&rec)
         ),
     );
     let (rpc, _incoming) = open_rust(dir.as_path(), "é\n").await;
@@ -252,7 +252,7 @@ async fn exec_cmd_sends_the_command_to_the_server() {
     let rec = dir.join("rec.jsonl");
     arm_mock(
         dir.as_path(),
-        &format!(r#"{{ "record": "{}" }}"#, rec.display()),
+        &format!(r#"{{ "record": "{}" }}"#, bemtvi_test_harness::q(&rec)),
     );
     let (rpc, _incoming) = open_rust(dir.as_path(), "let x = 1\n").await;
     enable_demo(&rpc).await;
@@ -286,7 +286,7 @@ async fn exec_cmd_prefers_the_configs_own_command_handler() {
     let rec = dir.join("rec.jsonl");
     arm_mock(
         dir.as_path(),
-        &format!(r#"{{ "record": "{}" }}"#, rec.display()),
+        &format!(r#"{{ "record": "{}" }}"#, bemtvi_test_harness::q(&rec)),
     );
     let (rpc, _incoming) = open_rust(dir.as_path(), "let x = 1\n").await;
     exec_lua(
@@ -390,15 +390,31 @@ async fn a_uri_percent_encodes_the_characters_that_would_break_it() {
     // byte-identical or the server's document map misses the buffer it already holds.
     let dir = temp_dir("lsp-client-uri");
     let (rpc, _incoming) = open_rust(dir.as_path(), "x\n").await;
+    // A native absolute path per host: on Windows a drive path, whose URI keeps the
+    // drive's `:` (as `Url::from_file_path` spells it) and comes back with native `\`
+    // separators. (`/tmp/…` is not absolute there: it is rooted on the current drive.)
+    let (path, want) = if cfg!(windows) {
+        (
+            "C:/tmp/a b/c#d/é.rs",
+            "file:///C:/tmp/a%20b/c%23d/%C3%A9.rs|C:\\tmp\\a b\\c#d\\é.rs",
+        )
+    } else {
+        (
+            "/tmp/a b/c#d/é.rs",
+            "file:///tmp/a%20b/c%23d/%C3%A9.rs|/tmp/a b/c#d/é.rs",
+        )
+    };
     let out = exec_lua(
         &rpc,
-        "local u = btv.utils.uri_from_path('/tmp/a b/c#d/é.rs')\n\
-         return u .. '|' .. tostring(btv.utils.uri_to_path(u))\n",
+        &format!(
+            "local u = btv.utils.uri_from_path('{path}')\n\
+             return u .. '|' .. tostring(btv.utils.uri_to_path(u))\n"
+        ),
     )
     .await;
     assert_eq!(
         out.as_str(),
-        Some("file:///tmp/a%20b/c%23d/%C3%A9.rs|/tmp/a b/c#d/é.rs"),
+        Some(want),
         "escaped on the way out, decoded byte-for-byte on the way back"
     );
 
@@ -433,10 +449,10 @@ async fn locations_to_items_converts_columns_and_reads_the_line() {
         &format!(
             "_G.items = nil\n\
              local locs = {{\n\
-             \x20 {{ uri = 'file://{p}', range = {{\n\
+             \x20 {{ uri = '{p}', range = {{\n\
              \x20     start = {{ line = 0, character = 5 }},\n\
              \x20     ['end'] = {{ line = 0, character = 7 }} }} }},\n\
-             \x20 {{ uri = 'file://{p}', range = {{\n\
+             \x20 {{ uri = '{p}', range = {{\n\
              \x20     start = {{ line = 1, character = 0 }},\n\
              \x20     ['end'] = {{ line = 1, character = 6 }} }} }},\n\
              }}\n\
@@ -444,7 +460,7 @@ async fn locations_to_items_converts_columns_and_reads_the_line() {
              \x20 _G.items = items\n\
              end)\n\
              return 'queued'",
-            p = other.display()
+            p = bemtvi_test_harness::file_uri(&other)
         ),
     )
     .await;
@@ -485,11 +501,11 @@ async fn locations_to_items_prefers_an_open_buffers_unsaved_text() {
         &rpc,
         &format!(
             "_G.items = nil\n\
-             btv.lsp.locations_to_items({{ {{ uri = 'file://{p}', range = {{\n\
+             btv.lsp.locations_to_items({{ {{ uri = '{p}', range = {{\n\
              \x20 start = {{ line = 0, character = 0 }},\n\
              \x20 ['end'] = {{ line = 0, character = 6 }} }} }} }})\n\
              \x20 :next(function(items) _G.items = items end)",
-            p = path.display()
+            p = bemtvi_test_harness::file_uri(&path)
         ),
     )
     .await;

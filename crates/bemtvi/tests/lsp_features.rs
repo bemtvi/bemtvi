@@ -15,7 +15,7 @@ use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
     attach, barrier, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, menu_items,
-    menu_of, message, mode, poll_menu, serial_lock, spawn, temp_dir, window0_field,
+    menu_of, message, mode, poll_menu, q, serial_lock, spawn, temp_dir, window0_field,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -24,7 +24,7 @@ const BEMTVI_BIN: &str = env!("CARGO_BIN_EXE_bemtvi");
 
 /// The `file://` URI of a path under `dir`, as the mock script's locations need.
 fn file_uri(dir: &Path, name: &str) -> String {
-    format!("file://{}", dir.join(name).display())
+    bemtvi_test_harness::file_uri(&dir.join(name))
 }
 
 /// Poll for the latest redraw whose `menu` key is a map (the picker surface), then
@@ -850,7 +850,7 @@ async fn check_rename_sync_round_trips(encoding: &str) {
                     }}
                 }}
             }}"#,
-            rec = record.display(),
+            rec = q(&record),
         ),
     );
     let original = "let balance = 1\nfn f() { balance }\n";
@@ -2521,7 +2521,7 @@ async fn did_save_fires_per_write_and_never_on_reload() {
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp_features_didsave");
     let record = dir.join("rec.jsonl");
-    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, q(&record)));
     let (rpc, _incoming) = open_with_server(&dir, "let balance = 1\n").await;
     assert!(
         await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await,
@@ -2610,7 +2610,7 @@ fn extract_to_new_file_mock(dir: &Path, record: &Path, tail: &str) -> String {
                 ]
             }}
         }}"#,
-        rec = record.display(),
+        rec = q(record),
         a = file_uri(dir, "a.rs"),
         b = file_uri(dir, "helper.rs"),
     )
@@ -2792,7 +2792,7 @@ async fn a_rename_op_moves_the_file_and_the_buffer_follows() {
                     {{ "kind": "rename", "oldUri": "{a}", "newUri": "{b}" }}
                 ] }}
             }}"#,
-            rec = record.display(),
+            rec = q(&record),
             a = file_uri(&dir, "a.rs"),
             b = file_uri(&dir, "moved.rs"),
         ),
@@ -2895,7 +2895,7 @@ async fn a_delete_op_removes_the_file_and_wipes_its_buffer() {
                     {{ "kind": "delete", "uri": "{d}" }}
                 ] }}
             }}"#,
-            rec = record.display(),
+            rec = q(&record),
             d = file_uri(&dir, "doomed.rs"),
         ),
     );
@@ -2972,7 +2972,7 @@ async fn a_failing_file_operation_is_reported_with_a_reason() {
                     {{ "kind": "delete", "uri": "{d}" }}
                 ] }}
             }}"#,
-            rec = record.display(),
+            rec = q(&record),
             // Never created: the delete must fail rather than quietly "succeed".
             d = file_uri(&dir, "absent.rs"),
         ),
@@ -3040,7 +3040,7 @@ async fn chained_file_operations_apply_in_order() {
                     {{ "kind": "rename", "oldUri": "{b}", "newUri": "{c}" }}
                 ] }}
             }}"#,
-            rec = record.display(),
+            rec = q(&record),
             a = file_uri(&dir, "a.rs"),
             b = file_uri(&dir, "b.rs"),
             c = file_uri(&dir, "c.rs"),
@@ -3098,7 +3098,7 @@ async fn a_failed_change_aborts_the_ones_after_it() {
                     {{ "kind": "rename", "oldUri": "{a}", "newUri": "{b}" }}
                 ] }}
             }}"#,
-            rec = record.display(),
+            rec = q(&record),
             absent = file_uri(&dir, "absent.rs"),
             a = file_uri(&dir, "a.rs"),
             b = file_uri(&dir, "moved.rs"),
@@ -3171,7 +3171,7 @@ async fn an_unresolvable_document_aborts_before_any_edit_applies() {
                     }}
                 ] }}
             }}"#,
-            rec = record.display(),
+            rec = q(&record),
             a = file_uri(&dir, "a.rs"),
         ),
     );
@@ -3233,7 +3233,7 @@ async fn edits_addressed_to_a_renamed_file_reach_the_renamed_buffer() {
                     }}
                 ] }}
             }}"#,
-            rec = record.display(),
+            rec = q(&record),
             a = file_uri(&dir, "a.rs"),
             b = file_uri(&dir, "moved.rs"),
         ),
@@ -3385,7 +3385,7 @@ async fn a_create_into_a_missing_directory_makes_the_directory() {
                     }}
                 ] }}
             }}"#,
-            rec = record.display(),
+            rec = q(&record),
             b = file_uri(&dir, "sub/nested/helper.rs"),
         ),
     );
@@ -3460,7 +3460,7 @@ async fn a_stalled_file_operation_gives_up_instead_of_blocking_the_server() {
                     {{ "kind": "delete", "uri": "{d}" }}
                 ] }}
             }}"#,
-            rec = record.display(),
+            rec = q(&record),
             d = file_uri(&dir, "doomed.rs"),
         ),
     );
@@ -3851,7 +3851,7 @@ fn annotated_edit_mock(dir: &Path, record: &Path) -> String {
                 ]
             }}
         }}"#,
-        rec = record.display(),
+        rec = q(record),
         a = file_uri(dir, "a.rs"),
     )
 }
@@ -3976,7 +3976,7 @@ async fn a_create_of_a_directory_makes_the_directory() {
                     {{ "kind": "create", "uri": "{folder}" }}
                 ] }}
             }}"#,
-            rec = record.display(),
+            rec = q(&record),
             folder = folder_uri,
         ),
     );
@@ -4045,7 +4045,7 @@ fn all_annotated_edit_mock(dir: &Path, record: &Path) -> String {
                 ]
             }}
         }}"#,
-        rec = record.display(),
+        rec = q(record),
         a = file_uri(dir, "a.rs"),
     )
 }
@@ -4159,7 +4159,7 @@ async fn a_malformed_apply_edit_is_refused_rather_than_acked() {
                 ],
                 "apply_edit": {{ "documentChanges": "not a list of changes" }}
             }}"#,
-            rec = record.display(),
+            rec = q(&record),
         ),
     );
     let (rpc, _incoming) = open_with_server(&dir, "let foo = 1\n").await;
@@ -4228,7 +4228,7 @@ async fn failed_change_is_indexed_against_the_edit_the_server_sent() {
                     ]
                 }}
             }}"#,
-            rec = record.display(),
+            rec = q(&record),
             a = file_uri(&dir, "a.rs"),
             made = file_uri(&dir, "made.rs"),
             // Never created: the delete fails, and it is change index 2.
@@ -4286,7 +4286,7 @@ async fn an_ignore_if_not_exists_delete_of_an_absent_file_is_not_a_failure() {
                                      "newText": "fn after() {{}}\n" }} ] }}
                 ] }}
             }}"#,
-            rec = record.display(),
+            rec = q(&record),
             gone = file_uri(&dir, "never-existed.rs"),
             after = file_uri(&dir, "after.rs"),
         ),
@@ -4453,7 +4453,7 @@ async fn did_open_sends_the_document_not_the_rope() {
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp_features_eol_didopen");
     let record = dir.join("rec.jsonl");
-    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, q(&record)));
     let (rpc, _incoming) = open_with_server(&dir, "let a = 1\nlet b = 2").await;
     assert!(
         await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await,
@@ -4475,7 +4475,7 @@ async fn did_open_keeps_the_trailing_newline_of_an_ordinary_file() {
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp_features_eol_didopen_normal");
     let record = dir.join("rec.jsonl");
-    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, q(&record)));
     let (rpc, _incoming) = open_with_server(&dir, "let a = 1\nlet b = 2\n").await;
     assert!(
         await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await,
@@ -4501,7 +4501,7 @@ async fn edits_to_a_no_eol_buffer_keep_the_server_in_step() {
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp_features_eol_didchange");
     let record = dir.join("rec.jsonl");
-    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, q(&record)));
     let original = "let a = 1\nlet b = 2";
     let (rpc, _incoming) = open_with_server(&dir, original).await;
     assert!(
@@ -4543,7 +4543,7 @@ async fn a_write_that_terminates_the_file_syncs_the_new_newline() {
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp_features_eol_write_syncs");
     let record = dir.join("rec.jsonl");
-    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, q(&record)));
     let original = "let a = 1\nlet b = 2";
     let (rpc, _incoming) = open_with_server(&dir, original).await;
     assert!(
@@ -4598,7 +4598,7 @@ async fn a_buffer_that_loses_its_terminator_syncs_the_removal() {
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp_features_eol_loses");
     let record = dir.join("rec.jsonl");
-    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, q(&record)));
     let original = "let a = 1\nlet b = 2\n";
     let (rpc, _incoming) = open_with_server(&dir, original).await;
     assert!(
@@ -4954,7 +4954,7 @@ async fn did_save_omits_the_text_field_rather_than_sending_null() {
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp_didsave_shape");
     let record = dir.join("rec.jsonl");
-    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, q(&record)));
     let (rpc, _incoming) = open_with_server(&dir, "let balance = 1\n").await;
     assert!(
         await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await,
@@ -5194,7 +5194,7 @@ async fn a_server_attaching_after_edits_receives_the_text_not_a_replay() {
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp_late_attach");
     let record = dir.join("rec.jsonl");
-    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, q(&record)));
 
     // Open the buffer with NO server, and type into it. Each keystroke journals a
     // delta that nothing can consume.
@@ -5243,7 +5243,7 @@ async fn an_attached_server_still_gets_its_deltas() {
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp_live_deltas");
     let record = dir.join("rec.jsonl");
-    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, q(&record)));
     let (rpc, _incoming) = open_with_server(&dir, "start\n").await;
     assert!(
         await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await,

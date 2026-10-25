@@ -20,6 +20,8 @@ tokio.workspace = true
 # this binary depends on native-gated server items, so it must not rely on feature
 # unification from a `--workspace` build to turn `native` on.
 bemtvi-server = { workspace = true, features = ["native"] }
+# `host::canonicalize` — the plain (non-verbatim) spelling of a canonical path.
+bemtvi-core.workspace = true
 # Direct dep for `--extract-lua-runtime` (prelude source + stdpath resolver).
 bemtvi-lua.workspace = true
 bemtvi-tui.workspace = true

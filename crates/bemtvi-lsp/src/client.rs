@@ -46,7 +46,7 @@ use lsp_types::{
     SemanticTokensClientCapabilitiesRequests, SemanticTokensFullOptions,
     SemanticTokensWorkspaceClientCapabilities, ServerCapabilities, TextDocumentClientCapabilities,
     TextDocumentSyncCapability, TextDocumentSyncClientCapabilities, TextDocumentSyncKind,
-    TokenFormat, Url, WindowClientCapabilities, WorkspaceClientCapabilities,
+    TokenFormat, WindowClientCapabilities, WorkspaceClientCapabilities,
     WorkspaceEditClientCapabilities, WorkspaceFolder,
 };
 #[cfg(feature = "native")]
@@ -87,6 +87,9 @@ pub(crate) struct ClientState {
     /// `workspace/configuration` requests (lua_ls/gopls read their config this way,
     /// returning the requested `section` slice). `None` when the config set none.
     settings: Option<serde_json::Value>,
+    /// The daemon's path syntax when the root is a remote path ([`ServerSpawn::path_style`]),
+    /// so the `workspace/workspaceFolders` pull spells the root as `initialize` did.
+    path_style: Option<bemtvi_core::pathstyle::PathStyle>,
     /// In-flight `workspace/applyEdit` requests: the server is blocked on each until
     /// the *editor* says whether it applied the edit, which happens a tick or more
     /// later. The request handler parks on the receiver; [`ApplyEditDone`] (emitted
@@ -124,6 +127,7 @@ pub(crate) fn new_client(
     event_tx: UnboundedSender<LspEvent>,
     log: Arc<LspLog>,
     settings: Option<serde_json::Value>,
+    path_style: Option<bemtvi_core::pathstyle::PathStyle>,
 ) -> (MainLoop<Router<ClientState>>, ServerSocket) {
     MainLoop::new_client(|_server| {
         let mut router = Router::new(ClientState {
@@ -131,6 +135,7 @@ pub(crate) fn new_client(
             event_tx,
             log,
             settings,
+            path_style,
             pending_apply: HashMap::new(),
             next_apply_id: 1,
         });
@@ -300,7 +305,7 @@ pub(crate) fn new_client(
         // would be worse than not declaring it: a server that pulls would get
         // method-not-found and fall back to *no* workspace at all.
         router.request::<WorkspaceFoldersRequest, _>(|st: &mut ClientState, ()| {
-            ready(Ok(workspace_folders(st.key.root.as_deref())))
+            ready(Ok(workspace_folders(st.key.root.as_deref(), st.path_style)))
         });
         // `client/registerCapability` / `client/unregisterCapability`: the dynamic half
         // of capability negotiation. Forwarded to the editor (and on to
@@ -738,13 +743,20 @@ fn client_capabilities() -> ClientCapabilities {
 /// Shared by the `initialize` params and the server→client `workspace/workspaceFolders`
 /// pull, so both spell the same folder — a server that reads one and then the other
 /// must not see them disagree.
-pub(crate) fn workspace_folders(root: Option<&std::path::Path>) -> Option<Vec<WorkspaceFolder>> {
+///
+/// `style` is the daemon's path syntax when `root` is a remote path (see
+/// [`ServerSpawn::path_style`]), `None` for a local one.
+pub(crate) fn workspace_folders(
+    root: Option<&std::path::Path>,
+    style: Option<bemtvi_core::pathstyle::PathStyle>,
+) -> Option<Vec<WorkspaceFolder>> {
     let root = root?;
-    let uri = Url::from_file_path(root).ok()?;
-    let name = root
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| root.to_string_lossy().into_owned());
+    let uri = crate::uri::path_to_uri(root, style)?;
+    let name = match style {
+        None => root.file_name().map(|n| n.to_string_lossy().into_owned()),
+        Some(style) => style.file_name(&root.to_string_lossy()).map(str::to_string),
+    }
+    .unwrap_or_else(|| root.to_string_lossy().into_owned());
     Some(vec![WorkspaceFolder { uri, name }])
 }
 
@@ -776,8 +788,8 @@ pub(crate) fn init_params(
 ) -> InitializeParams {
     InitializeParams {
         process_id,
-        root_uri: root.and_then(|root| Url::from_file_path(root).ok()),
-        workspace_folders: workspace_folders(root),
+        root_uri: root.and_then(|root| crate::uri::path_to_uri(root, spawn.path_style)),
+        workspace_folders: workspace_folders(root, spawn.path_style),
         initialization_options: spawn
             .init_options
             .clone()

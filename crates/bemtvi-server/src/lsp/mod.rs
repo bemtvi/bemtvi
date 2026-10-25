@@ -1527,12 +1527,6 @@ pub(crate) fn lsp_root_override() -> Option<PathBuf> {
     std::env::var_os("BEMTVI_LSP_ROOT").map(|root| absolutize(Path::new(&root)))
 }
 
-/// The filesystem path behind a `file://` URI (the inverse of
-/// [`EditHost::buffer_uri`](EditHost::buffer_uri)), or `None` for a non-file URI — the target of a go-to jump or a panel location.
-pub(crate) fn uri_to_path(uri: &Url) -> Option<PathBuf> {
-    uri.to_file_path().ok()
-}
-
 /// A human-facing spelling of `path` for a picker / panel row: stripped to a
 /// cwd-relative path when it lives under the working directory, else left
 /// absolute. Cosmetic only — navigation still carries the full path, which

@@ -116,9 +116,11 @@ async fn walk_recurses_and_prunes_dotfiles() {
         ),
     )
     .await;
+    // Relative paths are spelled with the platform's separator, as `rg` prints them.
+    let sub_b = std::path::Path::new("sub").join("b.txt");
     assert_eq!(
         poll_settled(&rpc, "return _G.out").await.as_str(),
-        Some("a.txt,sub/b.txt")
+        Some(format!("a.txt,{}", sub_b.display()).as_str())
     );
     let _ = fs::remove_dir_all(&dir);
 }
@@ -155,10 +157,12 @@ async fn grep_matches_substring_across_the_tree() {
         ),
     )
     .await;
-    // a.txt line 1 col 7 ("alpha NEEDLE"), sub/b.txt line 2 col 3 ("x NEEDLE").
+    // a.txt line 1 col 7 ("alpha NEEDLE"), sub/b.txt line 2 col 3 ("x NEEDLE"); the
+    // relative path is spelled with the platform's separator, as `rg` prints it.
+    let sub_b = std::path::Path::new("sub").join("b.txt");
     assert_eq!(
         poll_settled(&rpc, "return _G.out").await.as_str(),
-        Some("a.txt:1:7,sub/b.txt:2:3")
+        Some(format!("a.txt:1:7,{}:2:3", sub_b.display()).as_str())
     );
     let _ = fs::remove_dir_all(&dir);
 }

@@ -10,6 +10,15 @@ use bemtvi_server::{valid_namespace, workspace_namespace, workspace_shada, Serve
 use bemtvi_test_harness::{exec_lua, serial_lock, start_attached, temp_dir};
 use std::path::Path;
 
+/// The directory bemtvi's state hangs off under `$XDG_STATE_HOME`: `bemtvi` on unix,
+/// `bemtvi-data` on Windows (the managed-dir suffix documented in
+/// `bemtvi-core/src/stdpath.rs`, which keeps it apart from the hand-edited config).
+const STATE_SUBDIR: &str = if cfg!(windows) {
+    "bemtvi-data"
+} else {
+    "bemtvi"
+};
+
 #[test]
 fn valid_namespace_accepts_safe_tokens_and_rejects_the_rest() {
     assert_eq!(
@@ -36,7 +45,7 @@ async fn store_redirects_into_the_namespace_subfolder() {
     let ns = "session-ns-1";
     let mut store = workspace_shada(Some(ns));
     store.load().expect("namespaced store loads");
-    let ns_dir = state.join("bemtvi").join("shada").join("ns").join(ns);
+    let ns_dir = state.join(STATE_SUBDIR).join("shada").join("ns").join(ns);
     let has_redb = std::fs::read_dir(&ns_dir)
         .map(|rd| {
             rd.flatten()
@@ -48,7 +57,7 @@ async fn store_redirects_into_the_namespace_subfolder() {
     // … and the global store (no namespace) writes a top-level .redb instead.
     let mut global = workspace_shada(None);
     global.load().expect("global store loads");
-    let global_dir = state.join("bemtvi").join("shada");
+    let global_dir = state.join(STATE_SUBDIR).join("shada");
     let global_files: Vec<_> = std::fs::read_dir(&global_dir)
         .unwrap()
         .flatten()

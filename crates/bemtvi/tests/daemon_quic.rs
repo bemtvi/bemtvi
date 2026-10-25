@@ -189,7 +189,9 @@ async fn native_legs_round_trip_over_separate_quic_streams() {
 
     // Term stream — a real PTY runs on the daemon: open an interactive shell, type a marker
     // `echo`, and the child's echoed output streams back over the *separate* Term QUIC stream.
-    feed(&rpc, ":terminal sh<CR>");
+    // (`cmd` is the interactive shell on Windows, which has no `sh`; its `echo` is the same.)
+    let shell = if cfg!(windows) { "cmd" } else { "sh" };
+    feed(&rpc, &format!(":terminal {shell}<CR>"));
     feed(&rpc, "echo QUICTERMOK<CR>");
     let mut term_text = String::new();
     for _ in 0..100 {

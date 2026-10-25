@@ -4269,12 +4269,13 @@ fn serve_config_bundle(params: &[Value]) -> Result<Value, Value> {
 }
 
 /// `[config_dir?, [runtimepath…], [[abspath, bytes], …], [ts_lang…], cwd?, state_dir?,
-/// home?]` — the bundle on the wire ([`decode_config_bundle`] is the inverse). Paths are
-/// the daemon's absolute paths; the edit-host rebases the config roots onto its local
-/// cache. `cwd` is the daemon's working directory, `state_dir` its shada base dir, and
-/// `home` its `$HOME` (the base a leading `~` in a file argument expands against) — all
+/// home?, path_style]` — the bundle on the wire ([`decode_config_bundle`] is the inverse).
+/// Paths are the daemon's absolute paths; the edit-host rebases the config roots onto its
+/// local cache. `cwd` is the daemon's working directory, `state_dir` its shada base dir,
+/// `home` its `$HOME` (the base a leading `~` in a file argument expands against), and
+/// `path_style` the syntax its paths are spelled in (`"posix"` / `"windows"`) — all
 /// trailing fields an older peer omits (→ the edit-host keeps its local cwd / has no
-/// remote shada / expands `~` against its own `$HOME`).
+/// remote shada / expands `~` against its own `$HOME` / assumes its own path syntax).
 fn encode_config_bundle(
     config_dir: Option<PathBuf>,
     runtimepath: Vec<PathBuf>,
@@ -4298,6 +4299,10 @@ fn encode_config_bundle(
         cwd.map_or(Value::Nil, path_str),
         path_str(state_dir),
         home.map_or(Value::Nil, path_str),
+        // The daemon's own path syntax (this process *is* the daemon), so an edit-host
+        // on a different OS tests / joins / URI-encodes every remote path by the daemon's
+        // rules, not its own.
+        Value::from(bemtvi_core::pathstyle::PathStyle::native().wire_name()),
     ])
 }
 
@@ -4384,6 +4389,7 @@ impl RemoteConfig {
             .await?;
         let remote_cwd = bundle.cwd.clone().map(std::path::PathBuf::from);
         let remote_home = bundle.home.clone().map(std::path::PathBuf::from);
+        let remote_path_style = bundle.path_style;
         let ts_autoinstall = bundle.ts_languages.clone();
         let state_dir = bundle.state_dir.clone();
         let (config_dir, runtimepath) = match source {
@@ -4396,6 +4402,7 @@ impl RemoteConfig {
             runtimepath,
             remote_cwd,
             remote_home,
+            remote_path_style,
             ts_autoinstall,
             state_dir,
         })

@@ -254,10 +254,14 @@ local function assign_namespace(src)
     -- trailing slash (e.g. `BEMTVI_CONFIG=examples/foo/`) would otherwise compare against
     -- `dir .. "/"` → a double-slash that never prefixes the `@<dir>/<file>` source path, so
     -- the calling file would attribute to NO plugin and persistence calls would raise.
-    local dir = (raw:gsub("[/\\]+$", ""))
-    if src == dir or src:sub(1, #dir + 1) == dir .. "/" then
-      if not best or #dir > #best then
-        best = dir
+    -- Separators are compared folded: on Windows the chunk source is spelled with `\`
+    -- (`…\lua\treens\init.lua`) while the entry may have been typed with `/`.
+    local raw_dir = (raw:gsub("[/\\]+$", ""))
+    local dir = btv.utils._fold_seps(raw_dir)
+    local folded = btv.utils._fold_seps(src)
+    if folded == dir or folded:sub(1, #dir + 1) == dir .. "/" then
+      if not best or #raw_dir > #best then
+        best = raw_dir
       end
     end
   end
@@ -273,7 +277,7 @@ local function assign_namespace(src)
   -- namespace rather than its (machine-specific) directory name. Compare with trailing
   -- separators trimmed so `…/bemtvi` and `…/bemtvi/` match.
   local trim = function(p)
-    return (p:gsub("[/\\]+$", ""))
+    return btv.utils._fold_seps((p:gsub("[/\\]+$", "")))
   end
   local config = vim.fn and vim.fn.stdpath and vim.fn.stdpath("config")
   if config and trim(best) == trim(config) then

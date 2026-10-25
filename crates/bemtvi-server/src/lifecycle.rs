@@ -315,12 +315,17 @@ impl EditHost {
             // daemon serves many sessions and keeps no per-session process cwd, so a bare
             // relative path would resolve against its launch dir and silently ignore
             // `:cd` — so `:cd dir` then `:e file` must read `<dir>/file`. An absolute path
-            // crosses unchanged. See `docs/plans/2026-06-23-remote-cwd.md`.
-            let path = if open.path.is_relative() {
-                let (_, base) = self.dirs.effective(win, tab);
-                base.join(&open.path).to_string_lossy().into_owned()
+            // crosses unchanged. See `docs/plans/2026-06-23-remote-cwd.md`. The path is
+            // the daemon's, so "relative?" and the join follow the daemon's announced path
+            // syntax — `std::path` would apply this client's (a Windows client reads the
+            // unix `/srv/x` as drive-relative and lands on `C:/srv/x`).
+            let style = self.remote_path_style;
+            let raw = open.path.to_string_lossy();
+            let path = if style.is_absolute(&raw) {
+                raw.into_owned()
             } else {
-                open.path.display().to_string()
+                let (_, base) = self.dirs.effective(win, tab);
+                style.join(&base.to_string_lossy(), &raw)
             };
             // A `:e ++enc=` override can't ride the async fetch (it lands keyed only by
             // buffer); stash it so the landing decodes with the forced encoding.
@@ -1290,6 +1295,12 @@ impl EditHost {
         if let Err(e) = self.lua.set_cwd(&dir.to_string_lossy()) {
             self.editor
                 .echo(format!("E5108: Error publishing cwd mirror: {e}"));
+        }
+        // …and the syntax that cwd (and every session path) is spelled in — the daemon's
+        // in a daemon session — so Lua path helpers follow it rather than the local OS.
+        if let Err(e) = self.lua.set_path_style(self.remote_path_style.wire_name()) {
+            self.editor
+                .echo(format!("E5108: Error publishing path-style mirror: {e}"));
         }
         self.published_cwd = Some(dir);
         moved

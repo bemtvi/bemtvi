@@ -52,11 +52,16 @@ pub struct RemoteConfigBundle {
     /// though the core runs on the client. `None` when the daemon couldn't read it (or
     /// an older peer omitted it) — the edit-host then falls back to its own `$HOME`.
     pub home: Option<String>,
+    /// The syntax the daemon's paths are spelled in (`"posix"` / `"windows"` on the wire),
+    /// so the edit-host tests / joins / URI-encodes remote paths by the **daemon's** rules
+    /// — a Windows client must not read the unix `/srv/x` as relative. `None` when an older
+    /// peer omitted it; the edit-host then assumes its own syntax (the pre-field behavior).
+    pub path_style: Option<bemtvi_core::pathstyle::PathStyle>,
 }
 
 /// Decode a `config_bundle` reply (the inverse of the daemon's `encode_config_bundle`):
 /// the `[config_dir?, [runtimepath…], [[abspath, bytes], …], [ts_lang…], cwd?, state_dir?,
-/// home?]` array.
+/// home?, path_style?]` array.
 /// Any shape mismatch is a loud error string — never a silently-empty bundle that would
 /// look like "the remote has no config". Shared by the native daemon client and the wasm
 /// edit-host (via [`decode_config_bundle_bytes`]).
@@ -130,6 +135,16 @@ pub fn decode_config_bundle(v: Value) -> Result<RemoteConfigBundle, String> {
         None | Some(Value::Nil) => None,
         Some(v) => Some(v.as_str().ok_or_else(|| bad("home"))?.to_owned()),
     };
+    // The daemon's path syntax; absent (an older peer) decodes as `None` (the edit-host
+    // assumes its own). An unknown spelling is malformed — guessing would mis-join paths.
+    let path_style = match it.next() {
+        None | Some(Value::Nil) => None,
+        Some(v) => Some(
+            v.as_str()
+                .and_then(bemtvi_core::pathstyle::PathStyle::from_wire)
+                .ok_or_else(|| bad("path_style"))?,
+        ),
+    };
     Ok(RemoteConfigBundle {
         config_dir,
         runtimepath,
@@ -138,6 +153,7 @@ pub fn decode_config_bundle(v: Value) -> Result<RemoteConfigBundle, String> {
         cwd,
         state_dir,
         home,
+        path_style,
     })
 }
 

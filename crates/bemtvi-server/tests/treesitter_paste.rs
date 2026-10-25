@@ -40,8 +40,12 @@ fn registry_crate_dir(crate_dir: &str) -> PathBuf {
     let cargo_home = std::env::var("CARGO_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").expect("HOME or CARGO_HOME must be set"))
-                .join(".cargo")
+            PathBuf::from(
+                std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .expect("HOME, USERPROFILE or CARGO_HOME must be set"),
+            )
+            .join(".cargo")
         });
     let registry = cargo_home.join("registry").join("src");
     for index in std::fs::read_dir(&registry).expect("read cargo registry src") {
@@ -60,8 +64,9 @@ fn install_rust_grammar(root: &Path) -> bool {
     let src = registry_crate_dir("tree-sitter-rust-0.24.2").join("src");
     let parser_dir = root.join("parser");
     std::fs::create_dir_all(&parser_dir).unwrap();
-    let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-    let status = std::process::Command::new(&compiler)
+    let cc = bemtvi_test_harness::c_compiler();
+    let status = std::process::Command::new(&cc[0])
+        .args(&cc[1..])
         .args(["-shared", "-fPIC", "-O1"])
         .arg("-I")
         .arg(&src)

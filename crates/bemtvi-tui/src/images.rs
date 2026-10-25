@@ -324,11 +324,20 @@ fn detect_picker(caps: TermCaps) -> Picker {
 }
 
 /// Non-unix: [`crate::termquery::probe`] asks nothing there (no `poll(2)` to wait
-/// on stdin without consuming it), so keep ratatui-image's own query — on Windows
-/// it answers through the console API rather than a parked stdin read.
+/// on stdin without consuming it), so there is no cell size to convert an image's
+/// pixels into cells with — the halfblocks fallback, as on unix without one.
+///
+/// It must **not** fall back to `Picker::from_query_stdio` either: on Windows that
+/// is the very parked reader described on the unix [`detect_picker`] — its helper
+/// thread does a plain blocking `stdin.read()` (a `ReadConsoleW` that consumes
+/// console input) until it sees the reply to its own `ESC[5n`. Any terminal that
+/// doesn't answer (anything tmux-like, or one whose replies the pseudoconsole
+/// keeps to itself) cost two seconds in front of the first frame and left that
+/// thread sitting on stdin, where it ate the first key the user typed — before
+/// crossterm's console-event reader ever saw it.
 #[cfg(not(unix))]
 fn detect_picker(_caps: TermCaps) -> Picker {
-    Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
+    Picker::halfblocks()
 }
 
 /// The largest aspect-preserving sub-rect of `area` the image fits in — never

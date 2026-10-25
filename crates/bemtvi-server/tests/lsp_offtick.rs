@@ -13,9 +13,52 @@
 //! edit-host's *local* disk cannot read — so the renamed content appearing in its
 //! buffer can only have come across the wire from the daemon's fs.
 
+use bemtvi_core::pathstyle::PathStyle;
+use bemtvi_rpc::{Incoming, Rpc};
+use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
-    await_lines, command, cursor, exec_lua, spawn_with_daemon_fs, temp_dir, DaemonFs,
+    await_lines, command, cursor, exec_lua, file_uri, spawn_with_daemon_fs,
+    spawn_with_daemon_fs_init, temp_dir, DaemonFs,
 };
+use tokio::sync::mpsc::UnboundedReceiver;
+
+/// A path on the (unix) daemon's fake filesystem that the edit-host's local disk cannot
+/// read: `/virtual/<name>`, on every client OS — the daemon announces POSIX path syntax
+/// (the harness default for the `/virtual` fake), so even a Windows client must treat it
+/// as absolute and address it as `file:///virtual/<name>`.
+fn virt(name: &str) -> String {
+    assert!(
+        !std::path::Path::new("/virtual").is_dir(),
+        "/virtual must not exist locally: the test proves bytes came over the wire"
+    );
+    format!("/virtual/{name}")
+}
+
+/// The `file://` URI of [`virt`]`(name)`, by POSIX rules — the daemon's, not this
+/// client's (`Url::from_file_path` would reject a drive-less path on Windows).
+fn virt_uri(name: &str) -> String {
+    format!("file:///virtual/{name}")
+}
+
+/// A daemon session whose fs paths are **this host's** local temp paths — the create /
+/// abort tests below run the workspace edit's file operations (the `FsJob` seam) against
+/// the local disk while the buffer legs ride the daemon fake, so the "daemon" here is
+/// this machine and announces this machine's path syntax (not the harness default, which
+/// models a unix daemon serving `/virtual/...`).
+async fn spawn_with_local_style_daemon(
+    fake: DaemonFs,
+    file: &str,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
+    spawn_with_daemon_fs_init(
+        fake,
+        ServerInit {
+            file: Some(file.to_string()),
+            remote_path_style: Some(PathStyle::native()),
+            ..Default::default()
+        },
+    )
+    .await
+}
 
 /// A rename's `WorkspaceEdit` touches the open file *and* a file that was never
 /// opened, in a daemon session. The unopened file's bytes are fetched over the wire,
@@ -24,10 +67,10 @@ use bemtvi_test_harness::{
 #[tokio::test]
 async fn workspace_edit_reaches_an_unopened_file_off_tick() {
     let fake = DaemonFs::with_files(&[
-        ("/virtual/a.rs", "let foo = 1\n"),
-        ("/virtual/b.rs", "use a::foo;\nfn g() { foo() }\n"),
+        (&virt("a.rs"), "let foo = 1\n"),
+        (&virt("b.rs"), "use a::foo;\nfn g() { foo() }\n"),
     ]);
-    let (rpc, _incoming) = spawn_with_daemon_fs(fake, "/virtual/a.rs").await;
+    let (rpc, _incoming) = spawn_with_daemon_fs(fake, &virt("a.rs")).await;
 
     // The startup file fetches over the wire first.
     assert_eq!(
@@ -38,13 +81,17 @@ async fn workspace_edit_reaches_an_unopened_file_off_tick() {
 
     // Rename `foo` -> `bar`: one occurrence in the open `a.rs`, two in the unopened
     // `b.rs` (which has never been opened in a buffer).
-    let edit = "btv._lsp_apply_workspace_edit({ changes = { \
-        ['file:///virtual/a.rs'] = { \
-          { range = { start = { line = 0, character = 4 }, ['end'] = { line = 0, character = 7 } }, newText = 'bar' } }, \
-        ['file:///virtual/b.rs'] = { \
-          { range = { start = { line = 0, character = 7 }, ['end'] = { line = 0, character = 10 } }, newText = 'bar' }, \
-          { range = { start = { line = 1, character = 9 }, ['end'] = { line = 1, character = 12 } }, newText = 'bar' } } } })";
-    exec_lua(&rpc, edit).await;
+    let edit = format!(
+        "btv._lsp_apply_workspace_edit({{ changes = {{ \
+        ['{a}'] = {{ \
+          {{ range = {{ start = {{ line = 0, character = 4 }}, ['end'] = {{ line = 0, character = 7 }} }}, newText = 'bar' }} }}, \
+        ['{b}'] = {{ \
+          {{ range = {{ start = {{ line = 0, character = 7 }}, ['end'] = {{ line = 0, character = 10 }} }}, newText = 'bar' }}, \
+          {{ range = {{ start = {{ line = 1, character = 9 }}, ['end'] = {{ line = 1, character = 12 }} }}, newText = 'bar' }} }} }} }})",
+        a = virt_uri("a.rs"),
+        b = virt_uri("b.rs"),
+    );
+    exec_lua(&rpc, &edit).await;
 
     // The open buffer is rewritten synchronously.
     assert_eq!(
@@ -56,7 +103,7 @@ async fn workspace_edit_reaches_an_unopened_file_off_tick() {
     // The unopened `b.rs` was brought into a replica buffer, its bytes fetched over
     // the wire, and the stashed edits applied once they landed. Switch to it (the
     // edit created the buffer, so `:edit` reuses it) and check both occurrences.
-    command(&rpc, "edit /virtual/b.rs").await;
+    command(&rpc, &format!("edit {}", virt("b.rs"))).await;
     assert_eq!(
         await_lines(&rpc, &["use a::bar;", "fn g() { bar() }"]).await,
         vec!["use a::bar;", "fn g() { bar() }"],
@@ -73,10 +120,10 @@ async fn workspace_edit_reaches_an_unopened_file_off_tick() {
 #[tokio::test]
 async fn an_ignore_if_exists_create_spares_the_remote_file_it_finds() {
     let fake = DaemonFs::with_files(&[
-        ("/virtual/a.rs", "let foo = 1\n"),
-        ("/virtual/keep.rs", "fn keep() {}\nfn tail() {}\n"),
+        (&virt("a.rs"), "let foo = 1\n"),
+        (&virt("keep.rs"), "fn keep() {}\nfn tail() {}\n"),
     ]);
-    let (rpc, _incoming) = spawn_with_daemon_fs(fake, "/virtual/a.rs").await;
+    let (rpc, _incoming) = spawn_with_daemon_fs(fake, &virt("a.rs")).await;
     assert_eq!(
         await_lines(&rpc, &["let foo = 1"]).await,
         vec!["let foo = 1"],
@@ -86,14 +133,17 @@ async fn an_ignore_if_exists_create_spares_the_remote_file_it_finds() {
     // `create keep.rs (ignoreIfExists)`, then an edit that renames its function. The
     // file exists on the daemon, so the create is a no-op and the edit applies to the
     // content that is there.
-    let edit = "btv.lsp.apply_workspace_edit({ documentChanges = { \
-        { kind = 'create', uri = 'file:///virtual/keep.rs', options = { ignoreIfExists = true } }, \
-        { textDocument = { uri = 'file:///virtual/keep.rs', version = 0 }, \
-          edits = { { range = { start = { line = 0, character = 3 }, \
-                                ['end'] = { line = 0, character = 7 } }, newText = 'kept' } } } } })";
-    exec_lua(&rpc, edit).await;
+    let edit = format!(
+        "btv.lsp.apply_workspace_edit({{ documentChanges = {{ \
+        {{ kind = 'create', uri = '{keep}', options = {{ ignoreIfExists = true }} }}, \
+        {{ textDocument = {{ uri = '{keep}', version = 0 }}, \
+          edits = {{ {{ range = {{ start = {{ line = 0, character = 3 }}, \
+                                ['end'] = {{ line = 0, character = 7 }} }}, newText = 'kept' }} }} }} }} }})",
+        keep = virt_uri("keep.rs"),
+    );
+    exec_lua(&rpc, &edit).await;
 
-    command(&rpc, "edit /virtual/keep.rs").await;
+    command(&rpc, &format!("edit {}", virt("keep.rs"))).await;
     assert_eq!(
         await_lines(&rpc, &["fn kept() {}", "fn tail() {}"]).await,
         vec!["fn kept() {}", "fn tail() {}"],
@@ -108,25 +158,28 @@ async fn an_ignore_if_exists_create_spares_the_remote_file_it_finds() {
 #[tokio::test]
 async fn two_changes_for_one_unopened_file_both_survive_the_fetch() {
     let fake = DaemonFs::with_files(&[
-        ("/virtual/a.rs", "let foo = 1\n"),
-        ("/virtual/b.rs", "one\ntwo\n"),
+        (&virt("a.rs"), "let foo = 1\n"),
+        (&virt("b.rs"), "one\ntwo\n"),
     ]);
-    let (rpc, _incoming) = spawn_with_daemon_fs(fake, "/virtual/a.rs").await;
+    let (rpc, _incoming) = spawn_with_daemon_fs(fake, &virt("a.rs")).await;
     assert_eq!(
         await_lines(&rpc, &["let foo = 1"]).await,
         vec!["let foo = 1"]
     );
 
-    let edit = "btv.lsp.apply_workspace_edit({ documentChanges = { \
-        { textDocument = { uri = 'file:///virtual/b.rs', version = 0 }, \
-          edits = { { range = { start = { line = 0, character = 0 }, \
-                                ['end'] = { line = 0, character = 3 } }, newText = 'ONE' } } }, \
-        { textDocument = { uri = 'file:///virtual/b.rs', version = 0 }, \
-          edits = { { range = { start = { line = 1, character = 0 }, \
-                                ['end'] = { line = 1, character = 3 } }, newText = 'TWO' } } } } })";
-    exec_lua(&rpc, edit).await;
+    let edit = format!(
+        "btv.lsp.apply_workspace_edit({{ documentChanges = {{ \
+        {{ textDocument = {{ uri = '{b}', version = 0 }}, \
+          edits = {{ {{ range = {{ start = {{ line = 0, character = 0 }}, \
+                                ['end'] = {{ line = 0, character = 3 }} }}, newText = 'ONE' }} }} }}, \
+        {{ textDocument = {{ uri = '{b}', version = 0 }}, \
+          edits = {{ {{ range = {{ start = {{ line = 1, character = 0 }}, \
+                                ['end'] = {{ line = 1, character = 3 }} }}, newText = 'TWO' }} }} }} }} }})",
+        b = virt_uri("b.rs"),
+    );
+    exec_lua(&rpc, &edit).await;
 
-    command(&rpc, "edit /virtual/b.rs").await;
+    command(&rpc, &format!("edit {}", virt("b.rs"))).await;
     assert_eq!(
         await_lines(&rpc, &["ONE", "TWO"]).await,
         vec!["ONE", "TWO"],
@@ -148,7 +201,8 @@ async fn an_ignore_if_exists_create_of_an_absent_file_still_lands_on_disk() {
     let made = dir.join("made.rs");
     // The startup file exists on the daemon; `made.rs` deliberately does not.
     let fake = DaemonFs::with(&open.to_string_lossy(), "let foo = 1\n");
-    let (rpc, _incoming) = spawn_with_daemon_fs(fake.clone(), &open.to_string_lossy()).await;
+    let (rpc, _incoming) =
+        spawn_with_local_style_daemon(fake.clone(), &open.to_string_lossy()).await;
     assert_eq!(
         await_lines(&rpc, &["let foo = 1"]).await,
         vec!["let foo = 1"]
@@ -156,12 +210,12 @@ async fn an_ignore_if_exists_create_of_an_absent_file_still_lands_on_disk() {
 
     let edit = format!(
         "btv.lsp.apply_workspace_edit({{ documentChanges = {{ \
-        {{ kind = 'create', uri = 'file://{made}', options = {{ ignoreIfExists = true }} }}, \
-        {{ textDocument = {{ uri = 'file://{made}', version = 0 }}, \
+        {{ kind = 'create', uri = '{made}', options = {{ ignoreIfExists = true }} }}, \
+        {{ textDocument = {{ uri = '{made}', version = 0 }}, \
           edits = {{ {{ range = {{ start = {{ line = 0, character = 0 }}, \
                                    ['end'] = {{ line = 0, character = 0 }} }}, \
                        newText = 'fn created() {{}}\\n' }} }} }} }} }})",
-        made = made.display(),
+        made = file_uri(&made),
     );
     exec_lua(&rpc, &edit).await;
 
@@ -218,7 +272,8 @@ async fn an_aborted_edit_does_not_write_the_file_its_create_probe_was_checking()
     // Only the startup file exists on the daemon: `made.rs` does not (so the probe
     // says "create it"), and neither does the file the delete names (so it fails).
     let fake = DaemonFs::with(&open.to_string_lossy(), "let foo = 1\n");
-    let (rpc, _incoming) = spawn_with_daemon_fs(fake.clone(), &open.to_string_lossy()).await;
+    let (rpc, _incoming) =
+        spawn_with_local_style_daemon(fake.clone(), &open.to_string_lossy()).await;
     assert_eq!(
         await_lines(&rpc, &["let foo = 1"]).await,
         vec!["let foo = 1"]
@@ -228,14 +283,14 @@ async fn an_aborted_edit_does_not_write_the_file_its_create_probe_was_checking()
     // a file that isn't there *without* `ignoreIfNotExists`, which fails and aborts.
     let edit = format!(
         "btv.lsp.apply_workspace_edit({{ documentChanges = {{ \
-        {{ kind = 'create', uri = 'file://{made}', options = {{ ignoreIfExists = true }} }}, \
-        {{ textDocument = {{ uri = 'file://{made}', version = 0 }}, \
+        {{ kind = 'create', uri = '{made}', options = {{ ignoreIfExists = true }} }}, \
+        {{ textDocument = {{ uri = '{made}', version = 0 }}, \
           edits = {{ {{ range = {{ start = {{ line = 0, character = 0 }}, \
                                    ['end'] = {{ line = 0, character = 0 }} }}, \
                        newText = 'fn created() {{}}\\n' }} }} }}, \
-        {{ kind = 'delete', uri = 'file://{gone}' }} }} }})",
-        made = made.display(),
-        gone = dir.join("never-existed.rs").display(),
+        {{ kind = 'delete', uri = '{gone}' }} }} }})",
+        made = file_uri(&made),
+        gone = file_uri(&dir.join("never-existed.rs")),
     );
     exec_lua(&rpc, &edit).await;
 
@@ -277,11 +332,11 @@ async fn an_aborted_edit_does_not_write_the_file_its_create_probe_was_checking()
 #[tokio::test]
 async fn a_goto_into_an_unopened_file_lands_on_the_column_off_tick() {
     let fake = DaemonFs::with_files(&[
-        ("/virtual/a.rs", "let foo = 1\n"),
-        ("/virtual/top.rs", "fn zero() {}\n"),
-        ("/virtual/wide.rs", "// header\nlet héllo = world;\n"),
+        (&virt("a.rs"), "let foo = 1\n"),
+        (&virt("top.rs"), "fn zero() {}\n"),
+        (&virt("wide.rs"), "// header\nlet héllo = world;\n"),
     ]);
-    let (rpc, _incoming) = spawn_with_daemon_fs(fake, "/virtual/a.rs").await;
+    let (rpc, _incoming) = spawn_with_daemon_fs(fake, &virt("a.rs")).await;
     assert_eq!(
         await_lines(&rpc, &["let foo = 1"]).await,
         vec!["let foo = 1"],
@@ -292,9 +347,12 @@ async fn a_goto_into_an_unopened_file_lands_on_the_column_off_tick() {
     // refinement used to flatten to (1, 0).
     exec_lua(
         &rpc,
-        "btv.lsp.show_document({ uri = 'file:///virtual/top.rs', \
-         range = { start = { line = 0, character = 3 }, \
-                   ['end'] = { line = 0, character = 3 } } })",
+        &format!(
+            "btv.lsp.show_document({{ uri = '{}', \
+             range = {{ start = {{ line = 0, character = 3 }}, \
+                       ['end'] = {{ line = 0, character = 3 }} }} }})",
+            virt_uri("top.rs")
+        ),
     )
     .await;
     assert_eq!(
@@ -321,9 +379,12 @@ async fn a_goto_into_an_unopened_file_lands_on_the_column_off_tick() {
     // `héllo`, which is byte 9 — `é` costs one utf-16 unit and two bytes.
     exec_lua(
         &rpc,
-        "btv.lsp.show_document({ uri = 'file:///virtual/wide.rs', \
-         range = { start = { line = 1, character = 8 }, \
-                   ['end'] = { line = 1, character = 8 } } })",
+        &format!(
+            "btv.lsp.show_document({{ uri = '{}', \
+             range = {{ start = {{ line = 1, character = 8 }}, \
+                       ['end'] = {{ line = 1, character = 8 }} }} }})",
+            virt_uri("wide.rs")
+        ),
     )
     .await;
     assert_eq!(

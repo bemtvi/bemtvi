@@ -824,7 +824,7 @@ fn resolve_submodule_url(base: Option<&str>, raw: &str) -> String {
         return raw.to_string();
     }
     let base = match base {
-        Some(b) => b.trim_end_matches('/'),
+        Some(b) => b.trim_end_matches(is_dir_sep),
         None => return raw.to_string(), // nothing to resolve against — let the clone fail loud
     };
     let mut base = base.to_string();
@@ -839,7 +839,7 @@ fn resolve_submodule_url(base: Option<&str>, raw: &str) -> String {
             break;
         }
     }
-    let base = base.trim_end_matches('/');
+    let base = base.trim_end_matches(is_dir_sep);
     if base.is_empty() {
         rel.to_string()
     } else {
@@ -848,9 +848,9 @@ fn resolve_submodule_url(base: Option<&str>, raw: &str) -> String {
 }
 
 /// Drop the final path segment of a URL/path string — `.../owner/repo` → `.../owner`.
-/// Falls back to the scp-like `host:` boundary when there is no `/` past it.
+/// Falls back to the scp-like `host:` boundary when there is no separator past it.
 fn drop_last_path_segment(base: &str) -> String {
-    match base.rfind('/') {
+    match base.rfind(is_dir_sep) {
         Some(i) => base[..i].to_string(),
         None => match base.rfind(':') {
             Some(i) => base[..=i].to_string(), // keep `host:`
@@ -860,6 +860,14 @@ fn drop_last_path_segment(base: &str) -> String {
 }
 
 // ----- helpers ---------------------------------------------------------------
+
+/// Whether `c` separates path segments in a submodule base — git's own `is_dir_sep`:
+/// `/` everywhere, and `\` too on Windows, where a local superproject's base is a
+/// native path (`C:\src\super`). Without it the `../` walk found no `/`, fell back to
+/// the scp-like `host:` split, and resolved `../dep` against the bare drive (`C:\dep`).
+fn is_dir_sep(c: char) -> bool {
+    c == '/' || (cfg!(windows) && c == '\\')
+}
 
 /// The repo-relative, forward-slashed path of `file` under `root`. Canonicalizes both
 /// so a symlinked worktree dir (e.g. macOS `/var` → `/private/var`) still strips

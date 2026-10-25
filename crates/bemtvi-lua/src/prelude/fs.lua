@@ -76,6 +76,8 @@ end
 -- enumeration the codebase reaches for when `rg`/`fd` aren't available (the pure web
 -- client, where a spawn has no real shell) — it rides the same off-tick fs seam as
 -- every other `btv.fs` op, so it works against local disk, a daemon, and OPFS alike.
+-- The relative paths are spelled with the session's separator (`btv.utils.path_join`),
+-- as `rg` / `fd` print them — so a file reads the same whichever enumerator found it.
 -- opts:
 --
 -- ```
@@ -96,14 +98,14 @@ function btv.fs.walk(dir, opts)
     local stack = { "" }
     while #stack > 0 and #out < max do
       local rel = table.remove(stack)
-      local abs = rel == "" and dir or (dir .. "/" .. rel)
+      local abs = rel == "" and dir or btv.utils.path_join(dir, rel)
       -- Skip a directory we can't read (permissions / vanished mid-walk) rather
       -- than aborting the whole enumeration.
       local ok, entries = pcall(btv.await, btv.fs.readdir(abs))
       if ok then
         for _, e in ipairs(entries) do
           if hidden or e.name:sub(1, 1) ~= "." then
-            local child = rel == "" and e.name or (rel .. "/" .. e.name)
+            local child = rel == "" and e.name or btv.utils.path_join(rel, e.name)
             if e.type == "directory" then
               if not skip[e.name] then
                 stack[#stack + 1] = child
@@ -134,10 +136,9 @@ function btv.fs.grep(dir, query, opts)
       return out
     end
     local files = btv.await(btv.fs.walk(dir, opts))
-    local base = dir:gsub("/$", "")
     for _, rel in ipairs(files) do
       -- read_text rejects on invalid UTF-8 (a binary file); skip it rather than abort.
-      local ok, text = pcall(btv.await, btv.fs.read_text(base .. "/" .. rel))
+      local ok, text = pcall(btv.await, btv.fs.read_text(btv.utils.path_join(dir, rel)))
       if ok then
         local lnum = 0
         for line in (text .. "\n"):gmatch("(.-)\n") do

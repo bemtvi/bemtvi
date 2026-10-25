@@ -53,7 +53,7 @@ async fn cycle_window(rpc: &Rpc) {
 /// `getcwd()` returns after a `set_current_dir`, regardless of how the path was
 /// typed (e.g. `/tmp` is a symlink on some systems).
 fn canon(p: &Path) -> String {
-    std::fs::canonicalize(p)
+    bemtvi_test_harness::canonicalize(p)
         .expect("canonicalize")
         .to_string_lossy()
         .into_owned()

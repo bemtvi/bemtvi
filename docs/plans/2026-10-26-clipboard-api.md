@@ -60,10 +60,13 @@ against a sync read would break in the browser, and the remote session is tier 1
 
 ## Status
 
-Phase 1 is in. Until phase 2 lands, the browser runs the native drain against the
-wasm edit-host's clipboard *mirror*: a read there answers with whatever the page last
-pushed (on focus or a paste), which can be stale, and a write reaches the page's
-clipboard the way a `"+y` does.
+Both phases are in. In the browser a `btv.clipboard` op reaches `navigator.clipboard`
+through the page, so a read sees a copy made in another app without the mirror having
+been refreshed, and a settled op leaves the mirror holding what it read or wrote (a
+linewise write keeps its flag there, so a `"+p` puts it on its own line). The page's
+answer rides a ring type-11 frame under the SAB transport (the run loop may be parked
+on `Atomics.wait`) and a `clipboard_op_result` message under postMessage.
+`verify-clipboard.mjs` covers both transports and a denied read.
 
 bemtvi-tree's `yank_path` (branch `context-menu-group`) awaits
 `btv.clipboard.write`; its spec has no case for it.

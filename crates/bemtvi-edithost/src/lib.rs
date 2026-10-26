@@ -246,16 +246,25 @@ struct Sink {
     /// caches + registers them with the JS highlighter, and lands the outcome back via
     /// [`eh_ts_install_complete`]. Browser-side fetch, not a native compile.
     ts_requests: Vec<String>,
-    /// The browser clipboard mirror backing the `"+` / `"*` registers. `clipboard_get` is
-    /// the value the UI last pushed in from `navigator.clipboard` ([`eh_clipboard_push`],
-    /// refreshed on focus / paste); a `"+p` reads it. `clipboard_writes` queues each `"+` /
-    /// `"*` yank or delete for the Worker to drain ([`eh_take_clipboard_writes`]) and write
-    /// out to `navigator.clipboard`. Text is stored *verbatim* — linewise-ness rides the
-    /// trailing `\n`, exactly as `bemtvi-server`'s native `SystemClipboard` (pbcopy/pbpaste)
-    /// treats it — so a value agrees whether read back in-editor or after a round trip
-    /// through the OS clipboard. Written by [`WasmClipboard`] (the editor owns it).
-    clipboard_get: Option<String>,
+    /// The browser clipboard mirror backing the `"+` / `"*` registers: the text and whether
+    /// it is linewise. It is the value the UI last pushed in from `navigator.clipboard`
+    /// ([`eh_clipboard_push`], refreshed on focus / paste), the last in-editor `"+` / `"*`
+    /// yank, or the last settled `btv.clipboard` op; a `"+p` reads it. Text is stored
+    /// *verbatim*: a value that came from outside re-derives linewise from a trailing `\n`,
+    /// exactly as `bemtvi-server`'s native `SystemClipboard` (pbcopy/pbpaste) does.
+    /// `clipboard_writes` queues each `"+` / `"*` yank or delete for the Worker to drain
+    /// ([`eh_take_clipboard_writes`]) and write out to `navigator.clipboard`. Written by
+    /// [`WasmClipboard`] (the editor owns it).
+    clipboard_get: Option<(String, bool)>,
     clipboard_writes: Vec<String>,
+    /// `btv.clipboard.read` / `write` ops the editor enqueued this convergence, recorded by
+    /// [`clipboard_op`](HostEffects::clipboard_op). Drained by [`eh_take_clipboard_ops`]; the
+    /// Worker hands each to the page (only it can reach `navigator.clipboard`), which answers
+    /// through [`eh_clipboard_op_result`].
+    clipboard_ops: Vec<(u64, bemtvi_lua::ClipboardOpKind)>,
+    /// The writes among those ops that the page has not answered yet, by callback id: what a
+    /// successful write puts in the mirror ([`clipboard_get`](Sink::clipboard_get)).
+    clipboard_pending_writes: HashMap<u64, (String, bool)>,
     /// Raw LSP [`WireOp`]s the [`SyncLspClient`] produced this convergence (the LSP leg —
     /// Phase 6e): `Spawn` / `Stdin` / `Kill`, moved here by [`WasmEffects::flush_lsp_wire`]
     /// after every client interaction (an outbound `ensure`/`notify`/`request` *or* an
@@ -312,20 +321,14 @@ unsafe impl Send for WasmClipboard {}
 
 impl Clipboard for WasmClipboard {
     fn get(&self) -> Option<(String, bool)> {
-        // Linewise iff the text ends in `\n`, mirroring the native `SystemClipboard` — a
-        // linewise yank kept its trailing newline, so reading it back re-derives the flag.
-        self.sink
-            .borrow()
-            .clipboard_get
-            .as_ref()
-            .map(|text| (text.clone(), text.ends_with('\n')))
+        self.sink.borrow().clipboard_get.clone()
     }
 
-    fn set(&self, text: &str, _linewise: bool) {
+    fn set(&self, text: &str, linewise: bool) {
         // Store verbatim (a linewise yank already carries its `\n`); the UI hands the same
-        // bytes to `navigator.clipboard`, and `get` re-derives linewise from the newline.
+        // bytes to `navigator.clipboard`.
         let mut sink = self.sink.borrow_mut();
-        sink.clipboard_get = Some(text.to_string());
+        sink.clipboard_get = Some((text.to_string(), linewise));
         sink.clipboard_writes.push(text.to_string());
     }
 }
@@ -782,6 +785,18 @@ impl HostEffects for WasmEffects {
         // (unless `local` — `btv.http.fetch_local` — which forces the browser `fetch()`), else
         // the browser's own `fetch()`. The typed result returns via `eh_http_result`.
         self.sink.borrow_mut().http_ops.push((id, request, local));
+    }
+
+    fn clipboard_op(&mut self, id: u64, kind: bemtvi_lua::ClipboardOpKind) {
+        // `btv.clipboard.read` / `write`: record it for the Worker, which hands it to the
+        // page; the page's answer lands via `eh_clipboard_op_result`. A write's text waits
+        // here until then, so only a write the browser accepted reaches the mirror.
+        let mut sink = self.sink.borrow_mut();
+        if let bemtvi_lua::ClipboardOpKind::Write { text, linewise } = &kind {
+            sink.clipboard_pending_writes
+                .insert(id, (text.clone(), *linewise));
+        }
+        sink.clipboard_ops.push((id, kind));
     }
 
     fn http_mount(&mut self, id: u64, name: String) {
@@ -1430,7 +1445,9 @@ pub unsafe extern "C" fn eh_take_watch_requests(h: *mut WasmEditHost) -> *mut c_
     }
     let arm: Vec<serde_json::Value> = std::mem::take(&mut sink.watch_arms)
         .into_iter()
-        .map(|(path, stat)| serde_json::json!({ "path": path, "stat": stat.map(stat_to_wire_json) }))
+        .map(
+            |(path, stat)| serde_json::json!({ "path": path, "stat": stat.map(stat_to_wire_json) }),
+        )
         .collect();
     let disarm: Vec<String> = std::mem::take(&mut sink.watch_disarms);
     into_owned_cstr(serde_json::json!({ "arm": arm, "disarm": disarm }).to_string())
@@ -1445,7 +1462,10 @@ fn stat_to_wire_json(stat: bemtvi_core::FileStat) -> serde_json::Value {
         .mtime
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
     {
-        Some(d) => (serde_json::json!(d.as_secs()), serde_json::json!(d.subsec_nanos())),
+        Some(d) => (
+            serde_json::json!(d.as_secs()),
+            serde_json::json!(d.subsec_nanos()),
+        ),
         None => (serde_json::Value::Null, serde_json::json!(0)),
     };
     serde_json::json!([secs, nanos, stat.size])
@@ -1509,7 +1529,75 @@ pub unsafe extern "C" fn eh_take_clipboard_writes(h: *mut WasmEditHost) -> *mut 
 #[no_mangle]
 pub unsafe extern "C" fn eh_clipboard_push(h: *mut WasmEditHost, text: *const c_char) {
     let handle = host_or!(h);
-    handle.sink.borrow_mut().clipboard_get = Some(as_str(text).to_string());
+    let text = as_str(text).to_string();
+    let linewise = text.ends_with('\n');
+    handle.sink.borrow_mut().clipboard_get = Some((text, linewise));
+}
+
+/// Drain the `btv.clipboard` ops the editor enqueued since the last call, as a JSON array
+/// of `{ id, op: "read" }` / `{ id, op: "write", text }` objects, emptying the queue so each
+/// is forwarded exactly once. The Worker posts each to the page (a Worker has no clipboard
+/// access), which runs `navigator.clipboard.readText` / `writeText` and answers through
+/// [`eh_clipboard_op_result`]. Caller frees with [`eh_free_string`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_take_clipboard_ops(h: *mut WasmEditHost) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr("[]".into());
+    };
+    let ops = std::mem::take(&mut handle.sink.borrow_mut().clipboard_ops);
+    if ops.is_empty() {
+        return into_owned_cstr("[]".into());
+    }
+    let ops: Vec<serde_json::Value> = ops
+        .into_iter()
+        .map(|(id, kind)| match kind {
+            bemtvi_lua::ClipboardOpKind::Read => serde_json::json!({ "id": id, "op": "read" }),
+            bemtvi_lua::ClipboardOpKind::Write { text, .. } => {
+                serde_json::json!({ "id": id, "op": "write", "text": text })
+            }
+        })
+        .collect();
+    into_owned_cstr(serde_json::Value::Array(ops).to_string())
+}
+
+/// Settle the `btv.clipboard` op `id` with the page's answer. `ok` non-zero succeeded: for a
+/// read, `data`/`len` is the clipboard's text as UTF-8 (bytes, not a C string, so a NUL in
+/// copied text survives); for a write it is ignored. Zero failed, with `data` the reason (no
+/// `navigator.clipboard` on an insecure origin, a denied permission). Success also refreshes
+/// the mirror a `"+p` reads: a read stores what it found, a write what it wrote.
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `data` must point to `len` readable
+/// bytes (or be null when `len` is 0).
+#[no_mangle]
+pub unsafe extern "C" fn eh_clipboard_op_result(
+    h: *mut WasmEditHost,
+    id: f64,
+    ok: i32,
+    data: *const u8,
+    len: usize,
+) {
+    let handle = host_or!(h);
+    let id = id.max(0.0) as u64;
+    let text = String::from_utf8_lossy(as_bytes(data, len)).into_owned();
+    let result = {
+        let mut sink = handle.sink.borrow_mut();
+        let write = sink.clipboard_pending_writes.remove(&id);
+        if ok == 0 {
+            Err(text)
+        } else if let Some(written) = write {
+            sink.clipboard_get = Some(written);
+            Ok(None)
+        } else {
+            let linewise = text.ends_with('\n');
+            sink.clipboard_get = Some((text.clone(), linewise));
+            Ok(Some(text))
+        }
+    };
+    handle.host.clipboard_op_result(id, result);
 }
 
 /// Land a finished browser `:TSInstall`: the UI thread fetched + registered the grammar
@@ -2289,7 +2377,12 @@ pub unsafe extern "C" fn eh_take_git_op_requests(h: *mut WasmEditHost) -> *mut c
 /// `h` must come from [`eh_new`] and not yet be freed; `data` must point to `len` readable
 /// bytes (or be null when `len` is 0).
 #[no_mangle]
-pub unsafe extern "C" fn eh_git_op_result(h: *mut WasmEditHost, id: f64, data: *const u8, len: usize) {
+pub unsafe extern "C" fn eh_git_op_result(
+    h: *mut WasmEditHost,
+    id: f64,
+    data: *const u8,
+    len: usize,
+) {
     let handle = host_or!(h);
     let reply = as_byte_vec(data, len);
     handle.host.git_op_result(id.max(0.0) as u64, reply);

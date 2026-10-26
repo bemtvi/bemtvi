@@ -1085,7 +1085,14 @@ impl EditHost {
         // `btv.clipboard.read` / `write`: run against the clipboard provider (the one
         // `"+p` / `"+y` use) and settle each promise. Its reactions are scheduled work,
         // which this pass already drained, so pick them up now rather than next keystroke.
+        // In the browser only the page can reach `navigator.clipboard`, so each op goes
+        // there and settles in `EditHost::clipboard_op_result`.
         let clipboard_ops = self.lua.take_clipboard_ops();
+        #[cfg(not(feature = "native"))]
+        for op in clipboard_ops {
+            self.fx.clipboard_op(op.id, op.kind);
+        }
+        #[cfg(feature = "native")]
         if !clipboard_ops.is_empty() {
             for op in clipboard_ops {
                 let result = match op.kind {

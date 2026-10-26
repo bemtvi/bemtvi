@@ -6,7 +6,9 @@
 // directions through a real (headless Chromium) browser against the actual OS clipboard.
 //
 // Runs over the SAB transport (cross-origin isolated), so it also covers the ring type-8
-// clipboard-push frame and the run loop's drainClipboardWrites convergence.
+// clipboard-push frame and the run loop's drainClipboard convergence. The async Lua API
+// (`btv.clipboard.read` / `write`, answered by the page) runs over both SAB and postMessage,
+// plus a read the browser refuses.
 //
 // Prereqs: ./build.sh (dist/eh.mjs + eh.wasm) and a Chromium for Playwright. Run:
 //   node verify-clipboard.mjs
@@ -92,6 +94,61 @@ async function linesContain(page, want, tries = 50) {
     await sleep(20);
   }
   return last;
+}
+
+// Run `code` in the editor's Lua, returning its `return` value (rendered by rmpv).
+const luaResult = (page, code) =>
+  page.evaluate((c) => window.__bemtvi.execLua(c).then((r) => r.result), code);
+
+// `btv.clipboard` settles on a later pass — poll `_G.<key>` until it's no longer nil.
+async function pollGlobal(page, key, tries = 100) {
+  for (let i = 0; i < tries; i++) {
+    const v = String(await luaResult(page, `return _G.${key}`));
+    if (!v.includes("Nil")) return v;
+    await sleep(30);
+  }
+  return "Nil";
+}
+
+// The `btv.clipboard` read / write round trips, on whichever transport `page` runs.
+async function clipboardApiChecks(page, label) {
+  await page.evaluate(() => navigator.clipboard.writeText(`OTHER-APP-${Math.random()}`));
+  const external = await page.evaluate(() => navigator.clipboard.readText());
+  await luaResult(page, `_G.clip_read = nil
+    btv.clipboard.read():next(function(t) _G.clip_read = "ok:" .. t end,
+      function(e) _G.clip_read = "err:" .. tostring(e) end)`);
+  const read = await pollGlobal(page, "clip_read");
+  check(
+    `[${label}] btv.clipboard.read resolves with a copy made outside, no mirror refresh`,
+    read.includes(`ok:${external}`),
+    `result=${read} want=${external}`,
+  );
+
+  await luaResult(page, `_G.clip_write = nil
+    btv.clipboard.write("LUA-WROTE"):next(function(v) _G.clip_write = "ok:" .. tostring(v) end,
+      function(e) _G.clip_write = "err:" .. tostring(e) end)`);
+  const write = await pollGlobal(page, "clip_write");
+  const onClip = await clipboardEquals(page, "LUA-WROTE");
+  check(
+    `[${label}] btv.clipboard.write settles and puts the text on navigator.clipboard`,
+    write.includes("ok:nil") && onClip === "LUA-WROTE",
+    `result=${write} clipboard=${JSON.stringify(onClip)}`,
+  );
+
+  // A linewise write with no trailing newline: the mirror keeps the flag, so `"+p` puts the
+  // text on a line of its own.
+  await luaResult(page, `_G.clip_lw = nil
+    btv.clipboard.write("LW-LINE", { linewise = true }):next(function() _G.clip_lw = "ok" end,
+      function(e) _G.clip_lw = "err:" .. tostring(e) end)`);
+  const lw = await pollGlobal(page, "clip_lw");
+  await page.evaluate(() => window.__bemtvi.feed("ggdGianchor<Esc>"));
+  await page.evaluate(() => window.__bemtvi.feed('"+p'));
+  const lwLines = await page.evaluate(() => window.__bemtvi.lines());
+  check(
+    `[${label}] a linewise btv.clipboard.write pastes with \"+p on its own line`,
+    lw.includes("ok") && lwLines === "anchor\nLW-LINE",
+    `result=${lw} lines=${JSON.stringify(lwLines)}`,
+  );
 }
 
 try {
@@ -243,6 +300,49 @@ try {
     chordInsert === "[CHORD-COPY]",
     `lines=${JSON.stringify(chordInsert)}`,
   );
+
+  // ── btv.clipboard: the async Lua API, round-tripped through the page ──────────────────────
+  // The mirror is never primed here: `btv.clipboard.read` has to reach navigator.clipboard
+  // itself, so a copy made "in another app" reads back with no refresh / focus dance.
+  await clipboardApiChecks(page, "SAB");
+
+  // ── btv.clipboard over the postMessage transport (5c) ────────────────────────────────────
+  // Strip the isolation headers so the page falls back to postMessage: the op's answer then
+  // arrives as a `clipboard_op_result` message rather than a ring frame.
+  const plain = await browser.newContext();
+  await plain.grantPermissions(["clipboard-read", "clipboard-write"], { origin: ORIGIN });
+  await plain.route("**/*", async (route) => {
+    const resp = await route.fetch();
+    const headers = { ...resp.headers() };
+    delete headers["cross-origin-opener-policy"];
+    delete headers["cross-origin-embedder-policy"];
+    await route.fulfill({ response: resp, headers });
+  });
+  const page5c = await plain.newPage();
+  page5c.on("pageerror", (e) => console.log("  [pageerror 5c]", e.message));
+  await page5c.goto(`${ORIGIN}/web/index.html`);
+  const isolated5c = await page5c.evaluate(() => self.crossOriginIsolated);
+  check("5c page is not cross-origin isolated (postMessage transport)", isolated5c === false, `isolated=${isolated5c}`);
+  await waitReady(page5c);
+  await clipboardApiChecks(page5c, "5c");
+  await plain.close();
+
+  // ── btv.clipboard.read rejects when the browser refuses ──────────────────────────────────
+  const denied = await browser.newContext();
+  await denied.grantPermissions(["clipboard-write"], { origin: ORIGIN }); // no clipboard-read
+  const pageDenied = await denied.newPage();
+  await pageDenied.goto(`${ORIGIN}/web/index.html`);
+  await waitReady(pageDenied);
+  await luaResult(pageDenied, `_G.clip_denied = nil
+    btv.clipboard.read():next(function(t) _G.clip_denied = "resolved:" .. t end,
+      function(e) _G.clip_denied = "rejected:" .. tostring(e) end)`);
+  const deniedRes = await pollGlobal(pageDenied, "clip_denied");
+  check(
+    "btv.clipboard.read rejects, naming the op, when the page may not read the clipboard",
+    deniedRes.includes("rejected:btv.clipboard.read:"),
+    `result=${deniedRes}`,
+  );
+  await denied.close();
 
   await browser.close();
 } finally {

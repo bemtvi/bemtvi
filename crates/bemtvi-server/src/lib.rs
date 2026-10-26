@@ -3326,6 +3326,24 @@ impl EditHost {
         self.settle_events(true);
     }
 
+    /// Settle a `btv.clipboard.read` / `write` with the page's answer — the wasm twin of the
+    /// native drain in `apply_lua_effects`. `result` is `Ok(Some(text))` for a read,
+    /// `Ok(None)` for a write, `Err(message)` when the browser had no clipboard for the page
+    /// or refused it. The caller has already refreshed the `"+` / `"*` mirror.
+    #[cfg(not(feature = "native"))]
+    pub fn clipboard_op_result(&mut self, id: u64, result: Result<Option<String>, String>) {
+        if let Err(e) = self.lua.run_callback(
+            id,
+            false,
+            bemtvi_lua::CallbackArgs::ClipboardResult { result },
+        ) {
+            self.editor
+                .echo(format!("E5108: Error in btv.clipboard callback: {e}"));
+        }
+        self.apply_lua_effects();
+        self.settle_events(true);
+    }
+
     /// Run one Service-Worker-intercepted request through its mount's handler — the wasm twin
     /// of the native listener's axum handler, and the browser's entry into the *same*
     /// `HttpServerRequest` contract.

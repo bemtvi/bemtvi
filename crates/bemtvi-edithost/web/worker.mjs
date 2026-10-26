@@ -160,6 +160,11 @@ const eh_set_platform = M.cwrap("eh_set_platform", null, ["number", "string"]);
 // `eh_clipboard_push` so a `"+p` sees an external copy.
 const eh_take_clipboard_writes = M.cwrap("eh_take_clipboard_writes", "number", ["number"]);
 const eh_clipboard_push = M.cwrap("eh_clipboard_push", null, ["number", "string"]);
+// `btv.clipboard.read` / `write`: the editor enqueues each op; the Worker hands it to the UI
+// thread, which runs it against `navigator.clipboard` and answers `clipboard_op_result` (a
+// ring type-11 frame under SAB, a message under 5c), landing via `eh_clipboard_op_result`.
+const eh_take_clipboard_ops = M.cwrap("eh_take_clipboard_ops", "number", ["number"]);
+const eh_clipboard_op_result = M.cwrap("eh_clipboard_op_result", null, ["number", "number", "number", "number", "number"]);
 // Persistence (shada): the editor's cross-session snapshot ↔ a JSON blob the Worker keeps
 // in OPFS. `eh_export_shada(include_exit)` serializes it; `eh_load_shada(json)` restores it.
 const eh_export_shada = M.cwrap("eh_export_shada", "number", ["number", "number"]);
@@ -2093,9 +2098,26 @@ function drainTsRequests() {
 // Forward any `"+`/`"*` yanks/deletes the tick enqueued to the UI thread, which writes the
 // text to `navigator.clipboard` (a Worker has no clipboard access). Fire-and-forget, exactly
 // like `drainTsRequests` — the editor already painted the yank, so no extra repaint here.
-function drainClipboardWrites() {
+// Also forwards the `btv.clipboard` ops, whose answers come back as `clipboard_op_result`.
+function drainClipboard() {
   const writes = JSON.parse(readStr(eh_take_clipboard_writes(h)));
   for (const text of writes) postMessage({ type: "clipboard_write", text });
+  const ops = JSON.parse(readStr(eh_take_clipboard_ops(h)));
+  for (const op of ops) postMessage({ type: "clipboard_op", id: op.id, op: op.op, text: op.text });
+}
+
+// Land the UI's answer to a `btv.clipboard` op (`{ id, ok, text }` — the read's text, or the
+// reason it failed) into the tick, which settles the op's promise and refreshes the mirror.
+// The text crosses as UTF-8 bytes so a NUL in copied text survives.
+function landClipboardOpResult(r) {
+  const bytes = new TextEncoder().encode(String(r.text ?? ""));
+  const ptr = bytes.length ? M._malloc(bytes.length) : 0;
+  if (ptr) M.HEAPU8.set(bytes, ptr);
+  try {
+    eh_clipboard_op_result(h, Number(r.id), r.ok ? 1 : 0, ptr, bytes.length);
+  } finally {
+    if (ptr) M._free(ptr);
+  }
 }
 
 // 5c (postMessage, no run loop): apply a push + fulfil any reload re-fetch + repaint inline.
@@ -2258,7 +2280,8 @@ async function maybeCheckpoint5c() {
 //   2 = attach (payload = cols:u32, rows:u32),
 //   3 = mouse (payload = JSON {b:button, a:action, m:modifier, r:row, c:col}),
 //   9 = btv-http-request (payload = JSON, a Service Worker request for an btv.http.mount),
-//   10 = http_mount_result (payload = JSON, the window's answer to a mount publication).
+//   10 = http_mount_result (payload = JSON, the window's answer to a mount publication),
+//   11 = clipboard_op_result (payload = JSON, the window's answer to a `btv.clipboard` op).
 //
 // 9/10 ride the ring rather than postMessage for the reason the ring exists at all: this loop
 // PARKS on `Atomics.wait`, which blocks the Worker's event loop, so a postMessage would sit
@@ -2281,6 +2304,7 @@ async function runLoopSAB(ctrl, data) {
     const acks = [];
     const results = [];
     let tsLanded = false;
+    let clipboardLanded = false;
     let rp = Atomics.load(ctrl, READ) >>> 0;
     const wp = Atomics.load(ctrl, WRITE) >>> 0;
     while (rp !== wp) {
@@ -2344,11 +2368,18 @@ async function runLoopSAB(ctrl, data) {
         const r = JSON.parse(utf8(payload));
         eh_http_mount_result(h, r.id, r.ok ? 1 : 0, String(r.text || ""));
         continue;
+      } else if (type === 11) {
+        // clipboard_op_result: the window ran a `btv.clipboard` op against
+        // `navigator.clipboard`. Settles the plugin's promise; its reaction may touch the
+        // editor, so it earns a repaint, but no ack (it is not a user request).
+        landClipboardOpResult(JSON.parse(utf8(payload)));
+        clipboardLanded = true;
+        continue;
       }
       acks.push(reqId);
     }
     Atomics.store(ctrl, READ, rp);
-    return { acks, results, tsLanded };
+    return { acks, results, tsLanded: tsLanded || clipboardLanded };
   }
 
   // Initial paint (the attach the UI requested rode in as the first frame, but paint a
@@ -2425,7 +2456,7 @@ async function runLoopSAB(ctrl, data) {
     // Forward any `:TSInstall` the tick enqueued to the UI thread (fire-and-forget).
     drainTsRequests();
     // Forward any `"+`/`"*` yanks/deletes to the UI thread to write to navigator.clipboard.
-    drainClipboardWrites();
+    drainClipboard();
     if (fired || acks.length || fsWork || fsOpWork || gitOpWork || httpWork || mountWork || notified || tsLanded || termFlushed) {
       postMessage(redrawMsg({ acks, results }));
     }
@@ -2611,6 +2642,26 @@ onmessage = async (ev) => {
     eh_clipboard_push(h, String(msg.text ?? ""));
     return;
   }
+  // A `btv.clipboard` op's answer (5c; SAB routes it via a ring type-11 frame in `drain()`).
+  // Settle the promise, then forward whatever its reaction queued and repaint.
+  if (msg.type === "clipboard_op_result") {
+    landClipboardOpResult(JSON.parse(String(msg.json ?? "{}")));
+    await fulfillFsRequests();
+    await drainFsOpRequests();
+    await drainHttpRequests();
+    await drainWatchRequests();
+    await drainFsWatchRequests();
+    await drainProcRequests();
+    await drainTerminalRequests();
+    await drainLspRequests();
+    await drainDprocRequests();
+    await drainSockRequests();
+    drainTsRequests();
+    drainClipboard();
+    postMessage(redrawMsg({ acks: [], results: [] }));
+    await maybeCheckpoint5c();
+    return;
+  }
   // `btv.http.mount` (5c; SAB routes these as ring type-9 / type-10 frames in `drain()`).
   // Under 5c the loop never parks, so a plain message is delivered fine.
   if (msg.type === "btv_http_request") {
@@ -2667,7 +2718,7 @@ onmessage = async (ev) => {
       await drainDprocRequests();
       await drainSockRequests();
       drainTsRequests();
-      drainClipboardWrites();
+      drainClipboard();
       postFrame(msg.id);
       await maybeCheckpoint5c();
       break;
@@ -2686,7 +2737,7 @@ onmessage = async (ev) => {
       await drainDprocRequests();
       await drainSockRequests();
       drainTsRequests();
-      drainClipboardWrites();
+      drainClipboard();
       postFrame(msg.id);
       await maybeCheckpoint5c();
       break;
@@ -2703,7 +2754,7 @@ onmessage = async (ev) => {
       await drainDprocRequests();
       await drainSockRequests();
       drainTsRequests();
-      drainClipboardWrites();
+      drainClipboard();
       postFrame(msg.id, result);
       await maybeCheckpoint5c();
       break;

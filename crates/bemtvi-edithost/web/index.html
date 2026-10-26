@@ -1000,6 +1000,32 @@
       else worker.postMessage({ type: "clipboard_push", text });
     }
 
+    // Answer the Worker's `btv.clipboard` op — a ring type-11 frame under SAB (the run loop
+    // may be parked on `Atomics.wait`, and only the ring's SEQ bump wakes it), a message
+    // under 5c. `text` is the read's text, or why the op failed.
+    function clipboardOpResultOp(id, ok, text) {
+      const json = JSON.stringify({ id, ok, text });
+      if (useSAB) pushFrame(11, enc(json));
+      else worker.postMessage({ type: "clipboard_op_result", json });
+    }
+    // Run a `btv.clipboard` op against `navigator.clipboard` (Window-only and async, so it
+    // happens here). Every failure rejects the plugin's promise with a reason.
+    async function runClipboardOp(msg) {
+      const clip = navigator.clipboard;
+      try {
+        if (msg.op === "read") {
+          if (!clip?.readText) throw new Error("the browser gives this page no clipboard to read (it needs https:// or localhost)");
+          clipboardOpResultOp(msg.id, true, await clip.readText());
+        } else {
+          if (!clip?.writeText) throw new Error("the browser gives this page no clipboard to write (it needs https:// or localhost)");
+          await clip.writeText(String(msg.text ?? ""));
+          clipboardOpResultOp(msg.id, true, "");
+        }
+      } catch (e) {
+        clipboardOpResultOp(msg.id, false, `btv.clipboard.${msg.op}: ${(e && e.message) || e}`);
+      }
+    }
+
     // ---- btv.http.mount: the Service Worker relay ---------------------------
     //
     // A tab cannot bind a port, so where the native build runs a listener the web build runs
@@ -1212,6 +1238,11 @@
       // reach `navigator.clipboard`). Best-effort: a denied write is a no-op, not a crash.
       if (msg.type === "clipboard_write") {
         if (navigator.clipboard?.writeText) navigator.clipboard.writeText(msg.text).catch(() => {});
+        return;
+      }
+      // A `btv.clipboard.read` / `write` — run it and answer, settling the plugin's promise.
+      if (msg.type === "clipboard_op") {
+        runClipboardOp(msg);
         return;
       }
       // A runtime `:connect bemtvi://…` finished dialing — flash the outcome (the fs/watch seam

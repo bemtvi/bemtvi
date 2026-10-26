@@ -219,6 +219,16 @@ pub trait HostEffects {
     #[cfg(not(feature = "native"))]
     fn http_op(&mut self, id: u64, request: bemtvi_lua::HttpRequest, local: bool);
 
+    /// `btv.clipboard.read` / `write` (`btv._clipboard_op`) — the wasm twin of the native
+    /// drain, which runs the op against the editor's clipboard provider inside the tick. A
+    /// Worker has no clipboard access and the page's `navigator.clipboard` is async, so the
+    /// op goes to the page and its answer returns *inbound* via
+    /// [`EditHost::clipboard_op_result`](crate::EditHost::clipboard_op_result), which settles
+    /// the promise. No host gate: the page always answers, rejecting when the browser has no
+    /// clipboard for it or denies the read.
+    #[cfg(not(feature = "native"))]
+    fn clipboard_op(&mut self, id: u64, kind: bemtvi_lua::ClipboardOpKind);
+
     /// `btv.http.mount` — publish a plugin's subroute, the wasm twin of the native
     /// `loop_command(LoopCommand::HttpMount)`. A tab cannot bind a TCP port, so there is no
     /// listener here: the Worker registers a **Service Worker** that intercepts `fetch` for

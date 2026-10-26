@@ -68,5 +68,5 @@ answer rides a ring type-11 frame under the SAB transport (the run loop may be p
 on `Atomics.wait`) and a `clipboard_op_result` message under postMessage.
 `verify-clipboard.mjs` covers both transports and a denied read.
 
-bemtvi-tree's `yank_path` (branch `context-menu-group`) awaits
-`btv.clipboard.write`; its spec has no case for it.
+bemtvi-tree's `yank_path` awaits `btv.clipboard.write` (bemtvi-tree `18f5339`), and
+its spec has a case that presses `y` and checks the clipboard.

@@ -2365,11 +2365,12 @@ impl Editor {
     fn wheel_scroll_vertical(&mut self, win: WindowId, delta: i64) {
         let last = self.window_last_line(win);
         let th = self.window_text_height(win);
+        let max_top = self.wheel_max_top(win, th);
         if win == self.current_window_id() {
             let old_top = self.top;
             // A down-notch never steps back *up*: from a `top` already past the limit
             // (a `zt` at the buffer's end, say) the scroll just stops.
-            let limit = self.max_scroll_top(th).max(old_top) as i64;
+            let limit = max_top.max(old_top) as i64;
             let new_top = (old_top as i64 + delta).clamp(0, limit) as usize;
             if new_top == old_top {
                 return;
@@ -2397,7 +2398,7 @@ impl Editor {
             let w = tree.get_mut(win);
             let so = super::cursor::scroll_margin(w.options.scrolloff, th);
             let old_top = w.saved_top;
-            let limit = last.saturating_sub(so).max(old_top) as i64;
+            let limit = max_top.max(old_top) as i64;
             let new_top = (old_top as i64 + delta).clamp(0, limit) as usize;
             if new_top == old_top {
                 return;
@@ -2416,6 +2417,19 @@ impl Editor {
                 w.saved_cursor.line = bottom.min(last);
             }
         }
+    }
+
+    /// The deepest `top` the wheel scrolls window `win`, `th` text rows tall, to: the
+    /// focused window's [`max_scroll_top`](Self::max_scroll_top), and for another the
+    /// last line less its `'scrolloff'` (its layout isn't the live one to measure).
+    pub(crate) fn wheel_max_top(&self, win: WindowId, th: usize) -> usize {
+        if win == self.current_window_id() {
+            return self.max_scroll_top(th);
+        }
+        let so = self.tree_of_window(win).map_or(0, |(_, t)| {
+            super::cursor::scroll_margin(t.get(win).options.scrolloff, th)
+        });
+        self.window_last_line(win).saturating_sub(so)
     }
 
     /// Scroll window `win` horizontally by `delta` columns (negative = left),

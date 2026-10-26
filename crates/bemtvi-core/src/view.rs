@@ -1211,19 +1211,24 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
             || (!wrap && (cursor_screen_col < w.leftcol || cursor_screen_col >= w.leftcol + width))
     };
 
-    // The scroll markers: the lines the rows show (a closed fold counts every line
-    // it hides), and sideways, the widest line in view, which is as far as the
-    // wheel can scroll.
+    // The scroll markers. Down the side, a page of the window's rows over the range
+    // the wheel scrolls `top` through, so the thumb keeps one size wherever the view
+    // is: counting the lines on screen instead shrank it on wrapped lines and past
+    // the buffer's end. A buffer that fits whole from the top has nothing to scroll
+    // to. Sideways, the widest line in view, which is as far as the wheel can scroll.
     let scrollbars = (ed.options.modeless && !w.floating).then(|| {
-        let last = rows
-            .iter()
-            .filter_map(|r| r.line())
-            .max()
-            .map(|l| collapsed.iter().find(|f| f.start == l).map_or(l, |f| f.end));
+        let max_top = ed.wheel_max_top(w.id, height).max(top);
+        let fits = top == 0
+            && rows
+                .iter()
+                .filter_map(|r| r.line())
+                .max()
+                .map(|l| collapsed.iter().find(|f| f.start == l).map_or(l, |f| f.end))
+                .is_some_and(|l| l + 1 >= line_count);
         let vertical = ScrollSpan {
             start: top,
-            shown: last.map_or(0, |l| l + 1 - top.min(l)),
-            total: line_count,
+            shown: height,
+            total: if fits { height } else { max_top + height },
         };
         let horizontal = (!wrap).then(|| ScrollSpan {
             start: w.leftcol,

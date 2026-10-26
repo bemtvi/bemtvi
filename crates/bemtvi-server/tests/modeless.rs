@@ -1667,10 +1667,11 @@ async fn the_markers_say_where_the_view_is_in_the_buffer() {
     let rows = text_rows(&rpc).await;
     let map = redraw_after(&rpc, &mut inc, "").await;
     let (v, h) = scrollbars(&map).expect("markers in a modeless session");
+    // The wheel walks the last line up to the top row: 199 tops, then a page.
     assert_eq!(
         v,
-        vec![top - 1, rows, 200],
-        "from the top line, a screenful of 200"
+        vec![top - 1, rows, 199 + rows],
+        "from the top line, a page of the range the wheel scrolls"
     );
     let (_, h) = (v, h.expect("a sideways span under 'nowrap'"));
     assert!(
@@ -1700,8 +1701,7 @@ async fn a_wrapped_window_has_no_sideways_marker() {
     command(&rpc, "set wrap").await;
     let map = redraw_after(&rpc, &mut inc, "").await;
     let (v, h) = scrollbars(&map).expect("markers");
-    assert_eq!(v[0], 0);
-    assert!(v[1] < 22, "a wrapped line takes several rows: {v:?}");
+    assert_eq!(v[..2], [0, text_rows(&rpc).await]);
     assert_eq!(h, None);
 }
 
@@ -1716,12 +1716,66 @@ async fn vim_mode_has_no_markers() {
 #[tokio::test]
 async fn a_closed_fold_counts_every_line_it_hides() {
     let (rpc, mut inc) = start_long(200).await;
-    // A fold of 50 lines on the last row on screen.
+    // A fold on the last row on screen, hiding the rest of the buffer.
     let rows = text_rows(&rpc).await;
-    exec_lua(&rpc, &format!("btv.cmd('normal! {rows}Gzf49jgg')")).await;
+    exec_lua(&rpc, &format!("btv.cmd('normal! {rows}GzfGgg')")).await;
     let map = redraw_after(&rpc, &mut inc, "").await;
     let (v, _) = scrollbars(&map).expect("markers");
-    assert_eq!(v, vec![0, rows - 1 + 50, 200]);
+    assert_eq!(v, vec![0, rows, rows], "the whole buffer is in view");
+}
+
+/// The focused window's vertical span after the wheel scrolled `notches` down.
+async fn vertical_after_wheel(
+    rpc: &Rpc,
+    inc: &mut UnboundedReceiver<Incoming>,
+    notches: usize,
+) -> Vec<u64> {
+    wheel_down(rpc, notches);
+    let map = redraw_after(rpc, inc, "").await;
+    scrollbars(&map).expect("markers").0
+}
+
+#[tokio::test]
+async fn the_thumb_keeps_its_size_down_to_the_end_of_the_buffer() {
+    let (rpc, mut inc) = start_long(200).await;
+    let first = vertical_after_wheel(&rpc, &mut inc, 1).await;
+    // Far enough to walk the last line up the window, past the buffer's end.
+    let last = vertical_after_wheel(&rpc, &mut inc, 100).await;
+    assert_eq!(
+        (last[1], last[2]),
+        (first[1], first[2]),
+        "a page of the same length: {first:?} then {last:?}"
+    );
+    assert_eq!(
+        last[0] + last[1],
+        last[2],
+        "at the end of the track: {last:?}"
+    );
+}
+
+#[tokio::test]
+async fn wrapped_lines_do_not_resize_the_thumb() {
+    // Every other line wraps onto a few rows.
+    let text: String = (0..200)
+        .map(|i| {
+            if i % 2 == 0 {
+                format!("{i}\n")
+            } else {
+                format!("{i}{}\n", "x".repeat(200))
+            }
+        })
+        .collect();
+    let (rpc, mut inc) = start_modeless(&text).await;
+    command(&rpc, "set nonumber norelativenumber wrap").await;
+    let mut spans = Vec::new();
+    for _ in 0..4 {
+        spans.push(vertical_after_wheel(&rpc, &mut inc, 1).await);
+    }
+    let sizes: Vec<_> = spans.iter().map(|s| (s[1], s[2])).collect();
+    assert!(
+        sizes.windows(2).all(|w| w[0] == w[1]),
+        "one size throughout: {spans:?}"
+    );
 }
 
 // ===== Leaving and coming back keeps the caret and the selection ==============

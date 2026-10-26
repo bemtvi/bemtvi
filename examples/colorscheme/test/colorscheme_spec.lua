@@ -78,6 +78,35 @@ btv.test.describe("examples/colorscheme", function()
     btv.test.expect(hl("Normal").bg).to_be(0x282c34)
   end)
 
+  -- ":colorscheme habamax  -> a ported neovim scheme: grey on near-black"
+  btv.test.it("try-it — :colorscheme habamax loads a ported neovim scheme", function(t)
+    open(t)
+    t:cmd("colorscheme habamax")
+    btv.test.expect(btv.g.colors_name).to_be("habamax")
+    btv.test.expect(hl("Normal").bg).to_be(0x1c1c1c)
+    btv.test.expect(hl("Normal").fg).to_be(0xc7c7c7)
+  end)
+
+  -- ":colorscheme neovim   -> neovim's own theme, dark"
+  -- ":set background=light -> `neovim` reloads into its light variant"
+  btv.test.it("try-it — neovim follows :set background", function(t)
+    open(t)
+    t:cmd("colorscheme neovim")
+    btv.test.expect(hl("Normal").bg).to_be(0x14161b)
+    t:cmd("set background=light")
+    btv.test.expect(btv.g.colors_name).to_be("neovim")
+    btv.test.expect(hl("Normal").bg).to_be(0xe0e2ea)
+  end)
+
+  -- ":colorscheme default  -> the same as :colorscheme bemtvi"
+  btv.test.it("try-it — default is bemtvi", function(t)
+    open(t)
+    t:cmd("colorscheme habamax")
+    t:cmd("colorscheme default")
+    btv.test.expect(btv.g.colors_name).to_be("bemtvi")
+    btv.test.expect(hl("Normal").bg).to_be(0x1e1e24)
+  end)
+
   -- "Your config still wins: set `vim.cmd.colorscheme('...')` and that scheme is
   --  used instead, never overridden."
   btv.test.it("a config's own choice is what stands", function(t)

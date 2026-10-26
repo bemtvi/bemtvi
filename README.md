@@ -722,5 +722,11 @@ I can have a better quality control this way.
 
 [Apache License 2.0](LICENSE).
 
+The colorschemes ported from neovim (`crates/bemtvi-server/runtime/colors/`, all
+but `bemtvi` and `neutral`) keep their authors' licences, mostly the Vim license;
+see that directory's [README](crates/bemtvi-server/runtime/colors/README.md) for
+credits and [LICENSE.txt](crates/bemtvi-server/runtime/colors/LICENSE.txt) for
+the licence text.
+
 `vendor/neovim` is a git submodule kept purely as a behavioral/source-layout
 reference — it is never built or linked, and is not needed to build bemtvi.

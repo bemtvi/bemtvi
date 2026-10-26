@@ -64,7 +64,12 @@ press the key or run the command that triggers them.
 
 The colours need no plugin. bemtvi's own colorscheme, `bemtvi`, is built in and loads by
 default in the GUI, the browser and any truecolor terminal; `:colorscheme neutral` switches
-to the bundled One Dark, and any scheme a plugin installs is a `:colorscheme` away.
+to the bundled One Dark. Every scheme neovim ships is built in too, ported to bemtvi:
+`habamax`, `retrobox`, `sorbet`, `catppuccin`, `lunaperche`, `morning` and the rest, plus
+neovim's own theme as `neovim` and vim's as `vim` (`:colorscheme <Tab>` lists them).
+`:colorscheme default` is the same as `:colorscheme bemtvi`. Their authors are credited in
+[`runtime/colors/README.md`](https://github.com/bemtvi/bemtvi/blob/main/crates/bemtvi-server/runtime/colors/README.md).
+Any scheme a plugin installs is a `:colorscheme` away as well.
 
 **[bemtvi-line](https://github.com/bemtvi/bemtvi-line)** — configure it the way you'd
 configure `lualine.nvim`: sections `a`–`z`, a component library (mode, branch, diff,

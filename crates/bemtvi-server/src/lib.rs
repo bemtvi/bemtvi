@@ -1995,8 +1995,10 @@ impl EditHost {
         // `:colorscheme <Tab>` offers the binary's bundled schemes: the embedded
         // `runtime/colors/` tree is not on the runtimepath, so the completer's
         // `colors/*.lua` glob cannot discover them.
+        // The aliases (`default`) are offered too.
         let builtin_schemes: Vec<String> = crate::excmd::BUILTIN_COLORSCHEMES
             .iter()
+            .chain(crate::excmd::BUILTIN_COLORSCHEME_ALIASES)
             .map(|(name, _)| name.to_string())
             .collect();
         lua.set_builtin_colorschemes(&builtin_schemes)

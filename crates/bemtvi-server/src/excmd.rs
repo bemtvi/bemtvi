@@ -711,8 +711,18 @@ impl EditHost {
         }
         // A `colors/<name>.lua` on the runtimepath wins (so a user can shadow a
         // bundled scheme); otherwise fall back to a scheme embedded in the
-        // binary, so `:colorscheme bemtvi` works with zero config.
-        let src = match self.find_runtime_file(&format!("colors/{name}.lua")) {
+        // binary, so `:colorscheme bemtvi` works with zero config. An alias with
+        // no file of its own is exactly `:colorscheme <scheme>`.
+        let runtime_file = self.find_runtime_file(&format!("colors/{name}.lua"));
+        if runtime_file.is_none() {
+            if let Some((_, scheme)) = BUILTIN_COLORSCHEME_ALIASES
+                .iter()
+                .find(|(alias, _)| *alias == name)
+            {
+                return self.set_colorscheme(scheme);
+            }
+        }
+        let src = match runtime_file {
             Some(path) => match std::fs::read_to_string(&path) {
                 Ok(src) => src,
                 Err(e) => {
@@ -856,16 +866,64 @@ impl EditHost {
     }
 }
 
+/// `(name, source)` for the bundled scheme `runtime/colors/<name>.lua`.
+macro_rules! scheme {
+    ($name:literal) => {
+        (
+            $name,
+            include_str!(concat!("../runtime/colors/", $name, ".lua")),
+        )
+    };
+}
+
 /// The color schemes bundled in the binary: `(name, Lua source)`, with the source
 /// embedded from the `runtime/colors/` tree. The single source of truth for both
 /// [`builtin_colorscheme`] (loads one) and the `:colorscheme` completion catalog
 /// (the server hands the names to Lua as `btv._builtin_colorschemes`) — add a scheme
 /// here and both pick it up. They ship embedded so `:colorscheme <name>` works with
 /// no user config (and on the wasm build, which has no filesystem).
+///
+/// After bemtvi's own two come neovim's bundled schemes, ported by
+/// `scripts/gen-nvim-colorschemes.py` (credits in `runtime/colors/README.md`).
 pub(crate) const BUILTIN_COLORSCHEMES: &[(&str, &str)] = &[
-    ("bemtvi", include_str!("../runtime/colors/bemtvi.lua")),
-    ("neutral", include_str!("../runtime/colors/neutral.lua")),
+    scheme!("bemtvi"),
+    scheme!("neutral"),
+    scheme!("blue"),
+    scheme!("catppuccin"),
+    scheme!("darkblue"),
+    scheme!("delek"),
+    scheme!("desert"),
+    scheme!("elflord"),
+    scheme!("evening"),
+    scheme!("habamax"),
+    scheme!("industry"),
+    scheme!("koehler"),
+    scheme!("lunaperche"),
+    scheme!("morning"),
+    scheme!("murphy"),
+    scheme!("neovim"),
+    scheme!("pablo"),
+    scheme!("peachpuff"),
+    scheme!("quiet"),
+    scheme!("retrobox"),
+    scheme!("ron"),
+    scheme!("shine"),
+    scheme!("slate"),
+    scheme!("sorbet"),
+    scheme!("torte"),
+    scheme!("unokai"),
+    scheme!("vim"),
+    scheme!("wildcharm"),
+    scheme!("zaibatsu"),
+    scheme!("zellner"),
 ];
+
+/// Other names for bundled schemes: `(alias, scheme)`. `:colorscheme default`
+/// loads bemtvi's own scheme, the one every client starts on (neovim's own
+/// theme, which neovim calls `default`, is `neovim` here). An alias loads under
+/// the scheme's name, so `g:colors_name` reads `bemtvi`. A `colors/<alias>.lua`
+/// on the runtimepath still wins, like any other bundled name.
+pub(crate) const BUILTIN_COLORSCHEME_ALIASES: &[(&str, &str)] = &[("default", "bemtvi")];
 
 /// The Lua source of a colorscheme bundled in the binary, by name, or `None`
 /// for an unknown name. A user file on the runtimepath shadows these — the

@@ -92,6 +92,8 @@ mod marks;
 mod multicursor;
 #[path = "editing/numbers.rs"]
 mod numbers;
+#[path = "editing/nvim_colorschemes.rs"]
+mod nvim_colorschemes;
 #[path = "editing/padding.rs"]
 mod padding;
 #[path = "editing/paste.rs"]

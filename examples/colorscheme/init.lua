@@ -30,13 +30,21 @@
 -- on a fresh install. A user `colors/bemtvi.lua` on the runtimepath still wins,
 -- so you can fork the palette by dropping your own file there.
 --
--- A second scheme ships alongside it: `neutral`, a One Dark palette.
+-- A second scheme ships alongside it: `neutral`, a One Dark palette. So do all of
+-- neovim's bundled schemes (habamax, retrobox, sorbet, catppuccin, morning, …,
+-- plus neovim's own theme as `neovim` and vim's as `vim`), ported to bemtvi; their authors
+-- are credited in crates/bemtvi-server/runtime/colors/README.md.
 --
 -- TRY IT interactively:
 --   :colorscheme bemtvi        load it live
 --   :hi clear                 strip it back to the terminal's own colors
 --   :colorscheme bemtvi        bring it back
 --   :colorscheme neutral       switch to the bundled One Dark scheme
+--   :colorscheme <Tab>         list every bundled scheme
+--   :colorscheme habamax       a ported neovim scheme: grey on near-black
+--   :colorscheme neovim        neovim's own theme, dark
+--   :set background=light      `neovim` reloads into its light variant
+--   :colorscheme default       the same as :colorscheme bemtvi
 --
 -- The scheme needs a treesitter grammar installed to light up syntax; install
 -- the Rust parser once with `:TSInstall rust` (see examples/ts-install) so the

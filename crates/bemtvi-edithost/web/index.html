@@ -3868,13 +3868,12 @@
       if (button === "left") { dragBtn = "left"; lastDragCell = { row, col }; }
       mouseOp(button, "press", mods(e), row, col);
     });
-    // Cell of the last hover reported over an open editor-level menu (a context menu at
-    // the pointer, a picker), so the row under the pointer lights with one `move` per
-    // cell. Nothing is sent while no such menu is open. Mirrors bemtvi-gui's
-    // `mouse_hover`.
+    // Cell of the last hover reported over an open context menu at the pointer, so the
+    // row under the pointer lights with one `move` per cell. Nothing is sent while no
+    // such menu is open. Mirrors bemtvi-gui's `mouse_hover`.
     let lastHoverCell = null;
     function hover(e) {
-      if (!(view && view.menu && view.menu.editor_relative)) { lastHoverCell = null; return; }
+      if (!(view && view.menu && view.menu.pointer)) { lastHoverCell = null; return; }
       const { row, col } = cellAt(e);
       if (lastHoverCell && lastHoverCell.row === row && lastHoverCell.col === col) return;
       lastHoverCell = { row, col };

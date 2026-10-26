@@ -2206,7 +2206,8 @@ pub struct UiSelectReq {
     pub disabled: Vec<bool>,
     pub separators: Vec<bool>,
     /// Where the list opens: `"cursor"` (under the text cursor, the default) or
-    /// `"mouse"` (at the last mouse cell, the context-menu shape).
+    /// `"mouse"` (at the last mouse cell, the context-menu shape; the text cursor once a
+    /// key has come after that click).
     pub anchor: String,
 }
 

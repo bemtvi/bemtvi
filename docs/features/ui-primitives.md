@@ -254,8 +254,8 @@ btv.ui.confirm("Quit without saving?", { default = false })
   an aligned column on the right, a row with `enabled = false` greys out, and
   `{ separator = true }` draws a rule. Keys and clicks skip the rows that can't be
   chosen. The promise resolves to the chosen entry itself, so extra fields (an
-  `action`) come back with it. `anchor = "mouse"` opens it at the pointer, where it
-  acts like a GUI menu: one click chooses, hovering highlights, a click or
+  `action`) come back with it. `anchor = "mouse"` opens it at the pointer (at the text
+  cursor when a key came after the last click), where it acts like a GUI menu: one click chooses, hovering highlights, a click or
   right-click off it dismisses it. The right-click menu itself is built on it:
   to add rows there, register a group with [`btv.contextmenu`](context-menu.md)
   rather than opening a second menu.

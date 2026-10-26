@@ -1624,6 +1624,13 @@ pub struct Editor {
     /// `None` before any mouse event. See [`crate::editor::mouse`].
     last_mouse: Option<(usize, usize)>,
 
+    /// Whether the user's latest input was a mouse gesture rather than a key: set
+    /// with [`last_mouse`](Self::last_mouse), cleared by
+    /// [`note_key_input`](Self::note_key_input). A menu asked to open at the pointer
+    /// only does so while it holds, so one opened from a key after an old click sits at
+    /// the text cursor, not at that click.
+    pointer_is_latest: bool,
+
     /// Set by the `popup` / `popup_setpos` right-click default once it has placed the
     /// caret: the session wants its context menu. The server drains it
     /// ([`take_popup_request`](Self::take_popup_request)) and fires `MenuPopup`, whose
@@ -2434,6 +2441,7 @@ impl Editor {
             mouse_resize: None,
             mouse_dragging: false,
             last_mouse: None,
+            pointer_is_latest: false,
             popup_request: false,
             mouse_button_seq: None,
             mouse_wheels: Vec::new(),

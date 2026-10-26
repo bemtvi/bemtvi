@@ -838,6 +838,11 @@ pub struct MenuData {
     /// cursor-anchored completion popup / `btv.ui.select`. Mirrors
     /// [`ContentFloatData::editor_relative`].
     pub editor_relative: bool,
+    /// Whether this is a context menu at the pointer (`btv.ui.menu { anchor = "mouse" }`),
+    /// which tracks the pointer like a GUI menu: a client reports pointer moves over the
+    /// screen only while one is open, so the row under it lights. `false` (key absent)
+    /// for every other menu.
+    pub pointer: bool,
     /// Per visible row (parallel to `items`), the matched-character spans to
     /// highlight as half-open **char** ranges (empty for rows with no match).
     pub match_spans: Vec<Vec<(u16, u16)>>,
@@ -1220,6 +1225,7 @@ impl View {
                 cmdline: map_get(m, "cmdline").and_then(Value::as_bool) == Some(true),
                 editor_relative: map_get(m, "editor_relative").and_then(Value::as_bool)
                     == Some(true),
+                pointer: map_get(m, "pointer").and_then(Value::as_bool) == Some(true),
                 match_spans: parse_multi_spans(map_get(m, "match_spans")),
                 layouts: match map_get(m, "layouts") {
                     Some(Value::Array(a)) => a.iter().map(parse_triple).collect(),

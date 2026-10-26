@@ -108,7 +108,8 @@ end
 -- opts:
 --   * `anchor` — `"cursor"` (default) opens the list under the text cursor;
 --     `"mouse"` opens it at the last mouse cell, the shape for a `MenuPopup`
---     handler. At the pointer it behaves like a GUI menu: one click chooses a row,
+--     handler (under the text cursor instead when a key came after that click).
+--     At the pointer it behaves like a GUI menu: one click chooses a row,
 --     the pointer hovering a row highlights it, and a click or right-click off it
 --     dismisses it.
 --   * `prompt` — as for `btv.ui.select`.

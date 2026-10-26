@@ -1145,8 +1145,9 @@ impl EditHost {
         // like the prompt, only one is open at a time (the last queued wins).
         //
         // `btv.ui.menu` rows carry a detail (the aligned right-hand column), a row
-        // highlight, a disabled flag and a separator flag; its `"mouse"` anchor opens the list at the
-        // last mouse cell (the right-click that asked for it).
+        // highlight, a disabled flag and a separator flag; its `"mouse"` anchor opens
+        // the list at the last mouse cell (the right-click that asked for it), unless a
+        // key came since.
         for req in self.lua.take_ui_selects() {
             // A select still waiting on its result is replaced: settle its promise
             // first, with the result it already has queued (a right-click off a context
@@ -1165,7 +1166,7 @@ impl EditHost {
                 }
                 self.drain_cancel_loop_ops();
             }
-            let placement = match (req.anchor.as_str(), self.editor.last_mouse_cell()) {
+            let placement = match (req.anchor.as_str(), self.editor.pointer_anchor_cell()) {
                 ("mouse", Some((row, col))) => bemtvi_core::MenuPlacement::Pointer { row, col },
                 _ => bemtvi_core::MenuPlacement::Cursor,
             };

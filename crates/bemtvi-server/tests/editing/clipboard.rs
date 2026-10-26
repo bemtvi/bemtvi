@@ -477,3 +477,25 @@ async fn system_clipboard_round_trips_on_windows() {
     feed(&rpc, "o<Esc>\"+p");
     assert_eq!(lines(&rpc).await, vec!["héllo wörld ✓", "héllo"]);
 }
+
+#[tokio::test]
+async fn a_chained_read_then_write_settles_with_no_further_input() {
+    let (rpc, _incoming, clip) = start_with_clipboard().await;
+    clip.seed("abc", false);
+    exec_lua(
+        &rpc,
+        "btv.clipboard.read():next(function(t) return btv.clipboard.write(t:upper()) end)",
+    )
+    .await;
+    // Watch the provider alone: a request to the server would itself run the effects
+    // that a stalled chain is waiting for.
+    let mut got = None;
+    for _ in 0..100 {
+        got = clip.peek().filter(|(t, _)| t == "ABC");
+        if got.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(got, Some(("ABC".to_string(), false)));
+}

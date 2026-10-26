@@ -338,7 +338,7 @@ impl Editor {
         if ev.button == MouseButton::Move {
             if self.pointer_menu_active() {
                 if let Some(MenuHit::Item(idx)) = self.menu_hit(ev.row, ev.col) {
-                    self.menu_cursor_to(idx);
+                    self.menu_hover(idx);
                 }
             }
             return;
@@ -357,6 +357,7 @@ impl Editor {
         // Remember the cell so `vim.fn.getmousepos()` reports this event's position —
         // every processed gesture updates it (press / drag / release / wheel).
         self.last_mouse = Some((ev.row, ev.col));
+        self.pointer_is_latest = true;
         // A disrupting gesture (a click anywhere, or a wheel that scrolls the text)
         // moves the cursor / scrolls the view, so it dismisses the cursor-anchored
         // transient popups — the hover / signature **doc floats** and the completion
@@ -885,10 +886,20 @@ impl Editor {
         std::mem::take(&mut self.mouse_clicks)
     }
 
-    /// The global screen cell of the last mouse event, `None` before the first one —
-    /// where a `btv.ui.menu { anchor = "mouse" }` context menu opens.
-    pub fn last_mouse_cell(&self) -> Option<(usize, usize)> {
-        self.last_mouse
+    /// Where a `btv.ui.menu { anchor = "mouse" }` context menu opens: the global
+    /// screen cell of the last mouse event, while that gesture is the user's latest
+    /// input. `None` before the first one, or once a key has come after it — the menu
+    /// then opens at the text cursor.
+    pub fn pointer_anchor_cell(&self) -> Option<(usize, usize)> {
+        self.last_mouse.filter(|_| self.pointer_is_latest)
+    }
+
+    /// The user typed a key: a menu that asks for the pointer from now on opens at the
+    /// text cursor instead (see [`pointer_anchor_cell`](Self::pointer_anchor_cell)).
+    /// `getmousepos()` still reports the last click. Called at the client key-input
+    /// seams, not for keys a mapping or `feedkeys` replays.
+    pub fn note_key_input(&mut self) {
+        self.pointer_is_latest = false;
     }
 
     /// The position of the most recent mouse event, in the shape `vim.fn.getmousepos()`
@@ -1498,8 +1509,18 @@ impl Editor {
                         self.record_visual_marks();
                         self.mode = Mode::Normal;
                     }
-                    if self.mode == Mode::Select && self.nm_sel.is_some() {
-                        self.collapse_selection_to(self.cursor);
+                    // Select ends too, whatever made it (a modeless Shift-motion, a
+                    // snippet tabstop, `<C-g>`), or the cursor move below would stretch
+                    // it to the click: back to Insert where the session rests there, to
+                    // Normal otherwise, as Visual does.
+                    if self.mode == Mode::Select {
+                        if self.rests_in_insert() {
+                            self.collapse_selection_to(self.cursor);
+                        } else {
+                            self.record_visual_marks();
+                            self.nm_sel = None;
+                            self.mode = Mode::Normal;
+                        }
                     }
                     self.set_window_cursor(win, line, bcol);
                 }
@@ -1510,9 +1531,9 @@ impl Editor {
     }
 
     /// Whether a click on buffer position `(line, col)` lands in the selection: the
-    /// Visual one, or a modeless one, whose caret span is end-exclusive.
+    /// Visual one, or a Select one, whose caret span is end-exclusive.
     fn click_in_selection(&self, line: usize, col: usize) -> bool {
-        if self.mode == Mode::Select && self.nm_sel.is_some() {
+        if self.mode == Mode::Select {
             let (lo, hi) = self.caret_span(self.caret_selection());
             let at = self.anchor_byte(Cursor { line, col });
             return (lo..hi).contains(&at);

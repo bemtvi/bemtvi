@@ -2607,6 +2607,7 @@ impl EditHost {
         // watch, a proc line — `fire_due_timers` is the one wake that does not settle), so
         // a restored session would keep yanking focus back out of wherever you moved it.
         self.editor.clear_session_focus_hold();
+        self.editor.note_key_input();
         self.input(keys);
         // Arm the `timeoutlen` idle flush, the wasm analogue of the native clients'
         // flush timer: when this keystroke left an ambiguous mapped prefix withheld

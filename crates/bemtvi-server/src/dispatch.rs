@@ -230,6 +230,7 @@ impl EditHost {
                 // The user is driving now — release any restored-session focus hold so their
                 // own navigation wins from here (see `Editor::finalize_session_focus`).
                 self.editor.clear_session_focus_hold();
+                self.editor.note_key_input();
                 let keys = text(params.first());
                 self.input(&keys);
                 Ok(Value::from(keys.len() as u64))

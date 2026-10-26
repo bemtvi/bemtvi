@@ -1104,10 +1104,6 @@ impl Menu {
         self.all_items[self.item_at(self.cursor)].preview.as_ref()
     }
 
-    /// The highlighted item, when a row is **actively** selected and in range.
-    /// `None` for noselect (a completion popup before the first navigation) or an
-    /// empty view — so the docs sidebar stays hidden until a row is chosen. Drives
-    /// both the [`MenuView`] docs-selection fields and [`Editor::complete_selected`].
     /// Whether view row `i` can't be chosen ([`MenuItem::disabled`]).
     fn row_disabled(&self, i: usize) -> bool {
         self.all_items[self.item_at(i)].disabled
@@ -1126,6 +1122,10 @@ impl Menu {
         }
     }
 
+    /// The highlighted item, when a row is **actively** selected and in range.
+    /// `None` for noselect (a completion popup before the first navigation) or an
+    /// empty view — so the docs sidebar stays hidden until a row is chosen. Drives
+    /// both the [`MenuView`] docs-selection fields and [`Editor::complete_selected`].
     fn selected_item(&self) -> Option<&MenuItem> {
         if !self.selected_active || self.cursor >= self.view_len() {
             return None;
@@ -2452,6 +2452,21 @@ impl Editor {
         }
     }
 
+    /// The pointer moved onto view row `idx` of a context menu at the pointer: a row
+    /// that can be chosen lights, and one that can't (a separator, a greyed-out row)
+    /// lights nothing, as in a GUI menu. The cursor stays put on the latter, so a
+    /// key moves on from the last row that was lit.
+    pub(crate) fn menu_hover(&mut self, idx: usize) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        if idx < menu.view_len() && menu.row_disabled(idx) {
+            menu.selected_active = false;
+        } else {
+            self.menu_cursor_to(idx);
+        }
+    }
+
     /// Whether the open menu is a context menu at the pointer
     /// ([`MenuPlacement::Pointer`]), which the mouse drives like a GUI menu.
     pub(crate) fn pointer_menu_active(&self) -> bool {
@@ -3055,6 +3070,10 @@ impl Editor {
                 (row, col, width, height, start, rows, m.selected, None)
             }
         };
+        let first = match m.placement {
+            MenuPlacement::Editor | MenuPlacement::Bottom => start,
+            MenuPlacement::Cursor | MenuPlacement::Pointer { .. } | MenuPlacement::Cmdline => 0,
+        };
         MenuGeom {
             row,
             col,
@@ -3062,6 +3081,7 @@ impl Editor {
             height,
             selected,
             start,
+            first,
             rows,
             kind_col,
         }
@@ -3117,9 +3137,16 @@ pub struct MenuGeom<'a> {
     pub height: usize,
     /// Highlighted row, window-relative (add `start` for the absolute view index).
     pub selected: usize,
-    /// Scroll offset of the first visible row (`0` for the whole-list placements).
+    /// Scroll offset of the first visible row: the list's first painted row is view
+    /// row `start`, which is what the mouse hit-test adds a clicked offset to.
     pub start: usize,
-    /// The visible rows `[start, start + rows.len())`: label + matched-char spans,
+    /// The view index of `rows[0]`: `start` for a windowed placement (`Editor` /
+    /// `Bottom`, which project only the visible slice), `0` for the whole-list ones
+    /// (`Cursor` / `Pointer` / `Cmdline`, which send every row and let the client
+    /// scroll). The per-row extras (kinds, highlights, separators, …) are fetched
+    /// from here so they stay parallel to `rows`.
+    pub first: usize,
+    /// The rows from view index `first`: label + matched-char spans,
     /// borrowed from the editor's live menu — the projection and the mouse hit-test
     /// read them without cloning the list. The server must consume the borrow (into
     /// RPC values) before its next `&mut self` call.

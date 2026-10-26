@@ -203,9 +203,26 @@ async fn hovering_a_row_highlights_it() {
         Some(&Value::Boolean(true))
     );
     assert_eq!(num(&menu, "selected"), 3);
-    // Hovering a greyed-out row leaves the highlight where it was.
-    feed_mouse(&rpc, "move", "move", 8, 13);
+    // Hovering a greyed-out row or a separator lights nothing, the way a GUI menu
+    // does, so `<CR>` there chooses nothing.
+    for at in [8, 7] {
+        feed_mouse(&rpc, "move", "move", at, 13);
+        let menu = menu_of(&poll_menu(&rpc, &mut inc).await.expect("menu"));
+        assert_eq!(
+            map_get(&menu, "selected_active"),
+            Some(&Value::Boolean(false)),
+            "row at screen row {at}"
+        );
+    }
+    feed(&rpc, "<CR>");
+    assert_eq!(got(&rpc).await, "unset");
+    // Back on a row that can be chosen, it lights again.
+    feed_mouse(&rpc, "move", "move", 9, 13);
     let menu = menu_of(&poll_menu(&rpc, &mut inc).await.expect("menu"));
+    assert_eq!(
+        map_get(&menu, "selected_active"),
+        Some(&Value::Boolean(true))
+    );
     assert_eq!(num(&menu, "selected"), 3);
     feed(&rpc, "<CR>");
     assert_eq!(got(&rpc).await, "Select All");
@@ -257,4 +274,51 @@ async fn a_bad_anchor_fails_loud() {
     )
     .await;
     assert!(err.as_str().unwrap_or("").contains("anchor"), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_scrolled_menu_keeps_each_detail_and_separator_on_its_own_row() {
+    let (rpc, mut inc) = start().await;
+    // Fourteen rows under the cursor: more than the ten the box shows, so selecting
+    // the last one scrolls the list. Every row's detail and separator flag must stay
+    // with its own label.
+    let mut entries = String::from("{");
+    for i in 1..=14 {
+        if i == 7 {
+            entries.push_str("{ separator = true },");
+        } else {
+            entries.push_str(&format!("{{ label = 'row{i}', detail = 'd{i}' }},"));
+        }
+    }
+    entries.push('}');
+    open(&rpc, &entries, "{}").await;
+    poll_menu(&rpc, &mut inc).await.expect("the menu opens");
+    feed(&rpc, "G");
+    let menu = menu_of(&poll_menu(&rpc, &mut inc).await.expect("still open"));
+    let labels = menu_items(&menu);
+    let kinds = map_get(&menu, "kinds").expect("details ride the kinds column");
+    let kinds: Vec<Option<&str>> = kinds
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(Value::as_str)
+        .collect();
+    let seps: Vec<bool> = map_get(&menu, "separators")
+        .expect("a separator row")
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b.as_bool().unwrap())
+        .collect();
+    assert_eq!(labels.len(), kinds.len());
+    for (i, label) in labels.iter().enumerate() {
+        if seps[i] {
+            assert_eq!((label.as_str(), kinds[i]), ("", None), "row {i}");
+        } else {
+            let want = label.replace("row", "d");
+            assert_eq!(kinds[i], Some(want.as_str()), "row {i} ({label})");
+        }
+    }
+    assert_eq!(seps.iter().filter(|&&s| s).count(), 1);
+    assert!(seps[6], "the separator is the seventh row: {seps:?}");
 }

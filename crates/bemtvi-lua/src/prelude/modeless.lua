@@ -174,6 +174,10 @@ local KEY_NAMES = {
   Space = "Space",
 }
 
+-- A chord's modifier letters, either case, to the one each stands for: `M` (meta) is
+-- `A` (alt), as in key notation.
+local MODIFIERS = { C = "C", S = "S", A = "A", M = "A", D = "D" }
+
 -- How a key chord reads in a menu, the platform's way: `<C-S-z>` is `Ctrl+Shift+Z`,
 -- or `⇧⌘Z` on macOS. `nil` for anything that isn't a single chord.
 local function chord_label(lhs, mac)
@@ -188,7 +192,11 @@ local function chord_label(lhs, mac)
     if not m then
       break
     end
-    has[m] = true
+    local mod = MODIFIERS[m:upper()]
+    if not mod then
+      return nil
+    end
+    has[mod] = true
     key = rest
   end
   key = KEY_NAMES[key] or (#key == 1 and key:upper()) or key

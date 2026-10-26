@@ -2223,7 +2223,7 @@ impl EditHost {
             height,
             rows,
             selected,
-            start,
+            first,
             kind_col,
             ..
         } = geom;
@@ -2241,7 +2241,7 @@ impl EditHost {
         // right-aligns on each completion row (`"Snippet"`, `"Function"`, …). `Nil` for
         // a kind-less row (a `buffer` word) and for every non-completion menu. Omitted
         // entirely when no row carries a kind, so a `select` / picker map is unchanged.
-        let row_kinds = self.editor.menu_kinds_window(start, rows.len());
+        let row_kinds = self.editor.menu_kinds_window(first, rows.len());
         let any_kind = row_kinds.iter().any(Option::is_some);
         let kinds = Value::Array(
             row_kinds
@@ -2256,7 +2256,7 @@ impl EditHost {
         // source's own match — instead of head-cutting one string. `Nil` for a plain
         // row; the key is omitted entirely when no row declares one, so every other
         // menu's map is byte-for-byte unchanged.
-        let row_layouts = self.editor.menu_layout_window(start, rows.len());
+        let row_layouts = self.editor.menu_layout_window(first, rows.len());
         let any_layout = row_layouts.iter().any(Option::is_some);
         let layouts = Value::Array(
             row_layouts
@@ -2290,7 +2290,7 @@ impl EditHost {
         // visible row paints, so every other menu's map is byte-for-byte unchanged.
         let row_hls: Vec<Value> = self
             .editor
-            .menu_hl_window(start, rows.len())
+            .menu_hl_window(first, rows.len())
             .into_iter()
             .map(|g| g.and_then(|g| self.editor.highlights.resolve(g)))
             .collect::<Vec<_>>()
@@ -2303,7 +2303,7 @@ impl EditHost {
         // all-false when nothing is marked.
         let marked = Value::Array(
             self.editor
-                .menu_marked_window(start, rows.len())
+                .menu_marked_window(first, rows.len())
                 .into_iter()
                 .map(Value::from)
                 .collect(),
@@ -2356,7 +2356,7 @@ impl EditHost {
         }
         // A `btv.ui.menu` separator row draws as a rule across the list instead of a
         // label; the key is omitted when no visible row is one.
-        let separators = self.editor.menu_separators_window(start, rows.len());
+        let separators = self.editor.menu_separators_window(first, rows.len());
         if separators.iter().any(|&s| s) {
             map.push((
                 Value::from("separators"),
@@ -2411,6 +2411,11 @@ impl EditHost {
             MenuPlacement::Editor | MenuPlacement::Bottom | MenuPlacement::Pointer { .. }
         ) {
             map.push((Value::from("editor_relative"), Value::from(true)));
+        }
+        // A context menu at the pointer: clients send pointer moves (hover) only while
+        // one is open, so moving over a picker costs no traffic. Absent otherwise.
+        if matches!(m.placement, MenuPlacement::Pointer { .. }) {
+            map.push((Value::from("pointer"), Value::from(true)));
         }
         // The command-line wildmenu (`btv.cmdline_complete`) floats above the command
         // line, not the focused window — so the client anchors it to the command-line

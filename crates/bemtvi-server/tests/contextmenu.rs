@@ -638,3 +638,111 @@ async fn a_buffer_local_right_click_map_replaces_the_menu() {
     assert!(poll_true(&rpc, "return _G.mapped == 1").await);
     assert!(poll_menu(&rpc, &mut inc).await.is_none(), "no menu opens");
 }
+
+#[tokio::test]
+async fn a_menu_opened_from_a_key_after_a_click_opens_at_the_cursor() {
+    let (rpc, _clip, mut inc) = start_gui("hello world\nsecond line\n").await;
+    exec_lua(
+        &rpc,
+        "btv.keymap.set('n', '<F5>', function() btv.contextmenu.open() end)",
+    )
+    .await;
+    // An earlier click leaves `getmousepos()` on (1, 8); the key comes after it, so the
+    // menu belongs at the text cursor, not at that old click.
+    feed_mouse(&rpc, "left", "press", 1, 8);
+    feed_mouse(&rpc, "left", "release", 1, 8);
+    feed(&rpc, "gg0<F5>");
+    let menu = menu_of(&poll_menu(&rpc, &mut inc).await.expect("a menu opens"));
+    assert_eq!(
+        map_get(&menu, "editor_relative"),
+        None,
+        "a key-opened menu sits under the text cursor: {menu:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_right_click_off_an_open_picker_opens_the_menu() {
+    let (rpc, _clip, mut inc) = start_gui("hello world\n").await;
+    exec_lua(&rpc, "btv.picker.open('commands')").await;
+    poll_menu(&rpc, &mut inc).await.expect("the picker opens");
+    // The picker is centered: the top-left cell is off it.
+    feed_mouse(&rpc, "right", "press", 0, 0);
+    let menu = menu_of(&poll_menu(&rpc, &mut inc).await.expect("a menu opens"));
+    assert_eq!(menu_items(&menu)[0], "Undo");
+    // And it stays open: nothing settled it as cancelled behind the picker's back.
+    let menu = menu_of(&poll_menu(&rpc, &mut inc).await.expect("still open"));
+    assert_eq!(menu_items(&menu)[0], "Undo");
+}
+
+#[tokio::test]
+async fn a_pointer_menu_says_so_and_a_picker_does_not() {
+    let (rpc, _clip, mut inc) = start_gui("hello world\n").await;
+    feed_mouse(&rpc, "right", "press", 0, 4);
+    let menu = menu_of(&poll_menu(&rpc, &mut inc).await.expect("a menu opens"));
+    assert_eq!(
+        map_get(&menu, "pointer").and_then(Value::as_bool),
+        Some(true)
+    );
+    feed(&rpc, "<Esc>");
+    exec_lua(&rpc, "btv.picker.open('commands')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut inc).await.expect("the picker opens"));
+    assert_eq!(map_get(&menu, "pointer"), None);
+}
+
+#[tokio::test]
+async fn a_key_hint_reads_every_modifier_spelling() {
+    let (rpc, _clip, _inc) = start_modeless("hello\n").await;
+    let got = exec_lua(
+        &rpc,
+        "local f = function() end
+         btv.keymap.set('modeless', '<M-q>', f)
+         local g = function() end
+         btv.keymap.set('modeless', '<c-s-k>', g)
+         return { btv.modeless.key_hint(f) or 'nil', btv.modeless.key_hint(g) or 'nil' }",
+    )
+    .await;
+    let got: Vec<&str> = got
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    assert_eq!(got, ["Alt+Q", "Ctrl+Shift+K"]);
+}
+
+#[tokio::test]
+async fn a_right_click_off_a_select_mode_selection_ends_it() {
+    let (rpc, _clip, mut inc) = start_gui("foo bar baz qux\n").await;
+    // Visual over `foo`, switched to Select: no modeless selection behind it.
+    feed(&rpc, "vll<C-g>");
+    assert_eq!(mode(&rpc).await, "s");
+    feed_mouse(&rpc, "right", "press", 0, 12);
+    poll_menu(&rpc, &mut inc).await.expect("a menu opens");
+    assert_eq!(
+        exec_lua(&rpc, "return btv.mode().mode").await.as_str(),
+        Some("n"),
+        "the selection ended rather than stretching to the click"
+    );
+    let cur = exec_lua(&rpc, "return vim.fn.col('.')").await;
+    assert_eq!(cur.as_u64(), Some(13));
+}
+
+#[tokio::test]
+async fn a_right_click_inside_a_select_mode_selection_keeps_it() {
+    let (rpc, _clip, mut inc) = start_gui("foo bar baz qux\n").await;
+    feed(&rpc, "vll<C-g>");
+    feed_mouse(&rpc, "right", "press", 0, 1);
+    poll_menu(&rpc, &mut inc).await.expect("a menu opens");
+    let got = exec_lua(
+        &rpc,
+        "return { btv.mode().mode, vim.fn.getpos('v')[3], vim.fn.col('.') }",
+    )
+    .await;
+    let got: Vec<String> = got
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.to_string())
+        .collect();
+    assert_eq!(got, ["\"s\"", "1", "3"]);
+}

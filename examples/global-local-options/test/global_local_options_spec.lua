@@ -6,7 +6,7 @@
 -- between two tiers, so every case reads BOTH — `:set x?` / `btv.o` for the local
 -- value, `:setglobal x?` / `btv.go` for the tier a new buffer is born from.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

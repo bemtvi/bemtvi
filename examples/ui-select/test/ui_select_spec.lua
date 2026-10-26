@@ -6,7 +6,7 @@
 -- buffer views — `t:menu()` is what sees the rows and which one leads. Each case
 -- drives it with the very keys the notes name.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

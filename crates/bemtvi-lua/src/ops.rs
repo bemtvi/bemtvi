@@ -1423,6 +1423,26 @@ pub struct RegisterSetOp {
     pub append: bool,
 }
 
+/// A `btv.clipboard.read` / `write` queued for the server, which runs it against the
+/// clipboard provider and settles callback `id` with a
+/// [`CallbackArgs::ClipboardResult`]. Async on every platform: in the browser only the
+/// page can reach `navigator.clipboard`, so there the op round-trips through it.
+#[derive(Clone, Debug)]
+pub struct ClipboardOp {
+    /// The callback the result settles (`btv._run_cb(id, false, err, value)`).
+    pub id: u64,
+    pub kind: ClipboardOpKind,
+}
+
+/// What a [`ClipboardOp`] does.
+#[derive(Clone, Debug)]
+pub enum ClipboardOpKind {
+    /// Read the clipboard's text.
+    Read,
+    /// Put `text` on the clipboard; `linewise` marks it as whole lines for `"+p`.
+    Write { text: String, linewise: bool },
+}
+
 /// A user tree-sitter text-object binding queued by `btv.textobject.map`. `lhs` is
 /// the full `i`/`a` + object-key sequence (`"il"`, `"af"`); `capture` is the exact
 /// `textobjects.scm` capture to select (`Some("loop.inner")`, `Some("function.around")`)
@@ -1897,6 +1917,14 @@ pub enum CallbackArgs {
         /// the `{ code, message }` table.
         result: Result<GitValue, GitError>,
     },
+    /// The settled result of a [`ClipboardOp`]: run as `btv._run_cb(id, false, err,
+    /// value)` — `err` the `{ message }` table (with `value` nil) when there is no
+    /// clipboard or it can't be read, or `err` nil with `value` the clipboard's text (a
+    /// read) or nil (a write).
+    ClipboardResult {
+        /// `Ok(Some(text))` for a read, `Ok(None)` for a write, `Err(message)` on failure.
+        result: Result<Option<String>, String>,
+    },
     /// The settled result of an `btv.http.fetch` request ([`LoopOp::Http`]): the callback
     /// is run as `btv._run_cb(id, false, err, response)` — `err` the `{ message }` table
     /// (with `response` nil) on a transport failure, or `err` nil with `response` the
@@ -2169,6 +2197,17 @@ pub struct UiSelectReq {
     pub prompt: String,
     /// The `btv._cb_fns` id whose `on_choice` wrapper receives the chosen index.
     pub cb_id: u64,
+    /// Per-row extras from `btv.ui.menu`, parallel to `items` (empty for a plain
+    /// `btv.ui.select`): the right-hand detail text (`""` for none), the row's
+    /// highlight group (`""` for none), whether the row can't be chosen, and whether
+    /// it is a separator.
+    pub details: Vec<String>,
+    pub hls: Vec<String>,
+    pub disabled: Vec<bool>,
+    pub separators: Vec<bool>,
+    /// Where the list opens: `"cursor"` (under the text cursor, the default) or
+    /// `"mouse"` (at the last mouse cell, the context-menu shape).
+    pub anchor: String,
 }
 
 /// A `btv.complete.choice(items, { range })` request: open a **non-grabbing** cursor

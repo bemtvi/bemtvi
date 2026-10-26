@@ -7,7 +7,7 @@
 -- and no idle flush. `t:feed` settles exactly one tick, which is the whole
 -- assertion: had the matcher held the run, nothing would have happened yet.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 -- The mappings announce themselves with `print`; record that at the source so a
 -- case can prove the MAP fired rather than the built-in.

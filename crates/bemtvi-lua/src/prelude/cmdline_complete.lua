@@ -610,6 +610,8 @@ local AUTOCMD_EVENTS = {
   "CursorMovedI",
   "TextChanged",
   "TextChangedI",
+  -- Mouse
+  "MenuPopup",
   -- LSP
   "LspAttach",
   "LspDetach",

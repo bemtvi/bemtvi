@@ -9,7 +9,7 @@
 -- selection, else a point at the cursor — and that choice is observable without a
 -- server, because the request is built before it is sent.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

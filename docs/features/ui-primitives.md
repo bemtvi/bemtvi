@@ -249,6 +249,25 @@ btv.ui.confirm("Quit without saving?", { default = false })
   btv.keymap.set("select", "q", function() end)                  -- prev, first, last,
   ```                                                            -- confirm, cancel
 
+- **`btv.ui.menu(entries, opts)`** — a context menu on the same list. Each entry
+  is `{ label, detail?, enabled?, separator? }`. `detail` (a shortcut, say) sits in
+  an aligned column on the right, a row with `enabled = false` greys out, and
+  `{ separator = true }` draws a rule. Keys and clicks skip the rows that can't be
+  chosen. The promise resolves to the chosen entry itself, so extra fields (an
+  `action`) come back with it. `anchor = "mouse"` opens it at the pointer, where it
+  acts like a GUI menu: one click chooses, hovering highlights, a click or
+  right-click off it dismisses it. The right-click menu itself is built on it:
+  to add rows there, register a group with [`btv.contextmenu`](context-menu.md)
+  rather than opening a second menu.
+
+  ```lua
+  btv.ui.menu({
+    { label = "Format", detail = "Shift+Alt+F", action = btv.lsp.format },
+    { separator = true },
+    { label = "Close", action = function() btv.cmd("bdelete") end },
+  }, { anchor = "mouse" }):next(function(e) if e then e.action() end end)
+  ```
+
 - **`btv.ui.confirm(message, opts)`** — yes/no. `default = true` (the default) makes
   `<CR>` Yes and shows `[Y/n]`; `false` makes it decline and shows `[y/N]`. For a
   multi-choice menu use `select`.
@@ -289,7 +308,7 @@ selectable list?*
 | **Floating window** | A free, editable window over the layout — you manage its lifecycle | ✅ | optional (`grab`) | ✅ |
 | **Popup content** | A lightweight display overlay (`btv.ui.float`) — *not* a window | ❌ | never | ❌ |
 | **Popup window** | A transient, read-only *real* window over a scratch buffer — auto-dismissed but scrollable | ✅ | never | ✅ |
-| **List widget** | The floating selectable list — picker, `btv.ui.select`, completion | server widget | ✅ | ✅ (preview) |
+| **List widget** | The floating selectable list — picker, `btv.ui.select`, `btv.ui.menu`, completion | server widget | ✅ | ✅ (preview) |
 
 The naming is a two-axis system: **"popup"** marks the transient, read-only family
 (*popup content*, *popup window*); **"window"** marks a real backing window

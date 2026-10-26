@@ -7,7 +7,7 @@
 -- filetype on purpose — tree-sitter never indents it, so what is measured here is
 -- the three options and nothing else.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

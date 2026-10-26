@@ -7,7 +7,7 @@
 -- `t:decor()`, the span is `t:highlights()`. Rows are SCREEN rows, so a scrolled
 -- viewport is read from the top of the window down.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

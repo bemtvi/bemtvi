@@ -6,10 +6,7 @@
 -- What it can hold to account is the option itself: the value each step of the
 -- notes leaves 'imdisable' at, which is what the GUI follows.
 
--- On Windows the chunk name is a `\\?\D:\…` path: drop the prefix and turn the
--- separators around, so the match below and the `dofile` both work.
-local SRC = (debug.getinfo(1, "S").source:gsub("^@\\\\%?\\", "@"):gsub("\\", "/"))
-local DIR = SRC:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

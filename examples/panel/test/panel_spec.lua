@@ -6,7 +6,7 @@
 -- rows are `t:lines()`, its navigation is plain motions, and its selection is a
 -- buffer-local keymap. Every TRY-IT key is typed as written.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 -- The `<CR>` map reports through `vim.notify`, after the panel closes.
 local notified = {}

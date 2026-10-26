@@ -1581,6 +1581,27 @@ impl Editor {
         self.registers.set_api('"', text, kind, false);
     }
 
+    /// The clipboard's text for `btv.clipboard.read` (`""` when it's empty), or the
+    /// [`CLIPBOARD_UNAVAILABLE`] message when there is no provider.
+    pub fn clipboard_read_text(&self) -> Result<String, String> {
+        let Some(clipboard) = self.clipboard.as_ref() else {
+            return Err(CLIPBOARD_UNAVAILABLE.to_string());
+        };
+        Ok(clipboard.get().map(|(text, _)| text).unwrap_or_default())
+    }
+
+    /// Put `text` on the clipboard for `btv.clipboard.write`, or the
+    /// [`CLIPBOARD_UNAVAILABLE`] message when there is no provider. Unlike a `"+y`
+    /// (see [`clipboard_write`](Self::clipboard_write)) it leaves the unnamed register
+    /// alone, as vim's `setreg('+')` does.
+    pub fn clipboard_write_text(&mut self, text: &str, linewise: bool) -> Result<(), String> {
+        let Some(clipboard) = self.clipboard.as_ref() else {
+            return Err(CLIPBOARD_UNAVAILABLE.to_string());
+        };
+        clipboard.set(text, linewise);
+        Ok(())
+    }
+
     /// Whether the active register targets the clipboard but no provider is
     /// installed — the write must abort loudly instead of touching anything.
     fn clipboard_write_unavailable(&self) -> bool {
@@ -1673,6 +1694,14 @@ impl Editor {
         } else {
             RegKind::Char
         };
+        // `"+` / `"*` are the clipboard, which Lua reaches through `btv.clipboard`; the
+        // register API refuses them before queueing, so a write here is a bug upstream.
+        if is_clipboard_register(Some(name)) {
+            self.echo(format!(
+                "E354: register '{name}' is the clipboard: use btv.clipboard.write()"
+            ));
+            return;
+        }
         self.registers.set_api(name, text, kind, append);
     }
 

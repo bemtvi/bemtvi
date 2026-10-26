@@ -7,7 +7,7 @@
 -- the three gates that decide whether the offer appears, and the two surfaces
 -- (`<CR>` on the offer, `c` for the checklist) that the notes tell you to press.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

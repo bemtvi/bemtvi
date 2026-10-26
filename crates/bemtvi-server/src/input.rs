@@ -493,6 +493,13 @@ impl EditHost {
                 None => self.editor.mouse_apply_wheel_default(wheel),
             }
         }
+        // A right-click default that placed the caret asks for the context menu:
+        // `MenuPopup` is where a plugin opens it, reading the click from
+        // `getmousepos()`. A mapped right-click never gets here.
+        if self.editor.take_popup_request() {
+            let buf = self.editor.current_buffer_id();
+            self.fire_buf_event("MenuPopup", buf);
+        }
     }
 
     /// Resolve a withheld key-prefix on input idle — the matcher's `timeoutlen`

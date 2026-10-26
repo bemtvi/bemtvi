@@ -781,6 +781,9 @@ struct App {
     /// The cell the last left-drag was reported at, so motion within one cell is
     /// coalesced to a single drag (the server works in cells, not pixels).
     last_drag_cell: Option<(u16, u16)>,
+    /// The cell the last hover over an open menu was reported at, so a context menu
+    /// highlights the row under the pointer with one `move` per cell, not per pixel.
+    last_hover_cell: Option<(u16, u16)>,
     /// The resize cursor currently shown (over a draggable separator / dock edge),
     /// or `None` for the default arrow. Tracked so a hover only sets the cursor when
     /// the shape actually changes, not on every pointer move.
@@ -890,6 +893,7 @@ impl App {
                 cursor_px: (0.0, 0.0),
                 mouse_down: false,
                 last_drag_cell: None,
+                last_hover_cell: None,
                 resize_hint: None,
                 text_hint: false,
                 blink_since: Instant::now(),
@@ -1240,6 +1244,7 @@ impl App {
                 self.cursor_px = self.pixels(*position);
                 // While the left button is held, a move into a new cell is a drag.
                 self.mouse_drag();
+                self.mouse_hover();
                 self.update_pointer();
             }
             SurfaceInput::Button {
@@ -1825,6 +1830,26 @@ impl App {
         // (Re)arm continuous auto-scroll when the drag is parked in the edge band;
         // disarm once it moves back into the body.
         self.arm_autoscroll(cell);
+    }
+
+    /// The pointer moved with no button held: over an open editor-level menu (a
+    /// context menu at the pointer, a picker), report each new cell as a `move` so the
+    /// server can highlight the row under it. Nothing is sent while no such menu is
+    /// open, so moving over the text costs no traffic.
+    fn mouse_hover(&mut self) {
+        let open = self.view.menu.as_ref().is_some_and(|m| m.editor_relative);
+        if self.mouse_down || !open {
+            self.last_hover_cell = None;
+            return;
+        }
+        let Some(cell) = self.pointer_cell() else {
+            return;
+        };
+        if self.last_hover_cell == Some(cell) {
+            return;
+        }
+        self.last_hover_cell = Some(cell);
+        self.send_mouse("move", "move", cell.0, cell.1);
     }
 
     /// Left button released: finalize the Visual selection (the server keeps it)

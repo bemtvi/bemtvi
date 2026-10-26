@@ -6,7 +6,7 @@
 -- case reads the option per window id — and `t:gutter()` for the column the
 -- server actually reserves, which is the thing a reader sees.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

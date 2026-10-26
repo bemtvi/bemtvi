@@ -6,7 +6,7 @@
 -- read with `t:gutter()` rather than off the painted rows — and the reserved width
 -- is the honest measure anyway, since `'numberwidth'` is only a minimum.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

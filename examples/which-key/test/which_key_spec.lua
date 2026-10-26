@@ -6,7 +6,7 @@
 -- DEBOUNCED: it appears only once you pause, which is exactly what `t:sleep`
 -- expresses — a fast sequence must leave it hidden.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

@@ -161,8 +161,10 @@ impl Editor {
         self.buffer_modifiable(self.cur_buffer())
     }
 
-    /// [`modifiable`](Self::modifiable) for buffer `id`, focused or not.
-    pub(crate) fn buffer_modifiable(&self, id: BufferId) -> bool {
+    /// [`modifiable`](Self::modifiable) for buffer `id`, focused or not. This is what
+    /// `'modifiable'` reads as through the Lua `bo` mirror: a read-only kind reports
+    /// `nomodifiable` whatever its option says, the way neovim reports a terminal.
+    pub fn buffer_modifiable(&self, id: BufferId) -> bool {
         let buf = &self.buffers.get(id).buffer;
         !buf.read_only() && self.qf_context_of_buffer(id).is_none() && buf.options.modifiable
     }
@@ -313,6 +315,9 @@ impl Editor {
         // dead buffer is torn down only when the buffer is wiped, and a wipe checks
         // `was_terminal` (the kind no longer says it). See the field's doc.
         ob.buffer.was_terminal = true;
+        // The buffer's `bo` mirror row moved without an option write: it now reads
+        // `modifiable` and `buftype=""`. See `bump_options_generation`.
+        self.bump_options_generation();
         if is_current && self.mode == Mode::Terminal {
             self.mode = Mode::Normal;
             self.terminal_pending_backslash = false;

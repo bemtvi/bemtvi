@@ -6,7 +6,7 @@
 -- what its SEE line promises — the message a mapping printed, or the edit a
 -- literal key made.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 -- The mappings announce themselves with `print`; record it at the source.
 local printed = {}

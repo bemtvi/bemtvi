@@ -7,7 +7,7 @@
 -- timer nudges the server to resolve it on idle. `t:idle()` is that nudge — the
 -- spec's way of saying "the user stopped typing here".
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 local printed = {}
 do

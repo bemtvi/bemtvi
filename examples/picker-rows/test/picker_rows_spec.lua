@@ -5,7 +5,7 @@
 -- A picker row's SHAPE — a head, a pinned tag, a colour — is what the widget was
 -- handed, so the rows themselves are `t:menu()`.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 local notified = {}
 do

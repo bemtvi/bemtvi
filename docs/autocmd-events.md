@@ -190,6 +190,12 @@ no autocmd listens for them they cost nothing.
 | `CursorMoved` | The cursor moves in Normal mode. |
 | `CursorMovedI` | The cursor moves in Insert mode. |
 
+## Mouse
+
+| Event | When it fires | Notes |
+| --- | --- | --- |
+| `MenuPopup` | A right-click asks for the context menu: with `'mousemodel'` set to `popup_setpos` (the default) or `popup`, after the click has done its default. Under `popup_setpos` that means the caret has moved to the click, unless the click landed inside the selection, which is kept. | `buf` / `file` are the current buffer. Read the click with `btv.getmousepos()`. A mapped `<RightMouse>` replaces the default, so it fires no `MenuPopup`, and neither does `mousemodel=extend`. The prelude's own handler opens the context menu, in every session (see [The context menu](features/context-menu.md)). Add rows with a group there, not by opening a menu from a handler of your own: only one menu shows at a time. |
+
 ## LSP
 
 | Event | When it fires | Notes |

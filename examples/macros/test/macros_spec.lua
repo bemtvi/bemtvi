@@ -6,7 +6,7 @@
 -- ordinary text, so what was recorded is asserted directly — and what a replay
 -- did is asserted on the buffer.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

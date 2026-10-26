@@ -28,6 +28,7 @@
   - [Keyboard macros](features/macros.md)
   - [Fonts](features/fonts.md)
   - [Modeless editing](features/modeless.md)
+  - [The context menu](features/context-menu.md)
   - [Undo steps](features/undo.md)
   - [Expressions](features/expressions.md)
   - [Smooth scrolling](features/smooth-scrolling.md)

@@ -7,7 +7,7 @@
 -- `t:screen()` (the glyphs, including the `showbreak` marker), and `t:gutter()`
 -- — `t:lines()` shows nothing of it.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

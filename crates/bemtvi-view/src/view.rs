@@ -866,6 +866,10 @@ pub struct MenuData {
     /// for a kind-less row (a `buffer` word). Empty when no row carries a kind (every
     /// non-completion menu): the server omits the `kinds` key entirely then.
     pub kinds: Vec<Option<String>>,
+    /// Per visible row (parallel to `items`), whether the row is a **separator**
+    /// (`btv.ui.menu`): drawn as a rule across the list in the border color, with no
+    /// label or kind. Empty when no row is one — the server omits the key then.
+    pub separators: Vec<bool>,
     /// The content column just past the widest label — the label-truncation boundary
     /// and the start of the widest kind. Clients right-align each row's kind flush to
     /// the box's right edge; this column keeps even the widest kind clear of the label.
@@ -1240,6 +1244,12 @@ impl View {
                 kinds: match map_get(m, "kinds") {
                     Some(Value::Array(a)) => {
                         a.iter().map(|v| v.as_str().map(str::to_string)).collect()
+                    }
+                    _ => Vec::new(),
+                },
+                separators: match map_get(m, "separators") {
+                    Some(Value::Array(a)) => {
+                        a.iter().map(|v| v.as_bool().unwrap_or(false)).collect()
                     }
                     _ => Vec::new(),
                 },

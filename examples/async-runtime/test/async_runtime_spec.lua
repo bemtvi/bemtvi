@@ -7,7 +7,7 @@
 -- would and then watches `_G.async_demo` — the very table the notes tell a
 -- reader to inspect with `:lua print(vim.inspect(_G.async_demo))`.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 -- Demo 1's claim is about ORDER, and it is settled while the config is being
 -- sourced — so the recorder has to be in place for the `dofile` itself.

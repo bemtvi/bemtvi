@@ -1,0 +1,4 @@
+apple banana cherry
+The quick brown fox jumps over the lazy dog.
+second line of the sample
+third line of the sample

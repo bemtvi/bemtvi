@@ -50,3 +50,15 @@ btv.keymap.set("modeless", "<C-e>", "<S-End>", { desc = "Select to the end of th
 --    shows where you are. Shift with the wheel scrolls sideways (down goes right),
 --    and a thumb along the bottom follows. Type a letter: the view comes back to
 --    the caret.
+
+-- 10. Right-click. Double-click `quick` on line 1 to select it, then right-click
+--     it: a menu opens at the pointer with Undo, Cut, Copy, Paste and the rest, each
+--     showing its key. Click Cut and `quick` is gone. Right-click on line 2 instead
+--     and the caret moves there first; click `Duplicate Line` (the row added below)
+--     and line 2 is doubled. A click anywhere else, or `<Esc>`, dismisses the menu.
+--     The menu is made of groups (see docs/features/context-menu.md): this adds one,
+--     `lines`, at the end of the list every editable buffer starts from.
+btv.contextmenu.groups.lines = {
+  items = { { label = "Duplicate Line", action = btv.modeless.actions.duplicate_line } },
+}
+table.insert(btv.contextmenu.default, "lines")

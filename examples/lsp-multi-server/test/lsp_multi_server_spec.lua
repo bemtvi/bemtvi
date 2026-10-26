@@ -8,7 +8,7 @@
 -- enabled for the same filetype, gopls ranked above the linter) and the maps that
 -- exercise it, plus whichever servers happen to be installed on the machine.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

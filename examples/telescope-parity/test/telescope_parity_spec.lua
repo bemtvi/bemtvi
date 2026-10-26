@@ -8,7 +8,7 @@
 -- / `rg` sources spawn a program, so those cases check the source is registered
 -- and open it only when the tool is on the machine.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

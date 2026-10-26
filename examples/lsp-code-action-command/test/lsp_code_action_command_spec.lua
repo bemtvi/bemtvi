@@ -8,7 +8,7 @@
 -- plain function in `btv.lsp.commands`, so the spec calls it with the payload
 -- gopls sends and checks what the editor did with it — no server involved.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

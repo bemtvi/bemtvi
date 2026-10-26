@@ -9,7 +9,7 @@
 -- framings the config installs, and the two commands that turn the ladder off and
 -- on. (The colouring is covered natively, in the server's fragment suite.)
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

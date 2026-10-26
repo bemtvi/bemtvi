@@ -7,7 +7,7 @@
 -- every sample file (8-wide tabs), so each assertion below fails if the detection
 -- stops running — the file's own style is the only reason these numbers appear.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

@@ -9,7 +9,7 @@
 -- config's indentation options apply, and the treesitter-driven editing the notes
 -- promise works once a grammar is present (skipped when it is not).
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

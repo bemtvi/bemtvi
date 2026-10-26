@@ -16,7 +16,10 @@
 --   :put [x]                             -- paste register x BELOW, linewise
 --
 -- so a plugin or a user command can stash and recall text without driving the
--- keyboard. Everything below is wired through those four entry points.
+-- keyboard. Everything below is wired through those four entry points. The
+-- clipboard ("+ "*) isn't one of them: from Lua it's `btv.clipboard.read()` /
+-- `btv.clipboard.write(text)`, which return promises (a browser can only reach
+-- its clipboard asynchronously). The "+y / "+p keys work as ever.
 
 -- Seed two registers at startup, before you touch the keyboard:
 --   "h  a charwise greeting  (paste it inline with  "hp )

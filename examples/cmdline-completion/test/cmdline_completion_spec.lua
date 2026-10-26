@@ -6,7 +6,7 @@
 -- command line itself is `btv._ui.cmdline`. Between them the spec can type each
 -- WHAT-TO-TRY line exactly as written and check both halves.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

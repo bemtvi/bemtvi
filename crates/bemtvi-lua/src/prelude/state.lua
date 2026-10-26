@@ -2236,6 +2236,14 @@ local SETREG_READONLY = {
   ["#"] = true,
 }
 
+-- Raise for the clipboard register names: `btv.clipboard` reads and writes them,
+-- asynchronously, since a browser can't do either synchronously.
+local function refuse_clipboard(who, reg, instead)
+  if reg == "+" or reg == "*" then
+    error(who .. ": register '" .. reg .. "' is the clipboard: use " .. instead, 3)
+  end
+end
+
 -- `btv.reg.set`(name, value [, options]) [alias `vim.fn.setreg`]: write a register.
 -- `name` `""` / `"@"` means the unnamed register `"`. `value` is a string (charwise) or
 -- a list of strings (one per line, linewise). `options` is a string of flags: c/v
@@ -2251,6 +2259,7 @@ function btv.reg.set(name, value, options)
     name = '"'
   end
   local reg = name:sub(1, 1)
+  refuse_clipboard("btv.reg.set", reg, "btv.clipboard.write()")
   if SETREG_READONLY[reg] then
     error("E354: Invalid register name: '" .. reg .. "'")
   end
@@ -2326,6 +2335,7 @@ function btv.reg.get(name)
     name = '"'
   end
   local reg = name:sub(1, 1):lower()
+  refuse_clipboard("btv.reg.get", reg, "btv.clipboard.read()")
   local entry = (btv._registers or {})[reg]
   return entry and entry.text or ""
 end
@@ -2340,10 +2350,67 @@ function btv.reg.gettype(name)
     name = '"'
   end
   local reg = name:sub(1, 1):lower()
+  refuse_clipboard("btv.reg.gettype", reg, "btv.clipboard.read()")
   local entry = (btv._registers or {})[reg]
   return entry and entry.type or "v"
 end
 vim.fn.getregtype = btv.reg.gettype
+
+-- `btv.clipboard`: the system clipboard, the one the `"+` / `"*` keys name. Its reads and
+-- writes are asynchronous everywhere (in the browser only the page can reach
+-- `navigator.clipboard`), so `btv.reg` doesn't take `+` / `*`.
+btv.clipboard = btv.clipboard or {}
+
+-- Queue clipboard op `kind` and return its promise; the server settles callback `id`
+-- with `(err, value)`.
+local function clipboard_op(kind, text, linewise)
+  return btv.promise.new(function(resolve, reject)
+    local id = btv._next_cb_id()
+    btv._cb_fns[id] = function(err, value)
+      if err ~= nil then
+        reject(err.message)
+      else
+        resolve(value)
+      end
+    end
+    btv._bridge(id, function()
+      btv._clipboard_op(id, kind, text, linewise)
+    end)
+  end)
+end
+
+-- `btv.clipboard.read()` -> a promise of the system clipboard's text (`""` when it is
+-- empty). It rejects with a message when the editor has no clipboard, or when the
+-- browser won't let the page read it.
+--
+-- ```lua
+-- btv.clipboard.read():next(function(text)
+--   btv.notify(("%d characters on the clipboard"):format(#text))
+-- end)
+-- ```
+function btv.clipboard.read()
+  return clipboard_op("read")
+end
+
+-- `btv.clipboard.write(text, opts)` -> a promise that settles once `text` is on the
+-- system clipboard. `opts.linewise` marks it as whole lines, so a `"+p` puts it on lines
+-- of its own; it defaults to whether `text` ends in a newline. Rejects with a message
+-- when the editor has no clipboard. The unnamed register is left alone.
+--
+-- ```lua
+-- btv.clipboard.write(btv.buf.name(0))
+-- ```
+function btv.clipboard.write(text, opts)
+  if type(text) ~= "string" then
+    error("btv.clipboard.write: text must be a string", 2)
+  end
+  opts = opts or {}
+  local linewise = opts.linewise
+  if linewise == nil then
+    linewise = text:sub(-1) == "\n"
+  end
+  return clipboard_op("write", text, linewise and true or false)
+end
 
 -- `btv.macro`: the keyboard macros `<F2>{reg}` records and `<F3>{reg}` plays back.
 -- A macro is an ordinary register holding bemtvi key notation (`ciwfoo<Esc>`), so

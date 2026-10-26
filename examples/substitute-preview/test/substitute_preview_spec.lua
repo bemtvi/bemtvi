@@ -8,7 +8,7 @@
 -- the struck-through side and `t:decor()` for the inline addition — `t:lines()`
 -- would show nothing at all.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

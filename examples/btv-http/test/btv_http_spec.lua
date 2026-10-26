@@ -13,7 +13,7 @@
 --   * the six keymaps are driven for real, and the ones that need the network are
 --     driven only when it is reachable (and say so when it is not).
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 -- The example reports through `btv.notify`, and its reactions land a tick or more
 -- later — so record them at the source rather than racing the message line.

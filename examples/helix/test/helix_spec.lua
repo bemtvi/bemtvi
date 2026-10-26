@@ -5,7 +5,7 @@
 -- Helix is selection-first, so what a key DID is read off the selection it left
 -- behind and the text it changed — every TRY-IT line is typed as written.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

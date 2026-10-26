@@ -74,6 +74,7 @@ IMPORTS = [
     ("docs/features/macros.md", "features/macros.md"),
     ("docs/features/fonts.md", "features/fonts.md"),
     ("docs/features/modeless.md", "features/modeless.md"),
+    ("docs/features/context-menu.md", "features/context-menu.md"),
     ("docs/features/undo.md", "features/undo.md"),
     ("docs/features/expressions.md", "features/expressions.md"),
     ("docs/features/smooth-scrolling.md", "features/smooth-scrolling.md"),

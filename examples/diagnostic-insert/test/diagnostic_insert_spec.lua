@@ -6,7 +6,7 @@
 -- checks what is on screen WHILE the keys are still coming, and what is there
 -- after the quiet period or after `<Esc>`. The diagnostic layer is `t:decor()`.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

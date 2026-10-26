@@ -204,9 +204,9 @@ enum SelectAnchor {
 /// string options.
 enum MouseModel {
     /// `popup_setpos` (default): right-click moves the cursor (keeping a selection
-    /// the click lands inside) and would pop a context menu.
+    /// the click lands inside), then asks for the context menu (`MenuPopup`).
     PopupSetpos,
-    /// `popup`: right-click pops a context menu without moving the cursor.
+    /// `popup`: right-click asks for the context menu without moving the cursor.
     Popup,
     /// `extend`: right-click extends the selection toward the click.
     Extend,
@@ -332,6 +332,28 @@ impl Editor {
         if !self.mouse_enabled() && !on_wildmenu {
             return;
         }
+        // A pointer move only hovers a context menu's rows, the way a GUI menu tracks
+        // the pointer; clients send moves only while a menu is open. It is not a
+        // gesture: it moves nothing else and leaves `getmousepos()` on the last click.
+        if ev.button == MouseButton::Move {
+            if self.pointer_menu_active() {
+                if let Some(MenuHit::Item(idx)) = self.menu_hit(ev.row, ev.col) {
+                    self.menu_cursor_to(idx);
+                }
+            }
+            return;
+        }
+        // A right press off an open picker / select closes it, the way a click off a
+        // GUI menu does, and then goes on as an ordinary right-click (which may open a
+        // fresh context menu where it landed). One on the box does nothing.
+        if (ev.button, ev.action) == (MouseButton::Right, MouseAction::Press)
+            && self.picker_or_select_active()
+        {
+            if self.menu_hit(ev.row, ev.col).is_some() {
+                return;
+            }
+            self.menu_cancel();
+        }
         // Remember the cell so `vim.fn.getmousepos()` reports this event's position —
         // every processed gesture updates it (press / drag / release / wheel).
         self.last_mouse = Some((ev.row, ev.col));
@@ -399,6 +421,11 @@ impl Editor {
             // widget when it lands off the box — and a wheel scrolls the list or the
             // preview. Drag / release are swallowed so a stray drag can't start a text
             // selection through the box. These run before the chrome / text arms.
+            // A context menu at the pointer acts like a GUI menu: one click on a row
+            // chooses it.
+            (MouseButton::Left, MouseAction::Press) if self.pointer_menu_active() => {
+                self.mouse_pointer_menu_press(ev.row, ev.col)
+            }
             (MouseButton::Left, MouseAction::Press) if self.picker_or_select_active() => {
                 self.mouse_menu_press(ev.row, ev.col)
             }
@@ -856,6 +883,12 @@ impl Editor {
     /// right after a gesture). See [`MouseClick`] / [`Editor::mouse_clicks`].
     pub fn take_mouse_clicks(&mut self) -> Vec<MouseClick> {
         std::mem::take(&mut self.mouse_clicks)
+    }
+
+    /// The global screen cell of the last mouse event, `None` before the first one —
+    /// where a `btv.ui.menu { anchor = "mouse" }` context menu opens.
+    pub fn last_mouse_cell(&self) -> Option<(usize, usize)> {
+        self.last_mouse
     }
 
     /// The position of the most recent mouse event, in the shape `vim.fn.getmousepos()`
@@ -1440,10 +1473,13 @@ impl Editor {
     /// - `extend` — extend the selection to the click, exactly like
     ///   `<S-LeftMouse>` ([`Editor::mouse_left_extend`]).
     /// - `popup_setpos` (default) — move the cursor to the click, ending any
-    ///   Visual selection, *unless* the click lands inside the current selection,
-    ///   which is kept so a (deferred) popup menu could act on it.
-    /// - `popup` — pop a context menu without moving the cursor; the menu widget
-    ///   isn't built yet, so this is a no-op (tracked as its own feature).
+    ///   selection, *unless* the click lands inside the current selection, which is
+    ///   kept so the menu can act on it. Then ask for the menu.
+    /// - `popup` — ask for the menu without moving the cursor.
+    ///
+    /// The menu itself is a plugin: the request ([`Editor::take_popup_request`]) makes
+    /// the server fire `MenuPopup`, vim's "just before the popup menu" event, and
+    /// nothing shows when nothing handles it.
     fn mouse_right_press(&mut self, row: usize, col: usize, stamp_ms: u64) {
         match self.mousemodel() {
             MouseModel::Extend => self.mouse_left_extend(row, col, stamp_ms),
@@ -1456,20 +1492,38 @@ impl Editor {
                 else {
                     return;
                 };
-                // A click inside the active selection keeps it (the menu would act
-                // on the selection); elsewhere move the cursor and end Visual.
-                if win == self.current_window_id() && self.pos_in_visual(line, bcol) {
-                    return;
+                if !(win == self.current_window_id() && self.click_in_selection(line, bcol)) {
+                    self.set_current_window(win);
+                    if self.mode.is_visual() {
+                        self.record_visual_marks();
+                        self.mode = Mode::Normal;
+                    }
+                    if self.mode == Mode::Select && self.nm_sel.is_some() {
+                        self.collapse_selection_to(self.cursor);
+                    }
+                    self.set_window_cursor(win, line, bcol);
                 }
-                self.set_current_window(win);
-                if self.mode.is_visual() {
-                    self.record_visual_marks();
-                    self.mode = Mode::Normal;
-                }
-                self.set_window_cursor(win, line, bcol);
+                self.popup_request = true;
             }
-            MouseModel::Popup => {}
+            MouseModel::Popup => self.popup_request = true,
         }
+    }
+
+    /// Whether a click on buffer position `(line, col)` lands in the selection: the
+    /// Visual one, or a modeless one, whose caret span is end-exclusive.
+    fn click_in_selection(&self, line: usize, col: usize) -> bool {
+        if self.mode == Mode::Select && self.nm_sel.is_some() {
+            let (lo, hi) = self.caret_span(self.caret_selection());
+            let at = self.anchor_byte(Cursor { line, col });
+            return (lo..hi).contains(&at);
+        }
+        self.pos_in_visual(line, col)
+    }
+
+    /// Take the pending context-menu request a right-click default left
+    /// ([`popup_request`](Self::popup_request)); the server fires `MenuPopup` on it.
+    pub fn take_popup_request(&mut self) -> bool {
+        std::mem::take(&mut self.popup_request)
     }
 
     /// Middle-press: paste the `"*` clipboard (primary-selection) register at the
@@ -1882,6 +1936,23 @@ impl Editor {
         }
     }
 
+    /// A left-press while a context menu at the pointer is open: a click on an enabled
+    /// row chooses it at once, one on a disabled row, a separator or the border does
+    /// nothing, and one off the box cancels the menu.
+    fn mouse_pointer_menu_press(&mut self, row: usize, col: usize) {
+        self.mouse_select = None;
+        match self.menu_hit(row, col) {
+            Some(MenuHit::Item(idx)) => {
+                self.menu_cursor_to(idx);
+                if self.menu_view().map(|m| m.selected) == Some(idx) {
+                    self.menu_confirm();
+                }
+            }
+            Some(MenuHit::Preview | MenuHit::Chrome) => {}
+            None => self.menu_cancel(),
+        }
+    }
+
     /// A wheel notch while a picker / `select` is open: over the preview pane it
     /// scrolls the preview — vertically, or **horizontally** when `horizontal` (a
     /// `<S-ScrollWheel>` / horizontal wheel) so a wide file reads past the pane edge;
@@ -1974,7 +2045,10 @@ impl Editor {
                 .height
                 .checked_sub(geom.height.saturating_add(vborder))?;
             (geom.col, box_y, 1, vborder)
-        } else if matches!(m.placement, MenuPlacement::Editor | MenuPlacement::Bottom) {
+        } else if matches!(
+            m.placement,
+            MenuPlacement::Editor | MenuPlacement::Bottom | MenuPlacement::Pointer { .. }
+        ) {
             // Editor-absolute: `geom.col`/`geom.row` are the outer box's top-left in
             // windows-area cells (origin 0,0), so a split's focused-pane origin does
             // not enter — the box floats over the whole editor, mirroring the client's

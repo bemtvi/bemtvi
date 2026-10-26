@@ -6,7 +6,7 @@
 -- each round trip is done into a temp copy and compared with the original file,
 -- byte for byte, through `btv.fs`.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 -- The config announces each read through `vim.notify`, and the `:e` that triggers
 -- it repaints the message line as it finishes — so record the notifications at

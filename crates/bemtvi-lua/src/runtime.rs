@@ -17,7 +17,7 @@ use crate::host::seed_package_path;
 use crate::install::fs_stat_table;
 use crate::install::{install_runtime_api, install_vim};
 use crate::ops::{
-    BufOp, CallbackArgs, ChoiceMenuReq, CompletePush, CompleteSetupReq, ConfirmReq,
+    BufOp, CallbackArgs, ChoiceMenuReq, ClipboardOp, CompletePush, CompleteSetupReq, ConfirmReq,
     DecorInvalidate, DecorPublish, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsValue,
     GitValue, GlobalOptionOp, HlSet, HttpServerRequest, InlayHintMirrorData, LayerOp, LoopOp,
     LspClientData, LspOp, LspPickerItem, LspProgressData, MouseOp, PanelOp, PickerOpenReq,
@@ -434,9 +434,10 @@ pub struct BoMirror {
     /// filetype's built-in default when none — mirrored so `btv.bo.commentstring`
     /// reads what `gc`/`gcc` actually wrap lines with.
     pub commentstring: String,
-    /// The buffer's `'modifiable'` flag, mirrored so `vim.bo.modifiable` reads it and
-    /// `btv.buf.set_lines` can fail loud *before* queueing an edit a `nomodifiable`
-    /// buffer would refuse.
+    /// Whether the buffer accepts edits — its `'modifiable'` flag, and `false` for a
+    /// read-only kind (a `btv.view`, a live terminal, the quickfix list) whatever the
+    /// flag says — mirrored so `vim.bo.modifiable` reads it and `btv.buf.set_lines`
+    /// can fail loud *before* queueing an edit the buffer would refuse.
     pub modifiable: bool,
     /// The buffer's `'buftype'` (`""` ordinary, `"nofile"` scratch surface,
     /// `"quickfix"`, `"terminal"`), mirrored so `vim.bo.buftype` / `btv.bo.buftype`
@@ -867,6 +868,15 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
         "bemtvi:prelude/modeless",
         include_str!("prelude/modeless.lua"),
     ),
+    // The context menu (`btv.contextmenu`): the group registry, per-buffer group lists
+    // and the `MenuPopup` handler that opens them, in every session. Loads after
+    // modeless.lua: its default groups run the modeless verbs and read their key hints
+    // (`btv.modeless.key_hint`), all resolved at click time like the `btv.lsp.*` /
+    // `btv.picker.open` verbs. See docs/plans/2026-10-25-context-menu-groups.md.
+    (
+        "bemtvi:prelude/contextmenu",
+        include_str!("prelude/contextmenu.lua"),
+    ),
     // The package manager (`btv.plugins`) — declarative install + lazy/eager load
     // over `git` (`btv.run`) and `btv.fs`. Loads AFTER btv.lua: it builds on
     // `btv.command` / `btv.on` (defined there) plus btv.run / btv.fs / btv.promise /
@@ -1050,6 +1060,9 @@ pub(crate) struct Shared {
     /// editor's register file after the chunk. Reads resolve from the
     /// `btv._registers` mirror, so only the write needs an op.
     pub(crate) reg_ops: Vec<RegisterSetOp>,
+    /// `btv.clipboard.read` / `write` ops, drained by the server against the clipboard
+    /// provider (natively) or the page (in the browser), each settling a callback.
+    pub(crate) clipboard_ops: Vec<ClipboardOp>,
     /// User tree-sitter text-object bindings from `btv.textobject.map`, drained by the
     /// server into the editor's text-object registry (`Some` = bind, `None` = unbind).
     pub(crate) textobject_ops: Vec<TextObjectOp>,
@@ -1298,6 +1311,7 @@ impl Shared {
             filetype_detect,
             indent_expr,
             reg_ops,
+            clipboard_ops,
             textobject_ops,
             clipboard_seeds,
             ui_inputs,
@@ -1379,6 +1393,7 @@ impl Shared {
         *filetype_detect = Default::default();
         *indent_expr = Default::default();
         *reg_ops = Default::default();
+        *clipboard_ops = Default::default();
         *textobject_ops = Default::default();
         *clipboard_seeds = Default::default();
         *ui_inputs = Default::default();
@@ -2282,6 +2297,11 @@ impl LuaRuntime {
     }
 
     take_queue! {
+        /// Take the `btv.clipboard.read` / `write` ops queued since the last drain.
+        take_clipboard_ops -> Vec<ClipboardOp> = clipboard_ops
+    }
+
+    take_queue! {
         /// Take the user text-object bindings queued by `btv.textobject.map` since the
         /// last drain, for the server to apply to the editor's text-object registry.
         take_textobject_ops -> Vec<TextObjectOp> = textobject_ops
@@ -3133,6 +3153,24 @@ impl LuaRuntime {
                         err.set("code", e.code)?;
                         err.set("message", e.message)?;
                         run.call::<()>((id, keep, mlua::Value::Table(err), mlua::Value::Nil))
+                    }
+                }
+            }
+            CallbackArgs::ClipboardResult { result } => {
+                // `btv.clipboard.read` / `write` settle: `(id, keep, err, value)`, `err` the
+                // `{ message }` table on a failure, else nil with the text (a read) or nil.
+                match result {
+                    Ok(text) => {
+                        let value = match text {
+                            Some(t) => mlua::Value::String(self.lua.create_string(&t)?),
+                            None => mlua::Value::Nil,
+                        };
+                        run.call::<()>((id, keep, mlua::Value::Nil, value))
+                    }
+                    Err(message) => {
+                        let err = self.lua.create_table()?;
+                        err.set("message", message)?;
+                        run.call::<()>((id, keep, err, mlua::Value::Nil))
                     }
                 }
             }

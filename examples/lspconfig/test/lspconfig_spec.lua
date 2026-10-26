@@ -9,7 +9,7 @@
 -- fact it can (that the config declines to load, loudly, naming what is missing)
 -- rather than pretending.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 --- Load the config, tolerating an un-cloned plugin.
 local loaded, load_err = pcall(dofile, DIR .. "/init.lua")

@@ -5,7 +5,7 @@
 -- A gutter sign and a line fill are both drawn beside the text rather than in it,
 -- so they are `t:decor()` / the fill's own painted row — never `t:lines()`.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

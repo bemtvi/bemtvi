@@ -26,7 +26,7 @@
 -- would build this from `btv.fs.readdir`, lazily, on expand.
 -- Paths are resolved against THIS directory, not the working one, so `<CR>` opens
 -- the right file however the playground was launched.
-local HERE = debug.getinfo(1, "S").source:match("^@(.*)/[^/]+$")
+local HERE = btv.utils.dirname(debug.getinfo(1, "S").source:sub(2))
 local ENTRIES = {
   { label = "  sample.txt", path = HERE .. "/sample.txt" },
   { label = "  init.lua", path = HERE .. "/init.lua" },

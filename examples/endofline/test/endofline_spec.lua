@@ -6,7 +6,7 @@
 -- temp copy and reads the bytes back — never touching the checked-in sample,
 -- which is deliberately stored without a trailing newline.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 
@@ -115,8 +115,10 @@ btv.test.describe("examples/endofline", function()
     t:cmd("w")
     local raw = bytes(path)
     btv.test.expect(raw:sub(-#"new last line")).to_be("new last line")
-    -- Every earlier line is still terminated: the line before it ends in a break.
-    btv.test.expect(raw).to_contain(".\nnew last line")
+    -- Every earlier line is still terminated: the line before it ends in a break —
+    -- `\r\n` when the checkout gave the sample CRLF endings ('fileformat' `dos`).
+    local nl = btv.bo.fileformat == "dos" and "\r\n" or "\n"
+    btv.test.expect(raw).to_contain("." .. nl .. "new last line")
   end)
 
   -- 5. "AN EMPTY FILE STAYS EMPTY."

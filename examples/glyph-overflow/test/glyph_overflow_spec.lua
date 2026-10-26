@@ -9,7 +9,7 @@
 -- default is the empty client-default, and — the invariant the whole feature
 -- rests on — the COLUMN MODEL never moves whatever the mode is.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

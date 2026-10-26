@@ -10,7 +10,7 @@
 -- server's LSP-completion suite; a machine with the binary also gets the one cheap
 -- live check — that the server actually spawns.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

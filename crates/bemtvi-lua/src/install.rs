@@ -20,13 +20,13 @@ use crate::convert::{
 };
 use crate::host::{get_runtime_file, stdpath};
 use crate::ops::{
-    BufOp, ChoiceMenuReq, CompletePush, CompleteSetupReq, ConfirmReq, DecorInvalidate, DecorMark,
-    DecorPublish, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsJob, GitJob, GlobalOptionOp,
-    HlSet, HttpRequest, HttpServerReply, LayerOp, LoopOp, LspOp, MouseOp, NamedListOp, PanelOp,
-    PickerOpenReq, PickerPush, PreviewPush, QfItem, QfSetOp, RegisterSetOp, Sequenced,
-    SnippetAddReq, SnippetSetupReq, StatuslineKind, StatuslinePublishReq, StatuslineSetupReq,
-    StatuslineTarget, TabOp, TerminalOpenReq, TextObjectOp, TsOp, UiFloatReq, UiInputReq,
-    UiSelectReq, ViewOp, VirtChunkData, VirtDecorData, WindowOp, WorkspaceOptionOp,
+    BufOp, ChoiceMenuReq, ClipboardOp, ClipboardOpKind, CompletePush, CompleteSetupReq, ConfirmReq,
+    DecorInvalidate, DecorMark, DecorPublish, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsJob,
+    GitJob, GlobalOptionOp, HlSet, HttpRequest, HttpServerReply, LayerOp, LoopOp, LspOp, MouseOp,
+    NamedListOp, PanelOp, PickerOpenReq, PickerPush, PreviewPush, QfItem, QfSetOp, RegisterSetOp,
+    Sequenced, SnippetAddReq, SnippetSetupReq, StatuslineKind, StatuslinePublishReq,
+    StatuslineSetupReq, StatuslineTarget, TabOp, TerminalOpenReq, TextObjectOp, TsOp, UiFloatReq,
+    UiInputReq, UiSelectReq, ViewOp, VirtChunkData, VirtDecorData, WindowOp, WorkspaceOptionOp,
 };
 use crate::runtime::{OutputLine, Shared};
 use crate::vimregex;
@@ -3351,21 +3351,49 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `btv._ui_select(items, prompt, cb_id)`: queue a `btv.ui.select` request
+    // `btv._ui_select(items, prompt, cb_id, extra?)`: queue a `btv.ui.select` request
     // ([`UiSelectReq`]). The server opens the floating selectable-list widget
     // showing `items` (the already-rendered display labels) titled `prompt`, and
     // fires `btv._cb_fns[cb_id]` with the chosen 1-based index — or `nil` on
     // cancel — when the user confirms. The Lua wrapper maps the index back to the
-    // original item before calling the user's `on_choice`.
+    // original item before calling the user's `on_choice`. `extra` is `btv.ui.menu`'s:
+    // `{ details, hls, disabled, separators, anchor }`, all but `anchor` parallel to
+    // `items`.
     let sh = shared.clone();
     btv.set(
         "_ui_select",
         lua.create_function(
-            move |_, (items, prompt, cb_id): (Vec<String>, String, u64)| {
+            move |_, (items, prompt, cb_id, extra): (Vec<String>, String, u64, Option<Table>)| {
+                let (mut details, mut hls, mut disabled, mut separators) =
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                let mut anchor = "cursor".to_string();
+                if let Some(extra) = extra {
+                    details = extra
+                        .get::<Option<Vec<String>>>("details")?
+                        .unwrap_or_default();
+                    hls = extra.get::<Option<Vec<String>>>("hls")?.unwrap_or_default();
+                    disabled = extra
+                        .get::<Option<Vec<bool>>>("disabled")?
+                        .unwrap_or_default();
+                    separators = extra
+                        .get::<Option<Vec<bool>>>("separators")?
+                        .unwrap_or_default();
+                    anchor = extra.get::<Option<String>>("anchor")?.unwrap_or(anchor);
+                }
+                if !matches!(anchor.as_str(), "cursor" | "mouse") {
+                    return Err(mlua::Error::runtime(format!(
+                        "btv.ui.menu: anchor must be \"cursor\" or \"mouse\", got {anchor:?}"
+                    )));
+                }
                 sh.borrow_mut().ui_selects.push(UiSelectReq {
                     items,
                     prompt,
                     cb_id,
+                    details,
+                    hls,
+                    disabled,
+                    separators,
+                    anchor,
                 });
                 Ok(())
             },
@@ -4230,6 +4258,32 @@ pub(crate) fn install_runtime_api(
                     linewise,
                     append,
                 });
+                Ok(())
+            },
+        )?,
+    )?;
+
+    // `btv._clipboard_op(id, kind, text, linewise)`: queue a [`ClipboardOp`] — `kind`
+    // `"read"`, or `"write"` with `text` — whose result settles callback `id`. The Lua
+    // `btv.clipboard` wrappers register the callback and build the promise.
+    let sh = shared.clone();
+    btv.set(
+        "_clipboard_op",
+        lua.create_function(
+            move |_, (id, kind, text, linewise): (u64, String, Option<String>, bool)| {
+                let kind = match kind.as_str() {
+                    "read" => ClipboardOpKind::Read,
+                    "write" => ClipboardOpKind::Write {
+                        text: text.unwrap_or_default(),
+                        linewise,
+                    },
+                    other => {
+                        return Err(mlua::Error::runtime(format!(
+                            "btv._clipboard_op: unknown kind {other:?}"
+                        )))
+                    }
+                };
+                sh.borrow_mut().clipboard_ops.push(ClipboardOp { id, kind });
                 Ok(())
             },
         )?,

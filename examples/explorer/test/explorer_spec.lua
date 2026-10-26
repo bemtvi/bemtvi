@@ -5,7 +5,7 @@
 -- The explorer is a real buffer, so the listing is `t:lines()` and the selection
 -- is the cursor. Every WHAT-TO-TYPE line is typed as written.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 local TREE = DIR .. "/tree"
 
 --- Open the sample tree as a directory listing.

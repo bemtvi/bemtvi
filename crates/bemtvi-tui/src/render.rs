@@ -2999,6 +2999,13 @@ fn render_menu(
     let list_line = |r: usize| -> Line<'static> {
         let idx = start + r;
         match menu.items.get(idx) {
+            // A `btv.ui.menu` separator is a rule across the list in the border color.
+            Some(_) if menu.separators.get(idx).copied().unwrap_or(false) => {
+                Line::from(Span::styled(
+                    "─".repeat(width),
+                    menu.styles.border.map(rt).unwrap_or_default(),
+                ))
+            }
             Some(label) => {
                 let empty = Vec::new();
                 let spans = menu.match_spans.get(idx).unwrap_or(&empty);

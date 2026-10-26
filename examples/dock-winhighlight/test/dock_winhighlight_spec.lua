@@ -6,7 +6,7 @@
 -- painted cell resolves to — which is exactly what `t:highlights()` reports. The
 -- spec crosses into the dock and back and reads the groups on each side.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

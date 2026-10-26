@@ -1445,3 +1445,28 @@ async fn a_window_title_split_across_reads_still_applies() {
     }
     assert_eq!(buf_name(&rpc).await, "split-title");
 }
+
+/// `'modifiable'` reads what the edit chokepoints enforce: off while the child runs
+/// (only the child writes the mirror), back on once it exits and the buffer becomes an
+/// ordinary scratch buffer. Neither moment changes the option itself.
+#[tokio::test]
+async fn a_live_terminal_reads_nomodifiable_until_its_child_exits() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+
+    command(&rpc, &format!("terminal {CAT}")).await;
+    feed(&rpc, "hello<CR>");
+    wait_lines(&rpc, "cat to echo 'hello'", |ls| has_line(ls, "hello")).await;
+    let bo = |rpc: &Rpc| {
+        let rpc = rpc.clone();
+        async move { exec_lua(&rpc, "return btv.bo.modifiable").await.as_bool() }
+    };
+    assert_eq!(bo(&rpc).await, Some(false), "a live terminal");
+
+    feed(&rpc, EOF_KEYS);
+    wait_lines(&rpc, "the process-exit notice", |ls| {
+        ls.iter().any(|l| l.contains("[Process exited 0]"))
+    })
+    .await;
+    assert_eq!(bo(&rpc).await, Some(true), "an exited terminal");
+}

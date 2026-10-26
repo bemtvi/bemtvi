@@ -2968,8 +2968,17 @@
         const label = String(menu.items[idx] ?? "");
         const rowEl = document.createElement("div");
         rowEl.className = "row";
-        if (selActive && idx === menu.selected) applySel(rowEl);
         rowEl.style.width = listW * cw + "px";
+        // A `btv.ui.menu` separator is a rule across the list, themed like the prompt
+        // rule above. `pmenu-rule` is its stable hook.
+        if (menu.separators && menu.separators[idx]) {
+          rowEl.className = "row pmenu-rule" + (borderCss ? "" : " float-border");
+          if (borderCss) rowEl.style.color = borderCss;
+          rowEl.textContent = "─".repeat(listW);
+          listEls.push(rowEl);
+          continue;
+        }
+        if (selActive && idx === menu.selected) applySel(rowEl);
         // Bold + accent the matched characters (the fuzzy match), per the server's
         // char-based spans; plain text when this picker/select has no spans.
         // Path-priority truncation: keep the file name (path tail) on screen when the
@@ -3859,8 +3868,20 @@
       if (button === "left") { dragBtn = "left"; lastDragCell = { row, col }; }
       mouseOp(button, "press", mods(e), row, col);
     });
+    // Cell of the last hover reported over an open editor-level menu (a context menu at
+    // the pointer, a picker), so the row under the pointer lights with one `move` per
+    // cell. Nothing is sent while no such menu is open. Mirrors bemtvi-gui's
+    // `mouse_hover`.
+    let lastHoverCell = null;
+    function hover(e) {
+      if (!(view && view.menu && view.menu.editor_relative)) { lastHoverCell = null; return; }
+      const { row, col } = cellAt(e);
+      if (lastHoverCell && lastHoverCell.row === row && lastHoverCell.col === col) return;
+      lastHoverCell = { row, col };
+      mouseOp("move", "move", "", row, col);
+    }
     gridEl.addEventListener("mousemove", (e) => {
-      if (!dragBtn) { updateResizeCursor(e); return; }
+      if (!dragBtn) { updateResizeCursor(e); hover(e); return; }
       const { row, col } = cellAt(e);
       // Only a drag into a *new* cell is meaningful; within-cell jitter is noise and
       // must not emit a drag (which the core would read as the start of a selection).

@@ -6,7 +6,7 @@
 -- message line — and, for the `:silent` half the notes call out, on `:messages`
 -- holding no entry either.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

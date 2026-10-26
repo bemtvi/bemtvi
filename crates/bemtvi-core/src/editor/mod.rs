@@ -1624,6 +1624,12 @@ pub struct Editor {
     /// `None` before any mouse event. See [`crate::editor::mouse`].
     last_mouse: Option<(usize, usize)>,
 
+    /// Set by the `popup` / `popup_setpos` right-click default once it has placed the
+    /// caret: the session wants its context menu. The server drains it
+    /// ([`take_popup_request`](Self::take_popup_request)) and fires `MenuPopup`, whose
+    /// handler reads the click from `getmousepos()`.
+    popup_request: bool,
+
     /// Multi-click tracker for the **right / middle** buttons (the left button counts
     /// via the [`mouse_select`](Self::mouse_select) drag tracker): `(button, row, col,
     /// stamp_ms, count)` of the last such press, so a same-button same-cell repeat
@@ -2428,6 +2434,7 @@ impl Editor {
             mouse_resize: None,
             mouse_dragging: false,
             last_mouse: None,
+            popup_request: false,
             mouse_button_seq: None,
             mouse_wheels: Vec::new(),
             scroll_from: None,

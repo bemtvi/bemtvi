@@ -4,7 +4,7 @@
 --
 -- Each numbered note in init.lua, typed as written. `t:feed` is the keyboard.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 
@@ -155,5 +155,61 @@ btv.test.describe("examples/modeless", function()
     t:feed("Z")
     btv.test.expect(t:line(1):sub(1, 4)).to_be("Z001")
     btv.test.expect(btv.win.saveview().topline).to_be(1)
+  end)
+
+  -- A screen cell on buffer line `line` (1-based), `col` cells into its text: the
+  -- window's gutter comes first, and the menu opens at whatever cell was clicked.
+  local function cell(line, col)
+    return line - 1, btv.win.textoff(btv.win.current()) + col
+  end
+
+  -- The row of the open menu labelled `label`, as a screen cell to click: the box's
+  -- border sits on the right-clicked cell, so row `i` is `i` rows below it.
+  local function row_of(t, at_row, at_col, label)
+    local m = t:menu()
+    for i, item in ipairs(m.items) do
+      if item == label then
+        return at_row + i, at_col + 2
+      end
+    end
+    error("no menu row " .. label)
+  end
+
+  btv.test.it("10 — right-click opens a menu at the pointer; its rows do the work", function(t)
+    open(t)
+    -- Double-click `quick` (text columns 4-8 of line 1) and right-click inside it.
+    local r, c = cell(1, 6)
+    t:mouse("left", "press", r, c)
+    t:mouse("left", "release", r, c)
+    t:mouse("left", "press", r, c)
+    t:mouse("left", "release", r, c)
+    btv.test.expect(t:mode()).to_be("s")
+    t:mouse("right", "press", r, c)
+    local m = t:menu()
+    btv.test.expect(m.items[4]).to_be("Cut")
+    btv.test.expect(m.kinds[4]).to_contain("X")
+    btv.test.expect(m.items[#m.items]).to_be("Duplicate Line")
+    -- One click on Cut.
+    local cr, cc = row_of(t, r, c, "Cut")
+    t:mouse("left", "press", cr, cc)
+    t:mouse("left", "release", cr, cc)
+    btv.test.expect(t:line(1)).to_be("The  brown fox jumps over the lazy dog.")
+    btv.test.expect(t:menu()).to_be_nil()
+
+    -- Right-click line 2: the caret goes there, and the added row duplicates it.
+    r, c = cell(2, 3)
+    t:mouse("right", "press", r, c)
+    btv.test.expect(t:cursor()[1]).to_be(2)
+    local dr, dc = row_of(t, r, c, "Duplicate Line")
+    t:mouse("left", "press", dr, dc)
+    t:mouse("left", "release", dr, dc)
+    btv.test.expect(t:line(2)).to_be("fox is the word to find, and fox again here.")
+    btv.test.expect(t:line(3)).to_be("fox is the word to find, and fox again here.")
+
+    -- `<Esc>` dismisses it, and typing goes back to the text.
+    t:mouse("right", "press", r, c)
+    btv.test.expect(t:menu()).never.to_be_nil()
+    t:feed("<Esc>")
+    btv.test.expect(t:menu()).to_be_nil()
   end)
 end)

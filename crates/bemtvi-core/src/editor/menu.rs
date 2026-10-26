@@ -80,12 +80,17 @@ const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
 /// editor's bottom-right corner (the which-key content-float shape — menus never
 /// request it); `Cmdline` floats it directly **above the command line**, anchored
 /// under the token being completed (the `btv.cmdline_complete` shape).
+///
+/// `Pointer` opens a context menu at a global screen cell (the right-click that asked
+/// for it): the box's top-left corner sits on the cell, flipping up or left when the
+/// box doesn't fit below or right of it. Like `Editor` its box is editor-absolute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuPlacement {
     Cursor,
     Editor,
     Bottom,
     Cmdline,
+    Pointer { row: usize, col: usize },
 }
 
 /// Which orchestration drives this `Menu`. The widget is one shape; the kind
@@ -280,6 +285,14 @@ pub struct MenuItem {
     /// way round — the tiers differ by their `priority` bias, so a tie across them means
     /// the un-stated row out-matched the stated one by exactly that bias.
     pub sort_key: Option<String>,
+    /// A row that can't be chosen (`btv.ui.menu`'s `enabled = false` entries and its
+    /// separators): navigation steps over it, and confirming or clicking it does
+    /// nothing. `false` for every other menu's rows.
+    pub disabled: bool,
+    /// A rule between groups of rows (`btv.ui.menu`'s `separator` entries) rather
+    /// than a row with text: clients draw it as a line across the list. Always
+    /// [`disabled`](Self::disabled) too. `false` for every other row.
+    pub separator: bool,
 }
 
 impl MenuItem {
@@ -302,6 +315,8 @@ impl MenuItem {
             layout: None,
             hl: None,
             sort_key: None,
+            disabled: false,
+            separator: false,
         }
     }
 }
@@ -1093,6 +1108,24 @@ impl Menu {
     /// `None` for noselect (a completion popup before the first navigation) or an
     /// empty view — so the docs sidebar stays hidden until a row is chosen. Drives
     /// both the [`MenuView`] docs-selection fields and [`Editor::complete_selected`].
+    /// Whether view row `i` can't be chosen ([`MenuItem::disabled`]).
+    fn row_disabled(&self, i: usize) -> bool {
+        self.all_items[self.item_at(i)].disabled
+    }
+
+    /// The first enabled view row at or after `from` (`forward`), or at or before it,
+    /// within the view. `None` when there is none that way.
+    fn enabled_from(&self, from: usize, forward: bool) -> Option<usize> {
+        let len = self.view_len();
+        if forward {
+            (from..len).find(|&i| !self.row_disabled(i))
+        } else {
+            (0..=from.min(len.checked_sub(1)?))
+                .rev()
+                .find(|&i| !self.row_disabled(i))
+        }
+    }
+
     fn selected_item(&self) -> Option<&MenuItem> {
         if !self.selected_active || self.cursor >= self.view_len() {
             return None;
@@ -1297,6 +1330,19 @@ impl Editor {
             .enumerate()
             .map(|(key, label)| MenuItem::new(label, key))
             .collect();
+        self.open_menu_items(all_items, placement, cursor);
+    }
+
+    /// [`open_menu`](Self::open_menu) over full rows, for a list whose rows carry more
+    /// than a label: `btv.ui.menu`'s detail column (`kind`), row highlight (`hl`) and
+    /// rows that can't be chosen (`disabled`). Each row's `key` is what a confirm
+    /// reports.
+    pub fn open_menu_items(
+        &mut self,
+        all_items: Vec<MenuItem>,
+        placement: MenuPlacement,
+        cursor: usize,
+    ) {
         let last = all_items.len().saturating_sub(1);
         // Opens noselect (`selected_active` defaults `false`), like the completion
         // popup / wildmenu: nothing is highlighted until the user navigates, so
@@ -1978,7 +2024,7 @@ impl Editor {
                 // navigated to yet) resolves nothing and stays open — `<CR>` is inert
                 // until the user picks a row, like the completion popup / wildmenu.
                 let chosen = self.menu.as_ref().and_then(|m| {
-                    (m.selected_active && m.cursor < m.view_len())
+                    (m.selected_active && m.cursor < m.view_len() && !m.row_disabled(m.cursor))
                         .then(|| m.all_items[m.item_at(m.cursor)].key)
                 });
                 if let Some(key) = chosen {
@@ -2003,16 +2049,26 @@ impl Editor {
         // current row rather than moving past it; thereafter `next`/`prev` step it
         // (clamped — the select list doesn't wrap). `first`/`last` always jump. An
         // unknown action fails loud *before* touching the selection state.
+        // Disabled rows (a `btv.ui.menu` separator or greyed-out entry) are stepped
+        // over; a move with no enabled row in its direction stays put.
         let was_active = menu.selected_active;
-        match action {
-            "next" if was_active => menu.cursor = (menu.cursor + 1).min(last),
-            "prev" if was_active => menu.cursor = menu.cursor.saturating_sub(1),
-            "next" | "prev" => {}
-            "first" => menu.cursor = 0,
-            "last" => menu.cursor = last,
+        let target = match action {
+            "next" if was_active => menu.enabled_from(menu.cursor + 1, true),
+            "prev" if was_active => menu
+                .cursor
+                .checked_sub(1)
+                .and_then(|i| menu.enabled_from(i, false)),
+            "next" | "prev" => menu.enabled_from(menu.cursor, true),
+            "first" => menu.enabled_from(0, true),
+            "last" => menu.enabled_from(last, false),
             other => return Err(format!("unknown select action {other:?}")),
+        };
+        if let Some(i) = target {
+            menu.cursor = i;
+            menu.selected_active = true;
+        } else if !was_active && menu.view_len() > 0 && !menu.row_disabled(menu.cursor) {
+            menu.selected_active = true;
         }
-        menu.selected_active = true;
         Ok(())
     }
 
@@ -2387,9 +2443,23 @@ impl Editor {
     pub(crate) fn menu_cursor_to(&mut self, idx: usize) {
         if let Some(menu) = self.menu.as_mut() {
             let last = menu.view_len().saturating_sub(1);
-            menu.cursor = idx.min(last);
+            let idx = idx.min(last);
+            if menu.view_len() == 0 || menu.row_disabled(idx) {
+                return;
+            }
+            menu.cursor = idx;
             menu.selected_active = true;
         }
+    }
+
+    /// Whether the open menu is a context menu at the pointer
+    /// ([`MenuPlacement::Pointer`]), which the mouse drives like a GUI menu.
+    pub(crate) fn pointer_menu_active(&self) -> bool {
+        self.picker_or_select_active()
+            && matches!(
+                self.menu.as_ref().map(|m| m.placement),
+                Some(MenuPlacement::Pointer { .. })
+            )
     }
 
     /// Route a string action to whichever list menu is open (picker or select),
@@ -2663,6 +2733,19 @@ impl Editor {
             .collect()
     }
 
+    /// Whether each row in the visible window `[start, start + count)` is a
+    /// [separator](MenuItem::separator), parallel to [`Editor::menu_rows`]. Empty
+    /// without an open menu.
+    pub fn menu_separators_window(&self, start: usize, count: usize) -> Vec<bool> {
+        let Some(m) = self.menu.as_ref() else {
+            return Vec::new();
+        };
+        let end = start.saturating_add(count).min(m.view_len());
+        (start..end)
+            .map(|i| m.all_items[m.item_at(i)].separator)
+            .collect()
+    }
+
     /// Whether each row in the visible window `[start, start + count)` is **marked**
     /// (multi-select), parallel to [`Editor::menu_rows`] — so the client can flag the
     /// marked rows. All `false` when nothing is marked (the common case); empty when
@@ -2884,6 +2967,57 @@ impl Editor {
                     m.selected - start,
                     None,
                 )
+            }
+            MenuPlacement::Pointer {
+                row: at_row,
+                col: at_col,
+            } => {
+                // A context menu at a global screen cell: content-hugging like a
+                // `select`, with the details (shortcut hints) in an aligned column two
+                // cells past the widest label. The box is editor-absolute, its outer
+                // top-left on the cell; it flips up / left of the cell when it doesn't
+                // fit below / right of it, and is clamped into the editor either way.
+                const VCHROME: usize = 2;
+                const HCHROME: usize = 2;
+                let rows = self.menu_rows(0, m.total);
+                let kinds = self.menu_kinds_window(0, m.total);
+                let max_label = rows
+                    .iter()
+                    .map(|(l, _)| l.chars().count())
+                    .max()
+                    .unwrap_or(0);
+                let max_kind = kinds
+                    .iter()
+                    .flatten()
+                    .map(|k| k.chars().count())
+                    .max()
+                    .unwrap_or(0);
+                let content_w = if max_kind > 0 {
+                    max_label + 2 + max_kind
+                } else {
+                    max_label
+                };
+                let width = content_w
+                    .max(query_w)
+                    .clamp(1, editor_w.saturating_sub(HCHROME).max(1));
+                let kind_col = (max_kind > 0 && width > max_kind)
+                    .then(|| (max_label + 2).min(width - max_kind));
+                let height = rows.len().clamp(1, editor_h.saturating_sub(VCHROME).max(1));
+                let (box_w, box_h) = (width + HCHROME, height + VCHROME);
+                let col = if at_col + box_w <= editor_w {
+                    at_col
+                } else {
+                    (at_col + 1).saturating_sub(box_w)
+                };
+                let row = if at_row + box_h <= editor_h {
+                    at_row
+                } else {
+                    (at_row + 1).saturating_sub(box_h)
+                };
+                let col = col.min(editor_w.saturating_sub(box_w));
+                let row = row.min(editor_h.saturating_sub(box_h));
+                let start = menu_start(m.selected_active.then_some(m.selected), height);
+                (row, col, width, height, start, rows, m.selected, kind_col)
             }
             MenuPlacement::Cmdline => {
                 // The `btv.cmdline_complete` wildmenu: a bordered list floating just

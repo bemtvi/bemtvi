@@ -6,7 +6,7 @@
 -- claim that matters most: these are CORE defaults, so they work with nothing
 -- bound, and any of them can still be taken back by a config.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

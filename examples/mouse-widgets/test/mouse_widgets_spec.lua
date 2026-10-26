@@ -13,7 +13,7 @@
 -- scans for the row instead of assuming, re-opening the widget after each miss
 -- because a miss cancels a picker.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 -- The picker and the chooser report through `btv.notify`; `vim.notify` is a
 -- separate binding captured when the prelude loaded, so both are wrapped.
@@ -81,7 +81,7 @@ local function single_click(t, row, col)
   t:cmd("set mousetime=400")
 end
 
-local function probe_cell(t, widget, open_widget)
+local function probe_cell(t, widget, open_widget, bottom_up)
   local cached = hit[widget]
   if cached then
     open_widget(t)
@@ -92,7 +92,13 @@ local function probe_cell(t, widget, open_widget)
       return cached[1], cached[2], m.selected
     end
   end
-  for row = 0, 22 do
+  -- Every miss re-opens the widget, so start the scan where it is painted: a
+  -- widget docked above the command line found top-down costs ~100 misses.
+  local first, last, step = 0, 22, 1
+  if bottom_up then
+    first, last, step = 22, 0, -1
+  end
+  for row = first, last, step do
     for _, col in ipairs({ 2, 6, 8, 12, 20 }) do
       open(t)
       open_widget(t)
@@ -166,7 +172,7 @@ btv.test.describe("examples/mouse-widgets", function()
     t:feed("<Esc><Esc>")
     local row, col, first = probe_cell(t, "wildmenu", function(tt)
       tt:feed(":ene<Tab>")
-    end)
+    end, true)
     -- The wildmenu paints BOTTOM-UP, so its highlight walks the other way: a
     -- notch up is what moves toward the rows above.
     t:mouse("wheel", "up", row, col)

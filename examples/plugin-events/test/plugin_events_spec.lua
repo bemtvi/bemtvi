@@ -7,7 +7,7 @@
 -- that did not exist when it happened — so the spec waits for the events and
 -- asserts on the state each one promises.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 local notified = {}
 do

@@ -6,7 +6,7 @@
 -- select one check first that the grammar is on disk — the notes say `:TSInstall
 -- rust` is the prerequisite — and skip rather than fail without it.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

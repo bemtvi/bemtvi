@@ -11,7 +11,7 @@
 -- is measuring and asserts on the transcript, rather than on the one message
 -- line that only ever holds the last of them.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 
@@ -36,10 +36,10 @@ local function transcript(body)
   return seen
 end
 
---- Index of the first recorded line containing `needle`, or nil.
-local function index_of(lines, needle)
-  for i, line in ipairs(lines) do
-    if line:find(needle, 1, true) then
+--- Index of the first recorded line containing `needle` (at or after `from`), or nil.
+local function index_of(lines, needle, from)
+  for i = from or 1, #lines do
+    if lines[i]:find(needle, 1, true) then
       return i
     end
   end
@@ -111,10 +111,12 @@ btv.test.describe("examples/async-events", function()
       open(t)
       t:sleep(120)
     end)
+    -- Counted from the first sequence that STARTS in the transcript: on a loaded
+    -- machine the tail of an earlier one (the previous test's) can land first.
     local started = index_of(lines, "2. BufReadPost start")
-    local done = index_of(lines, "2. BufReadPost done")
-    local ft = index_of(lines, "2. FileType = demo")
     btv.test.expect(started).never.to_be_nil()
+    local done = index_of(lines, "2. BufReadPost done", started)
+    local ft = index_of(lines, "2. FileType = demo", started)
     btv.test.expect(done).never.to_be_nil()
     btv.test.expect(ft).never.to_be_nil()
     btv.test.expect(started < done).to_be(true)
@@ -128,8 +130,10 @@ btv.test.describe("examples/async-events", function()
       open(t)
       t:sleep(150)
     end)
-    local ft = index_of(lines, "2. FileType = demo")
-    local late = index_of(lines, "3. late subscriber ran for demo")
+    local started = index_of(lines, "2. BufReadPost start")
+    btv.test.expect(started).never.to_be_nil()
+    local ft = index_of(lines, "2. FileType = demo", started)
+    local late = index_of(lines, "3. late subscriber ran for demo", started)
     btv.test.expect(late).never.to_be_nil()
     -- It ran after the fire that registered it, not before.
     btv.test.expect(ft < late).to_be(true)

@@ -6,7 +6,7 @@
 -- sidebar, move inside it, open an entry into the MAIN area — plus the claim the
 -- sample buffer makes about a view being inert to the editing grammar.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

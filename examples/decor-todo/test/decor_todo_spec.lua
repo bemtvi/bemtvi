@@ -7,7 +7,7 @@
 -- conveniences the notes are about (the debounce, and `bufs` scoping) are checked
 -- as behaviour: one run after a fast scroll settles, and the provider's reach.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

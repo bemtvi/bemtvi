@@ -10,7 +10,7 @@
 -- step — the CLIENT swapping its window onto the returned transport — belongs to a
 -- real client, so the spec stops at the spec.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 -- The demo resolver reports progress through `btv.notify`; record it at the source.
 local notified = {}

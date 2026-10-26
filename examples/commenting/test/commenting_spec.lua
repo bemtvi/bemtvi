@@ -6,7 +6,7 @@
 -- the notes describe — so the demo cannot rot into an instruction that no longer
 -- works.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

@@ -2354,6 +2354,15 @@ impl EditHost {
         if any_hl {
             map.push((Value::from("row_hls"), Value::Array(row_hls)));
         }
+        // A `btv.ui.menu` separator row draws as a rule across the list instead of a
+        // label; the key is omitted when no visible row is one.
+        let separators = self.editor.menu_separators_window(start, rows.len());
+        if separators.iter().any(|&s| s) {
+            map.push((
+                Value::from("separators"),
+                Value::Array(separators.into_iter().map(Value::from).collect()),
+            ));
+        }
         // Only completion popups carry kinds; omit the key when every row is kind-less
         // so `select` / picker / cmdline maps are byte-for-byte unchanged.
         if any_kind {
@@ -2397,7 +2406,10 @@ impl EditHost {
         // the windows-area origin instead of the focused window's text inner — a split
         // can't squeeze it into the active pane. Absent ⇒ window-relative (the
         // cursor-anchored completion popup / `select`).
-        if matches!(m.placement, MenuPlacement::Editor | MenuPlacement::Bottom) {
+        if matches!(
+            m.placement,
+            MenuPlacement::Editor | MenuPlacement::Bottom | MenuPlacement::Pointer { .. }
+        ) {
             map.push((Value::from("editor_relative"), Value::from(true)));
         }
         // The command-line wildmenu (`btv.cmdline_complete`) floats above the command
@@ -2548,11 +2560,11 @@ impl EditHost {
                 };
                 (row, col, width, height)
             }
-            // Content floats are never cmdline-placed (only the `btv.cmdline_complete`
-            // menu is); a stray one falls back to editor-centered. Anchored to the
+            // Content floats are never cmdline- or pointer-placed (only menus are); a
+            // stray one falls back to editor-centered. Anchored to the
             // whole editor (`editor_w`/`editor_h`), not the focused window — a split
             // must not drag an editor-relative float into the active pane.
-            MenuPlacement::Editor | MenuPlacement::Cmdline => {
+            MenuPlacement::Editor | MenuPlacement::Cmdline | MenuPlacement::Pointer { .. } => {
                 let width = content_w.min(editor_w.saturating_sub(CHROME).max(1));
                 let height = count.min(editor_h.saturating_sub(CHROME).max(1));
                 let row = editor_h.saturating_sub(height + CHROME) / 2;

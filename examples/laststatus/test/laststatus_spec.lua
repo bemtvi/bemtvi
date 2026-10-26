@@ -6,7 +6,7 @@
 -- there is a bar at all (`t:statusline()`) and on how many text rows the window
 -- has left — mode 0 gives the freed bottom row back to the text.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 -- The click handler and the <leader>N maps report through `vim.notify`.
 local notified = {}

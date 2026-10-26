@@ -6,7 +6,7 @@
 -- recorder for the duration of each command and asserts on what it was handed —
 -- the exact text the notes promise a reader will see.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

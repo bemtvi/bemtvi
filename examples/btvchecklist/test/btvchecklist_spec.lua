@@ -7,7 +7,7 @@
 -- works. The dialog is a real (floating) window with a real buffer, so its rows
 -- are `t:lines()` — no special surface needed.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 -- The dialog reports through `btv.notify`, and it does so as it CLOSES — the
 -- repaint that tears the float down takes the message line with it, and the

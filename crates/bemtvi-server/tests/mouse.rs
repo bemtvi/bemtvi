@@ -2272,6 +2272,9 @@ async fn double_right_click_fires_a_mapped_2rightmouse() {
         r#"
         _G.dbl = 0
         btv.keymap.set('n', '<2-RightMouse>', function() _G.dbl = _G.dbl + 1 end)
+        -- No context menu: its box would open on the first press's cell and take the
+        -- second press.
+        btv.contextmenu.set(0, {})
         return true
     "#,
     )

@@ -6,7 +6,7 @@
 -- span either: the server sends the resolved column list and the CLIENT paints it.
 -- `t:rulers()` is the view that can see it.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

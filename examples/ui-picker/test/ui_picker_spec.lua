@@ -7,7 +7,7 @@
 -- (`files` / `live_grep`) need `rg`, so those cases skip when it is absent rather
 -- than failing on a missing binary; everything else runs in-process.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

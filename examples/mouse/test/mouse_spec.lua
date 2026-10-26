@@ -6,7 +6,7 @@
 -- (`btv._input_mouse`, the same call the TUI makes) and asserts on where the
 -- cursor, the selection or the viewport ended up.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

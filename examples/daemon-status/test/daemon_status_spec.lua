@@ -10,7 +10,7 @@
 -- the config listens for. What it does not do is fake a link: bringing a real
 -- daemon up and dropping it belongs to the daemon suites.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

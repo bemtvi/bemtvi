@@ -6,7 +6,7 @@
 -- (the snapshot is taken after the spec files are sourced), so every case starts
 -- from the same `"h` / `"t` a reader gets on launch.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

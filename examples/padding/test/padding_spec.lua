@@ -7,7 +7,7 @@
 -- the gutter starts, and where a click lands. Those are what the spec asserts on,
 -- rather than on the option string alone.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

@@ -4,7 +4,7 @@
 --
 -- Each numbered section is typed exactly as its TYPE line says.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 local printed = {}
 do

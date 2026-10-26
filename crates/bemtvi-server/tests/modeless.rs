@@ -1804,6 +1804,403 @@ async fn ctrl_w_in_a_second_tab_on_the_same_buffer_closes_it() {
     assert_eq!(mode(&rpc).await, "i");
 }
 
+// ===== The context menu (docs/plans/2026-10-25-modeless-context-menu.md) ======
+
+#[tokio::test]
+async fn a_right_click_outside_the_selection_drops_it_for_a_caret_at_the_click() {
+    let (rpc, _inc) = start_modeless("hello world\n").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed(&rpc, "<C-S-Right>");
+    assert_eq!(mode(&rpc).await, "s");
+    feed_mouse(&rpc, "right", "press", 0, 9);
+    assert_eq!(mode(&rpc).await, "i");
+    assert_eq!(cursor(&rpc).await, (1, 9));
+    feed(&rpc, "<Esc>!"); // dismiss the context menu first
+    assert_eq!(lines(&rpc).await, v(&["hello wor!ld"]));
+}
+
+#[tokio::test]
+async fn a_right_click_inside_the_selection_keeps_it() {
+    let (rpc, _inc) = start_modeless("hello world\n").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed(&rpc, "<C-S-Right>");
+    feed_mouse(&rpc, "right", "press", 0, 2);
+    feed(&rpc, "<Esc>"); // dismiss the context menu
+    assert_eq!(mode(&rpc).await, "s");
+    feed(&rpc, "X");
+    assert_eq!(lines(&rpc).await, v(&["X world"]));
+}
+
+#[tokio::test]
+async fn a_right_click_past_the_line_end_puts_the_caret_at_the_end() {
+    let (rpc, _inc) = start_modeless("hello world\nnext\n").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed_mouse(&rpc, "right", "press", 0, 30);
+    assert_eq!(mode(&rpc).await, "i");
+    assert_eq!(cursor(&rpc).await, (1, 11));
+}
+
+/// Register a `MenuPopup` handler that records where each fire saw the click.
+async fn record_menu_popup(rpc: &Rpc) {
+    exec_lua(
+        rpc,
+        "_G.popups = {}
+         btv.on('MenuPopup', {}, function()
+           local p = btv.getmousepos()
+           table.insert(_G.popups, { p.line, p.column, btv.mode().mode })
+         end)",
+    )
+    .await;
+}
+
+async fn popups(rpc: &Rpc) -> Value {
+    exec_lua(rpc, "return _G.popups").await
+}
+
+#[tokio::test]
+async fn a_right_click_fires_menu_popup_after_placing_the_caret() {
+    let (rpc, _inc) = start_modeless("hello world\n").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    record_menu_popup(&rpc).await;
+    feed_mouse(&rpc, "right", "press", 0, 4);
+    assert!(
+        poll_true(&rpc, "return #_G.popups == 1").await,
+        "MenuPopup fired"
+    );
+    let fired = popups(&rpc).await;
+    let first = &fired.as_array().unwrap()[0];
+    let got: Vec<String> = first
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.to_string().trim_matches('"').to_string())
+        .collect();
+    assert_eq!(
+        got,
+        ["1", "5", "i"],
+        "line 1, column 5 (1-based), in Insert"
+    );
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 4),
+        "the caret moved before the fire"
+    );
+}
+
+#[tokio::test]
+async fn menu_popup_fires_in_a_vim_session_too() {
+    let (rpc, _inc) = start_as("gui", "hello world\n").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    record_menu_popup(&rpc).await;
+    feed_mouse(&rpc, "right", "press", 0, 4);
+    assert!(
+        poll_true(&rpc, "return #_G.popups == 1").await,
+        "MenuPopup fired"
+    );
+}
+
+#[tokio::test]
+async fn a_mapped_right_click_or_mousemodel_extend_fires_no_menu_popup() {
+    let (rpc, _inc) = start_modeless("hello world\n").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    record_menu_popup(&rpc).await;
+    command(&rpc, "set mousemodel=extend").await;
+    // Cells apart, so the second press isn't counted as a `<2-RightMouse>`.
+    feed_mouse(&rpc, "right", "press", 0, 2);
+    command(&rpc, "set mousemodel=popup_setpos").await;
+    exec_lua(
+        &rpc,
+        "_G.mapped = 0
+         btv.keymap.set('modeless', '<RightMouse>', function() _G.mapped = _G.mapped + 1 end)",
+    )
+    .await;
+    feed_mouse(&rpc, "right", "press", 0, 8);
+    assert!(
+        poll_true(&rpc, "return _G.mapped == 1").await,
+        "the map fired"
+    );
+    assert_eq!(exec_lua(&rpc, "return #_G.popups").await.as_u64(), Some(0));
+}
+
+/// The labels and right-hand details of the open menu: `""` is a separator row's
+/// label, and `None` a row without a detail.
+fn menu_rows(menu: &[(Value, Value)]) -> Vec<(String, Option<String>)> {
+    let labels = menu_items(menu);
+    let kinds: Vec<Option<String>> = match map_get(menu, "kinds") {
+        Some(Value::Array(a)) => a.iter().map(|v| v.as_str().map(str::to_string)).collect(),
+        _ => vec![None; labels.len()],
+    };
+    labels.into_iter().zip(kinds).collect()
+}
+
+/// Wait for a menu row's verb to reach the clipboard: the chosen row runs from the
+/// menu's promise, a tick after the click.
+async fn clip_eventually(clip: &FakeClipboard) -> Option<(String, bool)> {
+    for _ in 0..50 {
+        if let Some(got) = clip.peek() {
+            return Some(got);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    None
+}
+
+/// Wait for the buffer to read `want`, for the same reason.
+async fn lines_eventually(rpc: &Rpc, want: &[&str]) -> Vec<String> {
+    let mut got = lines(rpc).await;
+    for _ in 0..50 {
+        if got == v(want) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        got = lines(rpc).await;
+    }
+    got
+}
+
+#[tokio::test]
+async fn a_right_click_opens_the_context_menu_at_the_pointer() {
+    let (rpc, mut inc) = start_modeless("hello world\n").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed_mouse(&rpc, "right", "press", 0, 4);
+    let menu = menu_of(&poll_menu(&rpc, &mut inc).await.expect("a menu opens"));
+    assert_eq!(
+        map_get(&menu, "editor_relative"),
+        Some(&Value::Boolean(true))
+    );
+    let at = |k: &str| map_get(&menu, k).and_then(Value::as_u64);
+    assert_eq!((at("row"), at("col")), (Some(0), Some(4)));
+    let d = |s: &str| Some(s.to_string());
+    assert_eq!(
+        menu_rows(&menu),
+        [
+            ("Undo".into(), d("Ctrl+Z")),
+            ("Redo".into(), d("Ctrl+Shift+Z")),
+            ("".into(), None),
+            ("Cut".into(), d("Ctrl+X")),
+            ("Copy".into(), d("Ctrl+C")),
+            ("Paste".into(), d("Ctrl+V")),
+            ("Select All".into(), d("Ctrl+A")),
+            ("".into(), None),
+            ("Command Palette".into(), d("Ctrl+Shift+P")),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn choosing_copy_from_the_menu_copies_the_selection_clicked_in() {
+    let (rpc, clip, mut inc) = start_clip("hello world\n").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed(&rpc, "<C-S-Right>");
+    feed_mouse(&rpc, "right", "press", 0, 2);
+    poll_menu(&rpc, &mut inc).await.expect("a menu opens");
+    // The box's border is on (0, 2); Copy is its fifth row.
+    feed_mouse(&rpc, "left", "press", 5, 5);
+    feed_mouse(&rpc, "left", "release", 5, 5);
+    assert_eq!(
+        clip_eventually(&clip).await,
+        Some(("hello".to_string(), false))
+    );
+    assert_eq!(lines(&rpc).await, v(&["hello world"]));
+    assert_eq!(mode(&rpc).await, "s", "the selection stays");
+}
+
+#[tokio::test]
+async fn choosing_paste_from_the_menu_pastes_where_you_clicked() {
+    let (rpc, clip, mut inc) = start_clip("hello world\n").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    clip.seed("XY", false);
+    feed_mouse(&rpc, "right", "press", 0, 6);
+    poll_menu(&rpc, &mut inc).await.expect("a menu opens");
+    // Paste is the sixth row of the box bordered at (0, 6).
+    feed_mouse(&rpc, "left", "press", 6, 8);
+    feed_mouse(&rpc, "left", "release", 6, 8);
+    assert_eq!(
+        lines_eventually(&rpc, &["hello XYworld"]).await,
+        v(&["hello XYworld"])
+    );
+}
+
+#[tokio::test]
+async fn the_menu_shows_a_rebound_key_and_a_row_you_add() {
+    let (rpc, mut inc) = start_modeless("hello world\n").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        "btv.keymap.set('modeless', '<C-c>', function() end)
+         btv.keymap.set('modeless', '<C-k>', btv.modeless.actions.copy)
+         _G.shouted = 0
+         table.insert(btv.contextmenu.groups.commands.items, {
+           label = 'Shout', detail = 'loud', action = function() _G.shouted = _G.shouted + 1 end,
+         })",
+    )
+    .await;
+    feed_mouse(&rpc, "right", "press", 0, 4);
+    let menu = menu_of(&poll_menu(&rpc, &mut inc).await.expect("a menu opens"));
+    let rows = menu_rows(&menu);
+    assert_eq!(rows[4], ("Copy".into(), Some("Ctrl+K".into())));
+    assert_eq!(rows.last().unwrap(), &("Shout".into(), Some("loud".into())));
+    feed(&rpc, "G<CR>");
+    assert!(poll_true(&rpc, "return _G.shouted == 1").await);
+}
+
+#[tokio::test]
+async fn on_a_mac_the_details_use_the_command_symbols() {
+    let path = write_temp("modeless", "txt", "hello world\n");
+    let (rpc, mut inc) = spawn(ServerInit {
+        file: Some(path),
+        ..Default::default()
+    });
+    let mut mac = caps("gui");
+    mac.push((Value::from("platform"), Value::from("macos")));
+    attach_with_caps(&rpc, 80, 24, mac).await;
+    command(&rpc, "set modeless nonumber norelativenumber").await;
+    feed_mouse(&rpc, "right", "press", 0, 4);
+    let menu = menu_of(&poll_menu(&rpc, &mut inc).await.expect("a menu opens"));
+    let rows = menu_rows(&menu);
+    assert_eq!(rows[1], ("Redo".into(), Some("\u{21e7}\u{2318}Z".into())));
+    assert_eq!(rows[4], ("Copy".into(), Some("\u{2318}C".into())));
+}
+
+/// The LSP rows show while a server is attached, and keys step over the ones no
+/// attached server answers. The stand-in client answers by method, the way a real
+/// one's capabilities do.
+#[tokio::test]
+async fn lsp_rows_show_with_a_server_and_skip_what_it_cant_do() {
+    let (rpc, mut inc) = start_modeless("hello world\n").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        "btv.lsp.clients = function()
+           return { { supports_method = function(_, m) return m ~= 'textDocument/rename' end } }
+         end",
+    )
+    .await;
+    feed_mouse(&rpc, "right", "press", 0, 4);
+    let menu = menu_of(&poll_menu(&rpc, &mut inc).await.expect("a menu opens"));
+    let labels = menu_items(&menu);
+    let at = labels
+        .iter()
+        .position(|l| l == "Go to Definition")
+        .expect("LSP rows");
+    assert_eq!(
+        labels[at..at + 5],
+        [
+            "Go to Definition",
+            "Find References",
+            "Rename Symbol",
+            "Format Document",
+            "Code Actions"
+        ]
+    );
+    // The first `j` lights Undo; each next one steps to the next row that can be
+    // chosen. Undo, Redo, Cut, Copy, Paste, Select All, Go to Definition, Find
+    // References, then Format Document: the separators and Rename Symbol are skipped.
+    feed(&rpc, &"j".repeat(9));
+    let menu = menu_of(&poll_menu(&rpc, &mut inc).await.expect("still open"));
+    assert_eq!(
+        map_get(&menu, "selected").and_then(Value::as_u64),
+        Some(at as u64 + 3),
+        "keys stepped over Rename Symbol onto Format Document"
+    );
+}
+
+#[tokio::test]
+async fn without_a_server_there_are_no_lsp_rows() {
+    let (rpc, mut inc) = start_modeless("hello world\n").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed_mouse(&rpc, "right", "press", 0, 4);
+    let menu = menu_of(&poll_menu(&rpc, &mut inc).await.expect("a menu opens"));
+    assert!(!menu_items(&menu).iter().any(|l| l.starts_with("Go to")));
+}
+
+// A read-only buffer rests in Normal and selects in Visual. Of the verbs, `copy` and
+// `select_all` still make sense there; the rest refuse.
+
+/// A modeless GUI session with a clipboard, over a read-only buffer.
+async fn start_read_only(content: &str) -> (Rpc, FakeClipboard, UnboundedReceiver<Incoming>) {
+    let (rpc, clip, inc) = start_clip(content).await;
+    command(&rpc, "set nonumber norelativenumber nomodifiable").await;
+    assert_eq!(mode(&rpc).await, "n");
+    (rpc, clip, inc)
+}
+
+#[tokio::test]
+async fn copy_in_a_read_only_buffer_takes_the_visual_selection_and_keeps_it() {
+    let (rpc, clip, _inc) = start_read_only("hello world\n").await;
+    feed(&rpc, "vll");
+    act(&rpc, "copy").await;
+    assert_eq!(clip.peek(), Some(("hel".to_string(), false)));
+    assert_eq!(mode(&rpc).await, "v");
+}
+
+#[tokio::test]
+async fn copy_in_a_read_only_buffer_with_nothing_selected_takes_the_line() {
+    let (rpc, clip, _inc) = start_read_only("hello world\nnext\n").await;
+    act(&rpc, "copy").await;
+    assert_eq!(clip.peek(), Some(("hello world\n".to_string(), true)));
+}
+
+#[tokio::test]
+async fn select_all_in_a_read_only_buffer_selects_everything() {
+    let (rpc, clip, _inc) = start_read_only("hello world\nnext\n").await;
+    act(&rpc, "select_all").await;
+    assert_eq!(mode(&rpc).await, "v");
+    act(&rpc, "copy").await;
+    assert_eq!(clip.peek(), Some(("hello world\nnext".to_string(), false)));
+}
+
+#[tokio::test]
+async fn the_editing_verbs_still_refuse_in_a_read_only_buffer() {
+    let (rpc, _clip, mut inc) = start_read_only(
+        "hello world
+",
+    )
+    .await;
+    for verb in ["cut", "paste", "undo", "duplicate_line"] {
+        act(&rpc, verb).await;
+        let msg = message_after(&rpc, &mut inc, "").await;
+        assert!(msg.contains("editable buffer"), "{verb}: {msg:?}");
+    }
+    assert_eq!(lines(&rpc).await, v(&["hello world"]));
+}
+
+#[tokio::test]
+async fn a_read_only_buffer_offers_select_all_and_with_a_selection_copy() {
+    let (rpc, clip, mut inc) = start_read_only(
+        "hello world
+next
+",
+    )
+    .await;
+    // Nothing selected: only Select All. No key hints, since the layout's keys
+    // don't run in a read-only buffer.
+    feed_mouse(&rpc, "right", "press", 0, 4);
+    let menu = menu_of(&poll_menu(&rpc, &mut inc).await.expect("a menu opens"));
+    assert_eq!(menu_rows(&menu), [("Select All".into(), None)]);
+    feed_mouse(&rpc, "left", "press", 1, 6);
+    assert_eq!(mode(&rpc).await, "v");
+    // A right-click inside the selection: Copy joins it.
+    feed_mouse(&rpc, "right", "press", 1, 2);
+    let menu = menu_of(&poll_menu(&rpc, &mut inc).await.expect("a menu opens again"));
+    assert_eq!(
+        menu_rows(&menu),
+        [("Copy".into(), None), ("Select All".into(), None)]
+    );
+    feed_mouse(&rpc, "left", "press", 2, 4);
+    assert_eq!(
+        clip_eventually(&clip).await,
+        Some((
+            "hello world
+next"
+                .to_string(),
+            false
+        ))
+    );
+    assert_eq!(mode(&rpc).await, "v", "the selection stays");
+    assert_eq!(lines(&rpc).await, v(&["hello world", "next"]));
+}
+
 /// A bracketed paste (the GUI's Cmd+V) over a modeless selection replaces it and
 /// leaves the caret after the pasted text, as typing over it does.
 #[tokio::test]

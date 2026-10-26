@@ -8,7 +8,7 @@
 -- formats itself: setting `'tabline'` replaces those, so only one of the two is
 -- ever drawn.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

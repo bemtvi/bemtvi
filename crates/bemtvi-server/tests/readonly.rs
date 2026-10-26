@@ -167,3 +167,46 @@ async fn image_preview_is_read_only_to_ex_command_edits() {
     .await;
     assert_ex_edits_refused(&rpc, &mut incoming, "image").await;
 }
+
+// ----- `'modifiable'` reads what the chokepoints enforce ------------------------
+// A read-only KIND reports `nomodifiable` through `btv.bo`, the way neovim reports it
+// for a terminal buffer, so a plugin asking "can this buffer be edited?" gets the
+// answer the edit chokepoints give rather than the bare option.
+
+async fn bo_modifiable(rpc: &Rpc) -> Option<bool> {
+    exec_lua(rpc, "return btv.bo.modifiable").await.as_bool()
+}
+
+#[tokio::test]
+async fn a_view_reads_nomodifiable() {
+    let (rpc, _incoming) = start().await;
+    assert_eq!(bo_modifiable(&rpc).await, Some(true), "an ordinary buffer");
+    exec_lua(
+        &rpc,
+        r#"vw = btv.view.create{}
+           vw:set_lines{ "alpha" }
+           vw:mount{ dock = "left", size = 20 }"#,
+    )
+    .await;
+    assert!(
+        bemtvi_test_harness::poll_true(&rpc, "return btv.bo.buftype == 'nofile'").await,
+        "the view is focused"
+    );
+    assert_eq!(bo_modifiable(&rpc).await, Some(false));
+}
+
+#[tokio::test]
+async fn the_quickfix_display_reads_nomodifiable() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"vim.fn.setqflist({ { filename = "a.c", lnum = 1, text = "x" } }, " ")"#,
+    )
+    .await;
+    message_after(&rpc, &mut incoming, ":copen<CR>").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.bo.buftype").await.as_str(),
+        Some("quickfix")
+    );
+    assert_eq!(bo_modifiable(&rpc).await, Some(false));
+}

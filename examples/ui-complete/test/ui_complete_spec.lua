@@ -6,7 +6,7 @@
 -- `t:menu()` is the view of what was offered and `t:line()` of what was accepted.
 -- The async sources are debounced, so a case pauses for them rather than assuming.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

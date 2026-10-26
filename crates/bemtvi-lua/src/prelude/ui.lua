@@ -88,6 +88,88 @@ function btv.ui.select(items, opts, on_choice)
   end)
 end
 
+-- `btv.ui.menu(entries, opts)` -> a PROMISE that resolves to the chosen entry, or to
+-- nil when the menu is dismissed (`<Esc>`, `q`, a click off it). A context menu: the
+-- same floating list as `btv.ui.select`, with rows that say more than a label. Each
+-- entry is a table:
+--
+-- ```lua
+-- {
+--   label = "Copy",      -- the row's text (required unless `separator`)
+--   detail = "Ctrl+C",   -- shown in an aligned column on the right, e.g. a shortcut
+--   enabled = false,     -- greyed out; can't be chosen (default true)
+--   separator = true,    -- a rule between groups of rows; can't be chosen
+-- }
+-- ```
+--
+-- Keys and the mouse skip the rows that can't be chosen. Any other field rides
+-- along on the entry the promise resolves to (an `action` to run, say).
+--
+-- opts:
+--   * `anchor` — `"cursor"` (default) opens the list under the text cursor;
+--     `"mouse"` opens it at the last mouse cell, the shape for a `MenuPopup`
+--     handler. At the pointer it behaves like a GUI menu: one click chooses a row,
+--     the pointer hovering a row highlights it, and a click or right-click off it
+--     dismisses it.
+--   * `prompt` — as for `btv.ui.select`.
+--
+-- Greyed-out rows paint with `BtvMenuDisabled` (default: linked to `Comment`);
+-- separators are drawn in the menu's border color.
+function btv.ui.menu(entries, opts)
+  opts = opts or {}
+  if type(entries) ~= "table" then
+    error("btv.ui.menu: entries must be a list", 2)
+  end
+  if type(opts) ~= "table" then
+    error("btv.ui.menu: opts must be a table", 2)
+  end
+  local anchor = opts.anchor or "cursor"
+  if anchor ~= "cursor" and anchor ~= "mouse" then
+    error('btv.ui.menu: opts.anchor must be "cursor" or "mouse", got ' .. tostring(anchor), 2)
+  end
+  btv.hl.fallback("BtvMenuDisabled", { link = "Comment" })
+  local labels, details, hls, disabled, separators = {}, {}, {}, {}, {}
+  for i, e in ipairs(entries) do
+    if type(e) ~= "table" then
+      error("btv.ui.menu: entry " .. i .. " must be a table", 2)
+    end
+    if e.separator then
+      labels[i], details[i], hls[i], disabled[i], separators[i] = "", "", "", true, true
+    else
+      if type(e.label) ~= "string" then
+        error("btv.ui.menu: entry " .. i .. " needs a string label", 2)
+      end
+      if e.detail ~= nil and type(e.detail) ~= "string" then
+        error("btv.ui.menu: entry " .. i .. "'s detail must be a string", 2)
+      end
+      local off = e.enabled == false
+      labels[i] = e.label
+      details[i] = e.detail or ""
+      hls[i] = off and "BtvMenuDisabled" or ""
+      disabled[i] = off
+      separators[i] = false
+    end
+  end
+  return btv.promise.new(function(resolve)
+    if #labels == 0 then
+      return resolve(nil)
+    end
+    local id = btv._next_cb_id()
+    btv._cb_fns[id] = function(idx)
+      resolve(idx and entries[idx] or nil)
+    end
+    btv._bridge(id, function()
+      btv._ui_select(labels, opts.prompt or "", id, {
+        details = details,
+        hls = hls,
+        disabled = disabled,
+        separators = separators,
+        anchor = anchor,
+      })
+    end)
+  end)
+end
+
 -- `vim.ui.select(items, opts, on_choice)`: neovim's callback-shaped alias (ADR 0002
 -- whitelist) — `on_choice(item, index)`, or `on_choice(nil, nil)` on cancel. Kept on the
 -- compat layer so plugins (telescope, …) that pass a callback and read the index

@@ -13,7 +13,7 @@
 -- *hidden* restores its own saved cursor whether or not the option is on, so a test
 -- that skipped it would pass with the feature turned off.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 local SAMPLE = DIR .. "/sample.txt"
 
 dofile(DIR .. "/init.lua")

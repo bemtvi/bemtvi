@@ -10,7 +10,7 @@
 -- fold demos need the second, because a closed fold's placeholder replaces the
 -- lines rather than changing them.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 -- Load the example's config the way a session would, once.
 dofile(DIR .. "/init.lua")

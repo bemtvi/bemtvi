@@ -7,7 +7,7 @@
 -- drawn past the text. `t:decor()` reads that layer; `t:screen()` is where the
 -- whole virtual ROWS (`virt_lines`) show up, because those really are painted rows.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

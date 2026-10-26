@@ -8,7 +8,7 @@
 -- MOUNT-RELATIVE, which is the property that lets the same handler run under any
 -- prefix.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 -- The mount resolves a tick or two after sourcing and announces its URL through
 -- `btv.notify`; record the notifications rather than racing the message line.

@@ -119,10 +119,10 @@ pub struct Options {
     /// otherwise it is a silent no-op (vim-faithful). Default `"nvi"` — note
     /// **not** `"a"`, so cmdline-mode mouse is off out of the box.
     pub mouse: String,
-    /// Right-click semantics (`'mousemodel'`): `popup`/`popup_setpos` pop a menu
-    /// (the selection-extend gesture is then `<S-LeftMouse>`), `extend` makes the
-    /// right button extend the selection. Default `"popup_setpos"`. Honored from
-    /// the phase that wires right-click; stored here so `:set` accepts it now.
+    /// Right-click semantics (`'mousemodel'`): `popup`/`popup_setpos` ask for the
+    /// context menu by firing `MenuPopup` (the selection-extend gesture is then
+    /// `<S-LeftMouse>`), `extend` makes the right button extend the selection.
+    /// Default `"popup_setpos"`.
     pub mousemodel: String,
     /// Wheel step (`'mousescroll'`): `"ver:{lines},hor:{cols}"`, a `0` count
     /// disabling that direction. Default `"ver:3,hor:6"`. Honored from the wheel

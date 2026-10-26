@@ -8,7 +8,7 @@
 -- bring it up with `:intro` and see the text-only form (the logo, and the startup
 -- rules, are covered by the server's own suite).
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

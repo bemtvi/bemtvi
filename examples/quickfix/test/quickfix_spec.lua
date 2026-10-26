@@ -7,7 +7,7 @@
 -- `:grep`) run this directory's own fake compiler and plain `grep`, so nothing
 -- here reaches past the repo.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 local ROOT = DIR .. "/../.."
 
 dofile(DIR .. "/init.lua")

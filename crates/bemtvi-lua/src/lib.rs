@@ -46,15 +46,15 @@ pub use httpwire::{
 };
 pub use luafs::{run_fs_job, FileKind, LuaDirEntry, LuaFs, LuaStat, StdLuaFs};
 pub use ops::{
-    build_server_request, mount_root_redirect, split_mount_path, BufOp, CallbackArgs, ConfirmReq,
-    DecorInvalidate, DecorMark, DecorPublish, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp,
-    FsError, FsJob, FsValue, GitError, GitHunk, GitJob, GitStatusEntry, GitValue, GlobalOptionOp,
-    HlSet, HttpError, HttpMountError, HttpRequest, HttpResponse, HttpServerReply,
-    HttpServerRequest, InlayHintMirrorData, LayerOp, LoopOp, LspClientData, LspOp, LspPickerItem,
-    LspProgressData, LspServerCapabilities, NamedListOp, OpenTarget, OptionValue, PanelOp, QfItem,
-    QfSetOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, Sequenced, StatuslineKind,
-    StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiInputReq, ViewOp, VirtChunkData,
-    VirtDecorData, WindowOp,
+    build_server_request, mount_root_redirect, split_mount_path, BufOp, CallbackArgs, ClipboardOp,
+    ClipboardOpKind, ConfirmReq, DecorInvalidate, DecorMark, DecorPublish, DiagnosticData, DockOp,
+    ExtmarkOp, FeedKeysOp, FsError, FsJob, FsValue, GitError, GitHunk, GitJob, GitStatusEntry,
+    GitValue, GlobalOptionOp, HlSet, HttpError, HttpMountError, HttpRequest, HttpResponse,
+    HttpServerReply, HttpServerRequest, InlayHintMirrorData, LayerOp, LoopOp, LspClientData, LspOp,
+    LspPickerItem, LspProgressData, LspServerCapabilities, NamedListOp, OpenTarget, OptionValue,
+    PanelOp, QfItem, QfSetOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, Sequenced,
+    StatuslineKind, StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiInputReq, ViewOp,
+    VirtChunkData, VirtDecorData, WindowOp,
 };
 pub use runtime::{
     extract_prelude, BoGlobalMirror, BoMirror, BufBytesEdit, BufMirror, CmdlineComplete,

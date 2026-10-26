@@ -161,3 +161,94 @@ local function install()
   end
 end
 btv.on("UIEnter", {}, install)
+
+-- ----- key hints -------------------------------------------------------------
+-- How a layout key reads in a menu, for the context menu's hints.
+
+-- The display names of the special keys a layout chord can end in.
+local KEY_NAMES = {
+  BS = "Backspace",
+  Del = "Delete",
+  CR = "Enter",
+  Esc = "Escape",
+  Space = "Space",
+}
+
+-- How a key chord reads in a menu, the platform's way: `<C-S-z>` is `Ctrl+Shift+Z`,
+-- or `⇧⌘Z` on macOS. `nil` for anything that isn't a single chord.
+local function chord_label(lhs, mac)
+  local inner = lhs:match("^<(.+)>$")
+  if not inner or inner:find("[<>]") then
+    return nil
+  end
+  local has = {}
+  local key = inner
+  while true do
+    local m, rest = key:match("^(%a)%-(.+)$")
+    if not m then
+      break
+    end
+    has[m] = true
+    key = rest
+  end
+  key = KEY_NAMES[key] or (#key == 1 and key:upper()) or key
+  if mac then
+    return (has.C and "⌃" or "")
+      .. (has.A and "⌥" or "")
+      .. (has.S and "⇧" or "")
+      .. (has.D and "⌘" or "")
+      .. key
+  end
+  local parts = {}
+  for _, m in ipairs({ { "C", "Ctrl" }, { "A", "Alt" }, { "S", "Shift" }, { "D", "Super" } }) do
+    if has[m[1]] then
+      parts[#parts + 1] = m[2]
+    end
+  end
+  parts[#parts + 1] = key
+  return table.concat(parts, "+")
+end
+
+-- `btv.modeless.key_hint(action)` -> the key that runs `action` in the modeless
+-- layout, written the platform's way (`Ctrl+Shift+Z`, or `⇧⌘Z` on macOS), or `nil`
+-- when no single key runs it. `action` is a `btv.modeless.actions` name or a
+-- function. The key is read from the live `modeless` keymap, so a rebound key shows
+-- its new chord: a map you set beats a default on the same key, and where the client
+-- stands in another chord for an unreachable one (`btv.ui.caps().key_labels`), the
+-- one shown is the chord you press. The context menu's rows use it for their hints
+-- (see `btv.contextmenu`).
+function btv.modeless.key_hint(action)
+  local fn = action
+  if type(action) == "string" then
+    fn = actions[action]
+    if not fn then
+      error("btv.modeless.key_hint: no action named " .. action, 2)
+    end
+  elseif type(action) ~= "function" then
+    error("btv.modeless.key_hint: action must be an action name or a function", 2)
+  end
+  local order, winner = {}, {}
+  for _, e in ipairs(btv._keymaps) do
+    local layer = false
+    for _, m in ipairs(e.modes) do
+      layer = layer or m == "modeless"
+    end
+    if layer and (e.buffer == nil or e.buffer == 0) then
+      local prev = winner[e.lhs]
+      if not prev then
+        order[#order + 1] = e.lhs
+      end
+      if not prev or prev.default or not e.default then
+        winner[e.lhs] = e
+      end
+    end
+  end
+  local caps = btv.ui.caps()
+  for _, lhs in ipairs(order) do
+    local e = winner[lhs]
+    if e.rhs.kind == "lua" and btv._keymap_fns[e.id] == fn then
+      return chord_label(caps.key_labels[lhs] or lhs, caps.platform == "macos")
+    end
+  end
+  return nil
+end

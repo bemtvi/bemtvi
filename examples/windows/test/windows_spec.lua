@@ -5,7 +5,7 @@
 -- The lifecycle log the config keeps (`_G.win_log`) is the observable for the
 -- autocmds; the rest is the `nvim_win_*` read surface and the two commands.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

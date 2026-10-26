@@ -6,7 +6,7 @@
 -- keypress, so every assertion is on the highlight layer before and after — the
 -- one place a `btv.decor` publish shows up.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

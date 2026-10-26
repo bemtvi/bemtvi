@@ -6,7 +6,7 @@
 -- assertions are on `btv.glob` itself, since what the demo is teaching is a set of
 -- exact answers (`*` stops at `/`, path style is an option, a set is one pass).
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 -- Every command reports through `vim.notify`; record it at the source, since the
 -- reports are multi-line and the message line holds only the last of them.

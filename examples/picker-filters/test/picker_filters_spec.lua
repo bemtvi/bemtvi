@@ -6,7 +6,7 @@
 -- is always the picker's row list — `t:menu()` — and the fixture is this
 -- directory's deliberate mess (a `target/`, a `vendor/`, a dotfile).
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 
@@ -49,10 +49,11 @@ local function open_picker(t, name, opts)
   return rows(t)
 end
 
---- Whether any row mentions `needle`.
+--- Whether any row mentions `needle`. The file pickers list native paths (`src\main.rs`
+--- on Windows), so a row is matched with its separators folded to the needle's `/`.
 local function lists(t, needle)
   for _, row in ipairs((t:menu() or { items = {} }).items) do
-    if row:find(needle, 1, true) then
+    if row:gsub("\\", "/"):find(needle, 1, true) then
       return true
     end
   end

@@ -6,7 +6,7 @@
 -- sample buffer tells a reader to try, reading the result off `t:statusline()` —
 -- the composed bar the client would paint.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

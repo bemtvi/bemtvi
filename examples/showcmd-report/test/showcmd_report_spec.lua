@@ -6,7 +6,7 @@
 -- *withheld* mapped prefix never reaches the editor at all — so `t:showcmd()` is
 -- the only view that can see either. `'report'` speaks through the message line.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

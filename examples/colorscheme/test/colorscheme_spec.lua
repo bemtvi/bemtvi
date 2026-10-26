@@ -7,7 +7,7 @@
 -- and no download, that `:hi clear` strips it and re-loading brings it back, and
 -- that a config's own choice is never overridden.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

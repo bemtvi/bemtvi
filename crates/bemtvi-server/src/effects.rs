@@ -1082,6 +1082,29 @@ impl EditHost {
             self.editor
                 .set_register_api(op.name, op.text, op.linewise, op.append);
         }
+        // `btv.clipboard.read` / `write`: run against the clipboard provider (the one
+        // `"+p` / `"+y` use) and settle each promise. Its reactions are scheduled work,
+        // which this pass already drained, so pick them up now rather than next keystroke.
+        let clipboard_ops = self.lua.take_clipboard_ops();
+        if !clipboard_ops.is_empty() {
+            for op in clipboard_ops {
+                let result = match op.kind {
+                    bemtvi_lua::ClipboardOpKind::Read => {
+                        self.editor.clipboard_read_text().map(Some)
+                    }
+                    bemtvi_lua::ClipboardOpKind::Write { text, linewise } => self
+                        .editor
+                        .clipboard_write_text(&text, linewise)
+                        .map(|()| None),
+                };
+                let args = bemtvi_lua::CallbackArgs::ClipboardResult { result };
+                if let Err(e) = self.lua.run_callback(op.id, false, args) {
+                    self.editor
+                        .echo(format!("E5108: Error in btv.clipboard callback: {e}"));
+                }
+            }
+            self.drain_cancel_loop_ops();
+        }
         // Clipboard seeds from `btv.test.clipboard.seed` (plugin-test seam): write the
         // editor's clipboard provider as if an external app set `"+` / `"*`.
         for (text, linewise) in self.lua.take_clipboard_seeds() {
@@ -1120,10 +1143,49 @@ impl EditHost {
         // which callback awaits the chosen index. The Lua wrapper never queues an
         // empty list (it resolves to cancel itself), so the menu always has rows;
         // like the prompt, only one is open at a time (the last queued wins).
+        //
+        // `btv.ui.menu` rows carry a detail (the aligned right-hand column), a row
+        // highlight, a disabled flag and a separator flag; its `"mouse"` anchor opens the list at the
+        // last mouse cell (the right-click that asked for it).
         for req in self.lua.take_ui_selects() {
-            self.editor
-                .open_menu(req.items, bemtvi_core::MenuPlacement::Cursor, 0);
-            self.cancel_pending_ui_select();
+            // A select still waiting on its result is replaced: settle its promise
+            // first, with the result it already has queued (a right-click off a context
+            // menu cancels it and opens the next in the same tick) or as a cancel, so
+            // that result can't be handed to the new one and the old promise doesn't
+            // hang.
+            if let Some(prev) = self.pending_ui_select.take() {
+                let result = if self.editor.menu_results.is_empty() {
+                    None
+                } else {
+                    self.editor.menu_results.remove(0)
+                };
+                if let Err(e) = self.lua.run_ui_select(prev, result) {
+                    self.editor
+                        .echo(format!("E5108: Error in btv.ui.select callback: {e}"));
+                }
+                self.drain_cancel_loop_ops();
+            }
+            let placement = match (req.anchor.as_str(), self.editor.last_mouse_cell()) {
+                ("mouse", Some((row, col))) => bemtvi_core::MenuPlacement::Pointer { row, col },
+                _ => bemtvi_core::MenuPlacement::Cursor,
+            };
+            let rows = req
+                .items
+                .into_iter()
+                .enumerate()
+                .map(|(i, label)| {
+                    let nonempty = |v: Option<&String>| v.filter(|s| !s.is_empty()).cloned();
+                    bemtvi_core::MenuItem {
+                        kind: nonempty(req.details.get(i)),
+                        hl: nonempty(req.hls.get(i)),
+                        disabled: req.disabled.get(i).copied().unwrap_or(false)
+                            || req.separators.get(i).copied().unwrap_or(false),
+                        separator: req.separators.get(i).copied().unwrap_or(false),
+                        ..bemtvi_core::MenuItem::new(label, i)
+                    }
+                })
+                .collect();
+            self.editor.open_menu_items(rows, placement, 0);
             self.cancel_pending_code_action();
             self.cancel_active_picker();
             self.pending_ui_select = Some(req.cb_id);
@@ -2355,7 +2417,10 @@ impl EditHost {
                         filetype: self.editor.buffer_filetype(id).unwrap_or_default(),
                         ts_highlight: self.editor.ts_highlight_enabled(id),
                         commentstring: self.editor.effective_commentstring(id),
-                        modifiable: o.modifiable,
+                        // The *effective* value: a read-only kind (a view, a live
+                        // terminal, the quickfix list) reads `nomodifiable`, as the
+                        // edit chokepoints treat it.
+                        modifiable: self.editor.buffer_modifiable(id),
                         buftype: self.editor.buffer_buftype(id).to_string(),
                         foldmethod: o.foldmethod.to_string(),
                         // The *effective* values, like `commentstring` above: a buffer with

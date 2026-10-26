@@ -853,17 +853,28 @@ impl Editor {
     /// (`btv._modeless_action(name)` → this), so every key is rebindable by name.
     /// Each verb is one undo step of its own. Unknown names, and any verb while
     /// `'modeless'` is off, fail loud; the server reports the `Err`.
+    ///
+    /// A read-only buffer rests in Normal and selects in Visual. `copy` and
+    /// `select_all` work there too, on that Visual selection; every other verb needs
+    /// an editable buffer.
     pub fn apply_modeless_action(&mut self, name: &str) -> Result<(), String> {
         if !self.options.modeless {
             return Err(format!("modeless action {name}: 'modeless' is off"));
         }
-        if !matches!(self.mode, Mode::Insert | Mode::Replace | Mode::Select) {
+        let editing = matches!(self.mode, Mode::Insert | Mode::Replace | Mode::Select);
+        let read_only = !self.rests_in_insert()
+            && matches!(self.mode, Mode::Normal | Mode::Visual | Mode::VisualLine);
+        if !editing && !(read_only && matches!(name, "copy" | "select_all")) {
             return Err(format!(
                 "modeless action {name}: needs an editable buffer (mode is {})",
                 self.mode.short_code()
             ));
         }
         match name {
+            "copy" if read_only => {
+                self.read_only_copy();
+            }
+            "select_all" if read_only => self.read_only_select_all(),
             "copy" => {
                 self.modeless_copy();
             }
@@ -978,6 +989,47 @@ impl Editor {
         };
         self.clipboard_write(text, kind);
         true
+    }
+
+    /// `copy` in a read-only buffer: the Visual selection (linewise for `V`), kept
+    /// selected, or the cursor's whole line when nothing is selected.
+    fn read_only_copy(&mut self) {
+        if !self.mode.is_visual() {
+            self.modeless_copy();
+            return;
+        }
+        if self.clipboard.is_none() {
+            self.echo_err(CLIPBOARD_UNAVAILABLE);
+            return;
+        }
+        let (text, kind) = if self.mode == Mode::VisualLine {
+            let (lo, hi, _) = self.visual_range_lw(true);
+            (self.buffer().text.slice(lo..hi).to_string(), RegKind::Line)
+        } else {
+            // Visual is inclusive: from the first selected character through the
+            // whole of the last one, however many bytes it takes.
+            let a = self.anchor_byte(self.visual_anchor);
+            let c = self.anchor_byte(self.cursor);
+            let (lo, hi) = (a.min(c), self.next_grapheme_idx(a.max(c)));
+            (self.buffer().text.slice(lo..hi).to_string(), RegKind::Char)
+        };
+        self.clipboard_write(text, kind);
+    }
+
+    /// `select_all` in a read-only buffer: Visual from the first character to the
+    /// last one.
+    fn read_only_select_all(&mut self) {
+        let last = self.last_line();
+        let len = self.buffer().line_len(last);
+        let col = if len == 0 {
+            0
+        } else {
+            let end = self.buffer().byte_at(last, len);
+            self.prev_grapheme_idx(end) - self.buffer().line_start(last)
+        };
+        self.visual_anchor = Cursor { line: 0, col: 0 };
+        self.cursor = Cursor { line: last, col };
+        self.mode = Mode::Visual;
     }
 
     /// Delete the selection, or the caret's whole line when nothing is selected

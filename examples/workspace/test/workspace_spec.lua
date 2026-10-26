@@ -10,7 +10,7 @@
 -- persisted `btv.wso` overrides — needs two launches, and is covered natively in
 -- the server's workspace suite.)
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

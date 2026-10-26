@@ -12,7 +12,7 @@
 -- Taken from this chunk's own source rather than `stdpath("config")`, so the paths
 -- hold however the file is loaded — including a `--test-plugin` run, which has no
 -- config dir at all.
-local here = debug.getinfo(1, "S").source:match("^@(.*)/[^/]+$")
+local here = btv.utils.dirname(debug.getinfo(1, "S").source:sub(2))
 
 ------------------------------------------------------------------------------
 -- 1. Declare the plugins.

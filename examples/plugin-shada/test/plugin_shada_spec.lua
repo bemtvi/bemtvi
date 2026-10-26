@@ -8,7 +8,7 @@
 -- second is what a single `--test-plugin` run cannot span, so the spec checks the
 -- store round-trips instead of crossing a restart.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 local printed = {}
 do

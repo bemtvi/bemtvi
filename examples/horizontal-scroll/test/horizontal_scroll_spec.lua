@@ -6,7 +6,7 @@
 -- full text and the client slides them left by `leftcol`. So `t:view().leftcol` is
 -- what proves it — the buffer line never changes, and neither does the row text.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

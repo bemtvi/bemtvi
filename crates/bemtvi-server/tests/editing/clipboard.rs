@@ -106,6 +106,120 @@ async fn clipboard_delete_without_a_provider_aborts() {
     assert_eq!(lines(&rpc).await, vec!["one", "two"]);
 }
 
+// ===== btv.clipboard =========================================================
+// Lua reads and writes the clipboard through `btv.clipboard`, asynchronously (a
+// browser's clipboard can only be reached that way); `btv.reg` refuses `+` / `*`.
+
+/// Run `code` (a Lua expression yielding a promise) and wait for it to settle, as
+/// `{ ok, value }` with `value` the resolution or the rejection message.
+async fn settle(rpc: &Rpc, code: &str) -> (bool, Value) {
+    exec_lua(
+        rpc,
+        &format!(
+            "_G.settled = nil
+             ({code}):next(function(v) _G.settled = {{ true, v }} end,
+                            function(e) _G.settled = {{ false, tostring(e) }} end)"
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(rpc, "return _G.settled ~= nil").await,
+        "{code} never settled"
+    );
+    let got = exec_lua(rpc, "return { _G.settled[1], _G.settled[2] }").await;
+    let pair = got.as_array().expect("a pair").clone();
+    (
+        pair[0].as_bool() == Some(true),
+        pair.get(1).cloned().unwrap_or(Value::Nil),
+    )
+}
+
+#[tokio::test]
+async fn clipboard_read_gets_what_another_app_copied() {
+    let (rpc, _incoming, clip) = start_with_clipboard().await;
+    clip.seed("from outside", false);
+    let (ok, text) = settle(&rpc, "btv.clipboard.read()").await;
+    assert!(ok);
+    assert_eq!(text.as_str(), Some("from outside"));
+    // Read again after another copy: live, not a cached value.
+    clip.seed("and again", false);
+    assert_eq!(
+        settle(&rpc, "btv.clipboard.read()").await.1.as_str(),
+        Some("and again")
+    );
+}
+
+#[tokio::test]
+async fn clipboard_read_of_an_empty_clipboard_is_empty() {
+    let (rpc, _incoming, _clip) = start_with_clipboard().await;
+    let (ok, text) = settle(&rpc, "btv.clipboard.read()").await;
+    assert!(ok);
+    assert_eq!(text.as_str(), Some(""));
+}
+
+#[tokio::test]
+async fn clipboard_write_puts_text_on_the_clipboard_and_leaves_the_unnamed_register() {
+    let (rpc, _incoming, clip) = start_with_clipboard().await;
+    let (ok, _) = settle(&rpc, "btv.clipboard.write('C:/some/path')").await;
+    assert!(ok);
+    assert_eq!(clip.peek(), Some(("C:/some/path".to_string(), false)));
+    feed(&rpc, "ialpha<Esc>p");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["alpha"],
+        "the unnamed register is untouched"
+    );
+}
+
+#[tokio::test]
+async fn clipboard_write_carries_linewise_to_a_paste() {
+    let (rpc, _incoming, clip) = start_with_clipboard().await;
+    settle(&rpc, "btv.clipboard.write('a line\\n')").await;
+    assert_eq!(clip.peek(), Some(("a line\n".to_string(), true)));
+    settle(&rpc, "btv.clipboard.write('one', { linewise = true })").await;
+    assert_eq!(clip.peek(), Some(("one".to_string(), true)));
+    feed(&rpc, "ialpha<Esc>\"+p");
+    assert_eq!(lines(&rpc).await, vec!["alpha", "one"]);
+}
+
+#[tokio::test]
+async fn the_clipboard_api_without_a_provider_rejects() {
+    let (rpc, _incoming) = start(None).await;
+    for code in ["btv.clipboard.read()", "btv.clipboard.write('x')"] {
+        let (ok, err) = settle(&rpc, code).await;
+        assert!(!ok, "{code} resolved");
+        assert!(
+            err.as_str().unwrap_or("").contains("clipboard"),
+            "{code}: {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_register_api_refuses_the_clipboard_registers() {
+    let (rpc, _incoming, clip) = start_with_clipboard().await;
+    for (call, instead) in [
+        ("btv.reg.get, '+'", "btv.clipboard.read()"),
+        ("vim.fn.getreg, '*'", "btv.clipboard.read()"),
+        ("btv.reg.gettype, '+'", "btv.clipboard.read()"),
+        ("btv.reg.set, '+', 'x'", "btv.clipboard.write()"),
+        ("vim.fn.setreg, '*', 'x'", "btv.clipboard.write()"),
+    ] {
+        let err = exec_lua(
+            &rpc,
+            &format!("local ok, e = pcall({call}) return tostring(e)"),
+        )
+        .await;
+        let err = err.as_str().unwrap_or("");
+        assert!(
+            err.contains("is the clipboard") && err.contains(instead),
+            "{call}: {err}"
+        );
+    }
+    let _ = lines(&rpc).await;
+    assert_eq!(clip.peek(), None, "nothing was written");
+}
+
 // ===== the built-in Ctrl+C / Ctrl+V bindings =================================
 // The desktop copy/paste chords, shipped as overridable defaults (prelude
 // `keymap.lua`) on the system clipboard rather than the unnamed register.

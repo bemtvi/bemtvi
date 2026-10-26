@@ -8,7 +8,7 @@
 -- `:ShadaShow` gives — the halves that, between them, are the whole feature. (The
 -- cross-session restore itself is covered natively, in the server's shada suite.)
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

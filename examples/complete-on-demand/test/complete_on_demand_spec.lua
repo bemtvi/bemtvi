@@ -6,7 +6,7 @@
 -- popup is the whole subject here, and it is in none of the buffer views — so
 -- this reads `t:menu()`, which is what the client is told to float.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

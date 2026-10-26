@@ -5,7 +5,7 @@
 -- Each numbered note in init.lua, typed exactly as written. `t:feed` is the
 -- keyboard, so these undo the way a person's typing does.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

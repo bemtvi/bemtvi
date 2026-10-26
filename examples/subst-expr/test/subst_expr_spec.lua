@@ -7,7 +7,7 @@
 -- instruction that no longer works. Each shortcut only *puts the command on the
 -- command line* — the `<CR>` here is what a reader would type next.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

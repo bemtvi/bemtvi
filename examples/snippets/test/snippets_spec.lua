@@ -6,7 +6,7 @@
 -- `<C-n>` onto the row, `<C-y>` to accept — so what is asserted is the body a
 -- reader would actually get, not a direct call to the engine.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

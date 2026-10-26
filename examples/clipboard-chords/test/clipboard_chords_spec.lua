@@ -7,7 +7,7 @@
 -- `btv.test.clipboard` reads and seeds — so a copy really does leave the editor
 -- and a paste really does come back through it.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

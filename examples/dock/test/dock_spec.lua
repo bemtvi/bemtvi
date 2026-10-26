@@ -6,7 +6,7 @@
 -- the single `<C-w>` that splits within one, the ex-commands, and the difference
 -- the notes make most of — TOGGLE keeps a dock's content, CLOSE drops it.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

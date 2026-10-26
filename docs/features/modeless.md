@@ -102,6 +102,20 @@ The named actions are `copy`, `cut`, `paste`, `undo`, `redo`, `select_all`,
 `move_line_up`, `move_line_down`, `search_next`, `search_prev`, `save`, `find`,
 `replace`, `command_line`, `palette`, `files`, `close`, `next_buffer`,
 `prev_buffer` and `reveal_caret` (bring a scrolled-away view back to the caret).
+In a read-only buffer only `copy` and `select_all` run, on its Visual selection.
+
+## The context menu
+
+A right-click opens a menu at the pointer. A click inside the selection keeps it,
+so the menu acts on it; anywhere else the caret moves to the click first. The menu
+offers Undo and Redo, Cut, Copy, Paste and Select All, the LSP verbs when a language
+server is attached, and the command palette, and each row shows the key that does
+the same thing. A read-only window (help, the quickfix list) gets Select All, plus
+Copy when text is selected there.
+
+The same menu works in a vim session, and it is built from groups you can reorder,
+edit and add to: see [the context menu](context-menu.md). For a key hint in a row of
+your own, `btv.modeless.key_hint(action)` gives the chord that runs a named action.
 
 ## In the browser
 

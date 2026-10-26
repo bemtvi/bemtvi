@@ -11,7 +11,7 @@
 -- The suite reports through `print`, so the spec records that rather than reading
 -- the one message line each result immediately overwrites.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 --- Record everything printed while `body` runs, in order.
 local function transcript(body)

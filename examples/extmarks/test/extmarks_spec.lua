@@ -7,7 +7,7 @@
 -- edits rather than staying at a byte offset — is checked by editing around one
 -- and watching the span move.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 -- The commands report through `vim.notify`; record them at the source.
 local notified = {}

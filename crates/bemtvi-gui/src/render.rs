@@ -3255,6 +3255,12 @@ impl Renderer {
             // keep the best match (row 0) at the bottom, nearest the command cursor.
             let display_r = if menu.cmdline { list_rows - 1 - r } else { r };
             let row = content_y0 + list_y0 + display_r;
+            // A `btv.ui.menu` separator is a rule across the list in the border color.
+            if menu.separators.get(idx).copied().unwrap_or(false) {
+                let rule = "─".repeat(list_w as usize);
+                self.push_plain(items, &rule, self.cell_px(cx, row), border, full);
+                continue;
+            }
             // The selected row gets the selection background and (when the theme's
             // selection group carries one) its own foreground.
             let row_fg = if sel == Some(idx) {

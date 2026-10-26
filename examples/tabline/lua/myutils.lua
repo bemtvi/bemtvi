@@ -2,7 +2,8 @@
 -- to what a custom 'tabline' needs so it runs under bemtvi standalone (the full
 -- file pulls in third-party helper libraries, none of which exist here). The
 -- functions below are copied verbatim from that config — this is the actual
--- tabline code, not a bemtvi-specific rewrite.
+-- tabline code, not a bemtvi-specific rewrite — save that the label splits a path
+-- on `\` as well as `/`, so it also reads right on Windows.
 
 local M = {}
 
@@ -65,7 +66,8 @@ local function my_tab_label(n)
     bufname = "[No Name]"
   end
 
-  local parts = get_last_x(vim.split(bufname, "/"), 3)
+  -- Either separator: a Windows name is `\`-separated (or mixed, as typed).
+  local parts = get_last_x(vim.split(bufname, "[/\\]"), 3)
   local fname = table.remove(parts)
   if #fname > 20 then
     fname = string.sub(fname, 0, 19) .. "…"

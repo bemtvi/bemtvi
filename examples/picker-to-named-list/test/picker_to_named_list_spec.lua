@@ -6,7 +6,7 @@
 -- the window it was sent from — so the assertions are on the list's rows and on
 -- where `<CR>` puts the cursor.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 local notified = {}
 do

@@ -6,7 +6,7 @@
 -- autocmd ordering; everything else is the `nvim_tabpage_*` read surface and the
 -- painted tab strip (`t:tabs("main")`).
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

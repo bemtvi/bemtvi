@@ -7,7 +7,7 @@
 -- Rust parser on disk — the notes say so — and those cases check `t:highlights()`
 -- only when one is installed, rather than failing on a missing grammar.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

@@ -6,7 +6,7 @@
 -- reads `t:view()` — where the focused window is scrolled to, and which buffer
 -- line each painted row carries. `t:lines()` cannot see any of it.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

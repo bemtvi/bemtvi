@@ -7,7 +7,7 @@
 -- the buffer alone would not distinguish "formatted then saved" from "saved then
 -- formatted".
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 -- §4 reports through `vim.notify`, after the write; record it at the source.
 local notified = {}

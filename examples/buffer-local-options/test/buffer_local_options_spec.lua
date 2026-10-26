@@ -5,7 +5,7 @@
 -- It sources `init.lua` as a session would and types the three numbered TRY-IT
 -- blocks verbatim, including the "prove it is PER BUFFER" round trip.
 
-local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
 
 dofile(DIR .. "/init.lua")
 

@@ -25,7 +25,8 @@
   NODE_VERSION = "24"
   # Rust toolchain version — read by netlify-build.sh, which installs/selects it via
   # rustup (Netlify's image has rustup but no default toolchain, and doesn't provision
-  # RUST_VERSION itself). Must be >= 1.85 (the transitive rmpv dep needs edition2024).
+  # RUST_VERSION itself). Must be >= 1.95, the workspace `rust-version` the edit-host's
+  # path crates inherit.
   RUST_VERSION = "1.96.0"
   # Emscripten SDK version netlify-build.sh installs/activates for the emcc link step.
   # Pinned to match the local emcc this is built/tested with.

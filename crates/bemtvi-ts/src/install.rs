@@ -793,9 +793,12 @@ fn unpack_zig_zip(bytes: &[u8], dest: &Path) -> Result<()> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).context("read Zig zip")?;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).with_context(|| format!("zip entry {i}"))?;
-        let rel = entry
-            .enclosed_name()
-            .with_context(|| format!("unsafe path in Zig zip: {}", entry.name()))?;
+        let rel = entry.enclosed_name().with_context(|| {
+            let name = entry
+                .name()
+                .map_or_else(|e| format!("<{e}>"), |n| n.into_owned());
+            format!("unsafe path in Zig zip: {name}")
+        })?;
         let out = dest.join(rel);
         if entry.is_dir() {
             std::fs::create_dir_all(&out).with_context(|| format!("mkdir {}", out.display()))?;
@@ -868,12 +871,13 @@ fn fetch_opt(url: &str) -> Result<Option<Vec<u8>>> {
     match ureq::get(url).call() {
         Ok(resp) => {
             let mut buf = Vec::new();
-            resp.into_reader()
+            resp.into_body()
+                .into_reader()
                 .read_to_end(&mut buf)
                 .with_context(|| format!("read body of {url}"))?;
             Ok(Some(buf))
         }
-        Err(ureq::Error::Status(404, _)) => Ok(None),
+        Err(ureq::Error::StatusCode(404)) => Ok(None),
         Err(e) => Err(anyhow!("GET {url}: {e}")),
     }
 }
@@ -884,7 +888,7 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
         .call()
         .map_err(|e| anyhow!("GET {url}: {e}"))?;
     let mut buf = Vec::new();
-    resp.into_reader().read_to_end(&mut buf)?;
+    resp.into_body().into_reader().read_to_end(&mut buf)?;
     Ok(buf)
 }
 

@@ -1543,7 +1543,9 @@ impl Editor {
         // the next quote — so between two strings it is the text between them.
         let (open, close) = if quotes.contains(&cursor_rel) {
             quotes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|p| (p[0], p[1]))
                 .find(|&(o, c)| o <= cursor_rel && cursor_rel <= c)?
         } else {

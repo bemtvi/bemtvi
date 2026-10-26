@@ -409,6 +409,7 @@ impl Renderer {
             power_preference: wgpu::PowerPreference::default(),
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))?;
         // Request the adapter's real limits, not `downlevel_defaults()` — the
         // latter caps `max_texture_dimension_2d` at 2048, far below a maximized
@@ -464,6 +465,7 @@ impl Renderer {
             alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
 
@@ -943,7 +945,7 @@ impl Renderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        frame.present();
+        self.queue.present(frame);
         self.atlas.trim();
         Ok(())
     }
@@ -4259,13 +4261,7 @@ impl Renderer {
         let mut buf = Buffer::new(&mut self.font_system, metrics);
         let default = Attrs::new().family(self.chain.primary());
         let rich = rich_runs(&self.chain, &self.italic_face, segments, metrics);
-        buf.set_rich_text(
-            &mut self.font_system,
-            rich,
-            &default,
-            Shaping::Advanced,
-            None,
-        );
+        buf.set_rich_text(rich, &default, Shaping::Advanced, None);
         // Snap every glyph's advance to a whole number of cells: cosmic-text scales each
         // glyph so its advance is a multiple of this width, so a wide CJK/emoji glyph
         // occupies two cells (centered in its 2-em box by the font) and the text after it
@@ -4277,7 +4273,7 @@ impl Renderer {
         // scaling reads). bemtvi-gui pulls cosmic-text in directly only to enable it — see
         // the dep note in the workspace `Cargo.toml`. Don't drop that dep.
         let cell_w = self.cell_w;
-        buf.set_monospace_width(&mut self.font_system, Some(cell_w));
+        buf.set_monospace_width(Some(cell_w));
         buf.shape_until_scroll(&mut self.font_system, false);
         buf
     }
@@ -5472,7 +5468,7 @@ pub fn shape_with_fonts(
     let rich = rich_runs(&chain, &italic_face, &segments, metrics);
     let mut buf = Buffer::new(&mut font_system, metrics);
     let default = Attrs::new().family(chain.primary());
-    buf.set_rich_text(&mut font_system, rich, &default, Shaping::Advanced, None);
+    buf.set_rich_text(rich, &default, Shaping::Advanced, None);
     buf.shape_until_scroll(&mut font_system, false);
     let mut glyphs = Vec::new();
     for run in buf.layout_runs() {
@@ -5503,13 +5499,7 @@ fn measure_cell(
     line_height: f32,
 ) -> (f32, f32) {
     let mut buf = Buffer::new(font_system, Metrics::new(font_size, line_height));
-    buf.set_text(
-        font_system,
-        "M",
-        &Attrs::new().family(family),
-        Shaping::Advanced,
-        None,
-    );
+    buf.set_text("M", &Attrs::new().family(family), Shaping::Advanced, None);
     buf.shape_until_scroll(font_system, false);
     let advance = buf
         .layout_runs()
@@ -6165,7 +6155,7 @@ impl RectPipeline {
                     module: &shader,
                     entry_point: Some("vs"),
                     compilation_options: Default::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
+                    buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: VERTEX_BYTES,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &[
@@ -6180,7 +6170,7 @@ impl RectPipeline {
                                 shader_location: 1,
                             },
                         ],
-                    }],
+                    })],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,

@@ -43,7 +43,7 @@ fn worst_drift_cells(size_pt: f32, scale: f32) -> Option<f32> {
 
     // `measure_cell`: the cell is the shaped advance of `M` at these metrics.
     let mut probe = Buffer::new(&mut fs, metrics);
-    probe.set_text(&mut fs, "M", &attrs, Shaping::Advanced, None);
+    probe.set_text("M", &attrs, Shaping::Advanced, None);
     probe.shape_until_scroll(&mut fs, false);
     let cell_w = probe
         .layout_runs()
@@ -57,8 +57,8 @@ fn worst_drift_cells(size_pt: f32, scale: f32) -> Option<f32> {
     // sees — the reported symptom is at the right-hand end of a wide window.
     let text: String = std::iter::repeat_n("abcdefghij", 12).collect();
     let mut buf = Buffer::new(&mut fs, metrics);
-    buf.set_text(&mut fs, &text, &attrs, Shaping::Advanced, None);
-    buf.set_monospace_width(&mut fs, Some(cell_w));
+    buf.set_text(&text, &attrs, Shaping::Advanced, None);
+    buf.set_monospace_width(Some(cell_w));
     buf.shape_until_scroll(&mut fs, false);
 
     let run = buf.layout_runs().next()?;

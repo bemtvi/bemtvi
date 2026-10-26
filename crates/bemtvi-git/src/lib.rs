@@ -733,6 +733,7 @@ fn pull(dir: &str) -> Result<GitValue, GitError> {
     let base = repo
         .merge_base(old_id, new_id)
         .map_err(|e| err("ENOTFF", format!("not a fast-forward: {e}")))?
+        .ok_or_else(|| err("ENOTFF", "not a fast-forward: no common ancestor"))?
         .detach();
     if base == new_id {
         // The upstream tip is at or behind our tip (local-only commits): nothing to

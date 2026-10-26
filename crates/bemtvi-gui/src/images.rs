@@ -168,7 +168,7 @@ impl ImageStore {
                 module: &shader,
                 entry_point: Some("vs"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: VERTEX_BYTES,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &[
@@ -183,7 +183,7 @@ impl ImageStore {
                             shader_location: 1,
                         },
                     ],
-                }],
+                })],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,

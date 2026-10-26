@@ -404,7 +404,7 @@ pub fn is_osc52(seq: &str) -> bool {
 
 /// Decode an even-length ASCII-hex string, or `None` if it isn't one.
 fn unhex(hex: &[u8]) -> Option<Vec<u8>> {
-    if hex.is_empty() || hex.len() % 2 != 0 {
+    if hex.is_empty() || !hex.len().is_multiple_of(2) {
         return None;
     }
     hex.chunks(2)

@@ -326,7 +326,9 @@ fn flatten_tokens(tokens: &[SemanticToken]) -> Vec<u32> {
 /// describe a partial token, so the unfinished tail is discarded rather than
 /// fabricated.
 fn chunk_tokens(data: &[u32]) -> Vec<SemanticToken> {
-    data.chunks_exact(5)
+    data.as_chunks::<5>()
+        .0
+        .iter()
         .map(|c| SemanticToken {
             delta_line: c[0],
             delta_start: c[1],

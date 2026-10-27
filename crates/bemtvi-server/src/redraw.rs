@@ -589,7 +589,13 @@ impl EditHost {
         // arrays for them so the redraw map keeps a stable shape (JS-side highlighting
         // paints from the buffer text instead).
         #[cfg(feature = "native")]
-        let highlights = self.highlights_for(win.buffer, &win.winhl, &segments, styles);
+        let highlights = self.highlights_for(
+            win.buffer,
+            &win.winhl,
+            &segments,
+            win.listchars.as_ref(),
+            styles,
+        );
         // The browser build highlights *code* JS-side, so it skips the treesitter
         // spans — but extmark highlights (the `btv.decor` / `btv.buf.set_extmark` layer)
         // and LSP semantic tokens are genuinely server-sourced and can't be
@@ -599,7 +605,13 @@ impl EditHost {
         // highlighting; the `js_highlight` frame flag (below) keeps these overlay
         // spans from flipping the client into full server-styled mode.
         #[cfg(not(feature = "native"))]
-        let highlights = self.overlay_highlights_for(win.buffer, &win.winhl, &segments, styles);
+        let highlights = self.overlay_highlights_for(
+            win.buffer,
+            &win.winhl,
+            &segments,
+            win.listchars.as_ref(),
+            styles,
+        );
         // Display columns of the `^X` / `<xx>` substitutions, for the wasm renderer
         // to colour as `SpecialKey`; the native client paints them from `highlights`,
         // so it gets an empty array (keeping the redraw map shape stable).
@@ -659,11 +671,9 @@ impl EditHost {
         let inlay_hints = self.inlay_hints_for(win.buffer, &win.winhl, &segments, styles);
         let scroll = match &win.scroll {
             Some(s) => self.project_band(
-                win.buffer,
-                &win.winhl,
+                win,
                 s,
                 s.from_leftcol.max(s.to_leftcol) + win.rect.width,
-                win.tabstop,
                 styles,
             ),
             None => Value::Nil,
@@ -1215,13 +1225,13 @@ impl EditHost {
     /// is expressed as the screen-row offsets `from_row`/`to_row` into the band.
     pub(crate) fn project_band(
         &self,
-        buffer: bemtvi_core::BufferId,
-        winhl: &WinHl,
+        win: &bemtvi_core::WindowView,
         s: &ScrollAnim,
         reach: usize,
-        tabstop: usize,
         styles: &mut StyleTable,
     ) -> Value {
+        let (buffer, winhl, tabstop) = (win.buffer, &win.winhl, win.tabstop);
+        let lcs = win.listchars.as_ref();
         let RowArrays {
             lines,
             numbers,
@@ -1248,9 +1258,9 @@ impl EditHost {
         // server-sourced overlay highlights (its code highlighting is JS-side), and the
         // diagnostics project on both builds.
         #[cfg(feature = "native")]
-        let highlights = self.highlights_for(buffer, winhl, &segments, styles);
+        let highlights = self.highlights_for(buffer, winhl, &segments, lcs, styles);
         #[cfg(not(feature = "native"))]
-        let highlights = self.overlay_highlights_for(buffer, winhl, &segments, styles);
+        let highlights = self.overlay_highlights_for(buffer, winhl, &segments, lcs, styles);
         let inlay_hints = self.inlay_hints_for(buffer, winhl, &segments, styles);
         let diagnostics_virt = self.diagnostics_virt_text_for(buffer, winhl, &segments, styles);
         let diagnostics = self.diagnostics_for(buffer, winhl, &segments, styles);

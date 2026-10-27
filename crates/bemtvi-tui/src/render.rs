@@ -2471,6 +2471,9 @@ pub(crate) fn group_style(group: &str) -> Style {
         // colorscheme defines `SpecialKey`: a standout foreground so the token
         // reads clearly as "this isn't ordinary text" (vim's `SpecialKey` look).
         "SpecialKey" => style.fg(Color::LightMagenta).add_modifier(Modifier::BOLD),
+        // The `'list'` glyphs and the `eol` marker: dim, so the drawn blanks recede
+        // behind the text.
+        "Whitespace" | "NonText" => style.fg(Color::DarkGray),
         _ => style,
     }
 }

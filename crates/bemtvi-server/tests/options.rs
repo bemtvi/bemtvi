@@ -540,6 +540,57 @@ async fn fillchars_round_trips_through_set_and_vim_wo() {
 }
 
 #[tokio::test]
+async fn list_and_listchars_round_trip_through_set_and_vim_wo() {
+    let (rpc, mut incoming) = start().await;
+
+    // `'list'` off, `'listchars'` neovim's default.
+    assert_eq!(set_message(&rpc, &mut incoming, "list?").await, "nolist");
+    assert_eq!(
+        set_message(&rpc, &mut incoming, "listchars?").await,
+        "listchars=tab:> ,trail:-,nbsp:+"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.wo.list").await.as_bool(),
+        Some(false)
+    );
+
+    // `:set list lcs=…` reads back through `vim.wo` / `btv.wo`…
+    let _ = set_message(&rpc, &mut incoming, "list lcs=eol:$,space:.").await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.wo.list").await.as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv.wo.listchars").await.as_str(),
+        Some("eol:$,space:.")
+    );
+
+    // …and the Lua writes reach the core.
+    exec_lua(&rpc, "vim.wo.list = false; vim.wo.listchars = 'trail:~'").await;
+    assert_eq!(set_message(&rpc, &mut incoming, "list?").await, "nolist");
+    assert_eq!(
+        set_message(&rpc, &mut incoming, "listchars?").await,
+        "listchars=trail:~"
+    );
+
+    // A bad value written from Lua fails loud too; `&` restores the default.
+    let msg = lua_write_message(&rpc, &mut incoming, "vim.wo.listchars = 'tab:x'").await;
+    assert!(
+        msg.contains("E474") && msg.contains("listchars=tab:x"),
+        "{msg}"
+    );
+    assert_eq!(
+        set_message(&rpc, &mut incoming, "listchars?").await,
+        "listchars=trail:~"
+    );
+    let _ = set_message(&rpc, &mut incoming, "listchars&").await;
+    assert_eq!(
+        set_message(&rpc, &mut incoming, "listchars?").await,
+        "listchars=tab:> ,trail:-,nbsp:+"
+    );
+}
+
+#[tokio::test]
 async fn unknown_vim_o_option_warns_but_stores() {
     let (rpc, mut incoming) = start().await;
 
@@ -2180,6 +2231,7 @@ async fn invalid_btv_wo_values_fail_loud_and_keep_the_old_value() {
     for (chunk, needle) in [
         ("btv.wo.signcolumn = 'sometimes'", "signcolumn=sometimes"),
         ("btv.wo.fillchars = 'nonsense'", "fillchars=nonsense"),
+        ("btv.wo.listchars = 'nonsense'", "listchars=nonsense"),
         ("btv.wo.padding = 'x y z w v'", "padding=x y z w v"),
         ("btv.wo.number = 1", "number"),
         ("btv.wo.scrolloff = 'lots'", "scrolloff"),

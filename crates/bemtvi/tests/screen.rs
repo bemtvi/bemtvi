@@ -176,6 +176,35 @@ async fn unprintable_control_byte_paints_as_a_highlighted_hex_token() {
 }
 
 #[tokio::test]
+async fn list_glyphs_paint_dim_and_text_does_not() {
+    // `'list'` draws the tab as `>---` and the trailing blanks as `-`; with no
+    // colorscheme loaded they paint in the `Whitespace` fallback (dark gray), while
+    // the real text around them keeps the default foreground.
+    let path = bemtvi_test_harness::temp_path("screen_list");
+    std::fs::write(&path, b"x\tb  \n").expect("write file");
+    let (rpc, mut incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+    feed(&rpc, ":set tabstop=4 list listchars=tab:>-,trail:-<CR>");
+    let buf = screen(&rpc, &mut incoming).await;
+
+    assert_eq!(row_text(&buf, 0).trim_end(), "1   x>--b--");
+    // x(0) >--(1..4) b(4) --(5..7), after the 4-cell gutter.
+    for x in [1, 2, 3, 5, 6] {
+        assert_eq!(
+            fg(&buf, GUTTER + x, 0),
+            Some(Color::DarkGray),
+            "text cell {x} is a list glyph"
+        );
+    }
+    for x in [0, 4] {
+        assert_ne!(
+            fg(&buf, GUTTER + x, 0),
+            Some(Color::DarkGray),
+            "text cell {x} is real text"
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_block_cursor_envelops_a_multi_cell_token() {
     // The cursor opens on the first byte — a 0x81 control shown as the 4-cell
     // `<81>` token. A block cursor envelops the whole token: the terminal's one

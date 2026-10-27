@@ -423,6 +423,7 @@ impl Editor {
             "wrap" => Some(|o| &mut o.wrap),
             "linebreak" => Some(|o| &mut o.linebreak),
             "breakindent" => Some(|o| &mut o.breakindent),
+            "list" => Some(|o| &mut o.list),
             _ => None,
         };
         let Some(win_slot) = win_slot else {
@@ -1066,6 +1067,29 @@ impl Editor {
                 StrOp::Query => {
                     let v = self.win_opts_queried(scope).fillchars.clone();
                     self.echo(format!("fillchars={v}"));
+                }
+            }
+            return;
+        }
+        // `listchars` is window-local: the glyphs `'list'` draws. Validated whole, so
+        // a bad entry (an unknown key, a wide or missing glyph) fails loud with E474
+        // instead of leaving the window on a value it can't draw. `&` restores
+        // neovim's default.
+        if name == "listchars" {
+            match op {
+                StrOp::Set(value) => {
+                    if crate::options::parse_listchars(&value).is_none() {
+                        self.echo(format!("E474: Invalid argument: listchars={value}"));
+                        return;
+                    }
+                    self.write_win_opt(scope, |o| o.listchars = value.clone());
+                }
+                StrOp::Reset => self.write_win_opt(scope, |o| {
+                    o.listchars = crate::options::DEFAULT_LISTCHARS.to_string()
+                }),
+                StrOp::Query => {
+                    let v = self.win_opts_queried(scope).listchars.clone();
+                    self.echo(format!("listchars={v}"));
                 }
             }
             return;

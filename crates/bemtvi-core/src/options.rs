@@ -954,6 +954,16 @@ pub struct WindowOptions {
     /// vim config's `fillchars` sets cleanly, but have no rendering effect yet.
     /// Empty by default, which means `eob:~` (see [`WindowOptions::fillchars_eob`]).
     pub fillchars: String,
+    /// `'list'`: draw normally-invisible whitespace (tabs, trailing blanks, non-breaking
+    /// spaces, the end of the line) as the visible glyphs [`listchars`] names. Off by
+    /// default (vim's default). Display-only: the buffer is untouched, and every
+    /// substitution keeps the width of what it replaces, so cursor columns don't move.
+    pub list: bool,
+    /// `'listchars'` (abbrev `lcs`): the comma-separated `key:chars` list choosing the
+    /// glyphs [`list`] draws. Defaults to neovim's `tab:> ,trail:-,nbsp:+`. Always
+    /// pre-validated by [`parse_listchars`] at set time; resolved with
+    /// [`WindowOptions::listchars`] at projection.
+    pub listchars: String,
     /// `'padding'` (bemtvi's own; no vim equivalent): a per-side blank margin in
     /// screen cells left around this window's content box — the number gutter, text
     /// body, and status line all inset by it, so the window reads with breathing
@@ -1055,6 +1065,20 @@ impl WindowOptions {
         }
     }
 
+    /// This window's resolved [`'listchars'`](WindowOptions::listchars) when
+    /// [`'list'`](WindowOptions::list) is on, `None` when it is off (nothing to draw).
+    /// The stored value was validated at set time, so a parse failure can't happen;
+    /// it falls back to the default set rather than panicking if one ever did.
+    pub fn listchars(&self) -> Option<ListChars> {
+        if !self.list {
+            return None;
+        }
+        Some(
+            parse_listchars(&self.listchars)
+                .unwrap_or_else(|| parse_listchars(DEFAULT_LISTCHARS).expect("valid default")),
+        )
+    }
+
     /// The `eob` filler char from this window's [`'fillchars'`](WindowOptions::fillchars):
     /// the character drawn on screen rows past the end of the buffer. Defaults to
     /// `~` (vim's default, and what an empty `fillchars` means). Setting `eob` to a
@@ -1120,6 +1144,111 @@ pub fn parse_fillchars(s: &str) -> Option<char> {
     Some(eob)
 }
 
+/// neovim's default `'listchars'`: tabs as `>` then blanks, trailing blanks as `-`,
+/// non-breaking spaces as `+`.
+pub const DEFAULT_LISTCHARS: &str = "tab:> ,trail:-,nbsp:+";
+
+/// A parsed [`'listchars'`](WindowOptions::listchars): the glyph for each kind of
+/// invisible character, `None` where the value has no entry (that character is
+/// drawn as it normally is).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListChars {
+    /// `tab:xy[z]`: a tab is drawn as `x`, then `y` for the remaining cells, with
+    /// `z` (when given) on the last cell.
+    pub tab: Option<(char, char, Option<char>)>,
+    /// `space:c`: every space not claimed by a more specific key.
+    pub space: Option<char>,
+    /// `multispace:c…`: a run of two or more spaces, the glyphs repeating across
+    /// the run. Wins over `space`.
+    pub multispace: Option<Vec<char>>,
+    /// `lead:c`: the spaces of a line's leading run. Wins over `space` /
+    /// `multispace`.
+    pub lead: Option<char>,
+    /// `leadmultispace:c…`: the leading run, when it is two or more spaces long.
+    /// Wins over `lead`.
+    pub leadmultispace: Option<Vec<char>>,
+    /// `trail:c`: the spaces of a line's trailing run of blanks. Wins over every
+    /// other space key.
+    pub trail: Option<char>,
+    /// `nbsp:c`: a non-breaking space (U+00A0, U+202F).
+    pub nbsp: Option<char>,
+    /// `eol:c`: one glyph drawn just past the end of each line.
+    pub eol: Option<char>,
+}
+
+/// The `'listchars'` keys. `extends`, `precedes` and `conceal` are validated but
+/// not drawn yet (see `docs/plans/2026-10-27-list-and-listchars.md`, Phase 2).
+const LISTCHARS_KEYS: &[&str] = &[
+    "tab",
+    "space",
+    "multispace",
+    "lead",
+    "leadmultispace",
+    "trail",
+    "nbsp",
+    "eol",
+    "extends",
+    "precedes",
+    "conceal",
+];
+
+/// Parse a `'listchars'` value, or `None` when any entry is malformed — the
+/// caller reports `E474`. Each entry is `key:chars` with a [known
+/// key](LISTCHARS_KEYS); `tab` takes two or three chars, the `*multispace` keys one
+/// or more, every other key exactly one. Every char must be a single-width,
+/// printable character (vim's rule), which is what lets a substitution keep the
+/// width of what it replaces. A repeated key keeps its last value; an empty value
+/// parses to no glyphs at all.
+pub fn parse_listchars(s: &str) -> Option<ListChars> {
+    let mut lcs = ListChars::default();
+    // Split on `,` only and never trim: a space is a legal glyph (`tab:> `).
+    for entry in s.split(',').filter(|e| !e.is_empty()) {
+        let (key, val) = entry.split_once(':')?;
+        if !LISTCHARS_KEYS.contains(&key) {
+            return None;
+        }
+        let chars: Vec<char> = val.chars().collect();
+        if chars
+            .iter()
+            .any(|&c| c.is_control() || unicode_width::UnicodeWidthChar::width(c) != Some(1))
+        {
+            return None;
+        }
+        match key {
+            "tab" => match chars[..] {
+                [x, y] => lcs.tab = Some((x, y, None)),
+                [x, y, z] => lcs.tab = Some((x, y, Some(z))),
+                _ => return None,
+            },
+            "multispace" | "leadmultispace" => {
+                if chars.is_empty() {
+                    return None;
+                }
+                if key == "multispace" {
+                    lcs.multispace = Some(chars);
+                } else {
+                    lcs.leadmultispace = Some(chars);
+                }
+            }
+            _ => {
+                let [c] = chars[..] else {
+                    return None;
+                };
+                match key {
+                    "space" => lcs.space = Some(c),
+                    "lead" => lcs.lead = Some(c),
+                    "trail" => lcs.trail = Some(c),
+                    "nbsp" => lcs.nbsp = Some(c),
+                    "eol" => lcs.eol = Some(c),
+                    // `extends` / `precedes` / `conceal`: validated, not drawn yet.
+                    _ => {}
+                }
+            }
+        }
+    }
+    Some(lcs)
+}
+
 impl Default for WindowOptions {
     fn default() -> Self {
         // bemtvi ships with the hybrid number column on: the cursor line shows its
@@ -1153,6 +1282,9 @@ impl Default for WindowOptions {
             breakindentopt: String::new(),
             // Empty fillchars: the end-of-buffer filler is vim's default `~`.
             fillchars: String::new(),
+            // `'list'` off; neovim's `'listchars'` ready for when it's turned on.
+            list: false,
+            listchars: DEFAULT_LISTCHARS.to_string(),
             // No margin out of the box — a default window renders flush as before.
             padding: Padding::default(),
             // No window-local highlight remap by default.
@@ -1857,6 +1989,20 @@ static OPTIONS: &[OptionInfo] = {
             kind: Str,
             scope: Window,
             doc: "Characters used to fill status lines and the end-of-buffer area.",
+        },
+        OptionInfo {
+            name: "list",
+            abbrev: None,
+            kind: Bool,
+            scope: Window,
+            doc: "Draw tabs, trailing blanks and other invisible characters visibly.",
+        },
+        OptionInfo {
+            name: "listchars",
+            abbrev: Some("lcs"),
+            kind: Str,
+            scope: Window,
+            doc: "Glyphs 'list' draws, as key:chars pairs (tab, space, trail, eol, …).",
         },
         OptionInfo {
             name: "padding",

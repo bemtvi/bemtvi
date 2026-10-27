@@ -2638,6 +2638,8 @@ impl EditHost {
                     colorcolumn: opts.colorcolumn.clone(),
                     signcolumn: opts.signcolumn.to_string(),
                     fillchars: opts.fillchars.clone(),
+                    list: opts.list,
+                    listchars: opts.listchars.clone(),
                     padding: opts.padding.to_string(),
                     linebreak: opts.linebreak,
                     breakindent: opts.breakindent,
@@ -2786,6 +2788,8 @@ impl EditHost {
             showbreak: w.showbreak.clone(),
             breakindentopt: w.breakindentopt.clone(),
             fillchars: w.fillchars.clone(),
+            list: w.list,
+            listchars: w.listchars.clone(),
             padding: w.padding.to_string(),
             winhighlight: w.winhighlight.clone(),
         });

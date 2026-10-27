@@ -611,6 +611,27 @@ impl Buffer {
         n
     }
 
+    /// Line-local byte where editable line `idx`'s trailing run of blanks (spaces and
+    /// tabs) begins: the line's length when it ends in a non-blank, `0` when it is
+    /// blank throughout. Read backwards off the rope, so it costs the trailing run,
+    /// not the line (a `'list'` row of a huge `nowrap` line needs it every frame).
+    pub fn trailing_blank_start(&self, idx: usize) -> usize {
+        let len = self.line_len(idx);
+        if len == 0 {
+            return 0;
+        }
+        let sl = self.text.line(idx, LINE_TYPE);
+        let mut chars = sl.chars_at(len);
+        let mut at = len;
+        while let Some(c) = chars.prev() {
+            if c != ' ' && c != '\t' {
+                break;
+            }
+            at -= 1;
+        }
+        at
+    }
+
     /// Byte offset at the start of editable line `idx`.
     pub fn line_start(&self, idx: usize) -> usize {
         self.text.line_to_byte_idx(idx, LINE_TYPE)

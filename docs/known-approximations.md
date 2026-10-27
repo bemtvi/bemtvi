@@ -93,7 +93,7 @@ fetch/compile — aren't listed; only the edges that still diverge are.)
   `incsearch`); the **window-local rendering** options (`number` /
   `relativenumber` / `cursorline` / `numberwidth` / `signcolumn` / `wrap` /
   `linebreak` / `breakindent` / `showbreak` / `sidescroll` / `sidescrolloff` / `winhighlight` /
-  `fillchars`); the **fold** options (`foldmethod` / `foldenable` / `foldcolumn` /
+  `fillchars` / `list` / `listchars`); the **fold** options (`foldmethod` / `foldenable` / `foldcolumn` /
   `foldlevel`); the **buffer-local indentation** options (`tabstop` / `shiftwidth`
   / `softtabstop` / `expandtab` / `commentstring`); the **editing-feedback** pair
   `showcmd` / `report` and the undo bound `undolevels`; and a set of
@@ -124,6 +124,14 @@ fetch/compile — aren't listed; only the edges that still diverge are.)
   filetype (the ~20 most common languages) when unset. Still, the **bulk** of
   vim's hundreds of options are missing — a write to an unmodeled option is
   recorded but inert.
+- **`'listchars'` gaps.** `list` draws `tab`, `space`, `multispace`, `lead`,
+  `leadmultispace`, `trail`, `nbsp` and `eol`, defaulting to neovim's
+  `tab:> ,trail:-,nbsp:+`. The `extends` / `precedes` (off-screen markers under
+  `nowrap`) and `conceal` keys are accepted but not drawn yet. With `list` on and no
+  `tab:` entry, vim shows a tab as `^I`; bemtvi leaves it as a plain tab. An `eol`
+  glyph on a wrapped line that exactly fills its last row is cut at the window edge
+  rather than wrapping to a row of its own. (Plan:
+  [`docs/plans/2026-10-27-list-and-listchars.md`](plans/2026-10-27-list-and-listchars.md).)
 - **Keyboard macros are on `<F2>` / `<F3>`, not `q` / `@`, and hold key
   notation.** Recording and playback are complete (`<F2>{reg}` … `<F2>` records,
   `{count}<F3>{reg}` plays, `<F3><F3>` repeats the last, `<F3>:` re-runs the last

@@ -69,7 +69,7 @@ pub use input::{
 };
 pub use mode::{KeyContext, Mode};
 pub use options::{
-    effective_history_scope, BufferOptions, HistoryScope, Options, Padding, SignColumn,
+    effective_history_scope, BufferOptions, HistoryScope, ListChars, Options, Padding, SignColumn,
     WindowOptions,
 };
 pub use snippet::{parse_snippet, ParsedSnippet, SnippetError, TabStop};

@@ -462,6 +462,140 @@ pub fn byte_at_virtcol(line: &str, target: usize, tabstop: usize) -> usize {
     line.len()
 }
 
+/// One invisible character `'list'` draws visibly: the byte range `[start, end)` of
+/// the line it covers and the glyphs drawn in its place. The glyphs always cover as
+/// many cells as the original did (a tab's full width, one cell for a space or nbsp),
+/// so every column computed from the buffer text stays valid on the drawn row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListSub {
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+}
+
+/// The `'list'` substitutions for `line` under `lcs`, in byte order. `line` is the
+/// line from its start, possibly only a head of it (a `nowrap` row's visible part);
+/// `trail_start` is the byte where the *whole* line's trailing run of blanks begins
+/// (see [`Buffer::trailing_blank_start`](crate::Buffer::trailing_blank_start)), since
+/// a head can't tell whether the blanks it ends on are trailing.
+///
+/// Precedence, as in neovim: a non-breaking space is `nbsp`; a tab is `tab`; a space
+/// in the trailing run is `trail`; a space in the leading run (of a line that isn't
+/// all blank) is `leadmultispace` when it is part of a run of two or more, else
+/// `lead`, else `space`; any other space is `multispace` when part of a run of two or
+/// more, else `space`. A character whose key is absent is not substituted.
+pub fn list_subs(
+    line: &str,
+    trail_start: usize,
+    tabstop: usize,
+    lcs: &crate::options::ListChars,
+) -> Vec<ListSub> {
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    if !bytes.iter().any(|&b| b == b' ' || b == b'\t' || b >= 0x80) {
+        return out;
+    }
+    // The leading run ends at the first non-blank; a line that is blank throughout
+    // (its trailing run starts at 0) has no leading run, only a trailing one.
+    let lead_end = if trail_start == 0 {
+        0
+    } else {
+        bytes
+            .iter()
+            .position(|&b| b != b' ' && b != b'\t')
+            .unwrap_or(bytes.len())
+    };
+    let lead_on = lcs.lead.is_some() || lcs.leadmultispace.is_some();
+    // Position in the current space run, for the repeating `*multispace` glyphs.
+    let mut run_pos = 0;
+    let mut col = 0;
+    for (i, g) in line.grapheme_indices(true) {
+        let w = grapheme_width(g, col, tabstop);
+        col += w;
+        let glyph = match g {
+            "\t" => {
+                run_pos = 0;
+                lcs.tab.map(|(x, y, z)| tab_glyphs(x, y, z, w))
+            }
+            " " => {
+                let in_run = bytes.get(i + 1) == Some(&b' ') || (i > 0 && bytes[i - 1] == b' ');
+                if !in_run {
+                    run_pos = 0;
+                }
+                let mut cycle = |glyphs: &[char]| {
+                    let c = glyphs[run_pos % glyphs.len()];
+                    run_pos += 1;
+                    c
+                };
+                let c = if lcs.trail.is_some() && i >= trail_start {
+                    lcs.trail
+                } else if lead_on && i < lead_end {
+                    match &lcs.leadmultispace {
+                        Some(ms) if in_run => Some(cycle(ms)),
+                        _ => lcs.lead.or(lcs.space),
+                    }
+                } else {
+                    match &lcs.multispace {
+                        Some(ms) if in_run => Some(cycle(ms)),
+                        _ => lcs.space,
+                    }
+                };
+                c.map(String::from)
+            }
+            "\u{a0}" | "\u{202f}" => {
+                run_pos = 0;
+                lcs.nbsp.map(String::from)
+            }
+            _ => {
+                run_pos = 0;
+                None
+            }
+        };
+        if let Some(text) = glyph {
+            out.push(ListSub {
+                start: i,
+                end: i + g.len(),
+                text,
+            });
+        }
+    }
+    out
+}
+
+/// A `w`-cell tab drawn with `'listchars'`' `tab:xy[z]`: `x`, then `y` to fill, with
+/// `z` on the last cell when given (a one-cell tab is then just `z`).
+fn tab_glyphs(x: char, y: char, z: Option<char>, w: usize) -> String {
+    let mut s = String::with_capacity(w);
+    match z {
+        Some(z) if w == 1 => s.push(z),
+        Some(z) => {
+            s.push(x);
+            s.extend(std::iter::repeat_n(y, w - 2));
+            s.push(z);
+        }
+        None => {
+            s.push(x);
+            s.extend(std::iter::repeat_n(y, w.saturating_sub(1)));
+        }
+    }
+    s
+}
+
+/// `line[from..to]` with every [`ListSub`] inside that range drawn in place of the
+/// bytes it covers. `subs` is in byte order (as [`list_subs`] returns it).
+pub fn apply_list_subs(line: &str, from: usize, to: usize, subs: &[ListSub]) -> String {
+    let mut out = String::with_capacity(to - from);
+    let mut at = from;
+    let first = subs.partition_point(|s| s.start < from);
+    for sub in subs[first..].iter().take_while(|s| s.end <= to) {
+        out.push_str(&line[at..sub.start]);
+        out.push_str(&sub.text);
+        at = sub.end;
+    }
+    out.push_str(&line[at..to]);
+    out
+}
+
 /// Cells occupied by a single grapheme starting at virtual column `col`.
 ///
 /// An unprintable control character is displayed vim-style — `^X` caret notation

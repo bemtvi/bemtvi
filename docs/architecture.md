@@ -798,7 +798,7 @@ Already on `WindowOptions`: the number gutter (`number`/`relativenumber`/
 cursor-line highlight (`cursorline`), soft word-wrap (`wrap`, with its `gj`/`gk`
 display motions, `linebreak`/`breakindent`/`showbreak`), the horizontal-scroll options, and
 the later arrivals — `scrolloff`, `signcolumn`, `colorcolumn`, `foldcolumn`,
-`fillchars`, `winhighlight`.
+`fillchars`, `winhighlight`, `list`/`listchars`.
 Still pending: the long tail of vim's window-local options beyond those.
 Floating windows are otherwise complete (model,
 paint, dynamic config, edge semantics); the remaining float fidelity knobs
@@ -1322,7 +1322,7 @@ screen," and that is exactly the shape of these tests.
   `nvim_tabpage_*` Lua surface, and `showtabline`) are all implemented — see
   [*Windows*](#windows). What remains on this axis is the long tail of vim's
   window-local options (`colorcolumn`, `scrolloff`, `signcolumn`, `foldcolumn`,
-  `fillchars`, and `winhighlight` are already wired).
+  `fillchars`, `list`/`listchars`, and `winhighlight` are already wired).
 - **The `btv.*` config surface** — `init.lua` targets bemtvi's own API
   ([ADR 0002](decisions/0002-native-plugin-system.md)); the prelude's current
   vim-shaped spelling is donor code, refactored under `btv` where it serves

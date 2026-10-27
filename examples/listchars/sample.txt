@@ -1,0 +1,8 @@
+Tabs, blanks and other invisible characters, drawn by :set list
+
+	indented with a tab
+    indented with four spaces
+	  a tab, then two spaces
+this line ends in three spaces   
+this word gap is a non-breaking space
+col	umns	line	up

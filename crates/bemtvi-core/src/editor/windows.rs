@@ -1499,7 +1499,7 @@ impl Editor {
 
     /// Set a boolean window-local option on window `id` (`vim.wo` /
     /// `nvim_win_set_option`). Recognizes `number` / `relativenumber` /
-    /// `cursorline` / `foldenable` / `wrap` / `linebreak` / `breakindent` /
+    /// `cursorline` / `foldenable` / `wrap` / `linebreak` / `breakindent` / `list` /
     /// `scrollanim`; a no-op
     /// for any other name or an unknown id. `0` is resolved to the focused window by
     /// the caller.
@@ -1516,6 +1516,7 @@ impl Editor {
             "wrap" => w.options.wrap = value,
             "linebreak" => w.options.linebreak = value,
             "breakindent" => w.options.breakindent = value,
+            "list" => w.options.list = value,
             // A per-window override of the global `'scrollanim'` (see
             // [`WindowOptions::scrollanim`]); `Some(value)` shadows the global until unset.
             "scrollanim" => w.options.scrollanim = Some(value),
@@ -1580,7 +1581,7 @@ impl Editor {
     /// Set a string window-local option on window `id` (`vim.wo` /
     /// `nvim_win_set_option`), the string analogue of
     /// [`Editor::set_window_option_bool`]. Recognizes `signcolumn`, `fillchars`,
-    /// `winhighlight`, `colorcolumn`, `showbreak`, `breakindentopt` and `padding`. An
+    /// `listchars`, `winhighlight`, `colorcolumn`, `showbreak`, `breakindentopt` and `padding`. An
     /// invalid value, or a string written to any other option, fails loud (`E474`) as
     /// on the `:set` path; an unknown id is a no-op.
     pub fn set_window_option_str(&mut self, id: WindowId, name: &str, value: &str) {
@@ -1598,6 +1599,12 @@ impl Editor {
         } else if name == "fillchars" {
             if crate::options::parse_fillchars(value).is_some() {
                 opts.fillchars = value.to_string();
+            } else {
+                rejected = Some("");
+            }
+        } else if name == "listchars" {
+            if crate::options::parse_listchars(value).is_some() {
+                opts.listchars = value.to_string();
             } else {
                 rejected = Some("");
             }

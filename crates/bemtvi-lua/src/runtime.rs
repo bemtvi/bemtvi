@@ -107,6 +107,12 @@ pub struct WindowMirror {
     /// `'fillchars'` as the raw `key:char` list string (empty ⇒ vim's default
     /// look), for `vim.wo`/`vim.o` read-back.
     pub fillchars: String,
+    /// `'list'` — whether invisible characters are drawn (so `vim.wo`/`vim.o` read
+    /// it back).
+    pub list: bool,
+    /// `'listchars'` as the raw `key:chars` list string, for `vim.wo`/`vim.o`
+    /// read-back.
+    pub listchars: String,
     /// `'linebreak'` — whether a soft-wrapped row breaks at a blank instead of
     /// mid-word (so `vim.wo`/`vim.o` read it back).
     pub linebreak: bool,
@@ -545,6 +551,8 @@ pub struct WoGlobalMirror {
     pub showbreak: String,
     pub breakindentopt: String,
     pub fillchars: String,
+    pub list: bool,
+    pub listchars: String,
     pub padding: String,
     pub winhighlight: String,
 }

@@ -496,6 +496,7 @@ impl EditHost {
         buffer: BufferId,
         winhl: &WinHl,
         segs: &[crate::redraw::RowSeg],
+        lcs: Option<&bemtvi_core::ListChars>,
         styles: &mut StyleTable,
     ) -> Value {
         // A terminal buffer's "syntax" is its vt100 grid colors, not treesitter:
@@ -547,6 +548,18 @@ impl EditHost {
                 // substitution is visibly distinct from real text. Forces the
                 // merge path even with no other highlight source.
                 let control = unicode::unprintable_positions(&text);
+                // The `'list'` glyphs core drew in place of tabs / blanks (`Whitespace`)
+                // and past the line's end (`eol`, `NonText`). Like the control chars,
+                // they force the merge path.
+                let list = match lcs {
+                    Some(l) => crate::extmarks::list_intervals(b, line_idx, &text, tab, l),
+                    None => Vec::new(),
+                };
+                let eol = lcs
+                    .and_then(|l| {
+                        crate::extmarks::list_eol_span(seg, &text, limit != usize::MAX, tab, l)
+                    })
+                    .map(|span| crate::extmarks::list_eol_value(self, span, winhl, styles));
 
                 // LSP semantic tokens (ADR 0001 bridge #2): a third highlight
                 // source at SEMANTIC_HL_PRIORITY, between treesitter and extmarks.
@@ -567,12 +580,12 @@ impl EditHost {
                     ),
                     None => Vec::new(),
                 };
-                if ext.is_empty() && sem.is_empty() && control.is_empty() {
+                if ext.is_empty() && sem.is_empty() && control.is_empty() && list.is_empty() {
                     let Some(spans) = ts_spans else {
-                        return Value::Array(Vec::new());
+                        return Value::Array(eol.into_iter().collect());
                     };
                     let mut vc = unicode::LineVirtcol::new(&text, tab);
-                    let row = spans
+                    let mut row: Vec<Value> = spans
                         .iter()
                         .filter(|s| s.start < limit)
                         .filter_map(|s| {
@@ -592,6 +605,7 @@ impl EditHost {
                             ]))
                         })
                         .collect();
+                    row.extend(eol);
                     return Value::Array(row);
                 }
 
@@ -628,8 +642,9 @@ impl EditHost {
                         capture: false,
                     });
                 }
+                intervals.extend(list);
                 let mut vc = unicode::LineVirtcol::new(&text, tab);
-                let row = crate::extmarks::merge_intervals(&intervals)
+                let mut row: Vec<Value> = crate::extmarks::merge_intervals(&intervals)
                     .into_iter()
                     .filter_map(|(sb, eb, group, capture)| {
                         // Clip the merged span to this row's wrap segment, rebased.
@@ -651,6 +666,7 @@ impl EditHost {
                         ]))
                     })
                     .collect();
+                row.extend(eol);
                 Value::Array(row)
             })
             .collect();

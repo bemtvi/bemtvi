@@ -80,6 +80,8 @@ mod indent_detect;
 mod indent_pairs;
 #[path = "editing/jumplist.rs"]
 mod jumplist;
+#[path = "editing/listchars.rs"]
+mod listchars;
 #[path = "editing/listings.rs"]
 mod listings;
 #[path = "editing/lua_surface.rs"]

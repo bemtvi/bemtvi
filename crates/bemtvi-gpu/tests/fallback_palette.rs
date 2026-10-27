@@ -162,6 +162,14 @@ async fn the_gui_syntax_fallback_is_the_bemtvi_scheme() {
             special.fg, special.bold
         ));
     }
+    // So are the `'list'` glyph groups.
+    for group in ["Whitespace", "NonText"] {
+        let got = group_fallback(group).fg;
+        let want = group_color(&rpc, group, "fg").await;
+        if got != want {
+            wrong.push(format!("{group}: gui {got:06x?}, bemtvi {want:06x?}"));
+        }
+    }
     assert!(
         wrong.is_empty(),
         "group_fallback differs from the bemtvi scheme:\n{}",

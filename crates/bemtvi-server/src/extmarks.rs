@@ -237,6 +237,7 @@ impl EditHost {
         buffer: BufferId,
         winhl: &WinHl,
         segs: &[crate::redraw::RowSeg],
+        lcs: Option<&bemtvi_core::ListChars>,
         styles: &mut StyleTable,
     ) -> Value {
         let numbers: Vec<Option<usize>> = segs.iter().map(|s| s.line).collect();
@@ -278,11 +279,17 @@ impl EditHost {
                     text.len(),
                     intervals.len() as u32,
                 ));
+                if let Some(lcs) = lcs {
+                    intervals.extend(list_intervals(b, line_idx, &text, tab, lcs));
+                }
+                let eol = lcs
+                    .and_then(|l| list_eol_span(seg, &text, limit != usize::MAX, tab, l))
+                    .map(|span| list_eol_value(self, span, winhl, styles));
                 if intervals.is_empty() {
-                    return Value::Array(Vec::new());
+                    return Value::Array(eol.into_iter().collect());
                 }
                 let mut vc = unicode::LineVirtcol::new(&text, tab);
-                let row = merge_intervals(&intervals)
+                let mut row: Vec<Value> = merge_intervals(&intervals)
                     .into_iter()
                     .filter_map(|(sb, eb, group, capture)| {
                         let (start, end) = seg.clip(vc.at(sb), vc.at(eb))?;
@@ -303,6 +310,7 @@ impl EditHost {
                         ]))
                     })
                     .collect();
+                row.extend(eol);
                 Value::Array(row)
             })
             .collect();
@@ -904,6 +912,68 @@ fn hl_mode_code(mode: HlMode) -> u64 {
         HlMode::Combine => 1,
         HlMode::Blend => 2,
     }
+}
+
+/// The `'list'` glyphs core drew onto one row (see `unicode::list_subs`) as
+/// highlight intervals over the buffer bytes they replace, all `Whitespace`. Painted
+/// at the control-char overlay's priority: a glyph isn't buffer content, so no
+/// syntax color or extmark should paint it. `text` is the row's head of buffer line
+/// `line_idx`, as [`RowSeg::text`](crate::redraw::RowSeg::text) returns it.
+pub(crate) fn list_intervals(
+    buf: &bemtvi_core::Buffer,
+    line_idx: usize,
+    text: &str,
+    tabstop: usize,
+    lcs: &bemtvi_core::ListChars,
+) -> Vec<HlInterval<'static>> {
+    unicode::list_subs(text, buf.trailing_blank_start(line_idx), tabstop, lcs)
+        .into_iter()
+        .map(|sub| HlInterval {
+            start: sub.start,
+            end: sub.end,
+            group: "Whitespace",
+            priority: bemtvi_core::SPECIAL_KEY_PRIORITY,
+            order: 0,
+            capture: false,
+        })
+        .collect()
+}
+
+/// The row-local `[start, end)` cell of the `'listchars'` `eol` glyph core drew on
+/// this row, or `None` when there is none here: `eol` unset, a head that stops
+/// before the line's end, or a wrapped row that isn't the line's last.
+pub(crate) fn list_eol_span(
+    seg: &crate::redraw::RowSeg,
+    text: &str,
+    clipped: bool,
+    tabstop: usize,
+    lcs: &bemtvi_core::ListChars,
+) -> Option<(usize, usize)> {
+    lcs.eol?;
+    if clipped {
+        return None;
+    }
+    let col = unicode::virtcol(text, text.len(), tabstop);
+    seg.clip(col, col + 1)
+}
+
+/// The `eol` glyph's highlight span, in the per-row payload's shape.
+pub(crate) fn list_eol_value(
+    host: &EditHost,
+    span: (usize, usize),
+    winhl: &WinHl,
+    styles: &mut StyleTable,
+) -> Value {
+    let style_id = match host.resolve_winhl(winhl, "NonText") {
+        Some(style) => Value::from(styles.intern(style) as u64),
+        None => Value::Nil,
+    };
+    Value::Array(vec![
+        Value::from(span.0 as u64),
+        Value::from(span.1 as u64),
+        Value::from("NonText"),
+        style_id,
+    ])
 }
 
 /// Resolve a set of possibly-overlapping highlight intervals into a

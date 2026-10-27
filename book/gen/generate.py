@@ -87,6 +87,7 @@ IMPORTS = [
     ("docs/features/quickfix-dock-lists.md", "features/quickfix-dock-lists.md"),
     ("docs/browser-editor.md", "features/browser-editor.md"),
     ("docs/edit-host-split.md", "features/edit-host-split.md"),
+    ("docs/features/embedding.md", "features/embedding.md"),
     ("docs/architecture.md", "architecture/overview.md"),
     ("docs/recommended-plugins.md", "guide/recommended-plugins.md"),
     ("docs/btv-model.md", "plugins/btv-model.md"),

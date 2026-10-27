@@ -1699,6 +1699,9 @@ impl Editor {
         if id == self.cur_buffer() || !self.buffers.map.contains_key(&id) {
             return;
         }
+        if self.refuse_other_buffer(id) {
+            return;
+        }
         // A panel buffer only ever shows inside the panel overlay — never as a regular main
         // buffer. Targeting one from *outside* the panel window (`:b [Messages]`, a stray
         // switch) opens it AS a panel instead. The in-panel-window swap is allowed through:
@@ -1908,6 +1911,72 @@ impl Editor {
     /// `canonicalize` syscall this used to run on every `:e`. Symlinks are not
     /// resolved, matching vim's path-based (not inode-based) buffer dedup. See
     /// [`super::same_path`] / [`super::absolutize_normalize`].
+    /// Lock the editor to one file: the buffer `id` (an app embedding the editor as the
+    /// editor for one given file). From then on no other file is opened, switched to or
+    /// written, and no new file buffer made: `:e other`, `:sp other`, `:tabedit`,
+    /// `:enew`, `:b`, `<C-^>`, a picker's or an LSP jump's other file, `:w other`, and
+    /// deleting the buffer itself all fail with `E5801`. Every other kind of buffer (a
+    /// view, a panel, a float, a quickfix list, a terminal: `'buftype'` not `""`) works
+    /// as ever.
+    pub fn lock_to_buffer(&mut self, id: BufferId) {
+        self.locked_buffer = Some(id);
+    }
+
+    /// The buffer the editor is locked to, if any ([`Self::lock_to_buffer`]).
+    pub fn locked_buffer(&self) -> Option<BufferId> {
+        self.locked_buffer
+    }
+
+    /// Refuse `path` if the editor is locked to another file, saying so. Whether it was
+    /// refused. A path is the locked file's when the core's own path matching (the same
+    /// cwd-aware [`Self::find_buffer_by_path`] every open uses) finds the locked buffer.
+    pub(crate) fn refuse_other_file(&mut self, path: &Path) -> bool {
+        let Some(locked) = self.locked_buffer else {
+            return false;
+        };
+        if self.find_buffer_by_path(path) == Some(locked) {
+            return false;
+        }
+        self.echo_locked(locked);
+        true
+    }
+
+    /// Refuse to bring buffer `id` into a window if the editor is locked to another file
+    /// and `id` is a file buffer (`'buftype'` `""`): `:b`, `<C-^>`, `:bnext`, a jump, a
+    /// picker's tab or split. A view, panel, float or quickfix buffer still comes in.
+    /// Whether it was refused.
+    pub(crate) fn refuse_other_buffer(&mut self, id: BufferId) -> bool {
+        let Some(locked) = self.locked_buffer else {
+            return false;
+        };
+        if id == locked || !self.buffer_buftype(id).is_empty() {
+            return false;
+        }
+        self.echo_locked(locked);
+        true
+    }
+
+    /// Refuse a new file buffer (`:enew`, `:new`, `:tabnew`) if the editor is locked to
+    /// a file. Whether it was refused.
+    pub(crate) fn refuse_new_file_buffer(&mut self) -> bool {
+        let Some(locked) = self.locked_buffer else {
+            return false;
+        };
+        self.echo_locked(locked);
+        true
+    }
+
+    /// `E5801`, naming the file the editor is locked to.
+    pub(crate) fn echo_locked(&mut self, locked: BufferId) {
+        let name = self
+            .buffers
+            .map
+            .get(&locked)
+            .and_then(|b| b.buffer.path.as_ref())
+            .map_or_else(|| "one file".to_owned(), |p| p.display().to_string());
+        self.echo(format!("E5801: this editor only edits {name}"));
+    }
+
     pub fn find_buffer_by_path(&self, path: &Path) -> Option<BufferId> {
         let target = super::absolutize_normalize(path);
         self.buffers.map.iter().find_map(|(id, ob)| {
@@ -2310,6 +2379,9 @@ impl Editor {
     /// new tab, …). `None` means a *synchronous* load failed and was already echoed
     /// (off-tick never fails here — the fetch's errors surface later in `apply_open`).
     fn load_new_buffer(&mut self, path: &Path) -> Option<BufferId> {
+        if self.refuse_other_file(path) {
+            return None;
+        }
         if self.should_defer_open() {
             // Deferred (off-tick fetch, or a BufReadCmd handler that may claim the
             // read): create the empty named buffer and enqueue. The server fills it —
@@ -2338,6 +2410,9 @@ impl Editor {
     /// throwaway-reuse on top via [`Editor::edit_in_current_window`]. `None` only on a
     /// synchronous load failure (already echoed).
     pub(crate) fn open_buffer(&mut self, path: &Path) -> Option<BufferId> {
+        if self.refuse_other_file(path) {
+            return None;
+        }
         if let Some(id) = self.find_buffer_by_path(path) {
             return Some(id);
         }
@@ -2361,6 +2436,9 @@ impl Editor {
     /// fetch stays the only route — as it already is for every open in that session.
     /// `None` only on a synchronous load failure (already echoed), which collapses the leaf.
     pub(crate) fn open_buffer_for_restore(&mut self, path: &Path) -> Option<BufferId> {
+        if self.refuse_other_file(path) {
+            return None;
+        }
         if let Some(id) = self.find_buffer_by_path(path) {
             return Some(id);
         }
@@ -2397,6 +2475,9 @@ impl Editor {
     /// land on emptiness and the fill would then clobber it; the direct read keeps the
     /// edit and the file's real contents together.
     pub fn ensure_buffer_loaded(&mut self, path: &Path) -> Option<BufferId> {
+        if self.refuse_other_file(path) {
+            return None;
+        }
         if let Some(id) = self.find_buffer_by_path(path) {
             return Some(id);
         }
@@ -2478,6 +2559,9 @@ impl Editor {
     /// Returns the buffer now shown, or `None` if a synchronous load failed (echoed) — the
     /// caller then leaves the current buffer in place rather than navigating into nothing.
     pub(crate) fn edit_in_current_window(&mut self, path: &Path) -> Option<BufferId> {
+        if self.refuse_other_file(path) {
+            return None;
+        }
         if let Some(id) = self.find_buffer_by_path(path) {
             self.switch_buffer(id);
             return Some(id);
@@ -2548,6 +2632,10 @@ impl Editor {
     /// mirroring `:tabedit`'s find-or-load ([`Editor::open_buffer`], off-tick aware)
     /// + [`Editor::new_tab`]; a failed synchronous load still opens an empty tab.
     pub fn jump_to_tab(&mut self, path: &Path, line: usize, col: usize) {
+        // Refused up front: the fallback below would open an empty tab.
+        if self.refuse_other_file(path) {
+            return;
+        }
         let options = self.windows.cur().options.clone();
         let buf = self
             .open_buffer(path)
@@ -2569,6 +2657,10 @@ impl Editor {
         } else {
             SplitDir::Horizontal
         };
+        // Refused before splitting, so it leaves no stray window.
+        if self.refuse_other_file(path) {
+            return;
+        }
         self.split(dir);
         if self.edit_in_current_window(path).is_some() {
             self.land_cursor(line, col);
@@ -2630,7 +2722,7 @@ impl Editor {
     /// `'switchbuf'`), unlike [`Editor::switch_to_buffer_switchbuf`]. A no-op for an
     /// unknown id.
     pub fn open_buffer_in_tab(&mut self, buf: BufferId) {
-        if !self.buffers.map.contains_key(&buf) {
+        if !self.buffers.map.contains_key(&buf) || self.refuse_other_buffer(buf) {
             return;
         }
         let options = self.windows.cur().options.clone();
@@ -2643,7 +2735,7 @@ impl Editor {
     /// raw [`Editor::switch_buffer`] swaps the buffer into the fresh window. A no-op
     /// for an unknown id.
     pub fn open_buffer_in_split(&mut self, buf: BufferId, vertical: bool) {
-        if !self.buffers.map.contains_key(&buf) {
+        if !self.buffers.map.contains_key(&buf) || self.refuse_other_buffer(buf) {
             return;
         }
         let dir = if vertical {
@@ -3263,6 +3355,11 @@ impl Editor {
     /// the `E89` guard blocked an unforced delete of a modified buffer.
     pub fn delete_buffer(&mut self, target: BufferId, force: bool) -> bool {
         if !self.buffers.map.contains_key(&target) {
+            return false;
+        }
+        // The file an editor is locked to stays: deleting it would leave an empty buffer.
+        if self.locked_buffer == Some(target) {
+            self.echo_locked(target);
             return false;
         }
         if self.buffers.get(target).buffer.modified && !force {

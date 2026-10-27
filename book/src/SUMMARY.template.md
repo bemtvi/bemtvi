@@ -41,6 +41,7 @@
   - [Workspaces](features/workspaces.md)
   - [Browser editor](features/browser-editor.md)
   - [The edit-host split](features/edit-host-split.md)
+  - [Embedding bemtvi in an app](features/embedding.md)
 
 # Plugin Development
 

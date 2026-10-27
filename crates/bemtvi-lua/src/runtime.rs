@@ -853,6 +853,9 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
         "bemtvi:prelude/connect",
         include_str!("prelude/connect.lua"),
     ),
+    // btv.host: the app embedding this editor (`btv.host.name` / `send` / `forward`).
+    // Loads after btv.lua (`btv.on` / `btv.off`) and utils.lua (`btv.utils.debounce`).
+    ("bemtvi:prelude/host", include_str!("prelude/host.lua")),
     // The Helix selection-first keymap plugin (opt-in — `btv.helix.enable`). Loads
     // AFTER btv.lua / lsp.lua / picker.lua: it registers `helix`-bucket default maps
     // that defer to `btv.lsp.*` / `btv.picker.open` (resolved at call time) and drive
@@ -993,6 +996,11 @@ pub(crate) struct Shared {
     /// carrying the URL string, and the client performs its built-in direct dial (QUIC URI /
     /// ssh host). See docs/plans/2026-07-05-remote-connectors-and-system-plugins.md → §C.
     pub(crate) connect_fallbacks: Vec<rmpv::Value>,
+    /// Messages for the app embedding the editor, from `btv.host.send(name, payload)`:
+    /// each `[name, payload]`. Like [`Self::connect_fallbacks`] they don't touch the
+    /// editor — the server drains them into a `bemtvi_host` notification for the client,
+    /// which hands them to its host.
+    pub(crate) host_messages: Vec<rmpv::Value>,
     /// `btv.view` content / mount / lifecycle requests, applied to the core after the
     /// chunk.
     pub(crate) view_ops: Vec<ViewOp>,
@@ -1227,6 +1235,18 @@ pub(crate) struct Shared {
     /// remote session), surfaced via `btv.workspace.dir()` / `btv.workspace.active()`. `None`
     /// outside a workspace launch. Seeded alongside [`shada_namespace`](Self::shada_namespace).
     pub(crate) workspace_dir: Option<String>,
+    /// The id of the app embedding this editor (`btv.host.name()`), or `None` when nothing
+    /// does. Seeded by the server from `ServerInit` before any config runs.
+    pub(crate) host: Option<String>,
+    /// Every spelling of every command the editor refuses (`btv.command_disabled`).
+    /// Seeded by the server before any config runs; fixed for the session.
+    pub(crate) disabled_commands: std::collections::HashSet<String>,
+    /// Whether user commands may only come from the config and the plugins loaded at
+    /// startup (`btv._user_commands_startup_only`). Seeded before any config runs.
+    pub(crate) startup_user_commands_only: bool,
+    /// The file the editor is locked to (`ServerInit::single_file`), as it was given, or
+    /// `None`: `btv._locked_file()`. Seeded before any config runs.
+    pub(crate) locked_file: Option<String>,
     /// Per-plugin isolated shada data: `namespace -> (key -> value)`, where each
     /// value is the plugin's serialized blob (JSON, from `btv.shada.plugin`). The
     /// live home of an opted-in plugin's cross-session store: the `btv._shada_plugin_*`
@@ -1291,6 +1311,7 @@ impl Shared {
             layer_ops,
             session_reconnects,
             connect_fallbacks,
+            host_messages,
             view_ops,
             panel_ops,
             terminal_ops,
@@ -1363,6 +1384,10 @@ impl Shared {
             session_save_layout: _,
             shada_namespace: _,
             workspace_dir: _,
+            host: _,
+            disabled_commands: _,
+            startup_user_commands_only: _,
+            locked_file: _,
             plugin_shada: _,
             key_pending_active: _,
             test_api_installed: _,
@@ -1373,6 +1398,7 @@ impl Shared {
         *layer_ops = Default::default();
         *session_reconnects = Default::default();
         *connect_fallbacks = Default::default();
+        *host_messages = Default::default();
         *view_ops = Default::default();
         *panel_ops = Default::default();
         *terminal_ops = Default::default();
@@ -1814,7 +1840,9 @@ impl LuaRuntime {
     /// chunk queued (ops, panel, commands) are drained by the caller afterward,
     /// exactly like a `:lua` chunk.
     pub fn eval_to_value(&self, chunk: &str) -> mlua::Result<rmpv::Value> {
-        let value: mlua::Value = self.lua.load(chunk).eval()?;
+        // Named for what it is, the client's (the app embedding the editor, a test):
+        // otherwise mlua names it after this call site, which reads like a file.
+        let value: mlua::Value = self.lua.load(chunk).set_name("=nvim_exec_lua").eval()?;
         lua_to_rmpv(&value)
     }
 
@@ -2170,6 +2198,13 @@ impl LuaRuntime {
         /// drain, for the server to push out to the client as `btv_connect_fallback`
         /// notifications (the client dials the URL directly — §C).
         take_connect_fallbacks -> Vec<rmpv::Value> = connect_fallbacks
+    }
+
+    take_queue! {
+        /// Take the messages `btv.host.send` queued since the last drain (each
+        /// `[name, payload]`), for the server to push out to the client as `bemtvi_host`
+        /// notifications.
+        take_host_messages -> Vec<rmpv::Value> = host_messages
     }
 
     take_queue! {
@@ -2796,6 +2831,31 @@ impl LuaRuntime {
     /// plugin calling `btv.shada.save_layout`; the config may still toggle it afterwards.
     pub fn set_session_save_layout(&self, on: bool) {
         self.shared.borrow_mut().session_save_layout = on;
+    }
+
+    /// Seed every spelling of the commands the editor refuses, for
+    /// `btv.command_disabled`. Before any config runs.
+    pub fn set_disabled_commands(&self, spellings: Vec<String>) {
+        self.shared.borrow_mut().disabled_commands = spellings.into_iter().collect();
+    }
+
+    /// Take user commands only from the config and the plugins loaded at startup: one
+    /// defined by any other code once startup ends is refused. Before any config runs.
+    pub fn set_startup_user_commands_only(&self, on: bool) {
+        self.shared.borrow_mut().startup_user_commands_only = on;
+    }
+
+    /// Seed the file the editor is locked to (`ServerInit::single_file`), which the
+    /// command line's completion offers in place of browsing for others. Before any
+    /// config runs.
+    pub fn set_locked_file(&self, file: Option<String>) {
+        self.shared.borrow_mut().locked_file = file;
+    }
+
+    /// Seed the id of the app embedding this editor, which `btv.host.name()` reports
+    /// and `btv.host.send` needs. Before any config runs, so a config can branch on it.
+    pub fn set_host(&self, host: Option<String>) {
+        self.shared.borrow_mut().host = host;
     }
 
     /// Seed the shada namespace + workspace root surfaced to Lua (`btv.shada.namespace()` /

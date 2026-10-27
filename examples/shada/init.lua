@@ -53,14 +53,14 @@ end, {})
 -- now (like :w for a buffer), so the state is durable immediately rather than
 -- only at the debounced checkpoint or at exit. `'0` stays clean-exit-only — a
 -- :wshada is not an exit, so it never rewrites the last-exit cursor.
-vim.keymap.set("n", "<space>w", "<cmd>wshada<CR>", { desc = "flush the shada store now" })
+vim.keymap.set("n", "<space>w", ":wshada<CR>", { desc = "flush the shada store now" })
 
 -- <space>r — :rshada, the explicit re-read. It re-merges every *readable* store
 -- in the dir (a still-live instance's file is locked, so you see its data only
 -- after it exits — neovim's contract) into this running session. Use :rshada!
 -- to overwrite a register you've already set this session; plain :rshada keeps
 -- your live value and only fills empty slots.
-vim.keymap.set("n", "<space>r", "<cmd>rshada<CR>", { desc = "re-read the shada store" })
+vim.keymap.set("n", "<space>r", ":rshada<CR>", { desc = "re-read the shada store" })
 
 -- A tiny status helper: show whether register "a survived from a prior session.
 vim.api.nvim_create_user_command("ShadaShow", function()

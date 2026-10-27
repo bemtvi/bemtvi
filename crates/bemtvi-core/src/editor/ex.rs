@@ -167,35 +167,6 @@ fn expand_tilde(rep: &str, prev: Option<&str>) -> Result<String, ()> {
     Ok(out)
 }
 
-/// Whether a backslash before `c` in a file argument is an escape to drop — the chars
-/// `btv.fname.escape` (`fnameescape`) backslashes, minus the start-of-argument guards
-/// (`\+`, `\>`, `\-`), which would otherwise turn back into a `++opt` before the
-/// argument is parsed. On Windows only `%` / `#`: there `\` is the path separator.
-fn is_fname_escaped(c: char) -> bool {
-    if cfg!(windows) {
-        return matches!(c, '%' | '#');
-    }
-    matches!(
-        c,
-        ' ' | '\t'
-            | '\n'
-            | '*'
-            | '?'
-            | '['
-            | '{'
-            | '`'
-            | '$'
-            | '\\'
-            | '%'
-            | '#'
-            | '\''
-            | '"'
-            | '|'
-            | '!'
-            | '<'
-    )
-}
-
 /// Expand a leading `~` / `~/…` in a file argument to the home directory (vim
 /// filename expansion). Only the argument's leading tilde is special; `~` anywhere
 /// else is a literal path character. `~user` (a passwd lookup, which the core has no
@@ -804,7 +775,11 @@ impl Editor {
             // `\%` / `\#` insert a literal `%` / `#`; off Windows (where `\` is the
             // separator) so does a backslash before any other char `fnameescape`
             // escapes, so an escaped name opens the file it names.
-            if c == '\\' && chars.get(i + 1).is_some_and(|&n| is_fname_escaped(n)) {
+            if c == '\\'
+                && chars
+                    .get(i + 1)
+                    .is_some_and(|&n| crate::ex_names::is_fname_escaped(n))
+            {
                 out.push(chars[i + 1]);
                 i += 2;
                 continue;
@@ -923,7 +898,9 @@ impl Editor {
         if lead.len() > cmd.len() {
             if let Ok((range, rest)) = self.parse_ex_range(lead) {
                 if let Some((bang, body)) = parse_normal_prefix(rest.trim_start()) {
-                    self.ex_normal(range, bang, body);
+                    if !self.refuse_disabled("normal") {
+                        self.ex_normal(range, bang, body);
+                    }
                     return;
                 }
             }
@@ -958,11 +935,15 @@ impl Editor {
         // `&&` keeps them). These have no alphabetic name, so they're matched on
         // the raw remainder before `split_ex` would strip an empty name.
         if let Some(after) = rest.strip_prefix("&&") {
-            self.repeat_substitute(range, after.trim(), true);
+            if !self.refuse_disabled("&&") {
+                self.repeat_substitute(range, after.trim(), true);
+            }
             return;
         }
         if let Some(after) = rest.strip_prefix('&') {
-            self.repeat_substitute(range, after.trim(), false);
+            if !self.refuse_disabled("&") {
+                self.repeat_substitute(range, after.trim(), false);
+            }
             return;
         }
 
@@ -973,7 +954,9 @@ impl Editor {
         // visible. (`:lua= {expr}` is the same shorthand with an explicit prefix,
         // handled in the `lua` arm below.)
         if let Some(expr) = rest.strip_prefix('=') {
-            self.print_lua_expr(expr);
+            if !self.refuse_disabled("=") {
+                self.print_lua_expr(expr);
+            }
             return;
         }
 
@@ -986,19 +969,28 @@ impl Editor {
         // pre-parse above; this arm handles the rest, where `rest` and the raw
         // remainder agree.
         if let Some((bang, body)) = parse_normal_prefix(rest) {
-            self.ex_normal(range, bang, body);
+            if !self.refuse_disabled("normal") {
+                self.ex_normal(range, bang, body);
+            }
             return;
         }
 
-        let (name, bang, args) = split_ex(rest);
+        let (typed, bang, args) = split_ex(rest);
+        // The command by its canonical name (`e` → `edit`): every arm below is spelled
+        // that way, from the one spelling list (`crate::ex_names`). A user command's
+        // name is its own.
+        let name = crate::ex_names::canonical_or_self(typed);
+        if self.refuse_disabled(typed) {
+            return;
+        }
         match name {
-            "w" | "write" => {
+            "write" => {
                 if let Some(a) = self.expand_file_arg_or_echo(args) {
                     self.ex_write(&a, bang, None);
                 }
             }
-            "q" | "quit" => self.ex_quit(bang),
-            "wq" | "x" | "xit" | "exit" => {
+            "quit" => self.ex_quit(bang),
+            "wq" => {
                 // Write the current buffer, then `:q` it (close the window, or
                 // quit on the last window). A failed write leaves the buffer
                 // modified, so a last-window quit then reports it. `ex_write`
@@ -1009,33 +1001,33 @@ impl Editor {
                     self.ex_write(&a, bang, Some(bang));
                 }
             }
-            "qa" | "qall" | "quita" | "quitall" => self.ex_quit_all(bang),
-            "wa" | "wall" => {
+            "quitall" => self.ex_quit_all(bang),
+            "wall" => {
                 self.ex_write_all(bang);
             }
-            "wqa" | "xa" | "xall" => self.ex_write_quit_all(bang),
-            "e" | "edit" => {
+            "xall" => self.ex_write_quit_all(bang),
+            "edit" => {
                 if let Some(a) = self.expand_file_arg_or_echo(args) {
                     self.ex_edit(&a, bang);
                 }
             }
-            "ene" | "enew" => self.ex_enew(),
-            "sp" | "spl" | "split" => {
+            "enew" => self.ex_enew(),
+            "split" => {
                 if let Some(a) = self.expand_file_arg_or_echo(args) {
                     self.ex_split(SplitDir::Horizontal, &a);
                 }
             }
-            "vs" | "vsp" | "vsplit" | "vspl" => {
+            "vsplit" => {
                 if let Some(a) = self.expand_file_arg_or_echo(args) {
                     self.ex_split(SplitDir::Vertical, &a);
                 }
             }
             "new" => self.ex_new(SplitDir::Horizontal),
-            "vne" | "vnew" => self.ex_new(SplitDir::Vertical),
-            "clo" | "close" => self.close_window(),
-            "hid" | "hide" => self.close_window(),
-            "on" | "only" => self.only_window(),
-            "ter" | "term" | "termi" | "termin" | "termina" | "terminal" => self.ex_terminal(args),
+            "vnew" => self.ex_new(SplitDir::Vertical),
+            "close" => self.close_window(),
+            "hide" => self.close_window(),
+            "only" => self.only_window(),
+            "terminal" => self.ex_terminal(args),
             // Toggle Helix's selection-first editing model on the editor (opt-in;
             // the Phase-5 plugin drives this the configurable way). Entered/left via
             // the mode's own state (see `editor::helix`).
@@ -1046,34 +1038,32 @@ impl Editor {
                     self.enter_helix();
                 }
             }
-            "tabnew" | "tabe" | "tabed" | "tabedit" => {
+            "tabedit" => {
                 if let Some(a) = self.expand_file_arg_or_echo(args) {
                     self.ex_tabnew(&a);
                 }
             }
-            "tabc" | "tabclo" | "tabclose" => self.close_tab_cmd(args),
-            "tabo" | "tabonly" => self.tab_only(),
-            "tabm" | "tabmo" | "tabmove" => self.move_tab(args),
-            "tabn" | "tabnext" => self.goto_tab_next(parse_opt_count_arg(args)),
-            "tabp" | "tabN" | "tabprevious" | "tabNext" => {
-                self.goto_tab_prev(parse_opt_count_arg(args))
-            }
-            "tabfir" | "tabfirst" | "tabr" | "tabrewind" => self.goto_tab_next(Some(1)),
-            "tabl" | "tablast" => self.goto_tab_next(Some(self.focused_stack().tabs.len())),
+            "tabclose" => self.close_tab_cmd(args),
+            "tabonly" => self.tab_only(),
+            "tabmove" => self.move_tab(args),
+            "tabnext" => self.goto_tab_next(parse_opt_count_arg(args)),
+            "tabprevious" => self.goto_tab_prev(parse_opt_count_arg(args)),
+            "tabfirst" => self.goto_tab_next(Some(1)),
+            "tablast" => self.goto_tab_next(Some(self.focused_stack().tabs.len())),
             "tab" => self.ex_tab(args),
-            "dr" | "dro" | "drop" => {
+            "drop" => {
                 if let Some(a) = self.expand_file_arg_or_echo(args) {
                     self.ex_drop(&a, false);
                 }
             }
-            "res" | "resize" => self.ex_resize(SplitDir::Horizontal, args),
-            "vert" | "vertical" | "ver" => self.ex_vertical(args),
+            "resize" => self.ex_resize(SplitDir::Horizontal, args),
+            "vertical" => self.ex_vertical(args),
             // `:checkt[ime]` re-stats loaded buffers against disk and reloads
             // (autoread) or warns (W11/W12/E211) on an external change.
-            "checkt" | "checkti" | "checktim" | "checktime" => self.checktime(args),
-            "ls" | "buffers" | "files" => self.ex_buffers(),
-            "lspanels" | "panels" => self.ex_lspanels(),
-            "b" | "bu" | "buf" | "buffer" => {
+            "checktime" => self.checktime(args),
+            "buffers" => self.ex_buffers(),
+            "lspanels" => self.ex_lspanels(),
+            "buffer" => {
                 if let Some(id) = self.resolve_buffer(args) {
                     // Honor 'switchbuf' (the `:ls`-then-`:b` navigation): under the
                     // default `usetab` a buffer already shown in another tab is focused
@@ -1082,91 +1072,65 @@ impl Editor {
                     self.switch_to_buffer_switchbuf(id);
                 }
             }
-            "bn" | "bnext" => self.ex_bnext(parse_count_arg(args)),
-            "bp" | "bN" | "bprev" | "bprevious" | "bNext" => self.ex_bprev(parse_count_arg(args)),
-            "bf" | "bfirst" | "br" | "brewind" => self.ex_bfirst(),
-            "bl" | "blast" => self.ex_blast(),
-            "bd" | "bdel" | "bdelete" | "bw" | "bwipe" | "bwipeout" => {
-                self.ex_bdelete(range.explicit, range_text, args, bang)
-            }
+            "bnext" => self.ex_bnext(parse_count_arg(args)),
+            "bprevious" => self.ex_bprev(parse_count_arg(args)),
+            "bfirst" => self.ex_bfirst(),
+            "blast" => self.ex_blast(),
+            "bdelete" => self.ex_bdelete(range.explicit, range_text, args, bang),
             // Quickfix / location-list ingest from a buffer. `:cbuffer` replaces the
             // list, `:caddbuffer` appends; the `:cget*` variants are identical here.
             // Every `:c*` has its `:l*` twin acting on the focused window's location
             // list. The optional argument is a buffer number; default current.
-            "cb" | "cbu" | "cbuf" | "cbuff" | "cbuffe" | "cbuffer" | "cgetb" | "cgetbu"
-            | "cgetbuf" | "cgetbuff" | "cgetbuffe" | "cgetbuffer" => {
-                self.ex_cbuffer(QfWhich::Quickfix, args, QfAction::New)
-            }
-            "cad" | "cadd" | "caddb" | "caddbu" | "caddbuf" | "caddbuff" | "caddbuffe"
-            | "caddbuffer" => self.ex_cbuffer(QfWhich::Quickfix, args, QfAction::Add),
-            "lb" | "lbu" | "lbuf" | "lbuff" | "lbuffe" | "lbuffer" | "lgetb" | "lgetbu"
-            | "lgetbuf" | "lgetbuff" | "lgetbuffe" | "lgetbuffer" => {
+            "cbuffer" => self.ex_cbuffer(QfWhich::Quickfix, args, QfAction::New),
+            "caddbuffer" => self.ex_cbuffer(QfWhich::Quickfix, args, QfAction::Add),
+            "lbuffer" => {
                 let which = self.loclist_which();
                 self.ex_cbuffer(which, args, QfAction::New)
             }
-            "lad" | "ladd" | "laddb" | "laddbu" | "laddbuf" | "laddbuff" | "laddbuffe"
-            | "laddbuffer" => {
+            "laddbuffer" => {
                 let which = self.loclist_which();
                 self.ex_cbuffer(which, args, QfAction::Add)
             }
             // `:cfile`/`:cgetfile`/`:caddfile {file}` (+ `:l*`): read a file off disk
             // and parse it against `'errorformat'`. `:cfile` opens + jumps to the
             // first error, `:cgetfile` only fills, `:caddfile` appends silently.
-            "cf" | "cfi" | "cfil" | "cfile" => {
-                self.ex_cfile(QfWhich::Quickfix, args, QfAction::New, true, true)
-            }
-            "cgetf" | "cgetfi" | "cgetfil" | "cgetfile" => {
-                self.ex_cfile(QfWhich::Quickfix, args, QfAction::New, false, false)
-            }
-            "caddf" | "caddfi" | "caddfil" | "caddfile" => {
-                self.ex_cfile(QfWhich::Quickfix, args, QfAction::Add, false, false)
-            }
-            "lf" | "lfi" | "lfil" | "lfile" => {
+            "cfile" => self.ex_cfile(QfWhich::Quickfix, args, QfAction::New, true, true),
+            "cgetfile" => self.ex_cfile(QfWhich::Quickfix, args, QfAction::New, false, false),
+            "caddfile" => self.ex_cfile(QfWhich::Quickfix, args, QfAction::Add, false, false),
+            "lfile" => {
                 let which = self.loclist_which();
                 self.ex_cfile(which, args, QfAction::New, true, true)
             }
-            "lgetf" | "lgetfi" | "lgetfil" | "lgetfile" => {
+            "lgetfile" => {
                 let which = self.loclist_which();
                 self.ex_cfile(which, args, QfAction::New, false, false)
             }
-            "laddf" | "laddfi" | "laddfil" | "laddfile" => {
+            "laddfile" => {
                 let which = self.loclist_which();
                 self.ex_cfile(which, args, QfAction::Add, false, false)
             }
             // Quickfix window + navigation (and the location-list twins).
-            "cope" | "copen" => self.ex_qf_open(QfWhich::Quickfix, args),
-            "ccl" | "cclo" | "cclos" | "cclose" => self.ex_qf_close(QfWhich::Quickfix),
-            "cw" | "cwin" | "cwindow" => self.ex_qf_window(QfWhich::Quickfix, args),
+            "copen" => self.ex_qf_open(QfWhich::Quickfix, args),
+            "cclose" => self.ex_qf_close(QfWhich::Quickfix),
+            "cwindow" => self.ex_qf_window(QfWhich::Quickfix, args),
             "cc" => self.ex_qf_cc(QfWhich::Quickfix, parse_opt_count_arg(args)),
-            "cn" | "cne" | "cnex" | "cnext" => {
-                self.ex_qf_step(QfWhich::Quickfix, true, parse_count_arg(args))
-            }
-            "cp" | "cpr" | "cprev" | "cprevious" | "cN" | "cNext" => {
-                self.ex_qf_step(QfWhich::Quickfix, false, parse_count_arg(args))
-            }
-            "cfir" | "cfirst" | "cr" | "crewind" => self.ex_qf_first(QfWhich::Quickfix),
-            "cla" | "clast" => self.ex_qf_last(QfWhich::Quickfix),
-            "cnf" | "cnfi" | "cnfil" | "cnfile" => {
-                self.ex_qf_step_file(QfWhich::Quickfix, true, parse_count_arg(args))
-            }
-            "cpf" | "cpfi" | "cpfil" | "cpfile" => {
-                self.ex_qf_step_file(QfWhich::Quickfix, false, parse_count_arg(args))
-            }
-            "col" | "cold" | "colde" | "colder" => {
-                self.ex_qf_history(QfWhich::Quickfix, false, parse_count_arg(args))
-            }
-            "cnew" | "cnewe" | "cnewer" => {
-                self.ex_qf_history(QfWhich::Quickfix, true, parse_count_arg(args))
-            }
-            "lop" | "lope" | "lopen" => {
+            "cnext" => self.ex_qf_step(QfWhich::Quickfix, true, parse_count_arg(args)),
+            "cprevious" => self.ex_qf_step(QfWhich::Quickfix, false, parse_count_arg(args)),
+            "cfirst" => self.ex_qf_first(QfWhich::Quickfix),
+            "clast" => self.ex_qf_last(QfWhich::Quickfix),
+            "cnfile" => self.ex_qf_step_file(QfWhich::Quickfix, true, parse_count_arg(args)),
+            "cpfile" => self.ex_qf_step_file(QfWhich::Quickfix, false, parse_count_arg(args)),
+            "colder" => self.ex_qf_history(QfWhich::Quickfix, false, parse_count_arg(args)),
+            "cnewer" => self.ex_qf_history(QfWhich::Quickfix, true, parse_count_arg(args)),
+            "lopen" => {
                 let which = self.loclist_which();
                 self.ex_qf_open(which, args);
             }
-            "lcl" | "lclo" | "lclos" | "lclose" => {
+            "lclose" => {
                 let which = self.loclist_which();
                 self.ex_qf_close(which);
             }
-            "lw" | "lwin" | "lwindow" => {
+            "lwindow" => {
                 let which = self.loclist_which();
                 self.ex_qf_window(which, args);
             }
@@ -1174,43 +1138,42 @@ impl Editor {
                 let which = self.loclist_which();
                 self.ex_qf_cc(which, parse_opt_count_arg(args));
             }
-            "lne" | "lnex" | "lnext" => {
+            "lnext" => {
                 let which = self.loclist_which();
                 self.ex_qf_step(which, true, parse_count_arg(args));
             }
-            "lp" | "lpr" | "lprev" | "lprevious" | "lN" | "lNext" => {
+            "lprevious" => {
                 let which = self.loclist_which();
                 self.ex_qf_step(which, false, parse_count_arg(args));
             }
-            "lfir" | "lfirst" | "lr" | "lrewind" => {
+            "lfirst" => {
                 let which = self.loclist_which();
                 self.ex_qf_first(which);
             }
-            "lla" | "llast" => {
+            "llast" => {
                 let which = self.loclist_which();
                 self.ex_qf_last(which);
             }
-            "lnf" | "lnfi" | "lnfil" | "lnfile" => {
+            "lnfile" => {
                 let which = self.loclist_which();
                 self.ex_qf_step_file(which, true, parse_count_arg(args));
             }
-            "lpf" | "lpfi" | "lpfil" | "lpfile" => {
+            "lpfile" => {
                 let which = self.loclist_which();
                 self.ex_qf_step_file(which, false, parse_count_arg(args));
             }
-            "lol" | "lold" | "lolde" | "lolder" => {
+            "lolder" => {
                 let which = self.loclist_which();
                 self.ex_qf_history(which, false, parse_count_arg(args));
             }
-            "lnew" | "lnewe" | "lnewer" => {
+            "lnewer" => {
                 let which = self.loclist_which();
                 self.ex_qf_history(which, true, parse_count_arg(args));
             }
             // `:vimgrep[!] /{pat}/[gj] {file}…` (no external process — searches with
             // the active `'regexsyntax'` engine). `:vimgrepadd` appends; `:lvimgrep`
             // populates the focused window's location list.
-            "vim" | "vimg" | "vimgr" | "vimgre" | "vimgrep" | "vimgrepa" | "vimgrepad"
-            | "vimgrepadd" => {
+            "vimgrep" | "vimgrepadd" => {
                 let action = if name.starts_with("vimgrepa") {
                     QfAction::Add
                 } else {
@@ -1218,8 +1181,7 @@ impl Editor {
                 };
                 self.ex_vimgrep(QfWhich::Quickfix, args, action);
             }
-            "lvim" | "lvimg" | "lvimgr" | "lvimgre" | "lvimgrep" | "lvimgrepa" | "lvimgrepad"
-            | "lvimgrepadd" => {
+            "lvimgrep" | "lvimgrepadd" => {
                 let action = if name.starts_with("lvimgrepa") {
                     QfAction::Add
                 } else {
@@ -1234,13 +1196,13 @@ impl Editor {
                 Some(expr) => self.print_lua_expr(expr),
                 None => self.lua_queue.push(args.to_string()),
             },
-            "sleep" | "sl" => match parse_sleep(args) {
+            "sleep" => match parse_sleep(args) {
                 Ok(ms) => self.pending_sleep = Some(ms),
                 Err(e) => self.echo(e),
             },
             // `:messages` opens the history panel; `:messages clear` empties it
             // (neovim's only argument — anything else is rejected loud).
-            "mes" | "messages" | "message" => match args.trim() {
+            "messages" => match args.trim() {
                 "" => self.ex_messages(),
                 "clear" => self.ex_messages_clear(),
                 other => self.echo(format!("E474: Invalid argument: {other}")),
@@ -1249,66 +1211,57 @@ impl Editor {
             // result on the message line *without* recording it in `:messages`;
             // `:echom[sg]` records it (the history-keeping form); `:echoe[rr]`
             // shows it as an error (also recorded).
-            "ec" | "ech" | "echo" => self.ex_echo(args, EchoKind::Transient),
-            "echom" | "echoms" | "echomsg" => self.ex_echo(args, EchoKind::Message),
-            "echoe" | "echoer" | "echoerr" => self.ex_echo(args, EchoKind::Error),
-            "reg" | "registers" | "di" | "dis" | "display" => self.ex_registers(args),
+            "echo" => self.ex_echo(args, EchoKind::Transient),
+            "echomsg" => self.ex_echo(args, EchoKind::Message),
+            "echoerr" => self.ex_echo(args, EchoKind::Error),
+            "registers" => self.ex_registers(args),
             "marks" => self.ex_marks(args),
-            "ju" | "jum" | "jump" | "jumps" => self.ex_jumps(args),
+            "jumps" => self.ex_jumps(args),
             "changes" => self.ex_changes(args),
             // The `:set` family shares one handler, distinguished by which tier of a
             // buffer-local option it writes (vim's global-local model): `:set` writes the
             // global value AND the current buffer's, `:setlocal` only the buffer's, and
             // `:setglobal` only the global value new buffers are born from.
-            "set" | "se" => self.ex_set(args, crate::options::SetScope::Both),
-            "setl" | "setlo" | "setloc" | "setloca" | "setlocal" => {
-                self.ex_set(args, crate::options::SetScope::Local)
-            }
-            "setg" | "setgl" | "setglo" | "setglob" | "setgloba" | "setglobal" => {
-                self.ex_set(args, crate::options::SetScope::Global)
-            }
+            "set" => self.ex_set(args, crate::options::SetScope::Both),
+            "setlocal" => self.ex_set(args, crate::options::SetScope::Local),
+            "setglobal" => self.ex_set(args, crate::options::SetScope::Global),
             // `:setf[iletype] {ft}` forces the buffer's filetype (and thus its
             // treesitter language), equivalent to `:set filetype={ft}`. The
             // no-Lua way to highlight a buffer the extension table misses.
-            "setf" | "setfi" | "setfil" | "setfile" | "setfilet" | "setfilety" | "setfiletyp"
-            | "setfiletype" => self.ex_setfiletype(args),
+            "setfiletype" => self.ex_setfiletype(args),
             // `:u[ndo]` undoes one change; `:undo {N}` jumps to the state with
             // sequence number N (anywhere in the tree). `:red[o]` redoes one.
-            "u" | "un" | "und" | "undo" => match args.trim() {
+            "undo" => match args.trim() {
                 "" => self.undo(),
                 n => match n.parse::<u64>() {
                     Ok(seq) => self.undo_to_seq(seq),
                     Err(_) => self.echo(format!("E488: Trailing characters: {n}")),
                 },
             },
-            "red" | "redo" => self.redo(),
+            "redo" => self.redo(),
             // `:undol[ist]` lists the tree's branch tips. Its abbreviations start at
             // `undol` — `:u`…`:undo` are the undo command above, as in vim.
-            "undol" | "undoli" | "undolis" | "undolist" => self.ex_undolist(),
+            "undolist" => self.ex_undolist(),
             // `:ea[rlier]` / `:lat[er]` — travel the undo states by count (the ex form
             // of `g-` / `g+`).
-            "ea" | "ear" | "earl" | "earli" | "earlie" | "earlier" => {
-                self.ex_undo_travel(args, true)
-            }
-            "lat" | "late" | "later" => self.ex_undo_travel(args, false),
-            "noh" | "nohlsearch" => self.search_active = false,
+            "earlier" => self.ex_undo_travel(args, true),
+            "later" => self.ex_undo_travel(args, false),
+            "nohlsearch" => self.search_active = false,
             name if is_substitute_name(name) => self.ex_substitute(range, args),
             // `:[range]g[!]/pat/cmd` runs `cmd` on every line matching `pat`
             // (default range = whole file); `:g!` and `:v` invert to non-matching.
-            "g" | "gl" | "glo" | "glob" | "globa" | "global" => self.ex_global(range, bang, args),
-            "v" | "vg" | "vgl" | "vglo" | "vglob" | "vgloba" | "vglobal" => {
-                self.ex_global(range, true, args)
-            }
-            "d" | "de" | "del" | "dele" | "delet" | "delete" => self.ex_delete(range),
+            "global" => self.ex_global(range, bang, args),
+            "vglobal" => self.ex_global(range, true, args),
+            "delete" => self.ex_delete(range),
             // `:[range]m[ove] {addr}` / `:[range]co[py] {addr}` (`:t` is `:copy`)
             // relocate / duplicate the range below the addressed line.
-            "m" | "mo" | "mov" | "move" => self.ex_move(range, args),
-            "t" | "co" | "cop" | "copy" => self.ex_copy(range, args),
-            "p" | "pr" | "pri" | "prin" | "print" => self.ex_print(range),
+            "move" => self.ex_move(range, args),
+            "copy" => self.ex_copy(range, args),
+            "print" => self.ex_print(range),
             // `:[line]pu[t] [x]` inserts register `x` (default unnamed) as whole
             // lines below the addressed line — always linewise, regardless of the
             // register's own kind. `:put!` inserts above instead.
-            "pu" | "put" => {
+            "put" => {
                 // Line `0` ("above the first line") is legal for `:put`, but the
                 // range parse clamps it into line 1; recover it from the raw text.
                 let addr = range_text.trim();
@@ -1327,7 +1280,7 @@ impl Editor {
             }
             // `:hi clear` resets the registry to defaults (empty); other `:hi`
             // forms are no-ops — catppuccin defines groups via the API, not `:hi`.
-            "hi" | "highlight" => {
+            "highlight" => {
                 if args.trim() == "clear" {
                     self.highlights.clear();
                 }
@@ -1339,8 +1292,8 @@ impl Editor {
             // `:wsh[ada]` / `:rsh[ada][!]` — the explicit shada flush / reload. The
             // store lives in the server (behind the `ShadaStore` seam), so these only
             // *enqueue* a request the server drains after the tick; they never no-op.
-            "wsh" | "wsha" | "wshad" | "wshada" => self.ex_wshada(args),
-            "rsh" | "rsha" | "rshad" | "rshada" => self.ex_rshada(bang, args),
+            "wshada" => self.ex_wshada(args),
+            "rshada" => self.ex_rshada(bang, args),
             // Unknown to the core: defer to the server, which resolves it
             // against Lua user commands (or reports the unknown-command error).
             // An *explicit* address (`:'<,'>LspCodeAction`) rides along resolved —
@@ -1351,6 +1304,53 @@ impl Editor {
                 range: range.explicit.then_some((range.lo, range.hi)),
             }),
         }
+    }
+
+    /// Take commands away from this editor (an app embedding it doesn't want `:edit`,
+    /// say): each, by any spelling (`e` disables `edit`), is refused from then on, on
+    /// every route — typed, from a mapping, from a plugin's `btv.cmd`. Replaces the set.
+    pub fn set_disabled_commands<I, S>(&mut self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.disabled_commands = names
+            .into_iter()
+            .map(|name| crate::ex_names::canonical_or_self(name.as_ref()).to_owned())
+            .collect();
+    }
+
+    /// Whether the command `name` (any spelling) is disabled in this editor.
+    pub fn command_disabled(&self, name: &str) -> bool {
+        !self.disabled_commands.is_empty()
+            && self
+                .disabled_commands
+                .contains(crate::ex_names::canonical_or_self(name))
+    }
+
+    /// Every spelling of every disabled command (`edit` gives `e` and `edit`), for
+    /// the Lua side, which has no spelling table of its own.
+    pub fn disabled_command_spellings(&self) -> Vec<String> {
+        let mut spellings: Vec<String> = self
+            .disabled_commands
+            .iter()
+            .flat_map(|name| crate::ex_names::spellings_of(name))
+            .map(str::to_owned)
+            .collect();
+        spellings.sort();
+        spellings
+    }
+
+    /// Refuse the command `typed` if it's disabled, saying so: `E5800`, an error, so
+    /// it also stops the rest of a `|` chain. Whether it was refused. The server asks
+    /// too, for the name it reads off a deferred command line (a user command's name
+    /// runs past the letters the core reads: `:Run2`).
+    pub fn refuse_disabled(&mut self, typed: &str) -> bool {
+        if !self.command_disabled(typed) {
+            return false;
+        }
+        self.echo(format!("E5800: :{typed} is disabled in this editor"));
+        true
     }
 
     /// `:={expr}` / `:lua= {expr}` — the shorthand for `:lua vim.print({expr})`.
@@ -2922,11 +2922,30 @@ impl Editor {
     /// finalizes the saved-state on the ack — so a slow remote write never freezes the
     /// editor; otherwise it writes synchronously through `host_fs` exactly as before.
     fn ex_write(&mut self, args: &str, bang: bool, then_quit: Option<bool>) {
-        let path = if args.is_empty() {
+        let mut path = if args.is_empty() {
             None
         } else {
             Some(PathBuf::from(args))
         };
+        // Locked to one file: it's written to that file and nowhere else (a write to
+        // another name would also rename the buffer to it).
+        if let Some(locked) = self.locked_buffer() {
+            if let Some(named) = &path {
+                if self.refuse_other_file(named) {
+                    return;
+                }
+                // Only the file's own buffer goes to it: another written there would
+                // clobber it and take its name.
+                if self.cur_buffer() != locked {
+                    self.echo_locked(locked);
+                    return;
+                }
+                // The name matched the file lexically, which isn't where the OS writes
+                // when a `..` follows a symlink (`link/../file`): write the buffer's own
+                // path, the one it was opened by.
+                path = None;
+            }
+        }
         // Off-tick save (daemon session): the disk-change guard can't run here — it
         // needs a remote stat we've sworn off the tick (a `HostWatch`-driven check is a
         // later slice) — so we only reject a path-less write up front. The actual
@@ -3284,8 +3303,13 @@ impl Editor {
     /// file argument) `:edit` it in the new window. With no argument both windows
     /// show the same buffer.
     fn ex_split(&mut self, dir: SplitDir, args: &str) {
-        self.split(dir);
         let file = args.trim();
+        // Locked to one file: refuse another before splitting, so a refused `:sp other`
+        // leaves no stray window behind (`:sp` itself, the same buffer, is fine).
+        if !file.is_empty() && self.refuse_other_file(Path::new(file)) {
+            return;
+        }
+        self.split(dir);
         if !file.is_empty() {
             self.ex_edit(file, false);
         }
@@ -3294,6 +3318,9 @@ impl Editor {
     /// `:new` / `:vnew` — split the focused window and open a fresh `[No Name]`
     /// buffer in the new window.
     fn ex_new(&mut self, dir: SplitDir) {
+        if self.refuse_new_file_buffer() {
+            return;
+        }
         self.split(dir);
         self.ex_enew();
     }
@@ -3310,6 +3337,16 @@ impl Editor {
     fn ex_tabnew(&mut self, args: &str) {
         let options = self.windows.cur().options.clone();
         let file = args.trim();
+        // Locked to one file: no other file, and no new empty one — checked up front,
+        // since a failed load below falls back to an empty buffer.
+        let refused = if file.is_empty() {
+            self.refuse_new_file_buffer()
+        } else {
+            self.refuse_other_file(Path::new(file))
+        };
+        if refused {
+            return;
+        }
         let buf = if file.is_empty() {
             self.add_buffer(Buffer::empty())
         } else {
@@ -3370,14 +3407,18 @@ impl Editor {
     /// enew` open a named or fresh buffer there, exactly like `:tabedit`.
     fn ex_tab(&mut self, args: &str) {
         let (name, _bang, rest) = split_ex(args.trim());
-        match name {
-            "sp" | "spl" | "split" => self.tab_split(),
-            "e" | "edit" | "new" | "ene" | "enew" => {
+        // What it modifies is a command of its own, disabled or not.
+        if !name.is_empty() && self.refuse_disabled(name) {
+            return;
+        }
+        match crate::ex_names::canonical_or_self(name) {
+            "split" => self.tab_split(),
+            "edit" | "new" | "enew" => {
                 if let Some(a) = self.expand_file_arg_or_echo(rest) {
                     self.ex_tabnew(&a);
                 }
             }
-            "dr" | "dro" | "drop" => {
+            "drop" => {
                 if let Some(a) = self.expand_file_arg_or_echo(rest) {
                     self.ex_drop(&a, true);
                 }
@@ -3419,9 +3460,12 @@ impl Editor {
     /// commands to their vertical (width-dividing) form.
     fn ex_vertical(&mut self, args: &str) {
         let (name, _bang, rest) = split_ex(args.trim());
-        match name {
-            "res" | "resize" => self.ex_resize(SplitDir::Vertical, rest),
-            "sp" | "spl" | "split" => {
+        if !name.is_empty() && self.refuse_disabled(name) {
+            return;
+        }
+        match crate::ex_names::canonical_or_self(name) {
+            "resize" => self.ex_resize(SplitDir::Vertical, rest),
+            "split" => {
                 if let Some(a) = self.expand_file_arg_or_echo(rest) {
                     self.ex_split(SplitDir::Vertical, &a);
                 }
@@ -3439,6 +3483,9 @@ impl Editor {
     /// throwaway current buffer rather than stacking another empty one.
     fn ex_enew(&mut self) {
         if self.current_is_throwaway() {
+            return;
+        }
+        if self.refuse_new_file_buffer() {
             return;
         }
         // Starting to edit a new buffer is a jump: stash the position we leave so

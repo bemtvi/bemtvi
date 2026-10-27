@@ -34,6 +34,86 @@ pub struct Session {
     /// The server thread, joined at teardown (or after the swap that retired it); its
     /// `Err` is a server error the joiner reports.
     pub handle: JoinHandle<Result<()>>,
+    /// How it was started — a `:connect`/`:workspace` from it starts the next session
+    /// the same way, so an embedded editor's config and shada stay its own.
+    pub launch: Launch,
+}
+
+/// Which config an editor session runs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Config {
+    /// The user's own: `$BEMTVI_CONFIG`, else `$XDG_CONFIG_HOME/bemtvi`, else the
+    /// platform default, with its plugins and the system-plugin tier. What `bemtvi-gui`
+    /// runs, and right for a tool whose users already run bemtvi.
+    #[default]
+    User,
+    /// An app's own config directory: its `init.lua` is sourced, and it (with the plugins
+    /// under its `pack/*/start/`) is the runtimepath. Nothing of the user's.
+    Dir(PathBuf),
+    /// No `init.lua` and no plugins: the prelude and the bundled plugins only.
+    None,
+}
+
+/// Where an editor session's shada (marks, registers, history, …) lives.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Shada {
+    /// The user's own store, shared with every other bemtvi (each instance owns its file
+    /// and merges the others').
+    #[default]
+    Global,
+    /// A store of its own under the shada dir (`ns/<name>`), so an app's marks and history
+    /// stay apart from the user's own bemtvi. The name is `[A-Za-z0-9_-]`, up to 128
+    /// characters; anything else fails the session's start.
+    Namespace(String),
+    /// Nothing persisted.
+    Off,
+}
+
+/// How a session starts: its config, its shada, whether it shows the intro screen when
+/// it opens no file, and whether it may switch to another session.
+#[derive(Clone, Debug, Default)]
+pub struct Launch {
+    pub config: Config,
+    pub shada: Shada,
+    pub intro: bool,
+    /// Whether `:connect`, `:workspace` and `btv.session.reconnect` may swap the editor
+    /// onto another session. Off, `:workspace` isn't a command and a `:connect` or
+    /// reconnect that would swap fails, saying so.
+    pub session_switching: bool,
+    /// The id of the app embedding the editor, for `btv.host` (`None`: nothing does).
+    pub host: Option<String>,
+    /// Commands the editor refuses, by any spelling (see `ServerInit::disabled_commands`).
+    pub disabled_commands: Vec<String>,
+    /// User commands only from the config and the plugins loaded at startup (see
+    /// `ServerInit::startup_user_commands_only`).
+    pub startup_user_commands_only: bool,
+    /// Lock the editor to its file (see `ServerInit::single_file`).
+    pub single_file: bool,
+    /// Turn the plugin manager off (see `ServerInit::disable_plugin_manager`).
+    pub disable_plugin_manager: bool,
+    /// Turn LSP off (see `ServerInit::disable_lsp`).
+    pub disable_lsp: bool,
+    /// Pickers taken away, by source name (see `ServerInit::disabled_pickers`).
+    pub disabled_pickers: Vec<String>,
+}
+
+impl Launch {
+    /// `bemtvi-gui`'s: the user's config and shada, and the intro screen.
+    pub fn gui() -> Launch {
+        Launch {
+            config: Config::User,
+            shada: Shada::Global,
+            intro: true,
+            session_switching: true,
+            host: None,
+            disabled_commands: Vec::new(),
+            startup_user_commands_only: false,
+            single_file: false,
+            disable_plugin_manager: false,
+            disable_lsp: false,
+            disabled_pickers: Vec::new(),
+        }
+    }
 }
 
 /// Spawn the local server for `target` (`None` = embedded, local disk) on its own
@@ -50,40 +130,57 @@ pub fn spawn_session(
     file: Option<String>,
     config_source: ConfigSource,
 ) -> Result<Session> {
+    spawn_session_with(target, file, config_source, Launch::gui())
+}
+
+/// [`spawn_session`], started as `launch` says rather than as `bemtvi-gui` starts.
+pub fn spawn_session_with(
+    target: Option<ConnectTarget>,
+    file: Option<String>,
+    config_source: ConfigSource,
+    launch: Launch,
+) -> Result<Session> {
     let remote = target.is_some();
-    spawn_server(remote, file, None, config_source, move || async move {
-        // Build the host seams: `None` for the embedded local disk, or a daemon client
-        // (ssh stdio / quic) for the edit-host split.
-        match target {
-            None => Ok((None, None, no_guard())),
-            Some(ConnectTarget::Ssh(spec)) => {
-                // `ssh … bemtvi --daemon` over stdio: the child's stdout/stdin *is* the
-                // daemon wire. Use the RE-SPAWNING link so a dropped ssh hop (laptop
-                // sleep, network blip) re-runs `ssh …` and rebinds the seams in place —
-                // the editor keeps its local buffers/undo.
-                let (client, handle) = connect_daemon_respawning(
-                    "spawning ssh (is it installed and on PATH?)",
-                    move || Ok(ssh_daemon_command(&spec)),
-                    ReconnectPolicy::default(),
-                )?;
-                Ok((Some(client), Some(handle), no_guard()))
+    spawn_server(
+        remote,
+        file,
+        None,
+        config_source,
+        launch,
+        move || async move {
+            // Build the host seams: `None` for the embedded local disk, or a daemon client
+            // (ssh stdio / quic) for the edit-host split.
+            match target {
+                None => Ok((None, None, no_guard())),
+                Some(ConnectTarget::Ssh(spec)) => {
+                    // `ssh … bemtvi --daemon` over stdio: the child's stdout/stdin *is* the
+                    // daemon wire. Use the RE-SPAWNING link so a dropped ssh hop (laptop
+                    // sleep, network blip) re-runs `ssh …` and rebinds the seams in place —
+                    // the editor keeps its local buffers/undo.
+                    let (client, handle) = connect_daemon_respawning(
+                        "spawning ssh (is it installed and on PATH?)",
+                        move || Ok(ssh_daemon_command(&spec)),
+                        ReconnectPolicy::default(),
+                    )?;
+                    Ok((Some(client), Some(handle), no_guard()))
+                }
+                Some(ConnectTarget::Quic(uri)) => {
+                    let (url, cert_hash, token) = parse_connect_uri(&uri)?;
+                    // `connect_quic_reconnecting` blocks on its own link thread until the QUIC +
+                    // WebTransport session is up, then returns the seams + a reconnect handle (or
+                    // fails loud). On a drop (sleep/wake, a network blip) the supervisor re-dials a
+                    // fresh QUIC connection under the seams, like the ssh path.
+                    let (client, handle) = connect_quic_reconnecting(
+                        &url,
+                        &cert_hash,
+                        &token,
+                        ReconnectPolicy::default(),
+                    )?;
+                    Ok((Some(client), Some(handle), no_guard()))
+                }
             }
-            Some(ConnectTarget::Quic(uri)) => {
-                let (url, cert_hash, token) = parse_connect_uri(&uri)?;
-                // `connect_quic_reconnecting` blocks on its own link thread until the QUIC +
-                // WebTransport session is up, then returns the seams + a reconnect handle (or
-                // fails loud). On a drop (sleep/wake, a network blip) the supervisor re-dials a
-                // fresh QUIC connection under the seams, like the ssh path.
-                let (client, handle) = connect_quic_reconnecting(
-                    &url,
-                    &cert_hash,
-                    &token,
-                    ReconnectPolicy::default(),
-                )?;
-                Ok((Some(client), Some(handle), no_guard()))
-            }
-        }
-    })
+        },
+    )
 }
 
 /// Spawn the daemon **stdio** child for a `--connect-daemon` startup (no explicit
@@ -94,7 +191,7 @@ pub fn spawn_stdio_daemon_session(
     file: Option<String>,
     config_source: ConfigSource,
 ) -> Result<Session> {
-    spawn_server(true, file, None, config_source, || async {
+    spawn_server(true, file, None, config_source, Launch::gui(), || async {
         // Reconnecting like the ssh path: re-spawn the daemon command on each (re)dial,
         // holding the current child on the link thread.
         let (client, handle) = connect_daemon_respawning(
@@ -112,29 +209,36 @@ pub fn spawn_stdio_daemon_session(
 /// the local one per swap. The system-plugin tier (§A) is re-seeded by `server_init`
 /// regardless. **Blocking** on the handshake, like every other builder, so a failed
 /// provision/spawn is an `Err` here and the *current* session is left intact.
-pub fn spawn_session_from_spec(spec: ReconnectSpec) -> Result<Session> {
+pub fn spawn_session_from_spec(spec: ReconnectSpec, launch: Launch) -> Result<Session> {
     spec.reject_keep_buffers()?;
     let config_source = spec.config_source;
     match spec.transport {
         ReconnectTransport::Spawn { command } => {
-            spawn_server(true, None, None, config_source, move || async move {
-                // Reconnecting, like `spawn_stdio_daemon_session`: re-launch the command on
-                // each (re)dial, holding the current child on the link thread. The daemon's
-                // stderr goes to a private log (it can't share the GUI's terminal).
-                let (client, handle) = connect_daemon_respawning(
-                    "spawning the daemon",
-                    move || {
-                        let mut c = command.to_command();
-                        c.stderr(daemon_log_stderr());
-                        Ok(c)
-                    },
-                    ReconnectPolicy::default(),
-                )?;
-                Ok((Some(client), Some(handle), no_guard()))
-            })
+            spawn_server(
+                true,
+                None,
+                None,
+                config_source,
+                launch,
+                move || async move {
+                    // Reconnecting, like `spawn_stdio_daemon_session`: re-launch the command on
+                    // each (re)dial, holding the current child on the link thread. The daemon's
+                    // stderr goes to a private log (it can't share the GUI's terminal).
+                    let (client, handle) = connect_daemon_respawning(
+                        "spawning the daemon",
+                        move || {
+                            let mut c = command.to_command();
+                            c.stderr(daemon_log_stderr());
+                            Ok(c)
+                        },
+                        ReconnectPolicy::default(),
+                    )?;
+                    Ok((Some(client), Some(handle), no_guard()))
+                },
+            )
         }
         ReconnectTransport::Quic { addr } => {
-            spawn_session(Some(ConnectTarget::Quic(addr)), None, config_source)
+            spawn_session_with(Some(ConnectTarget::Quic(addr)), None, config_source, launch)
         }
     }
 }
@@ -146,7 +250,11 @@ pub fn spawn_session_from_spec(spec: ReconnectSpec) -> Result<Session> {
 /// (builds the server thread + config like every session). `dir` must be an existing
 /// directory: a non-directory / missing path is a loud `Err` (no silent fall-through),
 /// surfaced to the user via `:echoerr` just like a failed `:connect`.
-pub fn spawn_workspace_session(dir: PathBuf, config_source: ConfigSource) -> Result<Session> {
+pub fn spawn_workspace_session(
+    dir: PathBuf,
+    config_source: ConfigSource,
+    launch: Launch,
+) -> Result<Session> {
     // A `:workspace` is a *directory* session; resolve to an absolute path now (so its
     // derived shada namespace + `btv.workspace` root are stable) and reject a non-directory
     // or missing path loudly, matching the TUI's `resolve_workspace_dir`. A leading `~` is
@@ -163,7 +271,7 @@ pub fn spawn_workspace_session(dir: PathBuf, config_source: ConfigSource) -> Res
     }
     // A workspace session is always local (embedded disk); only its shada identity and
     // session capture differ from the default embedded session.
-    spawn_server(false, None, Some(abs), config_source, || async {
+    spawn_server(false, None, Some(abs), config_source, launch, || async {
         Ok((None, None, no_guard()))
     })
 }
@@ -206,6 +314,7 @@ fn spawn_server<F, Fut>(
     file: Option<String>,
     workspace: Option<PathBuf>,
     config_source: ConfigSource,
+    launch: Launch,
     connect: F,
 ) -> Result<Session>
 where
@@ -214,18 +323,21 @@ where
         Output = Result<(Option<DaemonClient>, Option<ReconnectHandle>, SessionGuard)>,
     >,
 {
+    let session_launch = launch.clone();
     let (stream, handle) = spawn_session_thread(move || async move {
         let (client, daemon_link, guard) = connect().await?;
         // Build the server config — for a daemon session this fetches + materializes
         // the remote's config/plugins, so a failure here is a setup failure the caller
         // must see (it is relayed as the handshake outcome).
-        let init = server_init(file, client, daemon_link, workspace, config_source).await?;
+        let init =
+            server_init(file, client, daemon_link, workspace, config_source, &launch).await?;
         Ok((init, guard))
     })?;
     Ok(Session {
         stream,
         remote,
         handle,
+        launch: session_launch,
     })
 }
 
@@ -285,18 +397,31 @@ async fn server_init(
     daemon_link: Option<ReconnectHandle>,
     workspace: Option<PathBuf>,
     config_source: ConfigSource,
+    launch: &Launch,
 ) -> Result<ServerInit> {
     // A `:workspace` session (local only) derives its shada namespace from the directory
     // and exposes the root to `btv.workspace`; an explicit namespace isn't offered from the
     // GUI, so the directory-derived one is the only source. `None`/`false` for every other
     // session (a daemon session never carries a workspace here).
-    let (shada_namespace, workspace_dir) = match &workspace {
+    let (workspace_namespace, workspace_dir) = match &workspace {
         Some(dir) => (
             Some(bemtvi_server::workspace_namespace(dir)),
             Some(dir.to_string_lossy().into_owned()),
         ),
         None => (None, None),
     };
+    // An app's own namespace, checked before anything starts: it becomes a path
+    // component under the shada dir.
+    let launch_namespace = match &launch.shada {
+        Shada::Namespace(ns) => Some(bemtvi_server::valid_namespace(ns).ok_or_else(|| {
+            anyhow!("shada namespace {ns:?}: use [A-Za-z0-9_-], up to 128 characters")
+        })?),
+        _ => None,
+    };
+    // A `:workspace` session's own namespace wins over the app's (scoping to the
+    // directory is the point of it); `Shada::Off` turns both off.
+    let shada_namespace = workspace_namespace.or(launch_namespace);
+    let shada_off = launch.shada == Shada::Off;
     let mut ts_autoinstall = Vec::new();
     // The daemon's cwd seeds `DirState` so `:pwd`/`:cd`/`getcwd` operate on the remote
     // dir in a daemon session (`docs/plans/2026-06-23-remote-cwd.md`); `None` for a local
@@ -326,13 +451,14 @@ async fn server_init(
         git_jobs,
     ) = match client {
         None => {
-            let (config_dir, runtimepath) = bemtvi_server::default_runtime();
-            // A `:workspace` session scopes shada to a per-directory `ns/<NS>` store; a
-            // plain local session's primary store IS the global one.
-            let store = match shada_namespace.as_deref() {
+            let (config_dir, runtimepath) = launch_runtime(&launch.config);
+            // A namespaced session (`:workspace`, or an app's `Shada::Namespace`) scopes
+            // shada to its `ns/<NS>` store; a plain local session's primary store IS the
+            // global one.
+            let store = (!shada_off).then(|| match shada_namespace.as_deref() {
                 Some(ns) => bemtvi_server::workspace_shada(Some(ns)),
                 None => bemtvi_server::default_shada(),
-            };
+            });
             (
                 config_dir,
                 runtimepath,
@@ -364,21 +490,33 @@ async fn server_init(
             // (download now over `c.host_fs`, before it is moved below; sync back after
             // each flush), `Local` uses the local store. A download error turns shada off
             // for the session (never the local store, which the daemon's config must not see).
-            let (store, rs) = bemtvi_server::resolve_session_shada(
-                &c.host_fs,
-                config_source,
-                resolved.state_dir.as_deref(),
-                // The GUI has no `--shada-namespace` yet (v1: TUI only).
-                None,
-                bemtvi_server::default_shada(),
-            )
-            .await;
-            remote_shada = rs;
+            let store = if shada_off {
+                None
+            } else {
+                let (store, rs) = bemtvi_server::resolve_session_shada(
+                    &c.host_fs,
+                    config_source,
+                    resolved.state_dir.as_deref(),
+                    shada_namespace.as_deref(),
+                    bemtvi_server::workspace_shada(shada_namespace.as_deref()),
+                )
+                .await;
+                remote_shada = rs;
+                Some(store)
+            };
+            // A `Local`-config session runs this machine's config — the one the launch
+            // names; a `Remote` one runs the daemon's, which the app asked for.
+            let (config_dir, runtimepath) = match (config_source, &launch.config) {
+                (ConfigSource::Local, Config::Dir(_) | Config::None) => {
+                    launch_runtime(&launch.config)
+                }
+                _ => (resolved.config_dir, resolved.runtimepath),
+            };
             (
                 // A daemon session leaves the synchronous `host_fs` unused — every fs
                 // read goes through the async daemon seam below — so it stays `None`.
-                resolved.config_dir,
-                resolved.runtimepath,
+                config_dir,
+                runtimepath,
                 store,
                 None,
                 Some(Box::new(c.host_proc) as _),
@@ -401,12 +539,10 @@ async fn server_init(
         config_dir,
         // Editor + Lua run locally; shada is local for a `Local`-config session and on the
         // daemon for a `Remote`-config one (Approach A — synced over the fs seam).
-        shada: Some(shada_store),
+        shada: shada_store,
         // A `:workspace` session routes history to the global store too (parity with the
         // TUI's `--workspace`); a plain/daemon session's primary store is already global.
-        global_shada: shada_namespace
-            .as_ref()
-            .map(|_| bemtvi_server::default_shada()),
+        global_shada: (workspace.is_some() && !shada_off).then(bemtvi_server::default_shada),
         remote_shada,
         // A `:workspace` session captures + restores the editor session (open files +
         // exact layout) and auto-opts into layout capture, exactly like `--workspace`; a
@@ -437,13 +573,18 @@ async fn server_init(
         // The GUI is the interactive editor — offer the built-in default recommended
         // set on a fresh setup (a config's own recommend{} still overrides it), and
         // enable command-line completion by default (a config's setup{} still wins).
-        offer_default_recommended: true,
+        offer_default_recommended: launch.config == Config::User,
         // Seed the client-owned system-plugin tier into every session (local and daemon
         // alike) — loaded before init.lua, so a connector persists across a session swap.
-        system_plugins: bemtvi_server::discover_system_plugins(),
+        // (The user's tier: an app's own config, or none, gets none of it.)
+        system_plugins: if launch.config == Config::User {
+            bemtvi_server::discover_system_plugins()
+        } else {
+            Vec::new()
+        },
         cmdline_complete_default: true,
         // The interactive editor shows the intro screen when started with no file.
-        show_intro: true,
+        show_intro: launch.intro,
         // Interactive: `print` shows on the message line, not stdout.
         lua_stdio: false,
         ts_autoinstall,
@@ -454,12 +595,34 @@ async fn server_init(
         // they get name completion, help, cmdline history, and (for `:workspace`)
         // directory-path completion. The actual session swap is still done client-side
         // (see [`crate::run`]); the server-side body does nothing.
-        client_init_lua: Some(CLIENT_INIT_LUA.to_string()),
+        // Where the session can't switch, the VM refuses `:connect` and reconnects itself
+        // (and `:workspace` isn't registered: it would be a command that does nothing).
+        client_init_lua: Some(if launch.session_switching {
+            CLIENT_INIT_LUA.to_string()
+        } else {
+            NO_SWITCHING_LUA.to_string()
+        }),
         // The reconnecting daemon link (ssh/stdio) — its status flows into the editor + Lua
         // (`btv.daemon.status()`) and `:reconnect`/`:disconnect` drive it. `None` for a local
         // session, or a one-shot QUIC connect.
         daemon_link,
+        host: launch.host.clone(),
+        disabled_commands: launch.disabled_commands.clone(),
+        startup_user_commands_only: launch.startup_user_commands_only,
+        single_file: launch.single_file,
+        disable_plugin_manager: launch.disable_plugin_manager,
+        disable_lsp: launch.disable_lsp,
+        disabled_pickers: launch.disabled_pickers.clone(),
     })
+}
+
+/// The config dir and runtimepath a local session runs for `config`.
+fn launch_runtime(config: &Config) -> (Option<PathBuf>, Vec<PathBuf>) {
+    match config {
+        Config::User => bemtvi_server::default_runtime(),
+        Config::Dir(dir) => (Some(dir.clone()), bemtvi_server::config_dir_runtime(dir)),
+        Config::None => (None, Vec::new()),
+    }
 }
 
 /// Lua run at session startup (via [`ServerInit::client_init_lua`]) to register the GUI's
@@ -479,6 +642,11 @@ btv.user_command.create("workspace", function() end, {
   complete = "dir",
 })
 "#;
+
+/// Lua run at startup of a session that may not switch (see [`Launch::session_switching`]):
+/// the VM then refuses `:connect` and `btv.session.reconnect` with an error saying why,
+/// before anything reaches the window.
+const NO_SWITCHING_LUA: &str = "btv.session._switching = false\n";
 
 // `parse_connect_uri` is bemtvi-server's (shared with the TUI binary); re-exported so
 // `bemtvi_gui::parse_connect_uri` keeps working for the black-box tests.

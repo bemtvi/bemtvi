@@ -1760,6 +1760,14 @@ pub struct Editor {
     /// operation; the server awaits it without freezing the UI.
     pending_sleep: Option<u64>,
 
+    /// The commands this editor refuses, by canonical name (`crate::ex_names`): an app
+    /// embedding the editor took them away. Empty for every other editor.
+    disabled_commands: std::collections::HashSet<String>,
+
+    /// The one file buffer this editor may show (an app embedding it as the editor for
+    /// one given file): see [`Editor::lock_to_buffer`]. `None` for every other editor.
+    locked_buffer: Option<BufferId>,
+
     /// The in-process treesitter backend, or `None` in a bare-core test (or a
     /// front end that ships no grammars). The editor owns it so highlights — and,
     /// later, treesitter indentation — are answered **synchronously, in the same
@@ -2465,6 +2473,8 @@ impl Editor {
             open_messages_after_lua: false,
             background_applied: "dark".to_string(),
             pending_sleep: None,
+            disabled_commands: std::collections::HashSet::new(),
+            locked_buffer: None,
             syntax: None,
             sandbox: None,
             picker_scorer: None,

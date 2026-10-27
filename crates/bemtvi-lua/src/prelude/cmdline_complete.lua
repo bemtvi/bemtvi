@@ -248,7 +248,7 @@ end
 local function append_user_commands(out, seen)
   local function add(commands)
     for name, record in pairs(commands) do
-      if not seen[name] then
+      if not seen[name] and not btv.command_disabled(name) then
         seen[name] = true
         -- The synopsis heads the docs float, like a built-in's. A declared `usage`
         -- argument signature follows the name (`:Name [arg]`); otherwise it's bare.
@@ -280,11 +280,14 @@ function btv.cmdline_complete.catalog()
   local seen = {}
   for _, cmd in ipairs(BUILTIN) do
     seen[cmd[1]] = true
-    out[#out + 1] = { name = cmd[1], synopsis = cmd[2], description = cmd[3], user = false }
+    -- (What the editor refuses isn't listed: it would only fail.)
+    if not btv.command_disabled(cmd[1]) then
+      out[#out + 1] = { name = cmd[1], synopsis = cmd[2], description = cmd[3], user = false }
+    end
   end
   local users = {}
   for name, rec in pairs(btv.user_command.get()) do
-    if not seen[name] then
+    if not seen[name] and not btv.command_disabled(name) then
       users[#users + 1] = {
         name = name,
         synopsis = ":" .. name .. (rec.usage ~= "" and (" " .. rec.usage) or ""),
@@ -310,14 +313,16 @@ local function command_candidates()
   for _, cmd in ipairs(BUILTIN) do
     local name, synopsis, description = cmd[1], cmd[2], cmd[3]
     seen[name] = true
-    out[#out + 1] = {
-      label = name,
-      insert = name,
-      -- The docs pane (Phase 3): the synopsis heads the float, the description
-      -- follows a blank line. Core skips a leading blank, so a command with no
-      -- description still renders cleanly.
-      doc = synopsis .. "\n\n" .. description,
-    }
+    if not btv.command_disabled(name) then
+      out[#out + 1] = {
+        label = name,
+        insert = name,
+        -- The docs pane (Phase 3): the synopsis heads the float, the description
+        -- follows a blank line. Core skips a leading blank, so a command with no
+        -- description still renders cleanly.
+        doc = synopsis .. "\n\n" .. description,
+      }
+    end
   end
   append_user_commands(out, seen)
   return out
@@ -1047,7 +1052,8 @@ end
 --   * in a `:set` argument        → option names (with docs);
 --   * a `:buffer`/`:colorscheme`/`:highlight` argument → that name set;
 --   * an `:autocmd`/`:augroup`/`:put`/`:move` first argument → event/group/register/addr;
---   * in a file/dir argument      → launch the file picker, return the sentinel;
+--   * in a file/dir argument      → launch the file picker, return the sentinel (in an
+--                                   editor locked to one file: that file, or nothing);
 --   * any other command's args    → nothing yet (core closes the menu).
 --
 -- The file-picker case is a SIDE EFFECT (it queues `btv.picker.open`) and returns
@@ -1058,6 +1064,18 @@ end
 -- picker; since the command line stays open, confirm pastes the choice back into this
 -- same argument token via `btv._cmdline_set_arg`. `dirs_only` lists directories only.
 local function launch_path_picker(before, dirs_only)
+  -- An editor locked to one file (`ServerInit::single_file`) opens no other, so it
+  -- offers that file and browses for nothing: other files' names would only be refused.
+  local locked = btv._locked_file()
+  if locked then
+    if dirs_only then
+      return {}
+    end
+    -- Escaped for the command line where `\` isn't the separator (`fnameescape`); the
+    -- core reads it by this process's platform, as `btv.utils.is_windows` tells it.
+    local insert = btv.utils.is_windows() and locked or btv.fname.escape(locked)
+    return { { label = locked, insert = insert } }
+  end
   local prefix = before:match("(%S*)$") or ""
   pending = { dirs_only = dirs_only }
   local popts = { query = prefix, title = dirs_only and "Select directory" or "Select file" }

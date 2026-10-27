@@ -199,7 +199,9 @@ example and the Phase 2 `<leader>w` test) can't simply be `parse_keys`-fed. When
 string-RHS feed lands (Phase 2), either special-case a leading `<cmd>…<cr>` and run
 the inner text as an ex-command (like `vim.cmd` — neovim's `<Cmd>` semantics, no mode
 change), or write examples/tests with the `:write<cr>` colon form (which parses
-cleanly to `:`,`w`,`r`,`i`,`t`,`e`,Enter). The LSP **default** maps added on the
+cleanly to `:`,`w`,`r`,`i`,`t`,`e`,Enter). *Resolved (2026-10-27):* `<Cmd>` was never
+added, and a string RHS spelling it now fails at definition with `E5806`, naming the
+function RHS or `:Command<CR>` form to use instead. The LSP **default** maps added on the
 backport sidestep this entirely: they are **native** actions (point D7) that call
 `request_lsp(kind)` directly rather than feeding keys.
 

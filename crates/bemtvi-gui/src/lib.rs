@@ -39,6 +39,7 @@
 //!   also binds the buffer to it). (`:wo` mirrors the `…o` open family and, unlike
 //!   `:wn`, collides with no real ex-command — vim's `:wn` is `:wnext`.)
 
+pub mod embed;
 mod fontchain;
 mod images;
 mod input;
@@ -56,7 +57,8 @@ pub use mouse::{
 // method's commit).
 pub use bemtvi_view::{encode_paste, encode_text};
 pub use session::{
-    parse_connect_uri, spawn_session, spawn_stdio_daemon_session, spawn_workspace_session, Session,
+    parse_connect_uri, spawn_session, spawn_session_with, spawn_stdio_daemon_session,
+    spawn_workspace_session, Config, Launch, Session, Shada,
 };
 // The pure inline-inlay-hint geometry (the shift math) and the segment splice, so
 // the Tier-1 `inlay` test can exercise them without a GPU — like the mouse helpers.
@@ -120,6 +122,7 @@ use mitsuami::prelude::{
     SaveFile, ScrollDelta, Signal, Size, SurfaceHandle, SurfaceInput, SurfaceSize, SystemCursor,
     Window,
 };
+use mitsuami::raw_window_handle::HasWindowHandle;
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -358,10 +361,15 @@ pub enum UserEvent {
     },
     /// The server asked the UI to exit (`bemtvi_exit`), or the connection closed.
     Exit,
-    /// A fatal signal (`kill`, SIGHUP, SIGINT) asked the process to stop. Delivered
-    /// from [`bemtvi_view::signals`]' watchdog thread over the same channel, so the
-    /// shutdown runs on the UI thread like any other quit.
-    Shutdown,
+    /// `btv.host.send(name, payload)`: a message for the app embedding the editor.
+    Host { name: String, payload: Value },
+}
+
+/// What the app embedding the editor is to hear of, once the UI thread let go of the
+/// editor's state.
+enum HostCall {
+    Exit(Rc<dyn Fn()>),
+    Event(Rc<dyn Fn(embed::EditorEvent)>, embed::EditorEvent),
 }
 
 /// Run the GUI client until the window closes or the server disconnects, rendering with
@@ -378,338 +386,53 @@ pub enum UserEvent {
 /// new session off the UI thread, then the session loop retires the old server (it winds
 /// down on EOF) and re-attaches the UI onto the new one. The editor always runs local —
 /// only the fs/process/watch/LSP seams cross the wire.
+///
+/// The window's content is the same [`embed::Editor`] a mitsuami app mounts in its own
+/// layout; what's here is what belongs to an app that owns the process: the window, the
+/// signals, and the exit status.
 pub fn run(
     initial: Session,
     config: GuiConfig,
     open_dir: Option<PathBuf>,
     config_source: bemtvi_server::ConfigSource,
 ) -> Result<()> {
-    let (proxy, events) = tokio::sync::mpsc::unbounded_channel::<UserEvent>();
-
     // Be killable without losing the session. There is no terminal to hand back here
     // — a window is not a tty — so this client takes only the *graceful* half: a
     // `kill` / SIGHUP / SIGINT wakes the UI thread through the channel and the editor
-    // quits itself properly (see `UserEvent::Shutdown`), with the watchdog in
-    // `bemtvi_view::signals` still guaranteeing the process dies if that goes nowhere.
-    {
-        let proxy = proxy.clone();
-        bemtvi_view::signals::install(bemtvi_view::signals::Config {
-            restore_sequence: Vec::new(),
-            restore_termios: false,
-            on_shutdown: Box::new(move || {
-                let _ = proxy.send(UserEvent::Shutdown);
-            }),
-        });
-    }
-
-    // Shutdown signal: when the UI's run loop ends — the window closed after a `:qa`,
-    // or a server-sent `bemtvi_exit` — the main thread notifies the IO thread so it drops the
-    // RPC connection. The IO thread (not `run`) owns the stream, so unless it closes
-    // that, the server never sees EOF, never winds down, and the join below hangs
-    // forever — the close-button freeze.
-    let shutdown = Arc::new(tokio::sync::Notify::new());
-    let io_shutdown = shutdown.clone();
-
-    // Hand the `Rpc` handle from the IO thread back to the main thread once the
-    // (first) connection is up, so the UI side can fire input synchronously.
-    let (rpc_tx, rpc_rx) = std::sync::mpsc::channel::<Rpc>();
-    // `:connect <target>` / `:workspace <dir>` from the App request a switch to a new
-    // (daemon or local-workspace) session.
-    let (reconnect_tx, mut reconnect_rx) = tokio::sync::mpsc::unbounded_channel::<SessionRequest>();
-    // The image store (render thread) requests remote preview bytes here; the IO thread
-    // fulfils each over `bemtvi_image_read` on the *current* session and posts the bytes
-    // back as `UserEvent::ImageBytes`.
-    let (fetch_tx, mut fetch_rx) = tokio::sync::mpsc::unbounded_channel::<ImageFetch>();
-    // Preview decodes, the same shape: the (synchronous) paint can only enqueue a
-    // decode request — local previews carry just the path, remote ones their fetched
-    // bytes — and the IO thread runs the disk read + full-res decode on a blocking
-    // task, never on the UI thread, posting the outcome back as
-    // `UserEvent::ImageDecoded`.
-    let (decode_tx, mut decode_rx) = tokio::sync::mpsc::unbounded_channel::<DecodeReq>();
-    let initial_remote = initial.remote;
-
-    let io = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build client IO runtime");
-        runtime.block_on(async move {
-            // The current session's transport + server thread, plus the retired servers
-            // of earlier `:connect`s (each winds down on EOF; joined at teardown).
-            let mut stream = initial.stream;
-            let mut current_handle = Some(initial.handle);
-            let mut next_remote = initial.remote;
-            let mut retired: Vec<std::thread::JoinHandle<anyhow::Result<()>>> = Vec::new();
-            // A finished `:connect` build delivers its new session here, so the handshake
-            // (run off the UI thread on the blocking pool) doesn't stall the current
-            // session's redraws while it's in flight.
-            // Each carries the command label (`:connect` / `:workspace`) so a build
-            // failure is reported against the command the user actually typed.
-            let (built_tx, mut built_rx) =
-                tokio::sync::mpsc::unbounded_channel::<(&'static str, Result<Session>)>();
-            let mut first = true;
-
-            'session: loop {
-                let (reader, writer) = tokio::io::split(stream);
-                let (rpc, mut incoming) = connect(reader, writer);
-                // Hand the connection to the App: the first synchronously (so `App::new`
-                // has an `Rpc`); later ones as `Connected`, which swaps the live handle
-                // and re-attaches. Dropping the *old* session's `rpc`/`incoming` on the
-                // next iteration — together with the App swapping its clone — winds the
-                // previous connection (and its server) down.
-                if first {
-                    let _ = rpc_tx.send(rpc.clone());
-                    first = false;
-                } else {
-                    let event = UserEvent::Connected {
-                        rpc: Box::new(rpc.clone()),
-                        remote: next_remote,
-                    };
-                    if proxy.send(event).is_err() {
-                        break 'session; // event loop gone
-                    }
-                }
-
-                // Block until a `:connect` build succeeds (the only value-carrying
-                // break), or `break 'session` on disconnect / exit / shutdown.
-                let new_session: Session = loop {
-                    tokio::select! {
-                        message = incoming.recv() => match message {
-                            Some(Incoming::Notification { method, params }) => match method.as_str() {
-                                "redraw" => {
-                                    let view = View::from_redraw(&params);
-                                    if proxy.send(UserEvent::Redraw(Box::new(view))).is_err() {
-                                        break 'session; // event loop gone
-                                    }
-                                }
-                                "bemtvi_exit" => {
-                                    let _ = proxy.send(UserEvent::Exit);
-                                    break 'session;
-                                }
-                                // `btv.session.reconnect(spec)` from inside the VM (§B): a
-                                // plugin initiates the reload. Parse the wire spec and build
-                                // the new session off the UI thread (like `:connect`), then
-                                // `built_rx` swaps onto it. A bad spec / failed build is
-                                // reported and leaves the current session intact.
-                                "btv_session_reconnect" => {
-                                    match params.first().ok_or_else(|| {
-                                        anyhow::anyhow!("btv_session_reconnect: missing spec")
-                                    }).and_then(bemtvi_server::ReconnectSpec::from_value) {
-                                        Ok(spec) => {
-                                            let tx = built_tx.clone();
-                                            tokio::task::spawn_blocking(move || {
-                                                let built = session::spawn_session_from_spec(spec);
-                                                let _ = tx.send((":reconnect", built));
-                                            });
-                                        }
-                                        Err(err) => report_session_error(&rpc, ":reconnect", &err),
-                                    }
-                                }
-                                // `:connect <url>` with no matching connect-provider (§C): the
-                                // VM hands the raw URL back for the GUI's built-in direct dial.
-                                // Parse it into an ssh/quic target and build off the UI thread
-                                // (like `SessionRequest::Connect` — the ssh handshake and its
-                                // askpass dialog can take seconds); the swap arrives on
-                                // `built_rx`. An unparseable URL is reported, not swallowed.
-                                "btv_connect_fallback" => {
-                                    match params.first().and_then(Value::as_str) {
-                                        Some(url) => match remote::connect_target(url) {
-                                            Some(target) => {
-                                                let tx = built_tx.clone();
-                                                tokio::task::spawn_blocking(move || {
-                                                    let file = target.embedded_file();
-                                                    let built = session::spawn_session(
-                                                        Some(target),
-                                                        file,
-                                                        config_source,
-                                                    );
-                                                    let _ = tx.send((":connect", built));
-                                                });
-                                            }
-                                            None => report_session_error(
-                                                &rpc,
-                                                ":connect",
-                                                &anyhow::anyhow!(
-                                                    "not a connect target: {url:?} (expected bemtvi://… or [user@]host[:port][/file])"
-                                                ),
-                                            ),
-                                        },
-                                        None => report_session_error(
-                                            &rpc,
-                                            ":connect",
-                                            &anyhow::anyhow!("btv_connect_fallback: missing url"),
-                                        ),
-                                    }
-                                }
-                                _ => {}
-                            },
-                            // Answer server-initiated requests with nil, like the TUI.
-                            Some(Incoming::Request { id, .. }) => rpc.respond(id, Ok(Value::Nil)),
-                            None => break 'session, // connection closed → exit UI
-                        },
-                        // `:connect <target>`: build the new session off the UI thread
-                        // (the ssh/quic handshake — and its askpass dialog — can take
-                        // seconds), so the current session keeps rendering meanwhile. The
-                        // result arrives on `built_rx`.
-                        target = reconnect_rx.recv() => match target {
-                            Some(req) => {
-                                let tx = built_tx.clone();
-                                // A live `:connect`/`:workspace` build runs off the UI
-                                // thread (the ssh/quic handshake — and its askpass dialog —
-                                // can take seconds), so the current session keeps rendering
-                                // meanwhile. A `:connect` inherits the session-wide config
-                                // source chosen at startup (`--remote-config`), so every
-                                // reconnect is consistent with the first.
-                                tokio::task::spawn_blocking(move || {
-                                    let built = match req {
-                                        SessionRequest::Connect(target) => {
-                                            let file = target.embedded_file();
-                                            (
-                                                ":connect",
-                                                session::spawn_session(
-                                                    Some(target),
-                                                    file,
-                                                    config_source,
-                                                ),
-                                            )
-                                        }
-                                        SessionRequest::Workspace(dir) => (
-                                            ":workspace",
-                                            session::spawn_workspace_session(dir, config_source),
-                                        ),
-                                    };
-                                    let _ = tx.send(built);
-                                });
-                            }
-                            None => break 'session, // App (the only sender) is gone
-                        },
-                        // A `:connect`/`:workspace` build finished. On success, restart the
-                        // session on it; on failure, keep the current session and report why.
-                        built = built_rx.recv() => match built {
-                            Some((_, Ok(session))) => break session,
-                            Some((label, Err(err))) => report_session_error(&rpc, label, &err),
-                            None => {} // unreachable: `built_tx` is held above
-                        },
-                        // The render thread needs a remote preview's bytes. Fetch them
-                        // over `bemtvi_image_read` on the *current* session (a spawned
-                        // task, so a slow daemon read doesn't stall redraws) and post the
-                        // reply back to the UI thread, which hands it to the image store.
-                        // `None` (App, the only sender, is gone) just falls through —
-                        // teardown is handled by the other arms.
-                        fetch = fetch_rx.recv() => if let Some(ImageFetch { path, version }) = fetch {
-                            let rpc = rpc.clone();
-                            let proxy = proxy.clone();
-                            tokio::spawn(async move {
-                                let result = bemtvi_view::images::image_read_reply(
-                                    rpc.request(
-                                        "bemtvi_image_read",
-                                        vec![Value::from(path.as_str())],
-                                    )
-                                    .await,
-                                );
-                                let _ = proxy.send(UserEvent::ImageBytes {
-                                    path,
-                                    version,
-                                    result,
-                                });
-                            });
-                        },
-                        // A preview needs decoding: run the disk read + full-res decode
-                        // on a blocking task (a slow disk or a huge image must never
-                        // stall repaints) and post the outcome back as
-                        // `UserEvent::ImageDecoded`.
-                        decode = decode_rx.recv() => if let Some(req) = decode {
-                            let proxy = proxy.clone();
-                            tokio::task::spawn_blocking(move || {
-                                let (path, version, decoded) =
-                                    req.decode(bemtvi_view::images::MAX_EDGE);
-                                let _ = proxy.send(UserEvent::ImageDecoded {
-                                    path,
-                                    version,
-                                    decoded,
-                                });
-                            });
-                        },
-                        // The UI exited: stop, so dropping the runtime below closes the
-                        // connection and the server winds down.
-                        _ = io_shutdown.notified() => break 'session,
-                    }
-                };
-
-                // Swap in the new session: retire the old server (it winds down when this
-                // iteration's `rpc`/`incoming` drop on `continue`) and re-loop on the new
-                // transport, which re-attaches the UI via `Connected`.
-                if let Some(handle) = current_handle.take() {
-                    retired.push(handle);
-                }
-                current_handle = Some(new_session.handle);
-                next_remote = new_session.remote;
-                stream = new_session.stream;
-                continue 'session;
-            }
-
-            // Tell the UI to exit if it hasn't already. Dropping this scope's
-            // `rpc`/`incoming` closes the current stream — the EOF that lets the current
-            // server wind down. Join every server thread (current + retired), surfacing a
-            // panic so a crashed server is a non-zero exit, not a silent clean quit.
-            let _ = proxy.send(UserEvent::Exit);
-            let mut panicked = false;
-            for handle in current_handle.into_iter().chain(retired) {
-                match handle.join() {
-                    Err(_) => panicked = true,
-                    // A server error (not a panic): report it like the old in-thread
-                    // eprintln did, but keep the exit clean.
-                    Ok(Err(e)) => eprintln!("bemtvi-gui: server error: {e}"),
-                    Ok(Ok(())) => {}
-                }
-            }
-            panicked
-        })
+    // quits itself properly (see [`embed::EditorHandle::quit_now`]), with the watchdog
+    // in `bemtvi_view::signals` still guaranteeing the process dies if that goes nowhere.
+    let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    bemtvi_view::signals::install(bemtvi_view::signals::Config {
+        restore_sequence: Vec::new(),
+        restore_termios: false,
+        on_shutdown: Box::new(move || {
+            let _ = signal_tx.send(());
+        }),
     });
 
-    let rpc = match rpc_rx.recv() {
-        Ok(rpc) => rpc,
-        Err(_) => {
-            let _ = io.join();
-            return Err(anyhow::anyhow!("client IO thread exited before connecting"));
-        }
-    };
-    let app = App::new(
-        rpc,
-        config,
-        open_dir,
-        initial_remote,
-        reconnect_tx,
-        fetch_tx,
-        decode_tx,
-    );
+    let handle = embed::EditorHandle::new();
+    let ui_handle = handle.clone();
     // Runs until the window closes. The app id matches the installed `.desktop` file's
     // basename (its `StartupWMClass`), so Linux desktops associate the AppImage's icon
     // with the window; it's also an unpackaged Windows build's AppUserModelID.
-    let ui_app = app.clone();
     mitsuami::App::new()
         .id("bemtvi")
         .name("bemtvi")
-        .open(move || App::window(ui_app, events))
+        .open(move || {
+            window(
+                ui_handle,
+                initial,
+                config,
+                open_dir,
+                config_source,
+                signal_rx,
+            )
+        })
         .run();
-
-    // Leak the renderer instead of dropping it. wgpu's GLES/EGL backend segfaults inside
-    // `eglTerminate` when its `Instance` drops on Wayland + Mesa — an upstream wgpu/Mesa
-    // teardown bug: the EGL display teardown marshals a request onto an already-invalid
-    // Wayland proxy (`terminate_display` → `eglTerminate` → `wl_proxy_marshal_flags` →
-    // SIGSEGV). wgpu instantiates the GL/EGL backend even when Vulkan is the chosen
-    // adapter, so restricting the adapter wouldn't dodge it. `run` only ever returns as
-    // the process is about to exit (see `main` — every path tail-calls it), so forgetting
-    // the renderer — and with it every wgpu handle plus the surface it holds — is safe:
-    // the OS reclaims the GPU/driver resources at exit anyway. Everything else in `app`
-    // (the RPC handle, the channel senders) still drops normally, so the IO thread's
-    // shutdown handshake below is unaffected.
-    std::mem::forget(app.borrow_mut().renderer.take());
 
     // The UI is done: stop the IO thread and wait for it, so the streams are dropped
     // (servers see EOF) and their threads are joined before returning.
-    shutdown.notify_one();
-    let panicked = io.join().unwrap_or(true);
+    let panicked = handle.close();
     if panicked {
         eprintln!("bemtvi-gui: a server thread panicked");
         std::process::exit(101);
@@ -720,6 +443,392 @@ pub fn run(
     // user out) sees the kill it asked for, not a clean exit 0.
     bemtvi_view::signals::exit_as_signal_if_killed();
     Ok(())
+}
+
+/// The window: titled `bemtvi`, 960×640 points, its whole content the editor, focused so
+/// keys go to it from the start. Built in mitsuami's app scope.
+fn window(
+    handle: embed::EditorHandle,
+    session: Session,
+    config: GuiConfig,
+    open_dir: Option<PathBuf>,
+    config_source: bemtvi_server::ConfigSource,
+    mut signals: UnboundedReceiver<()>,
+) -> Window {
+    let open = signal(true);
+    // Killed: quit the session the way `:qall!` does (see `EditorHandle::quit_now`).
+    let killed = handle.clone();
+    spawn_local(async move {
+        // An editor that already quit is already on its way out.
+        if signals.recv().await.is_some() {
+            let _ = killed.quit_now();
+        }
+    });
+    let closing = handle.clone();
+    // `content` may be asked for again; the session is only there the first time.
+    let session = std::cell::Cell::new(Some(session));
+    Window::new("bemtvi")
+        .size(Size::new(960.0, 640.0))
+        .open(open)
+        // Don't close on the close button directly — that would discard a modified
+        // buffer silently. Route through the server's `:qa`, which quits a clean
+        // editor (it then sends `bemtvi_exit`, which closes the window through the
+        // editor's `on_exit`) but refuses with `E37` when a buffer is unsaved, keeping
+        // the window open. mitsuami routes the platform's Quit (macOS's app menu, the
+        // Dock, a logout) here too.
+        // An editor that already quit has nothing to refuse with: just close.
+        .on_close_request(move || {
+            if closing.request_quit().is_err() {
+                open.set(false);
+            }
+        })
+        .content(move || {
+            let session = session
+                .take()
+                .expect("bemtvi-gui: the window's content is built once");
+            // Closing the last window ends mitsuami's run loop, and `run`'s teardown.
+            Column::new().size(100.pct(), 100.pct()).child(
+                embed::Editor::new(session, move || open.set(false))
+                    .handle(handle.clone())
+                    .config(config.clone())
+                    .open_dir(open_dir.clone())
+                    .config_source(config_source)
+                    .autofocus(true),
+            )
+        })
+}
+
+/// What the client IO thread runs on: the session it starts on, and its ends of the
+/// channels to the UI thread. See [`spawn_io`].
+pub(crate) struct IoParts {
+    pub(crate) initial: Session,
+    pub(crate) config_source: bemtvi_server::ConfigSource,
+    /// Events to the UI thread.
+    pub(crate) proxy: tokio::sync::mpsc::UnboundedSender<UserEvent>,
+    /// Hands the first connection's `Rpc` back to the UI thread, so it can fire input
+    /// synchronously.
+    pub(crate) rpc_tx: std::sync::mpsc::Sender<Rpc>,
+    /// `:connect <target>` / `:workspace <dir>` requests from the UI thread.
+    pub(crate) reconnect_rx: UnboundedReceiver<SessionRequest>,
+    /// The image store requests remote preview bytes here; the IO thread fulfils each
+    /// over `bemtvi_image_read` on the *current* session and posts the bytes back as
+    /// `UserEvent::ImageBytes`.
+    pub(crate) fetch_rx: UnboundedReceiver<ImageFetch>,
+    /// Preview decodes, the same shape: the (synchronous) paint can only enqueue a
+    /// decode request — local previews carry just the path, remote ones their fetched
+    /// bytes — and the IO thread runs the disk read + full-res decode on a blocking
+    /// task, never on the UI thread, posting the outcome back as
+    /// `UserEvent::ImageDecoded`.
+    pub(crate) decode_rx: UnboundedReceiver<DecodeReq>,
+    /// Notified when the UI is done with the editor: the IO thread then drops the RPC
+    /// connection. The IO thread (not the UI) owns the stream, so unless it closes
+    /// that, the server never sees EOF, never winds down, and the join hangs forever —
+    /// the close-button freeze.
+    pub(crate) shutdown: Arc<tokio::sync::Notify>,
+}
+
+/// Start the client IO thread. mitsuami owns the UI thread, so the RPC runs here on a
+/// current-thread tokio runtime: it drives [`bemtvi_rpc::connect`] for the current
+/// session, decodes each `redraw` into a [`View`] for the UI thread, builds the new
+/// session a `:connect`/`:workspace` asks for, and joins every server thread at the end.
+/// Its result is whether a server thread panicked.
+pub(crate) fn spawn_io(parts: IoParts) -> std::thread::JoinHandle<bool> {
+    let IoParts {
+        initial,
+        config_source,
+        proxy,
+        rpc_tx,
+        mut reconnect_rx,
+        mut fetch_rx,
+        mut decode_rx,
+        shutdown: io_shutdown,
+    } = parts;
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build client IO runtime");
+        let servers = runtime.block_on(async move {
+        // The current session's transport + server thread, plus the retired servers
+        // of earlier `:connect`s (each winds down on EOF; joined at teardown).
+        let mut stream = initial.stream;
+        // How the sessions here start: a `:connect`/`:workspace` starts the next one
+        // the way the first was started.
+        let launch = initial.launch;
+        let mut current_handle = Some(initial.handle);
+        let mut next_remote = initial.remote;
+        let mut retired: Vec<std::thread::JoinHandle<anyhow::Result<()>>> = Vec::new();
+        // A finished `:connect` build delivers its new session here, so the handshake
+        // (run off the UI thread on the blocking pool) doesn't stall the current
+        // session's redraws while it's in flight.
+        // Each carries the command label (`:connect` / `:workspace`) so a build
+        // failure is reported against the command the user actually typed.
+        let (built_tx, mut built_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(&'static str, Result<Session>)>();
+        let mut first = true;
+
+        'session: loop {
+            let (reader, writer) = tokio::io::split(stream);
+            let (rpc, mut incoming) = connect(reader, writer);
+            // Hand the connection to the App: the first synchronously (so `App::new`
+            // has an `Rpc`); later ones as `Connected`, which swaps the live handle
+            // and re-attaches. Dropping the *old* session's `rpc`/`incoming` on the
+            // next iteration — together with the App swapping its clone — winds the
+            // previous connection (and its server) down.
+            if first {
+                let _ = rpc_tx.send(rpc.clone());
+                first = false;
+            } else {
+                let event = UserEvent::Connected {
+                    rpc: Box::new(rpc.clone()),
+                    remote: next_remote,
+                };
+                if proxy.send(event).is_err() {
+                    break 'session; // event loop gone
+                }
+            }
+
+            // Block until a `:connect` build succeeds (the only value-carrying
+            // break), or `break 'session` on disconnect / exit / shutdown.
+            let new_session: Session = loop {
+                tokio::select! {
+                    message = incoming.recv() => match message {
+                        Some(Incoming::Notification { method, params }) => match method.as_str() {
+                            "redraw" => {
+                                let view = View::from_redraw(&params);
+                                if proxy.send(UserEvent::Redraw(Box::new(view))).is_err() {
+                                    break 'session; // event loop gone
+                                }
+                            }
+                            "bemtvi_exit" => {
+                                let _ = proxy.send(UserEvent::Exit);
+                                break 'session;
+                            }
+                            // `btv.host.send(name, payload)`: for the app embedding the
+                            // editor, through the UI thread (where its handler runs).
+                            "bemtvi_host" => {
+                                let mut params = params.into_iter();
+                                let name = params.next();
+                                let payload = params.next().unwrap_or(Value::Nil);
+                                match name.as_ref().and_then(Value::as_str) {
+                                    Some(name) => {
+                                        let name = name.to_owned();
+                                        if proxy.send(UserEvent::Host { name, payload }).is_err() {
+                                            break 'session; // event loop gone
+                                        }
+                                    }
+                                    None => report_session_error(
+                                        &rpc,
+                                        "btv.host.send",
+                                        &anyhow::anyhow!("a message with no name: {name:?}"),
+                                    ),
+                                }
+                            }
+                            // `btv.session.reconnect(spec)` from inside the VM (§B): a
+                            // plugin initiates the reload. Parse the wire spec and build
+                            // the new session off the UI thread (like `:connect`), then
+                            // `built_rx` swaps onto it. A bad spec / failed build is
+                            // reported and leaves the current session intact.
+                            "btv_session_reconnect" if !launch.session_switching => {
+                                report_session_error(&rpc, ":reconnect", &switching_off());
+                            }
+                            "btv_session_reconnect" => {
+                                match params.first().ok_or_else(|| {
+                                    anyhow::anyhow!("btv_session_reconnect: missing spec")
+                                }).and_then(bemtvi_server::ReconnectSpec::from_value) {
+                                    Ok(spec) => {
+                                        let tx = built_tx.clone();
+                                        let launch = launch.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            let built = session::spawn_session_from_spec(spec, launch);
+                                            let _ = tx.send((":reconnect", built));
+                                        });
+                                    }
+                                    Err(err) => report_session_error(&rpc, ":reconnect", &err),
+                                }
+                            }
+                            // `:connect <url>` with no matching connect-provider (§C): the
+                            // VM hands the raw URL back for the GUI's built-in direct dial.
+                            // Parse it into an ssh/quic target and build off the UI thread
+                            // (like `SessionRequest::Connect` — the ssh handshake and its
+                            // askpass dialog can take seconds); the swap arrives on
+                            // `built_rx`. An unparseable URL is reported, not swallowed.
+                            "btv_connect_fallback" if !launch.session_switching => {
+                                report_session_error(&rpc, ":connect", &switching_off());
+                            }
+                            "btv_connect_fallback" => {
+                                match params.first().and_then(Value::as_str) {
+                                    Some(url) => match remote::connect_target(url) {
+                                        Some(target) => {
+                                            let tx = built_tx.clone();
+                                            let launch = launch.clone();
+                                            tokio::task::spawn_blocking(move || {
+                                                let file = target.embedded_file();
+                                                let built = session::spawn_session_with(
+                                                    Some(target),
+                                                    file,
+                                                    config_source,
+                                                    launch,
+                                                );
+                                                let _ = tx.send((":connect", built));
+                                            });
+                                        }
+                                        None => report_session_error(
+                                            &rpc,
+                                            ":connect",
+                                            &anyhow::anyhow!(
+                                                "not a connect target: {url:?} (expected bemtvi://… or [user@]host[:port][/file])"
+                                            ),
+                                        ),
+                                    },
+                                    None => report_session_error(
+                                        &rpc,
+                                        ":connect",
+                                        &anyhow::anyhow!("btv_connect_fallback: missing url"),
+                                    ),
+                                }
+                            }
+                            _ => {}
+                        },
+                        // Answer server-initiated requests with nil, like the TUI.
+                        Some(Incoming::Request { id, .. }) => rpc.respond(id, Ok(Value::Nil)),
+                        None => break 'session, // connection closed → exit UI
+                    },
+                    // `:connect <target>`: build the new session off the UI thread
+                    // (the ssh/quic handshake — and its askpass dialog — can take
+                    // seconds), so the current session keeps rendering meanwhile. The
+                    // result arrives on `built_rx`.
+                    target = reconnect_rx.recv() => match target {
+                        Some(req) => {
+                            let tx = built_tx.clone();
+                            let launch = launch.clone();
+                            // A live `:connect`/`:workspace` build runs off the UI
+                            // thread (the ssh/quic handshake — and its askpass dialog —
+                            // can take seconds), so the current session keeps rendering
+                            // meanwhile. A `:connect` inherits the session-wide config
+                            // source chosen at startup (`--remote-config`), so every
+                            // reconnect is consistent with the first.
+                            tokio::task::spawn_blocking(move || {
+                                let built = match req {
+                                    SessionRequest::Connect(target) => {
+                                        let file = target.embedded_file();
+                                        (
+                                            ":connect",
+                                            session::spawn_session_with(
+                                                Some(target),
+                                                file,
+                                                config_source,
+                                                launch,
+                                            ),
+                                        )
+                                    }
+                                    SessionRequest::Workspace(dir) => (
+                                        ":workspace",
+                                        session::spawn_workspace_session(
+                                            dir,
+                                            config_source,
+                                            launch,
+                                        ),
+                                    ),
+                                };
+                                let _ = tx.send(built);
+                            });
+                        }
+                        None => break 'session, // App (the only sender) is gone
+                    },
+                    // A `:connect`/`:workspace` build finished. On success, restart the
+                    // session on it; on failure, keep the current session and report why.
+                    built = built_rx.recv() => match built {
+                        Some((_, Ok(session))) => break session,
+                        Some((label, Err(err))) => report_session_error(&rpc, label, &err),
+                        None => {} // unreachable: `built_tx` is held above
+                    },
+                    // The render thread needs a remote preview's bytes. Fetch them
+                    // over `bemtvi_image_read` on the *current* session (a spawned
+                    // task, so a slow daemon read doesn't stall redraws) and post the
+                    // reply back to the UI thread, which hands it to the image store.
+                    // `None` (App, the only sender, is gone) just falls through —
+                    // teardown is handled by the other arms.
+                    fetch = fetch_rx.recv() => if let Some(ImageFetch { path, version }) = fetch {
+                        let rpc = rpc.clone();
+                        let proxy = proxy.clone();
+                        tokio::spawn(async move {
+                            let result = bemtvi_view::images::image_read_reply(
+                                rpc.request(
+                                    "bemtvi_image_read",
+                                    vec![Value::from(path.as_str())],
+                                )
+                                .await,
+                            );
+                            let _ = proxy.send(UserEvent::ImageBytes {
+                                path,
+                                version,
+                                result,
+                            });
+                        });
+                    },
+                    // A preview needs decoding: run the disk read + full-res decode
+                    // on a blocking task (a slow disk or a huge image must never
+                    // stall repaints) and post the outcome back as
+                    // `UserEvent::ImageDecoded`.
+                    decode = decode_rx.recv() => if let Some(req) = decode {
+                        let proxy = proxy.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let (path, version, decoded) =
+                                req.decode(bemtvi_view::images::MAX_EDGE);
+                            let _ = proxy.send(UserEvent::ImageDecoded {
+                                path,
+                                version,
+                                decoded,
+                            });
+                        });
+                    },
+                    // The UI exited: stop, so dropping the runtime below closes the
+                    // connection and the server winds down.
+                    _ = io_shutdown.notified() => break 'session,
+                }
+            };
+
+            // Swap in the new session: retire the old server (it winds down when this
+            // iteration's `rpc`/`incoming` drop on `continue`) and re-loop on the new
+            // transport, which re-attaches the UI via `Connected`.
+            if let Some(handle) = current_handle.take() {
+                retired.push(handle);
+            }
+            current_handle = Some(new_session.handle);
+            next_remote = new_session.remote;
+            stream = new_session.stream;
+            continue 'session;
+        }
+
+        // Tell the UI to exit if it hasn't already.
+        let _ = proxy.send(UserEvent::Exit);
+        current_handle.into_iter().chain(retired).collect::<Vec<_>>()
+    });
+        // Join the servers outside `block_on`, with the runtime gone. Blocked inside it, the
+        // runtime never runs its tasks again — they own the connections — and a server that
+        // hadn't quit by itself (an unmounted editor's) never winds down, so the join hangs.
+        // Dropping the runtime drops those tasks: each server sees EOF.
+        drop(runtime);
+        // Join every server thread (current + retired), surfacing a panic so a crashed
+        // server is a non-zero exit, not a silent clean quit.
+        let mut panicked = false;
+        for handle in servers {
+            match handle.join() {
+                Err(_) => panicked = true,
+                // A server error (not a panic): report it like the old in-thread
+                // eprintln did, but keep the exit clean.
+                Ok(Err(e)) => eprintln!("bemtvi-gui: server error: {e}"),
+                Ok(Ok(())) => {}
+            }
+        }
+        panicked
+    })
+}
+
+/// Why a session switch was refused in an editor whose launch doesn't allow them.
+fn switching_off() -> anyhow::Error {
+    anyhow::anyhow!("this editor can't switch sessions (its host turned that off)")
 }
 
 /// Report a session-switch failure in the GUI message line via the *current* session —
@@ -756,12 +865,26 @@ struct App {
     /// Wakes the paint loop: [`Self::request_redraw`] coalesces any number of requests
     /// into one paint.
     redraw: Rc<tokio::sync::Notify>,
-    /// The window's own state, made in its reactive scope: whether it's open (closing
-    /// it ends the app), the pointer's cursor over the surface (a resize arrow over a
-    /// split separator), the caret the input method's candidate window opens by,
-    /// whether input methods are on (unless `'imdisable'`: [`View::imdisable`]), and
-    /// whether the window's backdrop is under the surface (an opacity below `100`).
-    open: Option<Signal<bool>>,
+    /// What the editor's host does when the editor quits (`bemtvi_exit`, or the
+    /// connection closed): `bemtvi-gui` closes its window. Called once.
+    on_exit: Rc<dyn Fn()>,
+    /// Whether [`Self::on_exit`] was called.
+    exited: bool,
+    /// What the host does with the editor's events (`btv.host.send`), if it listens.
+    on_event: Option<Rc<dyn Fn(embed::EditorEvent)>>,
+    /// The surface, and the UI it's in, for the host to focus.
+    node: Option<(mitsuami::prelude::NodeRef, mitsuami::prelude::Ui)>,
+    /// Whether `<CR>` over a `:e`/`:w`-family command line pops the platform's file
+    /// dialog (see [`dialog_action`]); the host's choice.
+    native_dialogs: bool,
+    /// Whether `:workspace` switches this editor's session: its launch's switching, unless
+    /// the app disabled the command.
+    session_switching: bool,
+    /// The surface's own state, made in its reactive scope: the pointer's cursor over
+    /// the surface (a resize arrow over a split separator), the caret the input
+    /// method's candidate window opens by, whether input methods are on (unless
+    /// `'imdisable'`: [`View::imdisable`]), and whether the window's backdrop is under
+    /// the surface (an opacity below `100`).
     cursor: Option<Signal<Cursor>>,
     caret: Option<Signal<Option<Rect>>>,
     input_method: Option<Signal<bool>>,
@@ -865,8 +988,10 @@ struct App {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         rpc: Rpc,
+        on_exit: Rc<dyn Fn()>,
         config: GuiConfig,
         open_dir: Option<PathBuf>,
         remote: bool,
@@ -883,7 +1008,12 @@ impl App {
                 view: View::default(),
                 scroll: None,
                 redraw: Rc::new(tokio::sync::Notify::new()),
-                open: None,
+                on_exit,
+                exited: false,
+                on_event: None,
+                node: None,
+                native_dialogs: true,
+                session_switching: false,
                 cursor: None,
                 caret: None,
                 input_method: None,
@@ -919,19 +1049,24 @@ impl App {
         })
     }
 
-    /// The window: titled `bemtvi`, 960×640 points, its whole content the editor's
-    /// surface, focused so keys go to it from the start. Built in mitsuami's app scope,
-    /// where it starts the UI-thread tasks: the pump for the IO thread's `events`, and
-    /// the paint loop.
-    fn window(this: Rc<RefCell<Self>>, mut events: UnboundedReceiver<UserEvent>) -> Window {
-        let open = signal(true);
+    /// The editor's surface, taking the space its row or column has left. Built in the editor's
+    /// own reactive scope (see [`embed::Editor`]), where it starts the UI-thread tasks —
+    /// the pump for the IO thread's `events`, the paint loop and the caret's blink —
+    /// which end with that scope. `autofocus` focuses it as it's made, so keys go to it
+    /// from the start.
+    fn surface(
+        this: Rc<RefCell<Self>>,
+        mut events: UnboundedReceiver<UserEvent>,
+        ui: &mitsuami::prelude::Ui,
+        label: String,
+        autofocus: bool,
+    ) -> GpuSurface {
         let cursor = signal(Cursor::Default);
         let caret = signal(None::<Rect>);
         let input_method = signal(true);
         let transparent = signal(false);
         {
             let mut app = this.borrow_mut();
-            app.open = Some(open);
             app.cursor = Some(cursor);
             app.caret = Some(caret);
             app.input_method = Some(input_method);
@@ -940,54 +1075,45 @@ impl App {
         let app = this.clone();
         spawn_local(async move {
             while let Some(event) = events.recv().await {
-                app.borrow_mut().user_event(event);
+                // What the host hears of is called with the app let go of, so it can
+                // drive the editor again from in there (through its `EditorHandle`).
+                let call = app.borrow_mut().user_event(event);
+                match call {
+                    Some(HostCall::Exit(on_exit)) => on_exit(),
+                    Some(HostCall::Event(on_event, event)) => on_event(event),
+                    None => {}
+                }
             }
         });
         spawn_local(Self::paint_loop(this.clone()));
         spawn_local(Self::blink_loop(this.clone()));
 
-        let closing = this.clone();
-        let content = this.clone();
-        Window::new("bemtvi")
-            .size(Size::new(960.0, 640.0))
-            .open(open)
-            // Don't close on the close button directly — that would discard a modified
-            // buffer silently. Route through the server's `:qa`, which quits a clean
-            // editor (it then sends `bemtvi_exit`, arriving as `UserEvent::Exit`) but
-            // refuses with `E37` when a buffer is unsaved, keeping the window open.
-            // `btv_command` runs the ex-command regardless of the current mode (unlike
-            // injecting `:qa<CR>` keys). mitsuami routes the platform's Quit (macOS's
-            // app menu, the Dock, a logout) here too.
-            .on_close_request(move || {
-                closing
-                    .borrow()
-                    .rpc
-                    .notify("btv_command", vec![Value::from("qa")]);
-            })
-            .content(move || {
-                let surface = node_ref();
-                surface.focus();
-                let (ready, resized, input) = (content.clone(), content.clone(), content.clone());
-                Column::new().size(100.pct(), 100.pct()).child(
-                    GpuSurface::new()
-                        .label("bemtvi")
-                        .node_ref(surface)
-                        .size(100.pct(), 100.pct())
-                        // Text as a text field takes it: layouts, dead keys, AltGr and
-                        // input methods (composed accents, CJK) all type — input methods
-                        // unless a config sets `'imdisable'`.
-                        .text_input(true)
-                        .input_method(input_method)
-                        // The window's backdrop under it, for `'guiopacity'` to show
-                        // (macOS's vibrancy; Windows' Mica is always there).
-                        .transparent(transparent)
-                        .text_cursor(caret)
-                        .cursor(cursor)
-                        .on_ready(move |handle| ready.borrow_mut().surface = Some(handle))
-                        .on_resize(move |size| resized.borrow_mut().resized(size))
-                        .on_input(move |event| input.borrow_mut().input(&event)),
-                )
-            })
+        let surface = node_ref();
+        if autofocus {
+            surface.focus();
+        }
+        this.borrow_mut().node = Some((surface, ui.clone()));
+        let (ready, resized, input) = (this.clone(), this.clone(), this);
+        GpuSurface::new()
+            .label(label)
+            .node_ref(surface)
+            // It has no size of its own: it takes the space its row or column has
+            // left (stretched across the other way), so it sits beside an app's own
+            // controls as well as filling `bemtvi-gui`'s window.
+            .grow(1.0)
+            // Text as a text field takes it: layouts, dead keys, AltGr and
+            // input methods (composed accents, CJK) all type — input methods
+            // unless a config sets `'imdisable'`.
+            .text_input(true)
+            .input_method(input_method)
+            // The window's backdrop under it, for `'guiopacity'` to show
+            // (macOS's vibrancy; Windows' Mica is always there).
+            .transparent(transparent)
+            .text_cursor(caret)
+            .cursor(cursor)
+            .on_ready(move |handle| ready.borrow_mut().surface = Some(handle))
+            .on_resize(move |size| resized.borrow_mut().resized(size))
+            .on_input(move |event| input.borrow_mut().input(&event))
     }
 
     /// Paints whenever a repaint was asked for (any number of requests, one paint),
@@ -1098,6 +1224,12 @@ impl App {
         let Some(surface) = self.surface.clone() else {
             return;
         };
+        // A surface with no window to present to — mitsuami's headless backend, which the
+        // embed tests run on — has nothing to draw: the editor runs (its server, the
+        // host's handle) without a renderer.
+        if surface.window_handle().is_err() {
+            return;
+        }
         self.scale = if size.scale > 0.0 { size.scale } else { 1.0 };
         match Renderer::new(
             surface,
@@ -1133,8 +1265,9 @@ impl App {
         }
     }
 
-    /// Something from the IO thread.
-    fn user_event(&mut self, event: UserEvent) {
+    /// Something from the IO thread. What the host is to hear of (the editor quit, a
+    /// message for it), for the caller to call once it let go of the app.
+    fn user_event(&mut self, event: UserEvent) -> Option<HostCall> {
         match event {
             UserEvent::Redraw(view) => {
                 self.view = *view;
@@ -1212,25 +1345,28 @@ impl App {
                 self.apply_opacity();
                 self.request_redraw();
             }
-            // Closing the last window ends mitsuami's run loop, and `run`'s teardown.
+            // The editor quit (the IO thread says so on `bemtvi_exit`, and again as it
+            // ends): the host hears of it once.
             UserEvent::Exit => {
-                if let Some(open) = self.open {
-                    open.set(false);
+                if !std::mem::replace(&mut self.exited, true) {
+                    return Some(HostCall::Exit(self.on_exit.clone()));
                 }
             }
-            // Killed. Quit the session the way `:qall!` does rather than letting the
-            // process be torn down mid-tick: the exit sequence runs
-            // (QuitPre/ExitPre/VimLeavePre/VimLeave, so plugins persist their state)
-            // and the server's clean-exit shada flush lands. The bang is deliberate —
-            // nobody is there to answer an E37 prompt — and so is the missing `w`:
-            // writing files the user never asked to write would be worse than losing
-            // the edits. The server answers with `bemtvi_exit`, which arrives back here
-            // as `UserEvent::Exit` and closes the window; `run`'s tail then re-raises
-            // the signal so the kill still looks like a kill.
-            UserEvent::Shutdown => {
-                self.rpc.notify("btv_command", vec![Value::from("qall!")]);
-            }
+            UserEvent::Host { name, payload } => match &self.on_event {
+                Some(on_event) => {
+                    let event = embed::EditorEvent::Host { name, payload };
+                    return Some(HostCall::Event(on_event.clone(), event));
+                }
+                // Sent to an app that isn't listening: say so where it was sent from,
+                // rather than let the message vanish.
+                None => report_session_error(
+                    &self.rpc,
+                    "btv.host.send",
+                    &anyhow::anyhow!("{name:?} went nowhere: the app hears no editor events"),
+                ),
+            },
         }
+        None
     }
 
     /// Keys, typed text and the pointer on the surface.
@@ -1362,18 +1498,25 @@ impl App {
             // that routes through the VM so a connector can claim it, then swaps via a
             // `btv_session_reconnect` (provider) or `btv_connect_fallback` (direct
             // dial) notification handled in [`crate::run`].
-            if let Some(dir) = remote::workspace_command(&self.view.cmdline) {
+            if let Some(dir) =
+                remote::workspace_command(&self.view.cmdline).filter(|_| self.session_switching)
+            {
                 let _ = self
                     .reconnect
                     .send(SessionRequest::Workspace(PathBuf::from(dir)));
             }
             let unnamed = self.view.focused().is_some_and(|w| w.unnamed);
+            let dialog = if self.native_dialogs {
+                dialog_action(&self.view.cmdline, unnamed, self.remote)
+            } else {
+                None
+            };
             // `dialog_action` returns `None` in a remote (daemon) session, so the
             // native local-fs picker never fires for remote buffers — the command runs
             // as typed and the server/daemon handles it. Each `pick_*` swallows the
             // `<CR>` (it aborts the command line and re-issues the real command with
             // the chosen path), so `return` before the key is encoded below.
-            match dialog_action(&self.view.cmdline, unnamed, self.remote) {
+            match dialog {
                 Some(DialogAction::Open { base }) => {
                     self.pick_open(base);
                     return;
@@ -1622,10 +1765,9 @@ impl App {
     /// <file>` with the chosen path. The caller swallows the `<CR>`.
     ///
     /// On a pick it aborts the half-typed command line (`<Esc>`) and runs the base
-    /// command; on cancel it just aborts. bemtvi's `:edit`-family parser takes the
-    /// whole argument tail as the filename (no backslash unescaping, unlike vim),
-    /// so the path is passed **raw** — a leading `fnameescape` would wrongly bake
-    /// its `\ ` escapes into the name. The dialog is the platform's own, on the window
+    /// command; on cancel it just aborts. The path goes in escaped
+    /// ([`bemtvi_core::ex_names::escape_file_arg`]), so a `|`, `%` or `#` in it is part
+    /// of the name. The dialog is the platform's own, on the window
     /// (a sheet on macOS), and doesn't block the UI thread: the command runs when it
     /// answers.
     fn pick_open(&self, base: &'static str) {
@@ -1636,7 +1778,7 @@ impl App {
     /// answer to opening a *directory* (`:e somedir`, or `bemtvi-gui somedir`). Rather
     /// than the server's in-window netrw listing, the user gets the system file picker
     /// already browsing that directory, and the picked file is opened with `base`.
-    /// Same contract and raw-path rationale as [`Self::pick_open`]; a relative `dir`
+    /// Same contract as [`Self::pick_open`]; a relative `dir`
     /// resolves against the process cwd, exactly as the server's listing would.
     fn pick_open_at(&self, base: &'static str, dir: &str) {
         let dir = std::path::absolute(dir).unwrap_or_else(|_| PathBuf::from(dir));
@@ -1657,7 +1799,7 @@ impl App {
 
     /// Pop the native **save** dialog for `:wo` / a bare `:w` on an unnamed buffer,
     /// then `:w <file>` to the chosen path (which also binds the buffer to it).
-    /// Same contract and raw-path rationale as [`Self::pick_open`].
+    /// Same contract as [`Self::pick_open`].
     fn pick_save(&self) {
         let me = self.me.clone();
         spawn_local(async move {
@@ -1673,7 +1815,7 @@ impl App {
     fn run_picked(&self, verb: &str, picked: Option<PathBuf>) {
         self.rpc.notify("btv_input", vec![Value::from("<Esc>")]);
         if let Some(path) = picked {
-            let path = path.to_string_lossy();
+            let path = bemtvi_core::ex_names::escape_file_arg(&path.to_string_lossy());
             self.rpc
                 .notify("btv_command", vec![Value::from(format!("{verb} {path}"))]);
         }

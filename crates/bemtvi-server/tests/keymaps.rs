@@ -2068,3 +2068,45 @@ async fn an_unknown_keymap_option_warns_naming_it() {
         "each warning names its key: {notes:?}"
     );
 }
+
+/// `<Cmd>` isn't a key bemtvi has: an RHS spelling it would type `<`, `C`, `m`, `d`, `>`
+/// (`<` is the shift-left operator) instead of running the command. Defining one fails
+/// loudly — through every setter — and registers nothing.
+#[tokio::test]
+async fn a_cmd_mapping_is_refused() {
+    let dir = temp_dir("keymap_cmd");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+
+    for call in [
+        "btv.keymap.set('n', '<F5>', '<Cmd>echo 1<CR>')",
+        "vim.keymap.set('n', '<F5>', '<cmd>echo 1<cr>')",
+        "vim.api.nvim_set_keymap('n', '<F5>', '<CMD>echo 1<CR>', {})",
+        "btv.keymap.raw_buf_set(0, 'n', '<F5>', 'x<Cmd>echo 1<CR>', {})",
+    ] {
+        let got = exec_lua(
+            &rpc,
+            &format!("local ok, err = pcall(function() {call} end) return {{ ok, tostring(err) }}"),
+        )
+        .await;
+        let got = got.as_array().unwrap();
+        assert_eq!(got[0], Value::from(false), "{call}");
+        let err = got[1].as_str().unwrap();
+        assert!(
+            err.contains("E5806") && err.contains("<Cmd>"),
+            "{call}: {err}"
+        );
+    }
+    let mapped = exec_lua(
+        &rpc,
+        "for _, m in ipairs(btv.keymap.get('n')) do if m.lhs == '<F5>' then return true end end return false",
+    )
+    .await;
+    assert_eq!(mapped, Value::from(false), "nothing was registered");
+    // `<lt>Cmd>` spells the literal text, and a function RHS is the way to run a command.
+    let ok = exec_lua(
+        &rpc,
+        "return (pcall(btv.keymap.set, 'n', '<F6>', '<lt>Cmd>')) and (pcall(btv.keymap.set, 'n', '<F7>', function() end))",
+    )
+    .await;
+    assert_eq!(ok, Value::from(true));
+}

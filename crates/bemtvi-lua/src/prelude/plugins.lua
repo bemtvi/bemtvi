@@ -30,6 +30,48 @@
 btv.plugins = btv.plugins or {}
 local M = btv.plugins
 
+-- Whether the plugin manager is off in this editor (`ServerInit::disable_plugin_manager`).
+local plugins_disabled = false
+
+-- `btv.plugins.disabled()` -> whether the plugin manager is off in this editor: an app
+-- embedding it turned it off, so plugins are neither declared, loaded, installed nor
+-- updated through it. Every other `btv.plugins` call then raises `E5805`; plugins under
+-- the config's `pack/*/start/` still load.
+function M.disabled()
+  return plugins_disabled
+end
+
+-- Turn the plugin manager off: `btv.plugins` becomes a stand-in that raises `E5805` for
+-- every call but `disabled()`, while the prelude's own reads of its private state (`_`
+-- fields: shada attribution, the test runner's idle wait) still reach it. Called once,
+-- before any config runs. The manager's `:Plugin*` commands are disabled server-side.
+function btv._disable_plugin_manager()
+  plugins_disabled = true
+  local function refused(what)
+    return function()
+      error("E5805: " .. what .. ": the plugin manager is disabled in this editor", 2)
+    end
+  end
+  btv.plugins = setmetatable({}, {
+    __index = function(_, key)
+      if key == "disabled" then
+        return M.disabled
+      end
+      if type(key) == "string" and key:sub(1, 1) == "_" then
+        return M[key]
+      end
+      return refused("btv.plugins." .. tostring(key))
+    end,
+    __newindex = function(_, key)
+      error(
+        "E5805: btv.plugins." .. tostring(key) .. ": the plugin manager is disabled in this editor",
+        2
+      )
+    end,
+    __call = refused("btv.plugins"),
+  })
+end
+
 -- ----- state -----------------------------------------------------------------
 
 M._specs = M._specs or {} -- name -> normalized spec
@@ -754,6 +796,9 @@ local function maybe_fire_plugins_loaded()
     return
   end
   M._plugins_loaded_fired = true
+  -- Startup has ended: what was on the runtimepath until now is where user commands may
+  -- come from, under `ServerInit::startup_user_commands_only`.
+  btv._seal_user_command_roots()
   -- Close the startup announce window FIRST: every buffer read before the plugins
   -- existed (the startup file, a restored session's windows) is re-announced to the
   -- handlers the plugins just registered, so a plugin's `BufReadPost` / `FileType`
@@ -2666,7 +2711,9 @@ btv.on("VimEnter", {}, function()
   -- they already have).
   M._vim_entered = true
   maybe_fire_plugins_loaded()
-  M.bootstrap()
+  if not plugins_disabled then
+    M.bootstrap()
+  end
 end)
 
 return btv.plugins

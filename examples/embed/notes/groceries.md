@@ -1,0 +1,5 @@
+# Groceries
+
+- coffee
+- rice
+- lemons

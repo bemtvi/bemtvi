@@ -795,6 +795,16 @@ impl EditHost {
         for url in self.lua.take_connect_fallbacks() {
             self.fx.notify("btv_connect_fallback", vec![url]);
         }
+        // Messages for the app embedding the editor, from `btv.host.send(name, payload)`:
+        // pushed OUT as `bemtvi_host` notifications (`[name, payload]` as the params), which
+        // the client hands to its host. No editor state changes here either.
+        for message in self.lua.take_host_messages() {
+            let params = match message {
+                rmpv::Value::Array(params) => params,
+                other => vec![other],
+            };
+            self.fx.notify("bemtvi_host", params);
+        }
         // `btv.view` requests from the view handle methods drive the core's view
         // registry (plugin-owned, read-only content surfaces). Drained *before* the
         // layer crosses below so a `v:mount{...}` (which focuses the view) followed by
@@ -4559,7 +4569,9 @@ impl EditHost {
             #[cfg(feature = "native")]
             self.complete_plugin_maybe_resolve();
             for chunk in std::mem::take(&mut self.editor.lua_queue) {
-                if let Err(e) = self.lua.exec(&chunk) {
+                // Named, so what it does can be told from a file's code (a user command
+                // it defines, under `ServerInit::startup_user_commands_only`).
+                if let Err(e) = self.lua.exec_named(&chunk, "=:lua") {
                     self.editor.echo(format!("E5108: Error executing lua: {e}"));
                 }
                 self.apply_lua_effects();

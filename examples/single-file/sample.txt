@@ -1,0 +1,4 @@
+The one file this editor edits.
+
+Try :e other.txt, :lua print(1) or :terminal: each is refused.
+Try :Stamp or <Space>s: the config's own command still works.

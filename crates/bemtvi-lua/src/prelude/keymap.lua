@@ -110,6 +110,17 @@ end
 -- and a string RHS at set-time, matching neovim. Bumps the version so the server
 -- rebuilds its tries.
 local function keymap_register(modes, lhs, rhs, opts)
+  -- `<Cmd>` isn't a key bemtvi has. Left through, the RHS would type `<`, `C`, `m`, `d`,
+  -- `>` (`<` is the shift-left operator) instead of running anything, so it fails here,
+  -- where the config is, naming what to do instead. (`<lt>Cmd>` is the literal text.)
+  if type(rhs) == "string" and rhs:lower():find("<cmd>", 1, true) then
+    error(
+      "E5806: <Cmd> isn't supported in bemtvi mappings (the mapping for "
+        .. tostring(lhs)
+        .. "): map to a Lua function, or to `:Command<CR>`",
+      0
+    )
+  end
   lhs = keymap_expand_leader(lhs)
   local buffer = keymap_resolve_buffer(opts.buffer)
   if opts.unique and keymap_clashes(modes, lhs, buffer) then
@@ -274,6 +285,14 @@ end
 -- mapping layer (or, equivalently, `opts.noremap = false`). `opts.desc` is stored
 -- but unused; `opts.buffer` ties the map to one buffer (0 = current), `opts.default`
 -- marks an overridable built-in — both feed the precedence ladder the server applies.
+--
+-- There is no `<Cmd>` key: a string `rhs` spelling one raises `E5806` (it would type
+-- `<`, `C`, `m`, `d`, `>`). To run a command, map to a function, or to `:Command<CR>`:
+--
+-- ```lua
+-- btv.keymap.set("n", "<leader>w", function() btv.cmd("write") end)
+-- btv.keymap.set("n", "<leader>q", ":quit<CR>")
+-- ```
 function btv.keymap.set(mode, lhs, rhs, opts)
   opts = opts or {}
   keymap_check_opts("btv.keymap.set", opts, KEYMAP_SET_OPTS)

@@ -13,6 +13,11 @@ build = "build.rs"
 name = "bemtvi-gui"
 path = "src/main.rs"
 
+# mitsuami runs its tests itself (native UI must own the main thread).
+[[test]]
+name = "embed"
+harness = false
+
 
 [dependencies]
 anyhow.workspace = true
@@ -65,6 +70,8 @@ winresource.workspace = true
 # The shared black-box test harness: `tests/fallback_palette.rs` starts a real server
 # and loads the `bemtvi` colorscheme, to check the GUI's built-in colours against it.
 bemtvi-test-harness.workspace = true
+# mitsuami's test kit: `tests/embed.rs` mounts the editor in a (headless) mitsuami app.
+mitsuami-test.workspace = true
 
 # `kill(2)` in the signal e2e test: the killed binary must still run its exit
 # sequence (`tests/signal_exit.rs`).

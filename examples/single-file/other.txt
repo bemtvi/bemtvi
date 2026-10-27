@@ -1,0 +1,1 @@
+A file the single-file editor won't open.

@@ -12,6 +12,24 @@
 btv.picker = btv.picker or {}
 btv.picker._sources = btv.picker._sources or {}
 
+-- The pickers an app embedding the editor took away (`ServerInit::disabled_pickers`),
+-- by source name. Set once, before any config runs, by `btv._disable_pickers`.
+local disabled_pickers = {}
+
+function btv._disable_pickers(names)
+  for _, name in ipairs(names) do
+    disabled_pickers[name] = true
+  end
+end
+
+-- `btv.picker.disabled(name)` -> whether the picker `name` (a source name: `"files"`,
+-- `"live_grep"`) is disabled in this editor. An app embedding the editor can take
+-- pickers away; `btv.picker.open` then raises `E5803` for one, and the `commands` and
+-- `pickers` lists leave it out.
+function btv.picker.disabled(name)
+  return disabled_pickers[name] == true
+end
+
 -- btv._picker holds the *active* picker: the running source, its per-generation
 -- item array (keyed by the integer `key` pushed to the widget), the live
 -- generation, and the current run's `on_cancel` (a superseded dynamic query runs
@@ -481,6 +499,9 @@ local picker_cancel_inflight -- defined with the run machinery below
 --     the sidebar), `"active"` opens in the focused layer. Defaults to `"active"`; the
 --     shipped `files`/`live_grep` sources set `"main"`, `buffers` stays `"active"`.
 function btv.picker.open(name, opts)
+  if disabled_pickers[name] then
+    error("E5803: the " .. tostring(name) .. " picker is disabled in this editor", 2)
+  end
   local source = btv.picker._sources[name]
   if not source then
     error("btv.picker.open: no such source '" .. tostring(name) .. "'", 2)
@@ -1711,7 +1732,7 @@ btv.picker.source({
   items = function(ctx)
     local pickers = {}
     for name, src in pairs(btv.picker._sources) do
-      if src.title and name ~= "commands" then
+      if src.title and name ~= "commands" and not disabled_pickers[name] then
         pickers[#pickers + 1] = { title = src.title, source = name }
       end
     end
@@ -1755,7 +1776,9 @@ btv.picker.source({
   items = function(ctx)
     local names = {}
     for name in pairs(btv.picker._sources) do
-      names[#names + 1] = name
+      if not disabled_pickers[name] then
+        names[#names + 1] = name
+      end
     end
     table.sort(names)
     for _, name in ipairs(names) do

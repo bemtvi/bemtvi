@@ -330,6 +330,38 @@ pub struct ServerInit {
     ///
     /// [`shada_namespace`]: Self::shada_namespace
     pub workspace_dir: Option<String>,
+    /// The id of the app embedding this editor (a mitsuami app mounting
+    /// `bemtvi_gui::embed::Editor`), which `btv.host.name()` reports and without which
+    /// `btv.host.send` raises. Seeded before any config runs. `None` (the default) for the
+    /// TUI, `bemtvi-gui` and tests: nothing embeds them.
+    pub host: Option<String>,
+    /// Commands this editor refuses, by any spelling (`e` disables `:edit`): an app
+    /// embedding the editor took them away. Refused on every route, plugins' `btv.cmd`
+    /// included, with `E5800`. Empty (the default) for the TUI, `bemtvi-gui` and tests.
+    pub disabled_commands: Vec<String>,
+    /// Take user commands only from the config and the plugins loaded at startup. Once
+    /// startup ends (`PluginsLoaded`), `btv.user_command.create` refuses a command whose
+    /// defining code isn't in a file under a runtimepath entry of that moment (nor the
+    /// prelude, nor the client's `nvim_exec_lua`), and `:command` refuses to define one.
+    /// `false` (the default): any code may define commands, as ever.
+    pub startup_user_commands_only: bool,
+    /// Lock the editor to its startup file ([`Self::file`], required): no other file is
+    /// opened, switched to or written, and no new file buffer made (`E5801`); views,
+    /// panels, floats, quickfix lists and terminals work as ever. See
+    /// `Editor::lock_to_buffer`. `false` (the default) for every other editor.
+    pub single_file: bool,
+    /// Turn the plugin manager off: every `btv.plugins` call raises `E5805` (plugins under
+    /// the config's `pack/*/start/` still load), and its `:Plugin*` commands are disabled.
+    /// `false` (the default) for every other editor.
+    pub disable_plugin_manager: bool,
+    /// Turn LSP off: no language server starts, `btv.lsp.enable` / `start` / `restart`
+    /// raise `E5804`, and the `:Lsp*` commands are disabled. `false` (the default) for
+    /// every other editor.
+    pub disable_lsp: bool,
+    /// Pickers taken away, by source name (`"files"`, `"live_grep"`, `"buffers"`,
+    /// `"diagnostics"`): `btv.picker.open` raises `E5803` for one, and the `commands` and
+    /// `pickers` lists leave it out. Empty (the default) for every other editor.
+    pub disabled_pickers: Vec<String>,
     /// Whether a `--workspace` launch cds into [`workspace_dir`](Self::workspace_dir) at boot
     /// (the canonical `bemtvi --workspace DIR`; `--workspace-no-cwd` clears it). Done *before*
     /// the editor opens any file or restores the session, so a relative startup file and the
@@ -588,6 +620,46 @@ pub fn default_runtime() -> (Option<PathBuf>, Vec<PathBuf>) {
         runtimepath.extend(discover_plugins(cfg));
     }
     (config_dir, runtimepath)
+}
+
+/// The plugin manager's commands (`prelude/plugins.lua`, `plugins_ui.lua`), disabled with
+/// it ([`ServerInit::disable_plugin_manager`]).
+pub const PLUGIN_MANAGER_COMMANDS: &[&str] = &[
+    "Plugins",
+    "PluginsWelcome",
+    "PluginSync",
+    "PluginInstall",
+    "PluginUpdate",
+    "PluginClean",
+    "PluginRestore",
+    "PluginLock",
+    "PluginList",
+];
+
+/// The LSP commands (`excmd.rs`), disabled with LSP ([`ServerInit::disable_lsp`]).
+pub const LSP_COMMANDS: &[&str] = &[
+    "LspInfo",
+    "LspDiagnostics",
+    "LspDefinition",
+    "LspDeclaration",
+    "LspTypeDefinition",
+    "LspImplementation",
+    "LspReferences",
+    "LspHover",
+    "LspSignatureHelp",
+    "LspFormat",
+    "LspRename",
+    "LspCodeAction",
+];
+
+/// The runtimepath for an explicit config directory — an app embedding the editor with
+/// a config of its own: the directory and the plugins installed under it. Unlike
+/// [`default_runtime`], nothing of the user's (no `$BEMTVI_RUNTIMEPATH`).
+#[cfg(feature = "native")]
+pub fn config_dir_runtime(config_dir: &Path) -> Vec<PathBuf> {
+    let mut runtimepath = vec![config_dir.to_path_buf()];
+    runtimepath.extend(discover_plugins(config_dir));
+    runtimepath
 }
 
 /// First of `$BEMTVI_CONFIG`, `$XDG_CONFIG_HOME/bemtvi`, and the platform default
@@ -4434,6 +4506,13 @@ where
     // before — the first buffer fetched the same way every later `:edit` is; a bare
     // session still installs the fs so a later `:edit` / `:write` routes through it.
     let deferred_open = host_fs_async.as_ref().and(init.file.clone());
+    // The file a single-file editor is locked to, as given, for Lua (below).
+    let locked_file = init.single_file.then(|| init.file.clone()).flatten();
+    // A single-file editor is locked to the file it starts on, so it needs one.
+    anyhow::ensure!(
+        !init.single_file || init.file.is_some(),
+        "a single-file editor needs the file it edits (ServerInit::file)"
+    );
     let mut editor = match (&host_fs_async, init.file) {
         // Daemon fs: start empty regardless of `file`; the fetch task below loads it.
         // A daemon session also does buffer I/O off-tick — `:w` snapshots and enqueues
@@ -4453,6 +4532,11 @@ where
             editor
         }
     };
+    // Locked to the startup file: its buffer is the editor's first, here and in a daemon
+    // session alike (where the fetch below fills that same buffer).
+    if init.single_file {
+        editor.lock_to_buffer(editor.current_buffer_id());
+    }
     // The off-tick fetch of the deferred startup file: read its bytes over the wire
     // and deliver them (or a read error) into the loop, where they load into a
     // replica buffer. The same channel carries later `:edit` opens (each tagged with
@@ -4550,6 +4634,47 @@ where
     // report. These are runtime values (not env) because a daemon session derives them from
     // the daemon's cwd after it connects — the binary can't stamp them up front.
     lua.set_workspace_identity(init.shada_namespace.clone(), init.workspace_dir.clone());
+    // And the app embedding the editor, if any, for `btv.host`.
+    lua.set_host(init.host.clone());
+    // The commands an embedding app took away: the editor refuses them; Lua learns every
+    // spelling of them, so a config can tell and completion leaves them out.
+    // Turning off the plugin manager or LSP takes their commands with them.
+    let mut disabled_commands = init.disabled_commands.clone();
+    if init.disable_plugin_manager {
+        disabled_commands.extend(PLUGIN_MANAGER_COMMANDS.iter().map(|c| c.to_string()));
+    }
+    if init.disable_lsp {
+        disabled_commands.extend(LSP_COMMANDS.iter().map(|c| c.to_string()));
+    }
+    editor.set_disabled_commands(&disabled_commands);
+    lua.set_disabled_commands(editor.disabled_command_spellings());
+    // The plugin manager, LSP and pickers an embedding app took away, before any config
+    // runs (each is the prelude's own switch).
+    if init.disable_plugin_manager {
+        lua.exec("btv._disable_plugin_manager()")
+            .map_err(|e| anyhow::anyhow!("turning the plugin manager off: {e}"))?;
+    }
+    if init.disable_lsp {
+        lua.exec("btv._disable_lsp()")
+            .map_err(|e| anyhow::anyhow!("turning LSP off: {e}"))?;
+    }
+    if !init.disabled_pickers.is_empty() {
+        for name in &init.disabled_pickers {
+            anyhow::ensure!(
+                !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "disabled picker {name:?}: a picker's source name is [A-Za-z0-9_]"
+            );
+        }
+        let names: Vec<String> = init
+            .disabled_pickers
+            .iter()
+            .map(|n| format!("'{n}'"))
+            .collect();
+        lua.exec(&format!("btv._disable_pickers({{ {} }})", names.join(", ")))
+            .map_err(|e| anyhow::anyhow!("taking pickers away: {e}"))?;
+    }
+    lua.set_startup_user_commands_only(init.startup_user_commands_only);
+    lua.set_locked_file(locked_file);
     // Where the event-loop actor runs off-tick `btv.fs` ops (the ONLY fs surface — there
     // are no synchronous editor-thread fs callers anymore). A bare/local session runs
     // them against a local `StdLuaFs` on the actor's blocking pool; the edit-host split

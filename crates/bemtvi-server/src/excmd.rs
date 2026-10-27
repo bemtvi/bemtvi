@@ -97,22 +97,30 @@ impl EditHost {
         // user command (it shadows a global of the same name, and is unknown from
         // any other buffer).
         let cur_buf = self.editor.current_buffer_id().0;
-        match name {
-            "colorscheme" | "colo" => self.set_colorscheme(args.trim()),
+        // The core refused a disabled command by the name it reads (letters only); a user
+        // command's name runs on (`:Run2`, `:Run_it`), so ask again by the whole of it.
+        if self.editor.refuse_disabled(base) {
+            return;
+        }
+        // By canonical name (`bemtvi_core::ex_names`), the one spelling list the core's
+        // dispatch matches on too: a spelling only works once it's listed there, so
+        // nothing keyed on a command (a disabled one) misses a spelling of it.
+        match bemtvi_core::ex_names::canonical_or_self(base) {
+            "colorscheme" => self.set_colorscheme(args.trim()),
             // `:make[!] [args]` / `:grep[!] [args]` — run `'makeprg'` / `'grepprg'`
             // (with `$*` replaced by the args, else appended), capture the combined
             // output, parse it against `'errorformat'` / `'grepformat'`, open the
             // quickfix window if there are errors, and jump to the first one (a `!`
             // suppresses the jump). Async, via the job machinery (`btv._qf_make`).
-            _ if matches!(base, "mak" | "make") => self.ex_make(args, bang, false, false),
-            _ if matches!(base, "gr" | "gre" | "grep") => self.ex_make(args, bang, true, false),
+            "make" => self.ex_make(args, bang, false, false),
+            "grep" => self.ex_make(args, bang, true, false),
             // The location-list twins (`:lmake[!]` / `:lgrep[!]`): identical, but the
             // parsed output populates the focused window's location list.
-            _ if matches!(base, "lmak" | "lmake") => self.ex_make(args, bang, false, true),
-            _ if matches!(base, "lgr" | "lgre" | "lgrep") => self.ex_make(args, bang, true, true),
+            "lmake" => self.ex_make(args, bang, false, true),
+            "lgrep" => self.ex_make(args, bang, true, true),
             // `:so[urce] {file}` — run a script file (`.lua` executes through the
             // runtime; vimscript is fail-loud, not a silent skip).
-            "so" | "sou" | "sour" | "sourc" | "source" => self.ex_source(args.trim()),
+            "source" => self.ex_source(args.trim()),
             // `:cd[!]` / `:chdir[!] [dir]` — change the **global** working directory.
             // `:tcd` / `:lcd` are the tab- and window-local variants (vim's scope
             // override order: window > tab > global). No argument goes to `$HOME`
@@ -120,17 +128,11 @@ impl EditHost {
             // `~`/`~/…` expands to home; a relative path resolves against the current
             // cwd. The process cwd tracks the current window's effective dir (what
             // `vim.fn.getcwd` reads), so these mutate it directly.
-            _ if matches!(base, "cd" | "chd" | "chdi" | "chdir") => {
-                self.ex_chdir(CdScope::Global, args.trim())
-            }
-            _ if matches!(base, "tc" | "tcd" | "tch" | "tchd" | "tchdi" | "tchdir") => {
-                self.ex_chdir(CdScope::Tabpage, args.trim())
-            }
-            _ if matches!(base, "lc" | "lcd" | "lch" | "lchd" | "lchdi" | "lchdir") => {
-                self.ex_chdir(CdScope::Window, args.trim())
-            }
+            "cd" => self.ex_chdir(CdScope::Global, args.trim()),
+            "tcd" => self.ex_chdir(CdScope::Tabpage, args.trim()),
+            "lcd" => self.ex_chdir(CdScope::Window, args.trim()),
             // `:pw[d]` — print the working directory on the message line.
-            _ if matches!(base, "pw" | "pwd") => self.ex_pwd(),
+            "pwd" => self.ex_pwd(),
             // `:reconnect` / `:disconnect` — drive a remote session's daemon link. The link
             // re-dials underneath the seams the editor already holds, so neither command
             // touches local buffers/undo. No-ops with a loud message in a local session.
@@ -227,18 +229,18 @@ impl EditHost {
             // an optional `!`) drive the Lua autocmd registry. The core defers
             // them here; the prelude parses the argument line so the `:`-command
             // and the `nvim_*` API share one store.
-            _ if is_autocmd(base) => match self.lua.ex_autocmd(bang, args) {
+            "autocmd" => match self.lua.ex_autocmd(bang, args) {
                 Ok(out) => self.surface_autocmd_output("Autocommands", &out),
                 Err(e) => self.editor.echo(format!("E5108: Error in :autocmd: {e}")),
             },
-            _ if is_augroup(base) => match self.lua.ex_augroup(bang, args) {
+            "augroup" => match self.lua.ex_augroup(bang, args) {
                 Ok(out) => self.surface_autocmd_output("Autocommands", &out),
                 Err(e) => self.editor.echo(format!("E5108: Error in :augroup: {e}")),
             },
             // `:sil[ent][!] {cmd}` — the silent command modifier. The core defers the
             // whole `silent …` string here, so this is the one place it resolves.
-            _ if is_silent(base) => self.run_silent(args.trim(), bang),
-            _ if is_doautocmd(base) => {
+            "silent" => self.run_silent(args.trim(), bang),
+            "doautocmd" => {
                 match self.lua.ex_doautocmd(args) {
                     Ok(out) => self.surface_autocmd_output("Autocommands", &out),
                     Err(e) => self.editor.echo(format!("E5108: Error in :doautocmd: {e}")),
@@ -252,7 +254,7 @@ impl EditHost {
             // the same `btv._user_commands` store the `nvim_*` API uses), so the
             // many vimscript plugins that define their commands this way load. A
             // bare `:command` lists the defined commands (multi-line → panel).
-            _ if is_command_def(base) => match self.lua.ex_command(bang, args, cur_buf) {
+            "command" => match self.lua.ex_command(bang, args, cur_buf) {
                 Ok(out) if out.is_empty() => {}
                 Ok(out) if out.contains('\n') => {
                     let lines = out.lines().map(str::to_string).collect();
@@ -280,23 +282,17 @@ impl EditHost {
             // plugin (it registers `:help` / `:h`, handled by the user-command arm
             // below when installed). With the plugin absent, point the user at it
             // rather than emit the bare unknown-command error.
-            _ if matches!(base, "help" | "h") && !self.lua.has_user_command(name, cur_buf) => {
-                self.editor.echo(
-                    "help: the bemtvi-help plugin is not installed — add it with \
+            "help" if !self.lua.has_user_command(name, cur_buf) => self.editor.echo(
+                "help: the bemtvi-help plugin is not installed — add it with \
                      :Plugins (bemtvi/bemtvi-help), then use :help {topic}",
-                )
-            }
+            ),
             // `:helpt[ags]` — tag generation lives in bemtvi-help as `:BtvHelptags`
             // (bemtvi has no built-in `:helptags`). A plugin that registered
             // `:helptags` itself would shadow this via the arm below.
-            _ if matches!(base, "helpt" | "helpta" | "helptag" | "helptags")
-                && !self.lua.has_user_command(name, cur_buf) =>
-            {
-                self.editor.echo(
-                    "helptags: install the bemtvi-help plugin (:Plugins) and use \
+            "helptags" if !self.lua.has_user_command(name, cur_buf) => self.editor.echo(
+                "helptags: install the bemtvi-help plugin (:Plugins) and use \
                      :BtvHelptags to generate help tags",
-                )
-            }
+            ),
             // Look the command up by its bare name (`base`): a trailing `!` is the
             // invocation's bang, never part of the registered name, so matching on
             // `name` would send `:PluginSync!` to E492 even though the command
@@ -950,37 +946,6 @@ fn lsp_server_arg(args: &str) -> Result<Option<&str>, String> {
         Some(extra) => Err(format!("E488: Trailing characters: {extra}")),
         None => Ok(server),
     }
-}
-
-/// `:sil[ent]` and its abbreviations (`sil`, `sile`, `silen`, `silent`). The
-/// minimal form is `sil` — shorter prefixes are ambiguous with other commands.
-fn is_silent(base: &str) -> bool {
-    matches!(base, "sil" | "sile" | "silen" | "silent")
-}
-
-/// `:au[tocmd]` and its abbreviations (`au`, `aut`, … `autocmd`). The minimal
-/// form is `au` — `aug…` is `:augroup`, a different command.
-fn is_autocmd(base: &str) -> bool {
-    matches!(base, "au" | "aut" | "auto" | "autoc" | "autocm" | "autocmd")
-}
-
-/// `:aug[roup]` and its abbreviations (`aug`, `augr`, … `augroup`).
-fn is_augroup(base: &str) -> bool {
-    matches!(base, "aug" | "augr" | "augro" | "augrou" | "augroup")
-}
-
-/// `:doau[tocmd]` and its abbreviations (`doau`, `doaut`, … `doautocmd`).
-fn is_doautocmd(base: &str) -> bool {
-    matches!(
-        base,
-        "doau" | "doaut" | "doauto" | "doautoc" | "doautocm" | "doautocmd"
-    )
-}
-
-/// `:com[mand]` and its abbreviations (`com`, `comm`, … `command`) — the
-/// user-command *definition* command. The minimal form is `com`.
-fn is_command_def(base: &str) -> bool {
-    matches!(base, "com" | "comm" | "comma" | "comman" | "command")
 }
 
 /// The user's home directory (the bare `:cd` target / `~` base), or `None` when the

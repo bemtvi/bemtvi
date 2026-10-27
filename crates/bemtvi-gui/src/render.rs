@@ -364,6 +364,96 @@ pub struct Renderer {
     frame_image_draws: Vec<ImageDraw>,
 }
 
+/// The process's one wgpu instance, adapter and device, shared by every editor's
+/// renderer, and never dropped.
+///
+/// Never dropped because wgpu's GLES/EGL backend segfaults inside `eglTerminate` when
+/// its `Instance` drops on Wayland + Mesa — an upstream wgpu/Mesa teardown bug: the EGL
+/// display teardown marshals a request onto an already-invalid Wayland proxy
+/// (`terminate_display` → `eglTerminate` → `wl_proxy_marshal_flags` → SIGSEGV). wgpu
+/// instantiates the GL/EGL backend even when Vulkan is the chosen adapter, so restricting
+/// the adapter wouldn't dodge it. Held in statics, the instance outlives every renderer
+/// (each drops its surface, pipelines and atlas as its editor is unmounted), and the OS
+/// reclaims it at exit. Shared, too, so a second editor costs no second device.
+struct Gpu {
+    instance: wgpu::Instance,
+}
+
+static GPU: std::sync::OnceLock<Gpu> = std::sync::OnceLock::new();
+static ADAPTER: std::sync::OnceLock<wgpu::Adapter> = std::sync::OnceLock::new();
+static DEVICE: std::sync::OnceLock<(wgpu::Device, wgpu::Queue)> = std::sync::OnceLock::new();
+
+impl Gpu {
+    fn get() -> anyhow::Result<&'static Gpu> {
+        Ok(GPU.get_or_init(|| {
+            // wgpu 29's `InstanceDescriptor` gained a `display` handle field and lost its
+            // `Default` impl; `new_without_display_handle_from_env()` is the equivalent of
+            // the old `::default()` — no display handle, backend picked from the env.
+            #[allow(unused_mut)]
+            let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+            // On Windows the surface is a child window of the WinUI window. Vulkan on
+            // NVIDIA sometimes drops a child window's surface to 2 frames a second on fast
+            // resizes, which Direct3D 12 never did (mitsuami's ARCHITECTURE.md §13.26), so
+            // it's Direct3D 12 unless `WGPU_BACKEND` asks for another.
+            #[cfg(windows)]
+            if std::env::var_os("WGPU_BACKEND").is_none() {
+                descriptor.backends = wgpu::Backends::DX12;
+            }
+            // Present through a DirectComposition visual rather than straight to the child
+            // window: only that swapchain has an alpha channel the compositor honours, so
+            // it's what lets `'guiopacity'` show the window's Mica through the `Normal`
+            // background. Always, not only when the option is set — the option arrives in
+            // a redraw after the surface exists, and the swapchain kind can't change then.
+            // (RenderDoc can't capture these swapchains; `WGPU_BACKEND=vulkan` to debug.)
+            #[cfg(windows)]
+            {
+                descriptor.backend_options.dx12.presentation_system =
+                    wgpu::Dx12SwapchainKind::DxgiFromVisual;
+            }
+            Gpu {
+                instance: wgpu::Instance::new(descriptor),
+            }
+        }))
+    }
+
+    /// The adapter, chosen the first time for the first surface (every editor's
+    /// surface is the same kind of native surface on the same display).
+    fn adapter(&self, surface: &wgpu::Surface<'_>) -> anyhow::Result<&'static wgpu::Adapter> {
+        if let Some(adapter) = ADAPTER.get() {
+            return Ok(adapter);
+        }
+        let adapter =
+            pollster::block_on(self.instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::default(),
+                compatible_surface: Some(surface),
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            }))?;
+        Ok(ADAPTER.get_or_init(|| adapter))
+    }
+
+    fn device(
+        &self,
+        adapter: &wgpu::Adapter,
+    ) -> anyhow::Result<&'static (wgpu::Device, wgpu::Queue)> {
+        if let Some(device) = DEVICE.get() {
+            return Ok(device);
+        }
+        // Request the adapter's real limits, not `downlevel_defaults()` — the
+        // latter caps `max_texture_dimension_2d` at 2048, far below a maximized
+        // window on a hi-DPI display, which would abort in `Surface::configure`.
+        let device = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("bemtvi-gui device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: adapter.limits(),
+            memory_hints: wgpu::MemoryHints::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            trace: wgpu::Trace::Off,
+        }))?;
+        Ok(DEVICE.get_or_init(|| device))
+    }
+}
+
 impl Renderer {
     /// Build the renderer for the editor's `surface` (mitsuami's `GpuSurface`) at
     /// `size`, rendering with `config`'s font family and size. Blocks on wgpu's async
@@ -378,51 +468,18 @@ impl Renderer {
     ) -> anyhow::Result<Self> {
         let scale = if size.scale > 0.0 { size.scale } else { 1.0 };
 
-        // wgpu 29's `InstanceDescriptor` gained a `display` handle field and lost its
-        // `Default` impl; `new_without_display_handle_from_env()` is the equivalent of
-        // the old `::default()` — no display handle, backend picked from the env.
-        #[allow(unused_mut)]
-        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
-        // On Windows the surface is a child window of the WinUI window. Vulkan on NVIDIA
-        // sometimes drops a child window's surface to 2 frames a second on fast resizes,
-        // which Direct3D 12 never did (mitsuami's ARCHITECTURE.md §13.26), so it's
-        // Direct3D 12 unless `WGPU_BACKEND` asks for another.
-        #[cfg(windows)]
-        if std::env::var_os("WGPU_BACKEND").is_none() {
-            descriptor.backends = wgpu::Backends::DX12;
-        }
-        // Present through a DirectComposition visual rather than straight to the child
-        // window: only that swapchain has an alpha channel the compositor honours, so
-        // it's what lets `'guiopacity'` show the window's Mica through the `Normal`
-        // background. Always, not only when the option is set — the option arrives in
-        // a redraw after the surface exists, and the swapchain kind can't change then.
-        // (RenderDoc can't capture these swapchains; `WGPU_BACKEND=vulkan` to debug.)
-        #[cfg(windows)]
-        {
-            descriptor.backend_options.dx12.presentation_system =
-                wgpu::Dx12SwapchainKind::DxgiFromVisual;
-        }
-        let instance = wgpu::Instance::new(descriptor);
+        let gpu = Gpu::get()?;
         // The handle keeps the native surface alive for as long as the wgpu surface.
-        let surface = instance.create_surface(surface)?;
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        }))?;
-        // Request the adapter's real limits, not `downlevel_defaults()` — the
-        // latter caps `max_texture_dimension_2d` at 2048, far below a maximized
-        // window on a hi-DPI display, which would abort in `Surface::configure`.
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("bemtvi-gui device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: adapter.limits(),
-                memory_hints: wgpu::MemoryHints::default(),
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                trace: wgpu::Trace::Off,
-            }))?;
+        let surface = gpu.instance.create_surface(surface)?;
+        let adapter = gpu.adapter(&surface)?.clone();
+        if !adapter.is_surface_supported(&surface) {
+            anyhow::bail!(
+                "the GPU this process renders with ({}) can't present to this surface",
+                adapter.get_info().name
+            );
+        }
+        let (device, queue) = gpu.device(&adapter)?;
+        let (device, queue) = (device.clone(), queue.clone());
         let max_dim = device.limits().max_texture_dimension_2d;
 
         let caps = surface.get_capabilities(&adapter);

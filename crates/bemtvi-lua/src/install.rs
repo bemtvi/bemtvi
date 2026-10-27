@@ -501,6 +501,52 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     })?;
     btv.set("_connect_fallback", connect_fallback)?;
 
+    // `btv._host_name()` / `btv._host_send(name, payload)`: the raw halves of `btv.host`
+    // (the prelude's `host.lua` checks the arguments and that a host is there). The
+    // message rides out as a `bemtvi_host` notification (drained in `effects.rs`) to the
+    // client, which hands it to the app embedding the editor; the payload is carried
+    // verbatim, so the Rust side stays agnostic to what the app and its config agree on.
+    let sh = shared.clone();
+    btv.set(
+        "_host_name",
+        lua.create_function(move |_, ()| Ok(sh.borrow().host.clone()))?,
+    )?;
+    let sh = shared.clone();
+    let host_send = lua.create_function(move |_, (name, payload): (String, mlua::Value)| {
+        let payload = crate::convert::lua_to_rmpv(&payload)?;
+        sh.borrow_mut()
+            .host_messages
+            .push(rmpv::Value::Array(vec![rmpv::Value::from(name), payload]));
+        Ok(())
+    })?;
+    btv.set("_host_send", host_send)?;
+
+    // `btv._user_commands_startup_only()`: whether user commands may only come from the
+    // config and the plugins loaded at startup (the prelude's `autocmd.lua` checks it).
+    let sh = shared.clone();
+    btv.set(
+        "_user_commands_startup_only",
+        lua.create_function(move |_, ()| Ok(sh.borrow().startup_user_commands_only))?,
+    )?;
+
+    // `btv._locked_file()`: the file the editor is locked to (`ServerInit::single_file`),
+    // or nil. The command line's completion offers it in place of browsing for others.
+    let sh = shared.clone();
+    btv.set(
+        "_locked_file",
+        lua.create_function(move |_, ()| Ok(sh.borrow().locked_file.clone()))?,
+    )?;
+
+    // `btv._command_disabled(name)`: whether the editor refuses the command `name` spells
+    // (the server seeded every spelling of each). Wrapped by `btv.command_disabled`.
+    let sh = shared.clone();
+    btv.set(
+        "_command_disabled",
+        lua.create_function(move |_, name: String| {
+            Ok(sh.borrow().disabled_commands.contains(&name))
+        })?,
+    )?;
+
     vim.set("version", "bemtvi 0.1.0")?;
 
     // An empty `vim.api` namespace; the prelude fills it with `nvim_*` aliases onto

@@ -101,6 +101,9 @@ function btv.connect.connect(url)
       vim.log.levels.ERROR
     )
   end
+  if btv.session._switching == false then
+    return btv.notify(btv.session._switch_refused(":connect"), vim.log.levels.ERROR)
+  end
   local provider = btv.connect._resolve(url)
   if not provider then
     -- No connector owns this URL — let the client dial it directly (QUIC URI / ssh host).

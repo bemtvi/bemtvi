@@ -147,6 +147,14 @@ fn spawn_server(plugin_dir: PathBuf) -> (Rpc, UnboundedReceiver<Incoming>) {
             client_init_lua: None,
             // No daemon link in the plugin-test runner.
             daemon_link: None,
+            // No app embeds the plugin-test runner.
+            host: None,
+            disabled_commands: Vec::new(),
+            startup_user_commands_only: false,
+            single_file: false,
+            disable_plugin_manager: false,
+            disable_lsp: false,
+            disabled_pickers: Vec::new(),
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()

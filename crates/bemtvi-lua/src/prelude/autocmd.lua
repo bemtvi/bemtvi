@@ -123,6 +123,90 @@ local function check_command_name(name)
   end
 end
 
+-- ----- Where a user command comes from ------------------------------------------
+-- An app embedding the editor can take user commands only from the config and the
+-- plugins loaded at startup (`ServerInit::startup_user_commands_only`). Which code that
+-- is, is a fact the VM keeps: every config, plugin and `require`d file runs under an
+-- `@<path>` chunk name, so the code defining a command is in a file, and the file is
+-- under a runtimepath entry or not. As startup ends (`PluginsLoaded`) the runtimepath of
+-- that moment is sealed as the startup roots; from then on a command may be defined by
+-- code from a file under one of them (whenever it runs: a startup plugin's autocmd
+-- registering one later counts), by the prelude itself, or by the client
+-- (`nvim_exec_lua`: the app embedding the editor). Anything else is refused: a plugin
+-- loaded later, typed `:lua`, a `:source`d file elsewhere. It is a policy, not a
+-- sandbox: Lua can name a chunk what it likes, and plugins are trusted code anyway.
+
+-- The startup roots, folded and without trailing separators; `nil` while the policy is
+-- off or startup hasn't ended.
+local startup_roots = nil
+
+-- Seal the startup roots, if the policy is on. Called once, as `PluginsLoaded` fires
+-- (`prelude/plugins.lua`).
+function btv._seal_user_command_roots()
+  if not btv._user_commands_startup_only() then
+    return
+  end
+  local roots = {}
+  for _, raw in ipairs(btv._runtime_paths()) do
+    roots[#roots + 1] = btv.utils._fold_seps((raw:gsub("[/\\]+$", "")))
+  end
+  startup_roots = roots
+end
+
+-- The chunk name of the code defining a command: the first frame up the stack that is
+-- neither C nor the prelude's own (`btv.command`, an autocmd's dispatch). `nil` when it
+-- is the prelude all the way: the editor defining its own.
+local function defining_source()
+  for level = 2, 60 do
+    local info = debug.getinfo(level, "S")
+    if not info then
+      return nil
+    end
+    if info.what ~= "C" and info.source:sub(1, 7) ~= "bemtvi:" then
+      return info.source
+    end
+  end
+  return nil
+end
+
+-- Whether code from `src` may define a command after startup.
+local function from_startup(src)
+  if src == nil or src == "=nvim_exec_lua" or src == "@init.lua" then
+    return true
+  end
+  if src:sub(1, 1) ~= "@" then
+    return false
+  end
+  local path = btv.utils._fold_seps(src:sub(2))
+  for _, root in ipairs(startup_roots) do
+    if path == root or path:sub(1, #root + 1) == root .. "/" then
+      return true
+    end
+  end
+  return false
+end
+
+-- Refuse to define `:name` if the policy is on, startup has ended, and the defining code
+-- isn't the config's or a startup plugin's.
+local function check_definable(name)
+  if startup_roots == nil then
+    return
+  end
+  local src = defining_source()
+  if from_startup(src) then
+    return
+  end
+  local where = src:sub(1, 1) == "@" and src:sub(2) or src:gsub("^=", ""):sub(1, 60)
+  error(
+    "E5802: can't define :"
+      .. name
+      .. ": this editor takes user commands only from its config and the plugins loaded"
+      .. " at startup, and this comes from "
+      .. where,
+    0
+  )
+end
+
 -- `btv.user_command.create(name, command, opts)` [alias `nvim_create_user_command`]:
 -- register a global `:Name`. `command` is a function or an ex-command string. A
 -- function is called with `{ name, args, fargs, bang, line1, line2, range }`: the
@@ -147,6 +231,7 @@ end
 --     candidates.
 function btv.user_command.create(name, command, opts)
   check_command_name(name)
+  check_definable(name)
   btv._user_commands[name] = command
   btv._user_command_desc[name] = type(opts) == "table" and opts.desc or nil
   btv._user_command_complete[name] = type(opts) == "table" and opts.complete or nil
@@ -161,6 +246,7 @@ end
 -- consults both at dispatch.
 function btv.user_command.buf_create(buffer, name, command, opts)
   check_command_name(name)
+  check_definable(name)
   if buffer == nil or buffer == 0 then
     buffer = btv._cur_buf and btv._cur_buf.bufnr or 0
   end
@@ -1676,6 +1762,15 @@ function btv._ex_command(bang, args, bufnr)
   end
   if not name or not name:match("^%u") then
     return "E182: Invalid command name"
+  end
+
+  -- Under startup-only user commands, `:command` defines none once startup has ended:
+  -- it runs deferred, from the editor, so the code that asked for it is gone.
+  if startup_roots ~= nil then
+    return "E5802: can't define :"
+      .. name
+      .. ": this editor takes user commands only from its config and the plugins loaded"
+      .. " at startup, and :command after startup isn't one"
   end
 
   -- Resolve the target store (global, or this buffer's local table for -buffer),

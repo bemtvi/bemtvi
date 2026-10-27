@@ -821,6 +821,14 @@ fn main() -> Result<()> {
         // The reconnecting daemon link is not wired into the TUI yet (a later phase migrates
         // `--connect-daemon` / QUIC to the reconnecting dialer); a one-shot link has no handle.
         daemon_link: None,
+        // No app embeds the TUI (`btv.host.name()` is nil), or takes commands from it.
+        host: None,
+        disabled_commands: Vec::new(),
+        startup_user_commands_only: false,
+        single_file: false,
+        disable_plugin_manager: false,
+        disable_lsp: false,
+        disabled_pickers: Vec::new(),
     };
     let server_thread = std::thread::spawn(move || {
         // Test-only fault injection (debug builds only): force a server-thread
@@ -1257,6 +1265,14 @@ where
         // `btv.daemon.status()` and `:reconnect`/`:disconnect` drive it. `None` for a
         // one-shot QUIC connect.
         daemon_link,
+        // No app embeds the TUI (`btv.host.name()` is nil), or takes commands from it.
+        host: None,
+        disabled_commands: Vec::new(),
+        startup_user_commands_only: false,
+        single_file: false,
+        disable_plugin_manager: false,
+        disable_lsp: false,
+        disabled_pickers: Vec::new(),
     };
     Ok((init, guard))
 }

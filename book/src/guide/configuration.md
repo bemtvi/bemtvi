@@ -47,7 +47,7 @@ The editor's own config API is the **`btv.*` namespace** — see the
 ```lua
 vim.g.mapleader = " "
 vim.o.number = true
-btv.keymap.set("n", "<leader>w", "<cmd>w<cr>", { desc = "Save" })
+btv.keymap.set("n", "<leader>w", ":w<CR>", { desc = "Save" })
 ```
 
 The full whitelist lives in

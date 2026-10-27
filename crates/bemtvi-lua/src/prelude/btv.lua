@@ -52,6 +52,18 @@ function btv.off(id)
   return btv.autocmd.del(id)
 end
 
+-- `btv.command_disabled(name)` -> whether this editor refuses the command `name` spells
+-- (any spelling: `"e"` and `"edit"` alike; a leading `:` and a trailing `!` are
+-- ignored). An app embedding the editor can take commands away from it; running one
+-- then fails with `E5800`, on every route. Always `false` elsewhere.
+function btv.command_disabled(name)
+  if type(name) ~= "string" then
+    error("btv.command_disabled: name must be a string", 2)
+  end
+  name = name:gsub("^:", ""):gsub("!$", "")
+  return btv._command_disabled(name)
+end
+
 -- User commands — `btv.command(name, fn, opts)` defines `:Name`; `fn` is a
 -- function or an ex-command string.
 function btv.command(name, fn, opts)
@@ -613,6 +625,17 @@ end
 -- docs/plans/2026-07-05-remote-connectors-and-system-plugins.md → §B.
 btv.session = btv.session or {}
 
+-- Whether this editor may swap onto another session at all. Its client says so as the
+-- session starts: an app embedding the editor turns it off, so neither a plugin's
+-- reconnect nor `:connect` can move the editor off the session the app gave it. `nil`
+-- (a client that never said: the TUI, `bemtvi-gui`) allows it.
+btv.session._switching = btv.session._switching
+
+-- The error a swap is refused with where the client turned switching off.
+function btv.session._switch_refused(what)
+  return what .. ": this editor can't switch sessions (its host turned that off)"
+end
+
 -- `btv.session.reconnect(spec)` — swap the current client onto `spec`. `spec` is:
 --   {
 --     transport = { kind = "spawn", argv = { "ssh", "host", "bemtvi", "--daemon" } }
@@ -639,6 +662,9 @@ btv.session = btv.session or {}
 -- transport is a bug, not a silent no-op); a provisioning / spawn FAILURE surfaces later and
 -- leaves the current session intact (the client resolves fully, then swaps). Returns nothing.
 function btv.session.reconnect(spec)
+  if btv.session._switching == false then
+    error(btv.session._switch_refused("btv.session.reconnect"), 2)
+  end
   if type(spec) ~= "table" then
     error("btv.session.reconnect: spec must be a table", 2)
   end

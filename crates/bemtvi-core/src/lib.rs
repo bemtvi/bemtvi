@@ -14,6 +14,7 @@ pub mod buffer;
 pub mod clipboard;
 pub mod editor;
 pub mod encoding;
+pub mod ex_names;
 pub mod extmark;
 pub mod fuzzy;
 pub mod glob;

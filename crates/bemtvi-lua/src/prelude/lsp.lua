@@ -23,6 +23,22 @@ local vim = vim
 btv = btv or {}
 btv.lsp = btv.lsp or {}
 
+-- Whether LSP is off in this editor: an app embedding it turned it off
+-- (`ServerInit::disable_lsp`), so no server starts. Set once, before any config runs,
+-- by `btv._disable_lsp`.
+local lsp_disabled = false
+
+-- Refuse `what` (a server-starting call) where LSP is off, loudly, naming it.
+local function refuse_lsp(what)
+  if lsp_disabled then
+    error("E5804: " .. what .. ": LSP is disabled in this editor", 3)
+  end
+end
+
+function btv._disable_lsp()
+  lsp_disabled = true
+end
+
 -- ----- internal registry state -----------------------------------------------
 -- The user's override layers, keyed by config name (`"*"` is the all-clients
 -- base). Each `btv.lsp.config(name, opts)` call deep-merges `opts` into the layer;
@@ -690,6 +706,9 @@ end
 -- isn't a spawnable argv is reported loud (a server enabled but unspawnable is visible,
 -- never a silent no-op) and skipped — it never errors the whole enable.
 local start_resolved = btv.async(function(name, cfg, bufnr, ft, root)
+  -- (Every start comes through here: an enabled config on `FileType`, `start`,
+  -- `restart`.)
+  refuse_lsp("starting " .. tostring(name))
   local built = btv.await(resolve_cmd(cfg, root))
   if built.err then
     btv.notify("btv.lsp: not starting '" .. name .. "': " .. built.err, vim.log.levels.WARN)
@@ -930,10 +949,24 @@ local function ensure_dispatcher()
   })
 end
 
+-- `btv.lsp.disabled()` -> whether LSP is off in this editor: an app embedding it
+-- turned it off, so no language server starts here. `btv.lsp.enable`, `start` and
+-- `restart` then raise `E5804`, so a config meant for both checks first:
+--
+-- ```lua
+-- if not btv.lsp.disabled() then
+--   btv.lsp.enable({ "lua_ls" })
+-- end
+-- ```
+function btv.lsp.disabled()
+  return lsp_disabled
+end
+
 -- `btv.lsp.enable(names)`: mark configs for auto-activation on current and future
 -- buffers and install the dispatcher. `names` is a string or a list. `"*"` is the
 -- base layer, not an activatable server, so it is rejected here.
 function btv.lsp.enable(names)
+  refuse_lsp("btv.lsp.enable")
   if type(names) == "string" then
     names = { names }
   end
@@ -1034,6 +1067,7 @@ end
 -- restarting it makes the grown config take effect. Each buffer bound to the server
 -- re-attaches to the fresh process. A no-op when nothing named `name` is running.
 function btv.lsp.restart(name)
+  refuse_lsp("btv.lsp.restart")
   if type(name) ~= "string" or name == "" then
     error("btv.lsp.restart: name must be a non-empty string", 2)
   end
@@ -1057,6 +1091,7 @@ end
 -- resolved config (`{ name, cmd, root_dir, filetypes, settings, … }`); `opts.bufnr`
 -- is the buffer to attach (default the current one), `opts.filetype` its languageId.
 function btv.lsp.start(cfg, opts)
+  refuse_lsp("btv.lsp.start")
   opts = opts or {}
   local bufnr = opts.bufnr or cur_bufnr(0)
   local ft = opts.filetype or (btv._cur_buf and btv._cur_buf.filetype) or ""

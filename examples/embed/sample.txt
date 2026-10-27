@@ -1,0 +1,3 @@
+A note for the editor embedded in an app.
+
+Outside one (plain bemtvi), <Space>p says there's no app to preview in.

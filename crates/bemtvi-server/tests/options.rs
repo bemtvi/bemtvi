@@ -590,6 +590,31 @@ async fn list_and_listchars_round_trip_through_set_and_vim_wo() {
     );
 }
 
+/// `showwhitespace` is bemtvi's own, self-describing name for `'list'`: every
+/// surface that takes `list` takes it, and all of them move the one option.
+#[tokio::test]
+async fn showwhitespace_is_an_alias_for_list() {
+    let (rpc, mut incoming) = start().await;
+
+    let _ = set_message(&rpc, &mut incoming, "showwhitespace").await;
+    assert_eq!(set_message(&rpc, &mut incoming, "list?").await, "list");
+    let _ = set_message(&rpc, &mut incoming, "noshowwhitespace").await;
+    assert_eq!(set_message(&rpc, &mut incoming, "list?").await, "nolist");
+    let _ = set_message(&rpc, &mut incoming, "invshowwhitespace").await;
+    assert_eq!(
+        set_message(&rpc, &mut incoming, "showwhitespace?").await,
+        "list"
+    );
+
+    exec_lua(&rpc, "btv.wo.showwhitespace = false").await;
+    assert_eq!(set_message(&rpc, &mut incoming, "list?").await, "nolist");
+    exec_lua(&rpc, "vim.o.showwhitespace = true").await;
+    assert_eq!(
+        exec_lua(&rpc, "return { btv.wo.list, btv.wo.showwhitespace }").await,
+        rmpv::Value::Array(vec![rmpv::Value::from(true), rmpv::Value::from(true)])
+    );
+}
+
 #[tokio::test]
 async fn unknown_vim_o_option_warns_but_stores() {
     let (rpc, mut incoming) = start().await;

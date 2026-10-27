@@ -848,6 +848,24 @@ async fn set_arg_completes_option_names() {
     assert!(!items.contains(&"edit".to_string()), "items: {items:?}");
 }
 
+/// An option's bemtvi alias is offered as a completion of its own:
+/// `showwhitespace` (the clearer name for `'list'`) is found by what it says.
+#[tokio::test]
+async fn set_arg_completes_an_option_by_its_other_spelling() {
+    let dir = temp_dir("cmdcomplete");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    feed(&rpc, ":set showwhite<Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("an option menu after :set showwhite<Tab>");
+    let items = menu_items(&map);
+    assert!(
+        items.contains(&"showwhitespace".to_string()),
+        "items: {items:?}"
+    );
+}
+
 #[tokio::test]
 async fn set_arg_empty_lists_every_option() {
     let dir = temp_dir("cmdcomplete");

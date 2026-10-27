@@ -54,6 +54,8 @@ btv.test.describe("examples/listchars", function()
     btv.test.expect(btv.wo.list).to_be(false)
     t:cmd("set list!")
     btv.test.expect(btv.wo.list).to_be(true)
+    t:cmd("set showwhitespace!")
+    btv.test.expect(btv.wo.list).to_be(false)
   end)
 
   -- 3. "every space is a `·`, leading runs are `→` (line 4 starts `→→→→`), the

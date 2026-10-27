@@ -1601,6 +1601,8 @@ pub struct OptionCatalogRow {
     pub name: String,
     /// Standard abbreviation, e.g. `Some("nu")`, or `None`.
     pub abbrev: Option<String>,
+    /// bemtvi's own clearer spelling, e.g. `Some("showwhitespace")` for `list`.
+    pub alias: Option<String>,
     /// `"bool"` / `"number"` / `"string"`.
     pub kind: String,
     /// `"global"` / `"window"` / `"buffer"`.
@@ -2781,7 +2783,7 @@ impl LuaRuntime {
     /// truth (`bemtvi_core::options::options_catalog()`); bemtvi-lua stays decoupled
     /// from core, so the rows arrive as plain [`OptionCatalogRow`] data rather than
     /// core types. Each `rows` entry becomes a
-    /// `{ name, abbrev, kind, scope, global_tier, doc }` Lua table.
+    /// `{ name, abbrev, alias, kind, scope, global_tier, doc }` Lua table.
     pub fn set_options_catalog(&self, rows: &[OptionCatalogRow]) -> mlua::Result<()> {
         let btv = self.btv()?;
         let list = self.lua.create_table()?;
@@ -2789,6 +2791,7 @@ impl LuaRuntime {
             let row = self.lua.create_table()?;
             row.set("name", r.name.as_str())?;
             row.set("abbrev", r.abbrev.as_deref())?;
+            row.set("alias", r.alias.as_deref())?;
             row.set("kind", r.kind.as_str())?;
             row.set("scope", r.scope.as_str())?;
             row.set("global_tier", r.global_tier)?;

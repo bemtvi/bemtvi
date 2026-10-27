@@ -358,12 +358,24 @@ local function option_candidates()
     if opt.abbrev then
       header = header .. " (" .. opt.abbrev .. ")"
     end
+    if opt.alias then
+      header = header .. "\nalso: " .. opt.alias
+    end
     local meta = (SCOPE_LABEL[opt.scope] or opt.scope) .. ", " .. (KIND_LABEL[opt.kind] or opt.kind)
     out[#out + 1] = {
       label = opt.name,
       insert = opt.name,
       doc = header .. "\n" .. meta .. "\n\n" .. opt.doc,
     }
+    -- An alias is a name worth discovering, so it is a row of its own (a vim
+    -- abbreviation is not: it would only double the menu).
+    if opt.alias then
+      out[#out + 1] = {
+        label = opt.alias,
+        insert = opt.alias,
+        doc = opt.alias .. " (alias of " .. opt.name .. ")\n" .. meta .. "\n\n" .. opt.doc,
+      }
+    end
   end
   return out
 end

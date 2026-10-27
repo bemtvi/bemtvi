@@ -2056,6 +2056,7 @@ impl EditHost {
                 .map(|o| bemtvi_lua::OptionCatalogRow {
                     name: o.name.to_string(),
                     abbrev: o.abbrev.map(str::to_string),
+                    alias: o.alias().map(str::to_string),
                     kind: o.kind.as_str().to_string(),
                     scope: o.scope.as_str().to_string(),
                     global_tier: bemtvi_core::options::has_global_tier(o.name),

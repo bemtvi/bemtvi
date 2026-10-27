@@ -62,6 +62,9 @@ colorscheme doesn't define them, and the web renderer resolves them through
   Precedence, as in neovim: `nbsp`; then `trail` for the trailing run; then
   `lead`/`leadmultispace` for the leading run; then `multispace` for runs of 2+
   spaces; then `space`.
+- `showwhitespace` is accepted everywhere `list` is: bemtvi's own name, since vim's
+  only makes sense if you know ed's `l` command. It is an `ALIASES` entry in
+  `options.rs`, separate from vim's abbreviations, and completes as its own row.
 - `extends` / `precedes` / `conceal` are accepted (so a vim config sets cleanly) but
   have no effect until Phase 2. Documented on the option, like `fillchars`'s
   unhonored keys.

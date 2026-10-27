@@ -551,7 +551,7 @@ pub fn valid_persisthistory(value: &str) -> bool {
 pub fn option_meta(name: &str) -> Option<(&'static str, OptKind, OptScope)> {
     OPTIONS
         .iter()
-        .find(|o| o.name == name || o.abbrev == Some(name))
+        .find(|o| o.spelled(name))
         .map(|o| (o.name, o.kind, o.scope))
 }
 
@@ -954,7 +954,7 @@ pub struct WindowOptions {
     /// vim config's `fillchars` sets cleanly, but have no rendering effect yet.
     /// Empty by default, which means `eob:~` (see [`WindowOptions::fillchars_eob`]).
     pub fillchars: String,
-    /// `'list'`: draw normally-invisible whitespace (tabs, trailing blanks, non-breaking
+    /// `'list'` (also spelled `showwhitespace`): draw normally-invisible whitespace (tabs, trailing blanks, non-breaking
     /// spaces, the end of the line) as the visible glyphs [`listchars`] names. Off by
     /// default (vim's default). Display-only: the buffer is untouched, and every
     /// substitution keeps the width of what it replaces, so cursor columns don't move.
@@ -2550,6 +2550,31 @@ static OPTIONS: &[OptionInfo] = {
     ]
 };
 
+/// bemtvi's own spellings for options whose vim name says little about what they do,
+/// as `(alias, canonical)`. An alias is accepted everywhere the canonical name is
+/// (`:set`, its `no`/`inv` forms, `btv.wo`/`vim.o`), and unlike a vim abbreviation it
+/// is offered as a completion of its own, since it is a name worth discovering.
+const ALIASES: &[(&str, &str)] = &[
+    // vim's `list` comes from ed's `l` (list) command, which printed a line with its
+    // tabs and end shown.
+    ("showwhitespace", "list"),
+];
+
+impl OptionInfo {
+    /// bemtvi's own alias for this option (see [`ALIASES`]), if it has one.
+    pub fn alias(&self) -> Option<&'static str> {
+        ALIASES
+            .iter()
+            .find(|(_, canon)| *canon == self.name)
+            .map(|(alias, _)| *alias)
+    }
+
+    /// Whether `name` spells this option: its name, abbreviation or alias.
+    fn spelled(&self, name: &str) -> bool {
+        self.name == name || self.abbrev == Some(name) || self.alias() == Some(name)
+    }
+}
+
 /// The documented option catalog — the single source of truth for what `:set`
 /// accepts. `:set` command-line completion reads this to offer option names with
 /// their docs; [`canonical`] resolves against it.
@@ -2697,13 +2722,13 @@ pub fn resolve_set(tok: &str) -> Option<SetCmd> {
     None
 }
 
-/// Map an option name or its standard abbreviation to its canonical spelling and
+/// Map an option name, its standard abbreviation or its alias to its canonical spelling and
 /// kind by scanning the documented [`OPTIONS`] catalog (the single source of truth,
 /// so the names `:set` accepts can never drift from the names it completes). The
 /// table has ~55 entries, so the linear scan is a microsecond per `:set` token.
 fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
     OPTIONS
         .iter()
-        .find(|o| o.name == name || o.abbrev == Some(name))
+        .find(|o| o.spelled(name))
         .map(|o| (o.name, o.kind))
 }

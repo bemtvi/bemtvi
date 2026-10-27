@@ -6,7 +6,9 @@
 --       cargo run -p bemtvi -- examples/listchars/sample.txt
 --
 -- `'list'` (window-local, off by default) draws normally-invisible characters as
--- visible glyphs; `'listchars'` picks the glyphs, as `key:chars` pairs:
+-- visible glyphs; `'listchars'` picks the glyphs, as `key:chars` pairs. bemtvi also
+-- spells `list` as `showwhitespace`, since vim's name only makes sense if you know
+-- ed's `l` (list) command.
 --
 -- ```
 --   tab:xy[z]          a tab: x, then y to fill its width (z on the last cell)
@@ -38,7 +40,8 @@ btv.wo.listchars = "tab:» ,trail:·,nbsp:␣"
 --
 -- Type-this:  \l   (the default leader, then `l`)
 -- See-that:   the glyphs vanish, and the message line says `list off`. `\l` again
---             brings them back. `:set list!` does the same from the command line.
+--             brings them back. `:set list!` does the same from the command line,
+--             and so does `:set showwhitespace!`.
 --------------------------------------------------------------------------------
 btv.keymap.set("n", "<leader>l", function()
   btv.wo.list = not btv.wo.list

@@ -2496,6 +2496,9 @@ function btv._set_options_catalog(rows)
     if r.abbrev then
       spellings[#spellings + 1] = r.abbrev
     end
+    if r.alias then
+      spellings[#spellings + 1] = r.alias
+    end
     for _, spelling in ipairs(spellings) do
       if not O_GLOBAL[spelling] then
         if r.scope == "window" then

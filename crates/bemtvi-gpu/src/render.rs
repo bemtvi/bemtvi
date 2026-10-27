@@ -5002,10 +5002,9 @@ pub fn group_fallback(group: &str) -> Style {
         // bundled colorscheme paints it). The TUI's `group_style` has the same arm —
         // without it here the same buffer read as plain text in the GUI only.
         "SpecialKey" => return styled(0xeb_aa_b9, false, true),
-        // The `'list'` glyphs (`Whitespace`) and the `eol` marker (`NonText`): dim, so
-        // the drawn blanks recede behind the text.
-        "Whitespace" => 0x3f_41_4b, // surface1
-        "NonText" => 0x63_67_73,    // overlay0
+        // The `'list'` glyphs (`Whitespace`, which the scheme links to `NonText`) and
+        // the `eol` marker: muted, so the drawn blanks recede behind the text.
+        "Whitespace" | "NonText" => 0x63_67_73, // overlay0
         _ => return Style::default(),
     };
     Style {

@@ -960,7 +960,7 @@ pub struct WindowOptions {
     /// substitution keeps the width of what it replaces, so cursor columns don't move.
     pub list: bool,
     /// `'listchars'` (abbrev `lcs`): the comma-separated `key:chars` list choosing the
-    /// glyphs [`list`] draws. Defaults to neovim's `tab:> ,trail:-,nbsp:+`. Always
+    /// glyphs [`list`] draws. Defaults to [`DEFAULT_LISTCHARS`] (`tab:→ ,space:·,trail:•,nbsp:␣`). Always
     /// pre-validated by [`parse_listchars`] at set time; resolved with
     /// [`WindowOptions::listchars`] at projection.
     pub listchars: String,
@@ -1144,9 +1144,13 @@ pub fn parse_fillchars(s: &str) -> Option<char> {
     Some(eob)
 }
 
-/// neovim's default `'listchars'`: tabs as `>` then blanks, trailing blanks as `-`,
-/// non-breaking spaces as `+`.
-pub const DEFAULT_LISTCHARS: &str = "tab:> ,trail:-,nbsp:+";
+/// bemtvi's default `'listchars'`: tabs as `→` then blanks, every space as `·`, trailing
+/// blanks as `•`, non-breaking spaces as `␣`. Deliberately not neovim's
+/// `tab:> ,trail:-,nbsp:+`, for two reasons: that default has no glyph for an ordinary
+/// space, so on a file indented with spaces `:set list` changed nothing at all; and
+/// `>` / `-` / `+` are characters real text is full of, so a drawn glyph could not be
+/// told from typed text at a glance.
+pub const DEFAULT_LISTCHARS: &str = "tab:→ ,space:·,trail:•,nbsp:␣";
 
 /// A parsed [`'listchars'`](WindowOptions::listchars): the glyph for each kind of
 /// invisible character, `None` where the value has no entry (that character is
@@ -2558,6 +2562,7 @@ const ALIASES: &[(&str, &str)] = &[
     // vim's `list` comes from ed's `l` (list) command, which printed a line with its
     // tabs and end shown.
     ("showwhitespace", "list"),
+    ("whitespacechars", "listchars"),
 ];
 
 impl OptionInfo {

@@ -7,8 +7,8 @@
 --
 -- `'list'` (window-local, off by default) draws normally-invisible characters as
 -- visible glyphs; `'listchars'` picks the glyphs, as `key:chars` pairs. bemtvi also
--- spells `list` as `showwhitespace`, since vim's name only makes sense if you know
--- ed's `l` (list) command.
+-- spells them `showwhitespace` and `whitespacechars`, since vim's names only make
+-- sense if you know ed's `l` (list) command.
 --
 -- ```
 --   tab:xy[z]          a tab: x, then y to fill its width (z on the last cell)
@@ -21,19 +21,19 @@
 --   eol:c              one glyph past the end of every line
 -- ```
 --
--- The default is neovim's `tab:> ,trail:-,nbsp:+`. Glyphs are colored with the
--- `Whitespace` highlight group (`NonText` for `eol`). Drawing never moves the cursor:
--- a tab's glyphs cover exactly the cells the tab did.
+-- The default is `tab:→ ,space:·,trail:•,nbsp:␣`: glyphs nobody types, so a drawn
+-- blank can't be mistaken for text (neovim's `>`/`-`/`+` can). Glyphs are colored
+-- with the `Whitespace` highlight group (`NonText` for `eol`). Drawing never moves
+-- the cursor: a tab's glyphs cover exactly the cells the tab did.
 
 --------------------------------------------------------------------------------
--- 1. `list` on, with a set of glyphs that reads well.
+-- 1. `list` on, with the default glyphs.
 --
 -- Type-this:  nothing; open the sample.
--- See-that:   line 3's tab is `»` then blanks; line 6 ends in `···`; line 7's
---             non-breaking spaces show as `␣`.
+-- See-that:   every space is a `·` (line 4 starts `····`); line 3's tab is `→` then
+--             blanks; line 6 ends in `•••`; line 7's non-breaking spaces are `␣`.
 --------------------------------------------------------------------------------
 btv.wo.list = true
-btv.wo.listchars = "tab:» ,trail:·,nbsp:␣"
 
 --------------------------------------------------------------------------------
 -- 2. Toggle it.
@@ -52,12 +52,12 @@ end, { desc = "toggle 'list'" })
 -- 3. Show everything.
 --
 -- Type-this:  :ListAll<CR>
--- See-that:   every space is a `·`, leading runs are `→` (line 4 starts `→→→→`),
---             the tabs are `>--` arrows, and each line ends in `¬`.
+-- See-that:   leading runs are `›` (line 4 starts `››››`), the tabs are `→───`
+--             arrows, and each line ends in `¬`.
 --------------------------------------------------------------------------------
 btv.command("ListAll", function()
   btv.wo.list = true
-  btv.wo.listchars = "tab:>-,space:·,lead:→,trail:·,nbsp:␣,eol:¬"
+  btv.wo.listchars = "tab:→─,space:·,lead:›,trail:•,nbsp:␣,eol:¬"
 end, { desc = "draw every invisible character" })
 
 --------------------------------------------------------------------------------
@@ -71,8 +71,8 @@ end, { desc = "draw every invisible character" })
 --------------------------------------------------------------------------------
 -- 5. Read it back, and bad values.
 --
--- Type-this:  :set listchars?<CR>
--- See-that:   `listchars=` and the current value.
+-- Type-this:  :set whitespacechars?<CR>
+-- See-that:   `listchars=` and the current value (the alias reports the vim name).
 -- Type-this:  :set listchars=eol:ab<CR>
 -- See-that:   `E474: Invalid argument: listchars=eol:ab` (one glyph per key), and
 --             the old value is kept. `:set listchars&` restores the default.

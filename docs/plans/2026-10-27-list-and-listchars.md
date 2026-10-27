@@ -10,7 +10,12 @@ as a visible glyph. Tabs become `>---`, trailing blanks become `-`, a non-breaki
 space becomes `+`, and so on. The glyphs are painted in the `Whitespace` group, and
 the `eol` marker in `NonText`, as in neovim.
 
-Defaults follow neovim, not vim: `listchars=tab:> ,trail:-,nbsp:+`.
+The default is bemtvi's own, `listchars=tab:→ ,space:·,trail:•,nbsp:␣`. neovim's
+`tab:> ,trail:-,nbsp:+` was the first default, and in use `:set list` then changed
+nothing on a file indented with spaces (no glyph for a plain space), and its glyphs
+are characters real text is full of. The `bemtvi` colorscheme's `Whitespace` was also
+too faint to see (1.6:1 on the background); it now links to `NonText` (2.9:1), as in
+neovim.
 
 ## Where it lives, and why it isn't a plugin
 
@@ -62,8 +67,8 @@ colorscheme doesn't define them, and the web renderer resolves them through
   Precedence, as in neovim: `nbsp`; then `trail` for the trailing run; then
   `lead`/`leadmultispace` for the leading run; then `multispace` for runs of 2+
   spaces; then `space`.
-- `showwhitespace` is accepted everywhere `list` is: bemtvi's own name, since vim's
-  only makes sense if you know ed's `l` command. It is an `ALIASES` entry in
+- `showwhitespace` / `whitespacechars` are accepted everywhere `list` / `listchars`
+  are: bemtvi's own names, since vim's only make sense if you know ed's `l` command. It is an `ALIASES` entry in
   `options.rs`, separate from vim's abbreviations, and completes as its own row.
 - `extends` / `precedes` / `conceal` are accepted (so a vim config sets cleanly) but
   have no effect until Phase 2. Documented on the option, like `fillchars`'s

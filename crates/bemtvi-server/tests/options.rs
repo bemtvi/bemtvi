@@ -543,11 +543,11 @@ async fn fillchars_round_trips_through_set_and_vim_wo() {
 async fn list_and_listchars_round_trip_through_set_and_vim_wo() {
     let (rpc, mut incoming) = start().await;
 
-    // `'list'` off, `'listchars'` neovim's default.
+    // `'list'` off, `'listchars'` bemtvi's default.
     assert_eq!(set_message(&rpc, &mut incoming, "list?").await, "nolist");
     assert_eq!(
         set_message(&rpc, &mut incoming, "listchars?").await,
-        "listchars=tab:> ,trail:-,nbsp:+"
+        "listchars=tab:→ ,space:·,trail:•,nbsp:␣"
     );
     assert_eq!(
         exec_lua(&rpc, "return vim.wo.list").await.as_bool(),
@@ -586,14 +586,15 @@ async fn list_and_listchars_round_trip_through_set_and_vim_wo() {
     let _ = set_message(&rpc, &mut incoming, "listchars&").await;
     assert_eq!(
         set_message(&rpc, &mut incoming, "listchars?").await,
-        "listchars=tab:> ,trail:-,nbsp:+"
+        "listchars=tab:→ ,space:·,trail:•,nbsp:␣"
     );
 }
 
-/// `showwhitespace` is bemtvi's own, self-describing name for `'list'`: every
-/// surface that takes `list` takes it, and all of them move the one option.
+/// `showwhitespace` and `whitespacechars` are bemtvi's own, self-describing names for
+/// `'list'` and `'listchars'`: every surface that takes the vim name takes the alias,
+/// and both move the one option.
 #[tokio::test]
-async fn showwhitespace_is_an_alias_for_list() {
+async fn showwhitespace_and_whitespacechars_alias_list_and_listchars() {
     let (rpc, mut incoming) = start().await;
 
     let _ = set_message(&rpc, &mut incoming, "showwhitespace").await;
@@ -604,6 +605,18 @@ async fn showwhitespace_is_an_alias_for_list() {
     assert_eq!(
         set_message(&rpc, &mut incoming, "showwhitespace?").await,
         "list"
+    );
+
+    // `whitespacechars` is the same for `'listchars'`.
+    let _ = set_message(&rpc, &mut incoming, "whitespacechars=eol:¬").await;
+    assert_eq!(
+        set_message(&rpc, &mut incoming, "listchars?").await,
+        "listchars=eol:¬"
+    );
+    exec_lua(&rpc, "btv.wo.whitespacechars = 'trail:•'").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.wo.listchars").await.as_str(),
+        Some("trail:•")
     );
 
     exec_lua(&rpc, "btv.wo.showwhitespace = false").await;

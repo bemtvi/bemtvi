@@ -124,9 +124,12 @@ fetch/compile — aren't listed; only the edges that still diverge are.)
   filetype (the ~20 most common languages) when unset. Still, the **bulk** of
   vim's hundreds of options are missing — a write to an unmodeled option is
   recorded but inert.
-- **`'listchars'` gaps.** `list` draws `tab`, `space`, `multispace`, `lead`,
-  `leadmultispace`, `trail`, `nbsp` and `eol`, defaulting to neovim's
-  `tab:> ,trail:-,nbsp:+`. The `extends` / `precedes` (off-screen markers under
+- **`'listchars'` gaps.** `list` (also spelled `showwhitespace`) draws `tab`,
+  `space`, `multispace`, `lead`, `leadmultispace`, `trail`, `nbsp` and `eol`. The
+  default departs from neovim's `tab:> ,trail:-,nbsp:+` on purpose: it is
+  `tab:→ ,space:·,trail:•,nbsp:␣`, because neovim's draws nothing for an ordinary
+  space (so `:set list` changed nothing on a space-indented file) and its `>` / `-` /
+  `+` can't be told from typed text. `'listchars'` is also spelled `whitespacechars`. The `extends` / `precedes` (off-screen markers under
   `nowrap`) and `conceal` keys are accepted but not drawn yet. With `list` on and no
   `tab:` entry, vim shows a tab as `^I`; bemtvi leaves it as a plain tab. An `eol`
   glyph on a wrapped line that exactly fills its last row is cut at the window edge

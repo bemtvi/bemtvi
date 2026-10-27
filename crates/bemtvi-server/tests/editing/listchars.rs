@@ -60,10 +60,20 @@ async fn list_is_off_by_default_and_draws_the_default_listchars_when_on() {
     let view = render(&rpc, &mut incoming, &text, &["tabstop=4"]).await;
     assert_eq!(view_lines(&view)[0], "\tab\tc  ");
 
-    // On, with neovim's default `tab:> ,trail:-,nbsp:+`: each tab is `>` padded with
-    // blanks to its full width (4 cells at col 0, 2 at col 6), trailing spaces `-`.
+    // On, with the default `tab:→ ,space:·,trail:•,nbsp:␣`: each tab is `→` padded
+    // with blanks to its full width (4 cells at col 0, 2 at col 6), trailing spaces `•`.
     let view = redraw_after(&rpc, &mut incoming, ":set list<CR>").await;
-    assert_eq!(view_lines(&view)[0], ">   ab> c--");
+    assert_eq!(view_lines(&view)[0], "→   ab→ c••");
+}
+
+/// The default must show something on an ordinary file: one indented with spaces,
+/// with no tabs and no trailing blanks. neovim's default draws only tabs, trailing
+/// blanks and nbsps, so `:set list` changed nothing on such a file.
+#[tokio::test]
+async fn the_default_listchars_draws_plain_spaces() {
+    let (rpc, mut incoming) = start(None).await;
+    let view = render(&rpc, &mut incoming, &["    let y = 2;"], &["list"]).await;
+    assert_eq!(view_lines(&view)[0], "····let·y·=·2;");
 }
 
 #[tokio::test]
@@ -72,7 +82,7 @@ async fn list_keeps_the_cursor_column() {
     let _ = render(&rpc, &mut incoming, &["\t\tx"], &["tabstop=4"]).await;
     let off = redraw_after(&rpc, &mut incoming, "$").await;
     let on = redraw_after(&rpc, &mut incoming, ":set list<CR>").await;
-    assert_eq!(view_lines(&on)[0], ">   >   x");
+    assert_eq!(view_lines(&on)[0], "→   →   x");
     assert_eq!(view_u64(&off, "cursor_screen_col"), 8);
     assert_eq!(
         view_u64(&on, "cursor_screen_col"),

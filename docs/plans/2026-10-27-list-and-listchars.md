@@ -70,8 +70,9 @@ colorscheme doesn't define them, and the web renderer resolves them through
   `lead`/`leadmultispace` for the leading run; then `multispace` for runs of 2+
   spaces; then `space`.
 - `showwhitespace` / `whitespacechars` are accepted everywhere `list` / `listchars`
-  are: bemtvi's own names, since vim's only make sense if you know ed's `l` command. It is an `ALIASES` entry in
-  `options.rs`, separate from vim's abbreviations, and completes as its own row.
+  are: bemtvi's own names, since vim's only make sense if you know ed's `l` command.
+  They are `ALIASES` entries in `options.rs`, separate from vim's abbreviations, and
+  complete as their own rows.
 - `extends` / `precedes` / `conceal` are accepted (so a vim config sets cleanly) but
   have no effect until Phase 2. Documented on the option, like `fillchars`'s
   unhonored keys.
@@ -85,10 +86,10 @@ colorscheme doesn't define them, and the web renderer resolves them through
   test for the glyph colors (`crates/bemtvi/tests/screen.rs`); the browser check
   `crates/bemtvi-edithost/web/verify-listchars.mjs`. Example `examples/listchars/`
   with its own spec.
-- Known gap: an `eol` glyph on a wrapped line that exactly fills its last row is
-  cut at the window edge instead of wrapping onto a row of its own.
+- Known gap, moved to Phase 2: an `eol` glyph on a wrapped line that exactly fills
+  its last row is cut at the window edge.
 
-### Phase 2: `extends` / `precedes` and the `^I` form
+### Phase 2: `extends` / `precedes`, the `^I` form, and `eol` on a full row
 
 - `nowrap`: draw `extends` in the last column when the line continues past the
   right edge, `precedes` in the first column when `leftcol` hides text on the left.
@@ -96,6 +97,11 @@ colorscheme doesn't define them, and the web renderer resolves them through
   needs a decision (vim draws the marker, cursor stays where it is).
 - `list` without `tab:`: either implement `^I` with the width shift threaded through
   the virtcol math, or keep the documented gap.
+- `wrap`: when a line exactly fills its last row, its `eol` glyph needs a row of its
+  own (vim's behavior) instead of being cut at the edge. That row has to count
+  everywhere rows are counted (`line_text_rows_of`, `screen_rows_between`, the
+  cursor's row, scrolling), not just where they are drawn. Since `eol` is now on by
+  default, this is the most visible of the three.
 
 ## Not in scope
 

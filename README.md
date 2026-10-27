@@ -580,7 +580,9 @@ The short version:
 | `bemtvi-lsp`      | The native LSP client (protocol, transport, manager) — bemtvi's own stdio spawning. |
 | `bemtvi-regex`    | The vendored vim regexp engine (`regexp.c` as C), shared by search and `:s`. |
 | `bemtvi-tui`      | The terminal UI client (ratatui + crossterm). Owns no editor state.         |
-| `bemtvi-gui`      | Native GUI client (mitsuami + wgpu + glyphon).                              |
+| `bemtvi-gpu`      | The native GUI client with no toolkit: wgpu + glyphon renderer, sessions, the RPC IO thread. |
+| `bemtvi-mitsuami` | The GUI client as a mitsuami view an app embeds (`Editor`, `EditorHandle`). |
+| `bemtvi-gui`      | The native GUI binary: a mitsuami window around `bemtvi-mitsuami`'s view.  |
 | `bemtvi-edithost` | Fully client-side WebAssembly build of the whole editor (core + Lua + server tick, in a Web Worker; no server). Excluded from the workspace. |
 | `bemtvi-view`     | Frontend-neutral decode/input layer shared by the native clients.           |
 | `bemtvi`          | The `nvim`-style entry point: wires an embedded server + the TUI client.    |

@@ -37,7 +37,7 @@ command -v em++ >/dev/null 2>&1 || {
 #    lua54, the only backend) comes from the shared mlua dep. -fwasm-exceptions
 #    aligns Rust's wasm EH with the vendored C's (puc-lua-compiles-to-wasm-emscripten).
 EMCC_CFLAGS="-fwasm-exceptions" \
-  cargo build --release --target wasm32-unknown-emscripten
+  cargo build --locked --release --target wasm32-unknown-emscripten
 
 LIB=target/wasm32-unknown-emscripten/release/libbemtvi_edithost.a
 
@@ -97,7 +97,7 @@ rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown || 
   exit 1
 }
 ( cd ../.. && RUSTFLAGS="-C panic=abort" \
-    cargo build -p bemtvi-width --release --target wasm32-unknown-unknown )
+    cargo build --locked -p bemtvi-width --release --target wasm32-unknown-unknown )
 cp ../../target/wasm32-unknown-unknown/release/bemtvi_width.wasm dist/
 
 # 3. Tree-sitter highlighter assets → web/vendor/ (the web-tree-sitter runtime + the

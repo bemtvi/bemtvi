@@ -3794,7 +3794,7 @@
     // press would spuriously enter Visual mode. The browser fires `mousemove` for
     // every sub-cell pixel (a click that wobbles, a touchpad tap-and-move), so
     // without this every casual click drops into VISUAL. Mirrors bemtvi-gui's
-    // `last_drag_cell` coalescing (see crates/bemtvi-gui/src/lib.rs `mouse_drag`).
+    // `last_drag_cell` coalescing (see crates/bemtvi-gpu/src/client.rs).
     let lastDragCell = null;
     function cellAt(e) {
       const r = gridEl.getBoundingClientRect();

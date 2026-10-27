@@ -3,7 +3,7 @@
 --
 -- Run the embedding app (a mitsuami window: notes down the side, this editor
 -- beside them, and a line under it showing what the editor tells the app):
---   cargo run -p bemtvi-gui --example embed
+--   cargo run -p bemtvi-mitsuami --example embed
 --
 -- It runs the editor with this directory as its whole config (`Config::Dir`), so
 -- this file is what the app's editor does. Plain bemtvi runs it too, with no app

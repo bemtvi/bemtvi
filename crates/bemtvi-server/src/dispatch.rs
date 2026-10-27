@@ -113,6 +113,11 @@ impl EditHost {
                 // mirror it into the input parser and the keymap registry (which
                 // restamps its tries so a mapping's LHS is parsed to match).
                 // Absent/false ⇒ legacy folding.
+                // `file_dialogs = true` says the client shows native file dialogs: a
+                // submitted `:e`, `:eo`, `:wo`, … asks it for one (see
+                // `bemtvi_core::dialog`) rather than running. Only where the files are on
+                // this machine — a dialog would browse the wrong one for a daemon's.
+                self.editor.file_dialogs = cap("file_dialogs") && !self.editor.host_fs_offtick();
                 let kbd = cap("keyboard_protocol");
                 self.keyboard_protocol = kbd;
                 self.keymaps.set_keyboard_protocol(kbd);

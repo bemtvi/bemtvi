@@ -795,6 +795,10 @@ impl EditHost {
         for url in self.lua.take_connect_fallbacks() {
             self.fx.notify("btv_connect_fallback", vec![url]);
         }
+        // A GUI's `:workspace [dir]` (`btv._gui_workspace`): the client builds the session.
+        for dir in self.lua.take_workspaces() {
+            self.fx.notify("btv_workspace", vec![dir]);
+        }
         // Messages for the app embedding the editor, from `btv.host.send(name, payload)`:
         // pushed OUT as `bemtvi_host` notifications (`[name, payload]` as the params), which
         // the client hands to its host. No editor state changes here either.
@@ -4597,6 +4601,7 @@ impl EditHost {
                             self.editor.command(&c);
                         }
                     }
+                    DeferredCmd::FileDialog(dialog) => self.file_dialog(dialog),
                 }
             }
             // `<CR>` selections on a focused `btv.view` buffer: fire the view's Lua
@@ -5179,4 +5184,40 @@ pub(crate) fn parse_extent(spec: &str) -> Option<bemtvi_core::Extent> {
             .map(|n| bemtvi_core::Extent::Frac((n / 100.0).clamp(0.1, 1.0)));
     }
     spec.parse::<u16>().ok().map(bemtvi_core::Extent::Cells)
+}
+
+impl EditHost {
+    /// Ask the client for the file dialog a submitted `:` line asked for (see
+    /// [`bemtvi_core::dialog`]), as a `btv_file_dialog` notification: `[kind, base,
+    /// start_dir]`, `kind` being `"open"` or `"save"` and `base` the verb to run with the
+    /// file picked. A line naming a path asks for the open dialog there when the path,
+    /// taken against the editor's working directory, is a directory; any other path runs
+    /// as typed. (That check is one `stat` of a local path: the editor only asks for
+    /// dialogs on a session whose files are on this machine.)
+    fn file_dialog(&mut self, dialog: bemtvi_core::dialog::FileDialog) {
+        use bemtvi_core::dialog::FileDialog;
+        let (kind, base, start_dir) = match dialog {
+            FileDialog::Open { base } => ("open", base, None),
+            FileDialog::OpenAt { base, arg, line } => {
+                let win = self.editor.current_window_id();
+                let tab = self.editor.current_tab_id();
+                let dir = self
+                    .dirs
+                    .effective(win, tab)
+                    .1
+                    .join(crate::excmd::expand_cd_arg(&arg));
+                if !dir.is_dir() {
+                    self.editor.command(&line);
+                    return;
+                }
+                ("open", base, Some(dir))
+            }
+            FileDialog::Save => ("save", "w", None),
+        };
+        let start_dir = start_dir.map_or(Value::Nil, |d| Value::from(d.to_string_lossy().as_ref()));
+        self.fx.notify(
+            "btv_file_dialog",
+            vec![Value::from(kind), Value::from(base), start_dir],
+        );
+    }
 }

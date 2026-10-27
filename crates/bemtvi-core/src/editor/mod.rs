@@ -248,6 +248,9 @@ pub enum DeferredCmd {
     /// segment ahead of it has resolved. Skipped when that segment errored, matching
     /// vim's abandon-the-rest-of-the-line-on-error behavior.
     Chain(String),
+    /// A submitted command line that asks the client for a file dialog (see
+    /// [`Editor::file_dialogs`]), instead of running.
+    FileDialog(crate::dialog::FileDialog),
 }
 
 /// Whether `line` reads as a vim error message: the `E###:` error-code prefix
@@ -1751,9 +1754,13 @@ pub struct Editor {
     background_applied: String,
 
     /// Command lines queued for the server to run after the tick, in order — see
-    /// [`DeferredCmd`] for the two kinds. Keeps the core ignorant of the Lua command
+    /// [`DeferredCmd`] for the kinds. Keeps the core ignorant of the Lua command
     /// table while still routing typed `:Foo` and `vim.cmd.Foo()` through one place.
     pub deferred_commands: Vec<DeferredCmd>,
+    /// Whether a submitted `:` line that asks for a file dialog ([`crate::dialog`]) asks
+    /// the client for it instead of running: set by the server for a GUI client with
+    /// native dialogs, on a session whose files are on this machine.
+    pub file_dialogs: bool,
 
     /// Milliseconds the server should block after the current command, set by
     /// `:sleep` and drained via [`Editor::take_sleep`]. Models a slow editor
@@ -2470,6 +2477,7 @@ impl Editor {
             snippet_keys: snippet::SnippetKeys::default(),
             lua_queue: Vec::new(),
             deferred_commands: Vec::new(),
+            file_dialogs: false,
             open_messages_after_lua: false,
             background_applied: "dark".to_string(),
             pending_sleep: None,

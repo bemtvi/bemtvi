@@ -2,7 +2,7 @@
 -- A single-file editor — the editor an app embeds to edit one given file.
 --
 -- Run it (a mitsuami window editing sample.txt, or the file you name):
---   cargo run -p bemtvi-gui --example single_file [file]
+--   cargo run -p bemtvi-mitsuami --example single_file [file]
 --
 -- The app starts the editor with `SessionOptions::single_file(path)`: locked to the
 -- file, the commands that run code or processes taken away, and user commands only

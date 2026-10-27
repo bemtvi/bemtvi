@@ -996,6 +996,10 @@ pub(crate) struct Shared {
     /// carrying the URL string, and the client performs its built-in direct dial (QUIC URI /
     /// ssh host). See docs/plans/2026-07-05-remote-connectors-and-system-plugins.md → §C.
     pub(crate) connect_fallbacks: Vec<rmpv::Value>,
+    /// Directories a GUI's `:workspace [dir]` asked to swap onto, from
+    /// `btv._gui_workspace(dir)`: like [`Self::connect_fallbacks`], drained into a
+    /// `btv_workspace` notification for the client, which builds the session.
+    pub(crate) workspaces: Vec<rmpv::Value>,
     /// Messages for the app embedding the editor, from `btv.host.send(name, payload)`:
     /// each `[name, payload]`. Like [`Self::connect_fallbacks`] they don't touch the
     /// editor — the server drains them into a `bemtvi_host` notification for the client,
@@ -1311,6 +1315,7 @@ impl Shared {
             layer_ops,
             session_reconnects,
             connect_fallbacks,
+            workspaces,
             host_messages,
             view_ops,
             panel_ops,
@@ -1398,6 +1403,7 @@ impl Shared {
         *layer_ops = Default::default();
         *session_reconnects = Default::default();
         *connect_fallbacks = Default::default();
+        *workspaces = Default::default();
         *host_messages = Default::default();
         *view_ops = Default::default();
         *panel_ops = Default::default();
@@ -2198,6 +2204,13 @@ impl LuaRuntime {
         /// drain, for the server to push out to the client as `btv_connect_fallback`
         /// notifications (the client dials the URL directly — §C).
         take_connect_fallbacks -> Vec<rmpv::Value> = connect_fallbacks
+    }
+
+    take_queue! {
+        /// Take the `:workspace` directories queued by `btv._gui_workspace` since the last
+        /// drain, for the server to push out to the client as `btv_workspace`
+        /// notifications.
+        take_workspaces -> Vec<rmpv::Value> = workspaces
     }
 
     take_queue! {

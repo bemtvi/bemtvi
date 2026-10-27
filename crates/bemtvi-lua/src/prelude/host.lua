@@ -1,5 +1,5 @@
 -- bemtvi Lua prelude — `btv.host`: the app embedding this editor, and what a config or
--- plugin says to it. An app (a mitsuami app mounting `bemtvi_gui::embed::Editor`) names
+-- plugin says to it. An app (a mitsuami app mounting `bemtvi_mitsuami::Editor`) names
 -- itself as it starts the editor's session; `btv.host.send` then reaches it as an
 -- `EditorEvent::Host`, through a `bemtvi_host` notification the server drains from the
 -- `btv._host_send` queue. In the other direction an app needs nothing new: it runs Lua or

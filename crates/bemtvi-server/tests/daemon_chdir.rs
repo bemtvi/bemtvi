@@ -294,6 +294,19 @@ async fn focus_switch_fires_dirchanged_over_the_wire() {
     barrier(&rpc).await;
     feed(&rpc, ":lcd /virtual/proj/src<CR>");
     await_getcwd(&rpc, "/virtual/proj/src").await;
+    // The `:lcd` moves the dir at once but announces it when the daemon acknowledges it:
+    // wait for that, or it can land after the switch's own event below.
+    for _ in 0..100 {
+        let heard = exec_lua(
+            &rpc,
+            "return vim.tbl_contains(_G.dir_events, '/virtual/proj/src')",
+        )
+        .await;
+        if heard.as_bool() == Some(true) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     // Switch to the other window (global `/virtual/proj`): a real cwd boundary.
     feed(&rpc, "<C-w>w");

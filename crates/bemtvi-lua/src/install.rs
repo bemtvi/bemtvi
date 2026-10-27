@@ -501,6 +501,16 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     })?;
     btv.set("_connect_fallback", connect_fallback)?;
 
+    // `btv._gui_workspace(dir)`: a GUI's `:workspace [dir]` ran (registered by the client at
+    // startup). `dir` rides as a `btv_workspace` notification (drained in `effects.rs`)
+    // to the client, which swaps the window onto a local session rooted there.
+    let sh = shared.clone();
+    let workspace = lua.create_function(move |_, dir: String| {
+        sh.borrow_mut().workspaces.push(rmpv::Value::from(dir));
+        Ok(())
+    })?;
+    btv.set("_gui_workspace", workspace)?;
+
     // `btv._host_name()` / `btv._host_send(name, payload)`: the raw halves of `btv.host`
     // (the prelude's `host.lua` checks the arguments and that a host is there). The
     // message rides out as a `bemtvi_host` notification (drained in `effects.rs`) to the

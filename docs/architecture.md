@@ -90,7 +90,9 @@ subsystems:
 | `bemtvi-lsp`     | `lsp/`                                                | The native **LSP client**: protocol, transport, manager — bemtvi's own stdio spawning, driving the in-core editing features. `bemtvi-server/src/lsp/` is the editing-loop glue on top. |
 | `bemtvi-regex`   | `regexp.c`, `regexp_nfa.c`                            | The **vendored vim regexp engine** compiled as C (engine-global mutex): Lua's `vim.regex` / `vim.fn.substitute`, and `/` search + `:s` under `:set regexsyntax=vim`. |
 | `bemtvi-view`    | (UI layer)                                           | Frontend-neutral decode/input layer (`View`, `Style`, `Key`, `notation`, paste encoding) shared by the native clients. |
-| `bemtvi-gui`     | (a GUI frontend)                                     | The native GUI **client** on mitsuami + wgpu + glyphon; the GUI sibling of `bemtvi-tui`, consuming the same `View`. |
+| `bemtvi-gpu`     | (a GUI frontend)                                     | The native GUI **client** with no toolkit: the wgpu + glyphon renderer, the editor sessions, the RPC IO thread, and the `Client` a host drives through effects and deadlines; the GUI sibling of `bemtvi-tui`, consuming the same `View`. |
+| `bemtvi-mitsuami`| —                                                    | The client as a **mitsuami view** an app embeds (`Editor`, `EditorHandle`, `SessionOptions`): mitsuami's input in, the client's effects carried out on mitsuami. |
+| `bemtvi-gui`     | —                                                    | The GUI **binary**: a mitsuami window whose whole content is `bemtvi-mitsuami`'s view, plus the CLI, process signals and packaging. |
 | `bemtvi-edithost`| —                                                    | The fully client-side **WebAssembly** build of the whole editor (core + Lua + server tick) in a Web Worker; excluded from the Cargo workspace. See [*The web build*](#the-web-build--a-fully-client-side-webassembly-editor). |
 | `bemtvi-width`   | —                                                    | `unicode-segmentation` + `unicode-width` as a bare ~70 KB wasm module, so the web client's DOM renderer measures grapheme clusters with the **same crates and pinned versions** the server's `unicode::virtcol` does. That renderer runs on the main thread while the edit-host runs in a Worker, so it cannot call the editor; before this it mirrored the width tables in JS, which could drift on a dependency bump. Loaded by `web/width.js`, built by `bemtvi-edithost/build.sh`. |
 | `bemtvi-test-harness` | —                                               | The shared black-box integration-test harness (a `publish = false` dev-dependency of `bemtvi` and `bemtvi-server`): spawns a real server over an in-process RPC pipe and drives it as a UI client would. See [*Testing philosophy*](#testing-philosophy). |
@@ -110,8 +112,9 @@ core rpc lua ts  rpc  view
 
 The diagram shows the principal spine; the same one-way graph also carries the
 edges it elides — `bemtvi` and `bemtvi-server` both onto `bemtvi-lsp`, `bemtvi-lua`
-onto `bemtvi-ts` (the treesitter query/control bridge), `bemtvi-gui` onto
-`bemtvi-server` + `bemtvi-view`, and `bemtvi-lua` onto `bemtvi-regex` (with
+onto `bemtvi-ts` (the treesitter query/control bridge), `bemtvi-gpu` onto
+`bemtvi-server` + `bemtvi-view` (and `bemtvi-mitsuami` onto `bemtvi-gpu`, `bemtvi-gui`
+onto both), and `bemtvi-lua` onto `bemtvi-regex` (with
 `bemtvi-core`'s optional `vim-regex` feature — enabled by `bemtvi-server` —
 putting the same engine behind `:set regexsyntax=vim`).
 
@@ -172,7 +175,7 @@ of the local disk. The **GUI** also reaches this split at runtime via `:connect`
 interactive prompts routed to a native dialog via `SSH_ASKPASS`, so auth works from a
 windowed launch with no tty), and `:connect bemtvi://…` dials the QUIC listener. The
 editor stays local; `:connect` swaps onto a *fresh local server* whose seams point at
-the daemon and re-attaches the same window (`bemtvi_gui::run`'s session loop), since the
+the daemon and re-attaches the same window (the GUI client's IO-thread session loop, `bemtvi_gpu::spawn_io`), since the
 editor transport is always the in-process duplex. See
 [the edit-host plan](plans/2026-06-09-edit-host-and-browser-lua.md). It forces a
 **split-brain filesystem rule** for the Lua bridge, decided up front: the
@@ -1051,9 +1054,14 @@ Because every front end is just a client of bemtvi's own RPC, a **native GUI** �
 notably a non-terminal GUI on Windows — is just another client crate consuming
 the same `View` protocol, with zero changes to the server or core.
 
-That claim is now load-bearing: **`bemtvi-gui` is a native GUI client**
-([`crates/bemtvi-gui`](../crates/bemtvi-gui)) on **mitsuami + wgpu + glyphon**. It is
-the GUI sibling of `bemtvi-tui` and reuses the same frontend-neutral
+That claim is now load-bearing: **`bemtvi-gui` is a native GUI client** on **mitsuami +
+wgpu + glyphon**, in three crates. [`bemtvi-gpu`](../crates/bemtvi-gpu) is the client
+with no toolkit: the renderer, the sessions, the IO thread, and a `Client` state machine
+its host feeds input, wake-ups and timer ticks, and that asks the host for what it needs
+as effects (repaint, the pointer's shape, the IME caret, a file dialog, the clipboard,
+exit). [`bemtvi-mitsuami`](../crates/bemtvi-mitsuami) shows it as a mitsuami view an app
+embeds, and [`bemtvi-gui`](../crates/bemtvi-gui) is the binary whose window is that view.
+It is the GUI sibling of `bemtvi-tui` and reuses the same frontend-neutral
 [`bemtvi-view`](../crates/bemtvi-view) decode/input layer (`View`, `Style`, `Key`,
 `notation`, `encode_text`, `encode_paste`) — the seam the view crate was extracted
 for. The
@@ -1068,9 +1076,9 @@ pointer, and takes the cursor and the IME caret. Input methods are on unless the
 (`examples/input-method`). An input method's composition is spliced in at the cursor
 like inline virtual text (its own cells, the rest of the line pushed right), painted with
 bemtvi's `BtvImePreedit` group, which falls back to `Visual`. mitsuami owns the main thread, so the RPC
-runs on a separate IO thread that decodes each `redraw` into a `View` and sends it over a
-channel a UI-thread task drains, while input goes the other way on a cloned `Rpc` handle
-(`notify` is synchronous, no runtime). Rendering is a monospace
+runs on a separate IO thread that decodes each `redraw` into a `View`, queues it for the
+client and wakes the UI thread, which pumps the client; input goes the other way on a
+cloned `Rpc` handle (`notify` is synchronous, no runtime). Rendering is a monospace
 **cell grid**: a tiny solid-quad wgpu pipeline paints the backgrounds, selection,
 search, status bars and cursor, with a glyphon text layer (syntax-colored from the
 server's resolved `styles`) on top; the cell size is measured once from the font.
@@ -1091,7 +1099,9 @@ scrolling**: the focused window slides the server's scroll-gesture band at a
 fractional (sub-pixel) line offset driven by the client clock, repainted every frame
 by the client's paint loop while it runs (where the TUI animates at whole-row granularity, the GPU
 client interpolates `top` without rounding). Input reaches parity too:
-vim-notation keys, system-clipboard paste, native open/save dialogs, and **mouse**
+vim-notation keys, system-clipboard paste, native open/save dialogs (the editor decides
+which `:` lines ask for one as it runs them, `bemtvi_core::dialog`, and asks a client
+that attached with `file_dialogs` through a `btv_file_dialog` notification), and **mouse**
 — left click / drag-select / release, wheel scroll, right-click
 (`'mousemodel'`), middle-click paste, and the floating-overlay gestures (the
 completion popup, picker, `select`, wildmenu, and panel), sent as the same
@@ -1099,13 +1109,15 @@ completion popup, picker, `select`, wildmenu, and panel), sent as the same
 raw cell and carries no overlay geometry of its own). Wide-char + emoji rendering
 landed too (CJK cell-snapping, an emoji mask/scale pass that keeps the grid). Still
 deferred: undercurl is drawn as a plain underline.
-Because the GUI can't be black-box
-tested over RPC the way the TUI's paint is (it needs a GPU), only the pure,
-frontend-specific translation layers have Tier-1 tests — the surface key→notation input
-(`crates/bemtvi-gui/tests/keys.rs`), the pointer math
-(`crates/bemtvi-gui/tests/mouse.rs`), and the `:connect` target / `bemtvi://` URI / SSH
-askpass parsing (`crates/bemtvi-gui/tests/remote.rs`); the rendered frame, and the live
-`:connect` session swap, are validated by running it.
+The rendered frame needs a GPU, so it's validated by running it; everything around it
+is tested. The `Client` runs headless against a real server
+(`crates/bemtvi-gpu/tests/client.rs`: keys and frames, the dialogs and the clipboard as
+effects answered by the test, the `timeoutlen` flush, `:workspace` switching), next to
+the pure layers: key→notation (`crates/bemtvi-gpu/tests/input.rs`, and through
+mitsuami's events in `crates/bemtvi-mitsuami/tests/keys.rs`), the pointer math
+(`crates/bemtvi-mitsuami/tests/mouse.rs`), the `:connect` target / `bemtvi://` URI / SSH
+askpass parsing (`crates/bemtvi-gpu/tests/remote.rs`), and the renderer's geometry. The
+mitsuami view mounts, unmounts and drives the editor in `crates/bemtvi-mitsuami/tests/embed.rs`.
 
 ### The web build — a fully client-side WebAssembly editor
 

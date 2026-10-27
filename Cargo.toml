@@ -8,6 +8,8 @@ members = [
     "crates/bemtvi-lua",
     "crates/bemtvi-tui",
     "crates/bemtvi-gui",
+    "crates/bemtvi-gpu",
+    "crates/bemtvi-mitsuami",
     "crates/bemtvi-ts",
     "crates/bemtvi-git",
     "crates/bemtvi-lsp",
@@ -46,6 +48,11 @@ bemtvi-lua = { path = "crates/bemtvi-lua" }
 bemtvi-git = { path = "crates/bemtvi-git" }
 bemtvi-tui = { path = "crates/bemtvi-tui" }
 bemtvi-gui = { path = "crates/bemtvi-gui" }
+# The GUI client with no toolkit (renderer, sessions, the IO thread): `bemtvi-gui` and
+# the mitsuami view build on it.
+bemtvi-gpu = { path = "crates/bemtvi-gpu" }
+# The editor as a mitsuami view an app embeds; `bemtvi-gui`'s window is one.
+bemtvi-mitsuami = { path = "crates/bemtvi-mitsuami" }
 bemtvi-ts = { path = "crates/bemtvi-ts" }
 # `default-features = false` so the wasm build (`bemtvi-server --no-default-features`)
 # drops bemtvi-lsp's `native` (tokio + async-lsp); native consumers turn it back on
@@ -59,9 +66,16 @@ bemtvi-sandbox = { path = "crates/bemtvi-sandbox" }
 # Test-only harness (a single Lua backend, PUC lua54, baked in via mlua).
 bemtvi-test-harness = { path = "crates/bemtvi-test-harness" }
 
-# Direct dependencies are pinned to exact versions (`=x.y.z`) for reproducible
-# builds. Stable releases are preferred; a pre-release line is pinned only where
-# there is no stable equivalent yet (e.g. ropey, still on 2.0.0-beta).
+# Direct dependencies are version *ranges* (caret: the version we build and test with
+# is the floor; a `0.x` crate stays on its minor), because the libraries here are
+# linked by others: an app embedding the editor (`bemtvi-mitsuami`) resolves its own
+# dependencies against these, and an exact pin would refuse the app's newer patch of a
+# shared crate. Reproducible builds come from the committed `Cargo.lock`: the binaries
+# (`bemtvi`, `bemtvi-gui`) are built `--locked`, so they ship exactly the versions
+# locked there, and an upgrade is a deliberate `cargo update` (two-week release floor).
+# Stable releases are preferred; a pre-release line stays an exact pin (`=`), since a
+# caret on a pre-release admits the next pre-release and the stable line after it
+# (ropey, still on 2.0.0-beta).
 #
 # Lua backend: vendored PUC Lua 5.4, the single backend (LuaJIT was dropped —
 # bemtvi is PUC-Lua-only, matching the wasm build, which never supported LuaJIT).
@@ -69,40 +83,40 @@ bemtvi-test-harness = { path = "crates/bemtvi-test-harness" }
 # yieldable `pcall`, and a generational GC over the old 5.1 baseline. `lua54` is
 # selected here so every crate that links mlua shares it; there is no backend
 # toggle to thread anymore.
-anyhow = "=1.0.104"
+anyhow = "1.0.104"
 # CLI argument parsing for the `bemtvi` binary (the only consumer): the `derive`
 # feature gives a struct-driven parser that validates flags, errors on unknown
 # options, and auto-generates `--help`/`--version`.
-clap = { version = "=4.6.7", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 ropey = "=2.0.0-beta.1"
 # Fuzzy matcher (nucleo-class) shared by every static-source widget consumer —
 # completion, `btv.ui.select`, and static pickers. The matcher-only sub-crate:
 # pure Rust, no async/IO, so it lives inside the synchronous `bemtvi-core`. Pure
 # Rust ⇒ compiles under emscripten for the wasm edit-host too.
-nucleo-matcher = "=0.3.1"
+nucleo-matcher = "0.3.1"
 # Charset transcoding (the WHATWG Encoding Standard, Firefox's library) backing
 # per-buffer `'fileencoding'` and the convert-on-read/write seam. Pure Rust, no
 # C, no async/IO ⇒ lives inside the synchronous `bemtvi-core` and compiles under
 # emscripten for the wasm edit-host. `simd-accel` is left OFF (it needs nightly);
 # the default `alloc` build is stable and portable. See
 # docs/plans/2026-06-14-encoding-and-invalid-utf8.md.
-encoding_rs = "=0.8.42"
+encoding_rs = "0.8.42"
 # URL query-string + component percent-encoding for `btv.http` (the `query`/`form` opts
 # and `btv.http.encode_query` / `encode_uri_component`). The canonical `rust-url`
 # (servo) crates — pure Rust, wasm-safe, and already in the tree via `url`/`ureq`, so
 # no bespoke encoder. `form_urlencoded` builds `application/x-www-form-urlencoded`
 # query/body strings; `percent-encoding` does single-component `encodeURIComponent`.
-form_urlencoded = "=1.2.2"
-percent-encoding = "=2.3.2"
+form_urlencoded = "1.2.2"
+percent-encoding = "2.3.2"
 # CommonMark + GFM parser backing the markdown renderer for read-only doc popups
 # (LSP hover / completion docs / picker preview): a pull parser that emits an event
 # stream `bemtvi_core::markdown` walks into stripped display lines + highlight spans.
 # `default-features = false` drops its `html`/`getopts` bits — we only want the
 # parser. Pure Rust, no C, no async/IO ⇒ lives inside the synchronous `bemtvi-core`
 # and compiles under emscripten for the wasm edit-host.
-pulldown-cmark = { version = "=0.13.4", default-features = false }
-crossterm = { version = "=0.29.0", features = ["event-stream"] }
-ratatui = "=0.30.2"
+pulldown-cmark = { version = "0.13.4", default-features = false }
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+ratatui = "0.30.2"
 # In-terminal image rendering for the TUI client's `'imagepreview'` (Phase 2): a
 # ratatui widget over Kitty/Sixel/iTerm2 graphics protocols, with a unicode
 # halfblocks fallback. `chafa` (the higher-quality halfblocks encoder) is left OFF
@@ -112,52 +126,56 @@ ratatui = "=0.30.2"
 # >=0.30.1. `image` is the decoder (a direct dep so the client builds the
 # `DynamicImage` the picker turns into a protocol); pinned to share one compiled
 # copy with ratatui-image's `^0.25.6`.
-ratatui-image = { version = "=11.1.0", default-features = false, features = [
+ratatui-image = { version = "11.1.0", default-features = false, features = [
     "image-defaults",
     "crossterm",
 ] }
-image = "=0.25.10"
+image = "0.25.10"
 # Raw `poll(2)` for the TUI's does-this-terminal-answer-queries probe (see
 # `bemtvi-tui/src/images.rs::terminal_answers_status_query`): it must wait for a
 # reply *without consuming stdin*, which `std::io` can't express. Already in the
 # tree transitively; pinned to the resolved version.
-libc = "=0.2.190"
+libc = "0.2.190"
 # OSC 52 clipboard payloads (`crates/bemtvi-server/src/clipboard.rs`) — the escape
 # carries its text base64-encoded.
-base64 = "=0.23.1"
+base64 = "0.23.1"
 # The Windows host clipboard (`crates/bemtvi-server/src/clipboard.rs`): Win32 has no
 # clipboard CLI that can both read and write Unicode, so `"+` talks to the API
 # directly. Already in the tree transitively; pinned to the resolved version.
-windows-sys = "=0.61.2"
-# Native GUI client stack (`bemtvi-gui`). mitsuami owns the window, its run loop and
+windows-sys = "0.61.2"
+# Native GUI client stack (`bemtvi-gpu`, with `bemtvi-mitsuami` and `bemtvi-gui` on
+# mitsuami). mitsuami owns the window, its run loop and
 # input (AppKit / WinUI 3 / GTK 4 or Kirigami, each the platform's own), and hands
 # the GUI a `GpuSurface`; wgpu presents to it, and glyphon renders the text (it
 # re-exports cosmic-text, so the GUI reaches `FontSystem`/`Buffer`/`Attrs`/… through
 # `glyphon::`). glyphon 0.12 builds against wgpu 30 — bump the two together. `pollster`
 # blocks on wgpu's async device/adapter requests while the surface is set up.
 # Pinned to a GitHub revision rather than a crates.io release while embedding
-# (`bemtvi_gui::embed`) needs mitsuami changes no release has yet; back to an exact
-# `=x.y.z` once one does. `mitsuami-test` (bemtvi-gui's embed tests) comes from the
+# (`bemtvi-mitsuami`) needs mitsuami changes no release has yet; back to a version
+# requirement once one does. `mitsuami-test` (bemtvi-mitsuami's embed tests) comes from the
 # same revision, so the two can't drift apart.
 mitsuami = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "59db232086e13cf92ec65cab8acd4bf897582235" }
 mitsuami-test = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "59db232086e13cf92ec65cab8acd4bf897582235" }
-wgpu = "=30.0.1"
-glyphon = "=0.12.0"
+wgpu = "30.0.1"
+# The window handle a host's toolkit gives `bemtvi-gpu`'s renderer: the version wgpu
+# and mitsuami both speak, so a handle from one is a surface target for the other.
+raw-window-handle = "0.6.2"
+glyphon = "0.12.0"
 # Pulled in directly (same instance glyphon uses) only to enable `monospace_fallback`:
 # without it cosmic-text's `Buffer::set_monospace_width` is a silent no-op, so wide
 # (CJK/emoji) glyphs keep their font-native advance — not snapped to two cells — and
 # the text after them drifts off the cell grid. The feature lets the shaper scale each
 # glyph to a whole number of cells. Version must match glyphon's `cosmic-text` (0.19).
-cosmic-text = { version = "=0.19.0", features = ["monospace_fallback"] }
-pollster = "=1.0.1"
+cosmic-text = { version = "0.19.0", features = ["monospace_fallback"] }
+pollster = "1.0.1"
 # Build-dependency (Windows host only): embeds the app icon + version info into
 # the bemtvi-gui.exe via the Windows SDK's rc.exe. See crates/bemtvi-gui/build.rs.
-winresource = "=0.1.34"
+winresource = "0.1.34"
 # Build-dependency of bemtvi-regex: compiles the vendored vim/neovim regexp
 # engine (csrc/) into the crate. Plain C99; also builds for
 # wasm32-unknown-emscripten (the bemtvi-edithost target).
-cc = "=1.8.0"
-tokio = { version = "=1.53.2", features = ["rt", "macros", "io-util", "io-std", "net", "sync", "time", "process"] }
+cc = "1.8.0"
+tokio = { version = "1.53.2", features = ["rt", "macros", "io-util", "io-std", "net", "sync", "time", "process"] }
 # Cross-platform filesystem notification backing `vim.uv.fs_event` in the server's
 # event-loop actor. `macos_kqueue` selects the kqueue backend on macOS instead of
 # the default FSEvents one: FSEvents' `watch()` talks to the `fseventsd` daemon and
@@ -166,23 +184,23 @@ tokio = { version = "=1.53.2", features = ["rt", "macros", "io-util", "io-std", 
 # plain syscall (sub-ms) and needs no daemon. Linux still uses inotify, Windows
 # ReadDirectoryChangesW (both already non-blocking). bemtvi watches only a handful of
 # paths (e.g. lualine's `.git/HEAD`), so kqueue's one-fd-per-watch cost is moot.
-notify = { version = "=8.2.0", features = ["macos_kqueue"] }
-futures = "=0.3.34"
-rmpv = "=1.3.1"
-mlua = { version = "=0.12.2", features = ["vendored", "serde", "lua54"] }
-serde = { version = "=1.0.229", features = ["derive"] }
+notify = { version = "8.2.0", features = ["macos_kqueue"] }
+futures = "0.3.34"
+rmpv = "1.3.1"
+mlua = { version = "0.12.2", features = ["vendored", "serde", "lua54"] }
+serde = { version = "1.0.229", features = ["derive"] }
 # Persistence (shada). `redb` is the pure-Rust, ACID, single-file embedded store
 # each daemon's per-instance shada file lives in; `rmp-serde` encodes the table
 # values as msgpack. Both server-only (the wasm core never links them). See
 # docs/plans/2026-06-11-shada-persistence.md.
-redb = "=4.4.0"
-rmp-serde = "=1.3.1"
-unicode-width = "=0.2.2"
-unicode-segmentation = "=1.13.3"
+redb = "4.4.0"
+rmp-serde = "1.3.1"
+unicode-width = "0.2.2"
+unicode-segmentation = "1.13.3"
 # The GUI reads a font's character map with it (its font list resolves each
 # character to the first font that has it). Pinned to the version fontdb uses.
-ttf-parser = { version = "=0.25.1", default-features = false, features = ["std"] }
-regex = "=1.13.1"
+ttf-parser = { version = "0.25.1", default-features = false, features = ["std"] }
+regex = "1.13.1"
 # The glob parser behind `bemtvi_core::glob` (and so `btv.glob`). Used purely as the
 # glob->regex TRANSLATOR — `Glob::regex()` hands back regex source that we compile
 # and match ourselves with the `regex` crate above, rather than going through
@@ -191,29 +209,29 @@ regex = "=1.13.1"
 # "this candidate is a Windows path" — and the daemon/remote session can hand a
 # Unix-hosted client Windows paths. Owning the regex makes path style an explicit
 # option. Pure Rust and wasm-safe (aho-corasick / bstr / regex-automata).
-globset = { version = "=0.4.20", default-features = false }
-portable-pty = "=0.9.0"
-vt100 = "=0.16.2"
-tree-sitter = "=0.26.13"
-streaming-iterator = "=0.1.9"
-libloading = "=0.9.0"
+globset = { version = "0.4.20", default-features = false }
+portable-pty = "0.9.0"
+vt100 = "0.16.2"
+tree-sitter = "0.26.13"
+streaming-iterator = "0.1.9"
+libloading = "0.9.0"
 # In-process git (bemtvi-git, native-only). Feature set is chosen per crate;
 # default-features off keeps the network/tls tree opt-in.
-gix = { version = "=0.89.0", default-features = false }
+gix = { version = "0.89.0", default-features = false }
 # Sub-crates of gix used directly by bemtvi-git's hand-rolled reset --hard (build an
-# index from a tree, then check it out over the worktree). Pinned to the EXACT versions
-# gix 0.86 resolves internally so the `gix_index::State` we pass into
+# index from a tree, then check it out over the worktree). Held to the minor versions
+# gix resolves internally so the `gix_index::State` we pass into
 # `gix_worktree_state::checkout` is the same type gix uses (type identity across the
 # shared dep — a mismatched minor would be a distinct, incompatible type).
-gix-index = { version = "=0.57.0", default-features = false }
-gix-worktree-state = { version = "=0.36.0", default-features = false }
+gix-index = { version = "0.57.0", default-features = false }
+gix-worktree-state = { version = "0.36.0", default-features = false }
 # Dev-only: real grammars compiled into a test fixture (never linked into the
 # editor — bemtvi loads grammars dynamically at runtime). `tree-sitter-md` is a host
 # grammar that injects (markdown fenced code blocks → the fence's language), so the
 # injection tests can exercise cross-language + nested injections, not just
 # rust-in-rust self-injection.
-tree-sitter-rust = "=0.24.2"
-tree-sitter-md = "=0.5.3"
+tree-sitter-rust = "0.24.2"
+tree-sitter-md = "0.5.3"
 
 # `:TSInstall` grammar fetch + compile (bemtvi-ts `install` module). All in-process
 # so a *prebuilt* bemtvi needs no external curl/git/tar at runtime. `ureq` is the
@@ -225,7 +243,7 @@ tree-sitter-md = "=0.5.3"
 # on macOS/Linux (`xz2`) and a `.zip` on Windows (`zip`, reusing `flate2` for
 # deflate via its `deflate-flate2` feature so we don't pull a second inflate
 # stack). `sha2` verifies the pinned Zig checksum before we execute it.
-ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
+ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
 # The `btv.http.mount` listener (`bemtvi-server`'s `httpmount` module) — the INBOUND
 # twin of `ureq` above, which is outbound-only. One editor-owned origin serves every
 # plugin's mounted subroute (`/plugin/<name>/*`); see
@@ -238,45 +256,45 @@ ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
 # a running reactor, not a threaded one). Native-gated in `bemtvi-server` exactly like
 # `ureq`: a browser tab cannot bind a port, so the wasm build reaches the same mount
 # contract through a Service Worker instead.
-axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
-tar = "=0.4.46"
-flate2 = "=1.1.10"
-xz2 = "=0.1.7"
-zip = { version = "=9.0.2", default-features = false, features = ["deflate-flate2"] }
-sha2 = "=0.11.1"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+tar = "0.4.46"
+flate2 = "1.1.10"
+xz2 = "0.1.7"
+zip = { version = "9.0.2", default-features = false, features = ["deflate-flate2"] }
+sha2 = "0.11.1"
 # Hash digests for the `btv.hash.*` Lua utilities (alongside `sha2`, which doubles
 # as the zig-checksum verifier above). All RustCrypto, pure Rust and wasm-safe;
 # they share the `digest = 0.11` trait surface so one `Digest` import covers all.
-sha1 = "=0.11.0"
-md-5 = "=0.11.0"
+sha1 = "0.11.0"
+md-5 = "0.11.0"
 
 # LSP client stack — reached only through `bemtvi-lsp` (Decision 1/2 of the LSP
 # design). async-lsp owns the JSON-RPC `MainLoop`, framing, id correlation, and
 # `$/cancelRequest`; lsp-types is the protocol type vocabulary.
 #
-# `lsp-types` is pinned to the exact version async-lsp 0.2.4 builds against
+# `lsp-types` is held to the version line async-lsp 0.2.4 builds against
 # (0.95.1, which still uses `url::Url`); a newer line would resolve to a *second*
 # lsp-types and the types we construct wouldn't match async-lsp's API. Bump both
 # together. `default-features = false` drops async-lsp's `client-monitor`/`stdio`
 # (server-side helpers we don't use), keeping only the omni-trait client API and
 # the tokio integration.
-async-lsp = { version = "=0.2.4", default-features = false, features = ["omni-trait", "tokio"] }
-lsp-types = "=0.95.1"
-serde_json = "=1.0.154"
+async-lsp = { version = "0.2.4", default-features = false, features = ["omni-trait", "tokio"] }
+lsp-types = "0.95.1"
+serde_json = "1.0.154"
 # `compat` bridges tokio's child-process pipes to the `futures` AsyncRead/Write
 # that async-lsp's MainLoop drives.
-tokio-util = { version = "=0.7.20", features = ["compat"] }
+tokio-util = { version = "0.7.20", features = ["compat"] }
 
 # The native daemon transport (edit-host split): WebTransport/QUIC, so native and
 # the future browser path share one stack (Open Decision #2). Default features keep
 # the `ring` crypto backend (no aws-lc-rs / cmake) and `self-signed` (rcgen) for the
 # dev cert the daemon mints + the client pins TOFU. `connect_daemon`/`run_daemon_io`
 # take any AsyncRead/AsyncWrite, so a QUIC bidi stream's halves drop straight in.
-wtransport = "=0.7.2"
+wtransport = "0.7.2"
 # CSPRNG for the launch-minted daemon bearer token (the sole auth gate — an
 # unauthenticated daemon listener is RCE by design, Open Decision #2). Already in the
 # tree transitively (ring/quinn); pulled in directly for `getrandom::fill`.
-getrandom = "=0.4.3"
+getrandom = "0.4.3"
 
 # Debug/test builds are dominated by DWARF debug info, not code: a test binary's
 # `.text` is ~3MB while its debug sections are ~430MB, and the workspace produces

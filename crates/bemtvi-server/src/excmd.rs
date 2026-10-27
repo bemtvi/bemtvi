@@ -959,7 +959,7 @@ fn home_dir() -> Option<PathBuf> {
 /// Expand a `:cd` path argument: a leading `~` / `~/` resolves against `$HOME`,
 /// anything else is taken verbatim (a relative path resolves against the current
 /// cwd inside `set_current_dir`, so no canonicalization is needed here).
-fn expand_cd_arg(arg: &str) -> PathBuf {
+pub(crate) fn expand_cd_arg(arg: &str) -> PathBuf {
     if arg == "~" {
         if let Some(home) = home_dir() {
             return home;

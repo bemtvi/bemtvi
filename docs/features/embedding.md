@@ -6,16 +6,32 @@ its config, its plugins and LSP. The app drives it through a handle, and hears f
 through events. `bemtvi-gui` is itself one of these editors, filling a window.
 
 ```sh
-cargo run -p bemtvi-gui --example embed
+cargo run -p bemtvi-mitsuami --example embed
 ```
 
-runs a small notes app built this way (`crates/bemtvi-gui/examples/embed.rs`), with
+runs a small notes app built this way (`crates/bemtvi-mitsuami/examples/embed.rs`), with
 `examples/embed/init.lua` as its editor's config.
+
+## Depending on it
+
+The crates aren't on crates.io yet: an app takes `bemtvi-mitsuami` from git, and the
+same mitsuami revision bemtvi builds against (the editor's view is a mitsuami view, so
+both must be one mitsuami):
+
+```toml
+[dependencies]
+bemtvi-mitsuami = { git = "https://github.com/bemtvi/bemtvi" }
+mitsuami = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "59db232086e13cf92ec65cab8acd4bf897582235" }
+```
+
+`bemtvi-mitsuami` is a thin layer: the editor's client itself, with no toolkit, is
+`bemtvi-gpu` (renderer, sessions, the `Client` a host drives through effects and
+deadlines), so a host on another toolkit builds on that instead.
 
 ## The editor in a layout
 
 ```rust
-use bemtvi_gui::embed::{Config, Editor, EditorEvent, EditorHandle, SessionOptions, Shada};
+use bemtvi_mitsuami::{Config, Editor, EditorEvent, EditorHandle, SessionOptions, Shada};
 
 let editor = EditorHandle::new();
 let session = SessionOptions::new()
@@ -115,7 +131,7 @@ edit one given file:
 `.enable_commands([...])` gives commands back.
 
 ```sh
-cargo run -p bemtvi-gui --example single_file [file]
+cargo run -p bemtvi-mitsuami --example single_file [file]
 ```
 
 runs one, with `examples/single-file/init.lua` as its config.

@@ -1,5 +1,5 @@
 //! `bemtvi-gui` entry point — the GUI binary is a **client only**. It opens a native
-//! mitsuami + wgpu window ([`bemtvi_gui::run`]) onto a local editor server (a headless
+//! mitsuami + wgpu window ([`run`]) onto a local editor server (a headless
 //! server on its own thread, joined over an in-process duplex — the same msgpack-RPC the
 //! TUI binary uses). The editor (core + Lua + the keystroke path) always runs local; a
 //! session can point its fs/process/watch/LSP host seams at a remote `--daemon` (the
@@ -15,7 +15,7 @@
 //!
 //! After startup, `:connect [user@]host[:port][/file]` (ssh stdio, with native askpass)
 //! and `:connect bemtvi://…` (QUIC) switch a running window to a daemon session — see the
-//! session loop in [`bemtvi_gui::run`].
+//! session loop in the client's IO thread (`bemtvi_gpu::spawn_io`).
 //!
 //! There is deliberately **no** daemon-serving role in the GUI (run `bemtvi --daemon` for
 //! that) and **no** "whole editor runs remote, thin client local" role: the edit-host
@@ -25,10 +25,13 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use bemtvi_gui::remote::{self, ConnectTarget};
-use bemtvi_gui::{spawn_session, spawn_stdio_daemon_session, GlyphOverflow, GuiConfig};
+use bemtvi_gpu::remote::{self, ConnectTarget};
+use bemtvi_gpu::{spawn_session, spawn_stdio_daemon_session, GlyphOverflow, GuiConfig, Session};
+use bemtvi_mitsuami::{Editor, EditorHandle};
 use bemtvi_server::ConfigSource;
 use clap::Parser;
+use mitsuami::prelude::{signal, spawn_local, Column, ElementBuilder, LengthExt, Size, Window};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 /// bemtvi-gui's command line. clap derives the parser, validates flags, errors on unknown
 /// options, and generates `--help`/`--version` — the same real parsing the `bemtvi` (TUI)
@@ -142,14 +145,14 @@ fn main() -> Result<()> {
     // `--daemon --listen` listener and routes fs/process/watch/LSP to it.
     if let Some(uri) = connect_uri {
         let session = spawn_session(Some(ConnectTarget::Quic(uri)), file, config_source)?;
-        return bemtvi_gui::run(session, config, None, config_source);
+        return run(session, config, None, config_source);
     }
 
     // Edit-host split, local half, over stdio: spawn a `--daemon` child (sibling `bemtvi`
     // or `BEMTVI_DAEMON_CMD`) and route fs/process/watch/LSP to it over stdio pipes.
     if cli.connect_daemon {
         let session = spawn_stdio_daemon_session(file, config_source)?;
-        return bemtvi_gui::run(session, config, None, config_source);
+        return run(session, config, None, config_source);
     }
 
     // Default role: embedded server on the local disk. A *directory* argument
@@ -163,5 +166,131 @@ fn main() -> Result<()> {
         other => (other, None),
     };
     let session = spawn_session(None, file, config_source)?;
-    bemtvi_gui::run(session, config, open_dir, config_source)
+    run(session, config, open_dir, config_source)
+}
+
+/// Run the GUI client until the window closes or the server disconnects, rendering with
+/// `config`'s font. Must be called on the main thread (the platform's UI toolkits'
+/// requirement).
+///
+/// `initial` is the already-built startup [`Session`] (its server thread is running) —
+/// embedded local, or a daemon session if launched with `--connect-daemon` / a
+/// `bemtvi://` target. After startup, `:connect [user@]host[:port][/file]` or
+/// `:connect bemtvi://…` swaps the window onto a **new** local server whose host seams
+/// point at a daemon (see [`spawn_session`]), and `:workspace [dir]` swaps it
+/// onto a fresh **local** session rooted at a directory (its own shada namespace + saved
+/// layout — see `bemtvi_gpu::spawn_workspace_session`). Either way the IO thread builds the
+/// new session off the UI thread, then the session loop retires the old server (it winds
+/// down on EOF) and re-attaches the UI onto the new one. The editor always runs local —
+/// only the fs/process/watch/LSP seams cross the wire.
+///
+/// The window's content is the same [`Editor`] a mitsuami app mounts in its own
+/// layout; what's here is what belongs to an app that owns the process: the window, the
+/// signals, and the exit status.
+fn run(
+    initial: Session,
+    config: GuiConfig,
+    open_dir: Option<PathBuf>,
+    config_source: bemtvi_server::ConfigSource,
+) -> Result<()> {
+    // Be killable without losing the session. There is no terminal to hand back here
+    // — a window is not a tty — so this client takes only the *graceful* half: a
+    // `kill` / SIGHUP / SIGINT wakes the UI thread through the channel and the editor
+    // quits itself properly (see [`EditorHandle::quit_now`]), with the watchdog
+    // in `bemtvi_view::signals` still guaranteeing the process dies if that goes nowhere.
+    let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    bemtvi_view::signals::install(bemtvi_view::signals::Config {
+        restore_sequence: Vec::new(),
+        restore_termios: false,
+        on_shutdown: Box::new(move || {
+            let _ = signal_tx.send(());
+        }),
+    });
+
+    let handle = EditorHandle::new();
+    let ui_handle = handle.clone();
+    // Runs until the window closes. The app id matches the installed `.desktop` file's
+    // basename (its `StartupWMClass`), so Linux desktops associate the AppImage's icon
+    // with the window; it's also an unpackaged Windows build's AppUserModelID.
+    mitsuami::App::new()
+        .id("bemtvi")
+        .name("bemtvi")
+        .open(move || {
+            window(
+                ui_handle,
+                initial,
+                config,
+                open_dir,
+                config_source,
+                signal_rx,
+            )
+        })
+        .run();
+
+    // The UI is done: stop the IO thread and wait for it, so the streams are dropped
+    // (servers see EOF) and their threads are joined before returning.
+    let panicked = handle.close();
+    if panicked {
+        eprintln!("bemtvi-gui: a server thread panicked");
+        std::process::exit(101);
+    }
+    // If we are only here because the process was killed, the shutdown is now
+    // complete — the editor ran its exit sequence and the server flushed its shada.
+    // Die of that signal so whoever sent it (a shell, a session manager logging the
+    // user out) sees the kill it asked for, not a clean exit 0.
+    bemtvi_view::signals::exit_as_signal_if_killed();
+    Ok(())
+}
+
+/// The window: titled `bemtvi`, 960×640 points, its whole content the editor, focused so
+/// keys go to it from the start. Built in mitsuami's app scope.
+fn window(
+    handle: EditorHandle,
+    session: Session,
+    config: GuiConfig,
+    open_dir: Option<PathBuf>,
+    config_source: bemtvi_server::ConfigSource,
+    mut signals: UnboundedReceiver<()>,
+) -> Window {
+    let open = signal(true);
+    // Killed: quit the session the way `:qall!` does (see `EditorHandle::quit_now`).
+    let killed = handle.clone();
+    spawn_local(async move {
+        // An editor that already quit is already on its way out.
+        if signals.recv().await.is_some() {
+            let _ = killed.quit_now();
+        }
+    });
+    let closing = handle.clone();
+    // `content` may be asked for again; the session is only there the first time.
+    let session = std::cell::Cell::new(Some(session));
+    Window::new("bemtvi")
+        .size(Size::new(960.0, 640.0))
+        .open(open)
+        // Don't close on the close button directly — that would discard a modified
+        // buffer silently. Route through the server's `:qa`, which quits a clean
+        // editor (it then sends `bemtvi_exit`, which closes the window through the
+        // editor's `on_exit`) but refuses with `E37` when a buffer is unsaved, keeping
+        // the window open. mitsuami routes the platform's Quit (macOS's app menu, the
+        // Dock, a logout) here too.
+        // An editor that already quit has nothing to refuse with: just close.
+        .on_close_request(move || {
+            if closing.request_quit().is_err() {
+                open.set(false);
+            }
+        })
+        .content(move || {
+            let session = session
+                .take()
+                .expect("bemtvi-gui: the window's content is built once");
+            // Closing the last window ends mitsuami's run loop, and `run`'s teardown.
+            Column::new().size(100.pct(), 100.pct()).child(
+                Editor::new(session, move || open.set(false))
+                    .handle(handle.clone())
+                    .config(config.clone())
+                    .open_dir(open_dir.clone())
+                    .config_source(config_source)
+                    .autofocus(true),
+            )
+        })
 }

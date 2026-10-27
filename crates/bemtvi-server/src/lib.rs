@@ -331,7 +331,7 @@ pub struct ServerInit {
     /// [`shada_namespace`]: Self::shada_namespace
     pub workspace_dir: Option<String>,
     /// The id of the app embedding this editor (a mitsuami app mounting
-    /// `bemtvi_gui::embed::Editor`), which `btv.host.name()` reports and without which
+    /// `bemtvi_mitsuami::Editor`), which `btv.host.name()` reports and without which
     /// `btv.host.send` raises. Seeded before any config runs. `None` (the default) for the
     /// TUI, `bemtvi-gui` and tests: nothing embeds them.
     pub host: Option<String>,

@@ -12,6 +12,7 @@
 
 pub mod buffer;
 pub mod clipboard;
+pub mod dialog;
 pub mod editor;
 pub mod encoding;
 pub mod ex_names;

@@ -740,7 +740,7 @@ impl Editor {
         // the glyphs. Validated here all the same — a typo in an enumerated value must
         // fail loud (E474) rather than leaving the rendering silently on the previous
         // mode. The accepted spellings are the client's `GlyphOverflow::parse`
-        // (`bemtvi-gui/src/lib.rs`, mirrored by the web client's `glyphOverflowMode`);
+        // (`bemtvi-gpu/src/config.rs`, mirrored by the web client's `glyphOverflowMode`);
         // keep the three lists in step. `&` resets to empty — "the client's own setting".
         if name == "guiglyphoverflow" {
             match op {

@@ -214,9 +214,17 @@ impl Editor {
         match kind {
             CmdlineKind::Ex => {
                 self.remember_ex(&text);
-                self.begin_change_marks();
-                self.execute_ex(&text);
-                self.finish_change_marks(true);
+                let dialog = self
+                    .file_dialogs
+                    .then(|| crate::dialog::file_dialog(&text, self.buffer().path.is_none()))
+                    .flatten();
+                if let Some(dialog) = dialog {
+                    self.deferred_commands.push(DeferredCmd::FileDialog(dialog));
+                } else {
+                    self.begin_change_marks();
+                    self.execute_ex(&text);
+                    self.finish_change_marks(true);
+                }
             }
             CmdlineKind::Search(dir) => {
                 // Commit from the saved origin, not the incsearch preview hop, so the

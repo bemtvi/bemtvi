@@ -436,7 +436,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bemtvi-gui"
+name = "bemtvi-gpu"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -445,20 +445,32 @@ dependencies = [
  "bemtvi-server",
  "bemtvi-test-harness",
  "bemtvi-view",
- "clap",
  "cosmic-text",
  "glyphon",
  "image",
- "libc",
- "mitsuami",
- "mitsuami-test",
  "pollster",
+ "raw-window-handle",
  "rmpv",
  "tokio",
  "ttf-parser",
  "unicode-segmentation",
  "unicode-width",
  "wgpu",
+]
+
+[[package]]
+name = "bemtvi-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bemtvi-gpu",
+ "bemtvi-mitsuami",
+ "bemtvi-server",
+ "bemtvi-view",
+ "clap",
+ "libc",
+ "mitsuami",
+ "tokio",
  "winresource",
 ]
 
@@ -499,6 +511,23 @@ dependencies = [
  "sha1",
  "sha2 0.11.1",
  "unicode-width",
+]
+
+[[package]]
+name = "bemtvi-mitsuami"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bemtvi-core",
+ "bemtvi-gpu",
+ "bemtvi-rpc",
+ "bemtvi-server",
+ "bemtvi-test-harness",
+ "bemtvi-view",
+ "mitsuami",
+ "mitsuami-test",
+ "rmpv",
+ "tokio",
 ]
 
 [[package]]

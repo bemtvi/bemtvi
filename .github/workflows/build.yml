@@ -124,10 +124,14 @@ jobs:
         with:
           shared-key: ${{ matrix.target }}-${{ matrix.kind }}
 
+      # `--locked`: the binaries ship exactly the versions in Cargo.lock. The manifests
+      # give the libraries version ranges (so an app embedding the editor can share its
+      # dependencies); the lock is what makes a release reproducible, and a build that
+      # would change it fails instead.
       - name: Build
         if: matrix.os != 'linux'
         shell: bash
-        run: cargo build --release -p "$CRATE" --target ${{ matrix.target }}
+        run: cargo build --locked --release -p "$CRATE" --target ${{ matrix.target }}
 
       # Linux (TUI + GUI): link against an ancient glibc (2.17 — the
       # manylinux2014 baseline: CentOS/RHEL 7, ~2014, and the oldest glibc with
@@ -141,7 +145,7 @@ jobs:
       - name: Build with pinned glibc floor (Linux)
         if: matrix.os == 'linux'
         shell: bash
-        run: cargo zigbuild --release -p "$CRATE" --target ${{ matrix.target }}.2.17
+        run: cargo zigbuild --locked --release -p "$CRATE" --target ${{ matrix.target }}.2.17
 
       - name: Import signing certificates (macOS)
         if: matrix.os == 'macos'

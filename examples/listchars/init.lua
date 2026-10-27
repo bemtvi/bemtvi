@@ -21,7 +21,7 @@
 --   eol:c              one glyph past the end of every line
 -- ```
 --
--- The default is `tab:→ ,space:·,trail:•,nbsp:␣`: glyphs nobody types, so a drawn
+-- The default is `tab:→ ,space:·,trail:•,nbsp:◦,eol:¬`: glyphs nobody types, so a drawn
 -- blank can't be mistaken for text (neovim's `>`/`-`/`+` can). Glyphs are colored
 -- with the `Whitespace` highlight group (`NonText` for `eol`). Drawing never moves
 -- the cursor: a tab's glyphs cover exactly the cells the tab did.
@@ -31,7 +31,8 @@
 --
 -- Type-this:  nothing; open the sample.
 -- See-that:   every space is a `·` (line 4 starts `····`); line 3's tab is `→` then
---             blanks; line 6 ends in `•••`; line 7's non-breaking spaces are `␣`.
+--             blanks; line 6 ends in `•••`; line 7's non-breaking spaces are `◦`;
+--             every line, the empty line 2 too, ends in `¬`.
 --------------------------------------------------------------------------------
 btv.wo.list = true
 
@@ -52,12 +53,12 @@ end, { desc = "toggle 'list'" })
 -- 3. Show everything.
 --
 -- Type-this:  :ListAll<CR>
--- See-that:   leading runs are `›` (line 4 starts `››››`), the tabs are `→───`
---             arrows, and each line ends in `¬`.
+-- See-that:   leading runs are `›` (line 4 starts `››››`) and the tabs are `→───`
+--             arrows.
 --------------------------------------------------------------------------------
 btv.command("ListAll", function()
   btv.wo.list = true
-  btv.wo.listchars = "tab:→─,space:·,lead:›,trail:•,nbsp:␣,eol:¬"
+  btv.wo.listchars = "tab:→─,space:·,lead:›,trail:•,nbsp:◦,eol:¬"
 end, { desc = "draw every invisible character" })
 
 --------------------------------------------------------------------------------

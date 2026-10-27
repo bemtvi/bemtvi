@@ -85,7 +85,7 @@ try {
   check("nolist draws the plain row", !/[>~]/.test(off) && off.includes("x"), JSON.stringify(off));
 
   // The default glyphs draw an ordinary space-indented line, which neovim's default
-  // (no `space:` key) left unchanged.
+  // (no `space:` or `eol:` key) left unchanged.
   await page.evaluate(() =>
     window.__bemtvi.execLua(
       "btv.buf.set_lines(0, 0, -1, false, { '    let y = 2;' }); " +
@@ -94,7 +94,7 @@ try {
   );
   await sleep(300);
   const def = (await page.evaluate(firstRow)).map((c) => c.ch).join("").trim();
-  check("the default draws plain spaces as ·", def.endsWith("····let·y·=·2;"), JSON.stringify(def));
+  check("the default draws plain spaces as · and the line end as ¬", def.endsWith("····let·y·=·2;¬"), JSON.stringify(def));
 
   await browser.close();
 } catch (e) {

@@ -24,14 +24,16 @@ end
 
 btv.test.describe("examples/listchars", function()
   -- 1. "every space is a `·` (line 4 starts `····`); line 3's tab is `→` then
-  --    blanks; line 6 ends in `•••`; line 7's non-breaking spaces are `␣`."
+  --    blanks; line 6 ends in `•••`; line 7's non-breaking spaces are `◦`; every line ends in `¬`."
   btv.test.it("1 — the default glyphs are drawn on open", function(t)
     open(t)
     btv.test.expect(btv.wo.list).to_be(true)
     btv.test.expect(row(t, 4)).to_contain("····indented·with·four·spaces")
     btv.test.expect(row(t, 3)).to_contain("→   indented·with·a·tab")
     btv.test.expect(row(t, 6)).to_contain("three·spaces•••")
-    btv.test.expect(row(t, 7)).to_contain("this␣word␣gap")
+    btv.test.expect(row(t, 7)).to_contain("this◦word◦gap")
+    btv.test.expect(row(t, 4)).to_contain("spaces¬")
+    btv.test.expect(row(t, 2)).to_contain("¬")
     -- The buffer itself is untouched.
     btv.test.expect(t:lines()[3]).to_be("\tindented with a tab")
   end)
@@ -59,8 +61,8 @@ btv.test.describe("examples/listchars", function()
     btv.test.expect(btv.wo.list).to_be(false)
   end)
 
-  -- 3. "leading runs are `›` (line 4 starts `››››`), the tabs are `→───` arrows,
-  --    and each line ends in `¬`."
+  -- 3. "leading runs are `›` (line 4 starts `››››`) and the tabs are `→───`
+  --    arrows."
   btv.test.it("3 — :ListAll draws every invisible character", function(t)
     open(t)
     t:cmd("ListAll")
@@ -85,7 +87,7 @@ btv.test.describe("examples/listchars", function()
   --    `E474: Invalid argument: listchars=eol:ab` … the old value is kept.
   --    `:set listchars&` restores the default."
   btv.test.it("5 — read back, reject a bad value, restore the default", function(t)
-    local default = "tab:→ ,space:·,trail:•,nbsp:␣"
+    local default = "tab:→ ,space:·,trail:•,nbsp:◦,eol:¬"
     open(t)
     t:cmd("set whitespacechars?")
     btv.test.expect(t:message()).to_contain("listchars=" .. default)

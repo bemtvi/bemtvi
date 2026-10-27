@@ -10,12 +10,14 @@ as a visible glyph. Tabs become `>---`, trailing blanks become `-`, a non-breaki
 space becomes `+`, and so on. The glyphs are painted in the `Whitespace` group, and
 the `eol` marker in `NonText`, as in neovim.
 
-The default is bemtvi's own, `listchars=tab:→ ,space:·,trail:•,nbsp:␣`. neovim's
+The default is bemtvi's own, `listchars=tab:→ ,space:·,trail:•,nbsp:◦,eol:¬`. neovim's
 `tab:> ,trail:-,nbsp:+` was the first default, and in use `:set list` then changed
 nothing on a file indented with spaces (no glyph for a plain space), and its glyphs
 are characters real text is full of. The `bemtvi` colorscheme's `Whitespace` was also
-too faint to see (1.6:1 on the background); it now links to `NonText` (2.9:1), as in
-neovim.
+too faint to see (1.6:1 on the background). It now links to `NonText`, as in neovim,
+and the scheme's `NonText` (whose only first-party user is the `eol` marker) is
+surface2, 2.1:1: overlay0 (2.9:1) was tried and competed with the text. Line ends
+are drawn by default; `␣` / `↵` were avoided because Noto Sans Mono lacks them.
 
 ## Where it lives, and why it isn't a plugin
 

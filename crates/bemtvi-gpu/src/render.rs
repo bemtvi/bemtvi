@@ -5004,7 +5004,7 @@ pub fn group_fallback(group: &str) -> Style {
         "SpecialKey" => return styled(0xeb_aa_b9, false, true),
         // The `'list'` glyphs (`Whitespace`, which the scheme links to `NonText`) and
         // the `eol` marker: muted, so the drawn blanks recede behind the text.
-        "Whitespace" | "NonText" => 0x63_67_73, // overlay0
+        "Whitespace" | "NonText" => 0x4f_52_5d, // surface2
         _ => return Style::default(),
     };
     Style {

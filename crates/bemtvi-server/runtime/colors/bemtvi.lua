@@ -108,9 +108,10 @@ hl(0, "TabLineSel",   { fg = p.text, bg = p.base })
 hl(0, "TabLineFill",  { bg = p.mantle })
 hl(0, "WinBar",       { fg = p.rosewater })
 hl(0, "EndOfBuffer",  { fg = p.surface1 })
-hl(0, "NonText",      { fg = p.overlay0 })
--- The `'list'` glyphs. surface1 sat at 1.6:1 on `base`, too faint to see a `·`;
--- NonText's overlay0 (2.9:1) stays muted but reads, and is neovim's own link.
+-- The `'list'` glyphs and the line-end marker (`Whitespace` links here). surface2 is
+-- 2.1:1 on `base`: there when you look, gone when you read. (surface1, 1.6:1, could
+-- not be seen; overlay0, 2.9:1, competed with the text.)
+hl(0, "NonText",      { fg = p.surface2 })
 hl(0, "Whitespace",   { link = "NonText" })
 hl(0, "Conceal",      { fg = p.overlay1 })
 -- The `^X` / `<xx>` overlay on unprintable control chars: a standout colour.

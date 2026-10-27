@@ -447,11 +447,14 @@ is [**Beyond vim: what bemtvi adds**](docs/features.md); the highlights:
 - **A native GUI client.** `bemtvi-gui` (mitsuami + wgpu) is a first-party GPU
   client — not a third-party frontend — rendering the same `View` the terminal
   client does. It wires the OS's **native file dialogs** into the command line
-  (a GUI-only affordance; the server stays unaware):
+  (a GUI-only affordance, on sessions whose files are on this machine: the editor
+  recognizes these lines as it runs them and asks the GUI for the dialog):
   - The `…o` *open* family — `:eo`, `:spo`, `:vso`, `:tabeo`, `:newo`, `:vnewo`,
     and a bare `:e` (an alias of `:eo`) — pops a system **open** dialog, then
     runs the base command (`:e`/`:sp`/`:vs`/`:tabe`/…) on the chosen file,
     preserving its edit / split / tab semantics.
+  - `:e <dir>` (and `:sp`/`:vs`/`:tabe <dir>`) pops the open dialog in that
+    directory instead of the in-window listing.
   - `:wo` (and a bare `:w` on an unnamed buffer) pops a system **save** dialog
     and writes to the chosen path.
 

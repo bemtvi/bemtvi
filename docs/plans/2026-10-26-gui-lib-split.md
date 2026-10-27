@@ -274,3 +274,14 @@ All five phases landed, one commit each. Where the build differs from the design
   unchanged by it. CI's binary builds and `bemtvi-edithost/build.sh` build `--locked`.
   `bemtvi-edithost` (workspace-excluded, its own lock) keeps its exact pins.
 
+## After review (2026-10-27)
+
+Three review passes over the five phases changed one design point: the `<CR>`
+intercepts left the client. It acted on the command line it had last drawn, which
+input faster than a frame outruns. The editor now decides as it runs the line: the
+dialog rules are `bemtvi_core::dialog`, a client attaching with `file_dialogs` (local
+sessions only) gets a `btv_file_dialog` request, and `:workspace` hands the client its
+directory as `btv_workspace`. The other fixes (the unmount leak, unjoined IO threads,
+detach state, dialogs across a session swap, `open_dir` on remote, messages cut at a
+`|`, a close waiting on a dial) changed no API. Left open: embedded editors share the
+process cwd (`docs/plans/2026-10-27-per-editor-cwd.md`).

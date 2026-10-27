@@ -37,10 +37,12 @@ bemtvi --workspace                           # the current directory
   [`--workspace-no-cwd`](#keeping-the-launch-directory) to keep the launch
   directory). A relative `TARGET` file then resolves against the workspace root.
 
-The native GUI also exposes a client-side **`:workspace [dir]`** command: a bare
-`:workspace` reopens the current directory as a workspace, and `:workspace <dir>`
-switches the running window to that directory's session. (Like `:connect`, this
-is a GUI-client command — the server knows nothing of it.)
+The native GUI also exposes a **`:workspace [dir]`** command: a bare `:workspace`
+reopens the current directory as a workspace, and `:workspace <dir>` switches the
+running window to that directory's session (a relative `dir` is taken against the
+editor's working directory). The GUI registers the command when it starts a session;
+running it hands the GUI the directory, which builds the new session, as with
+`:connect`. An embedding app gets it only with `session_switching(true)`.
 
 ## What gets restored
 

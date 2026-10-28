@@ -128,13 +128,11 @@ fetch/compile — aren't listed; only the edges that still diverge are.)
   key but `conceal`: `tab`, `space`, `multispace`, `lead`, `leadmultispace`,
   `trail`, `nbsp`, `eol`, and under `nowrap` the `extends` / `precedes` edge
   markers. `'listchars'` is also spelled `whitespacechars`. Where bemtvi differs:
-  - The default is `tab:→ ,space:·,trail:•,nbsp:◦,eol:¬,extends:»,precedes:«`, not neovim's
+  - The default is `tab:→ ,space:·,trail:•,nbsp:◦,eol:¬`, not neovim's
     `tab:> ,trail:-,nbsp:+`. neovim's draws nothing for an ordinary space or a
     line end, so `:set list` changed nothing on a space-indented file, and its
     `>` / `-` / `+` can't be told from typed text. The glyphs are all in the common
-    monospace fonts (Noto Sans Mono has no `␣` or `↵`). The edge markers are in it
-    because bemtvi doesn't wrap by default, so a long line would otherwise run off
-    the window with no sign.
+    monospace fonts (Noto Sans Mono has no `␣` or `↵`).
   - An edge marker never covers the cursor's cell. vim draws it there, which hides
     the character under the cursor whenever it rides an edge (after `$`, or
     stepping right along a long line).

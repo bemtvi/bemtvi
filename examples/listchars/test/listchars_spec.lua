@@ -85,8 +85,9 @@ btv.test.describe("examples/listchars", function()
 
   -- 5. "before `$`, line 9 ends in `»` at the right edge … after `$` … lines 1 and
   --    9 start with `«` at the left edge"
-  btv.test.it("5 — the default marks where a nowrap line runs off an edge", function(t)
+  btv.test.it("5 — :Edges marks where a nowrap line runs off an edge", function(t)
     open(t)
+    t:cmd("Edges")
     t:feed("9G")
     btv.test.expect(row(t, 9)).to_contain("»")
     btv.test.expect(row(t, 9)).never.to_contain("«")
@@ -102,7 +103,7 @@ btv.test.describe("examples/listchars", function()
   --    `E474: Invalid argument: listchars=eol:ab` … the old value is kept.
   --    `:set listchars&` restores the default."
   btv.test.it("6 — read back, reject a bad value, restore the default", function(t)
-    local default = "tab:→ ,space:·,trail:•,nbsp:◦,eol:¬,extends:»,precedes:«"
+    local default = "tab:→ ,space:·,trail:•,nbsp:◦,eol:¬"
     open(t)
     t:cmd("set whitespacechars?")
     btv.test.expect(t:message()).to_contain("listchars=" .. default)

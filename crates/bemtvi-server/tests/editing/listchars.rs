@@ -60,8 +60,7 @@ async fn list_is_off_by_default_and_draws_the_default_listchars_when_on() {
     let view = render(&rpc, &mut incoming, &text, &["tabstop=4"]).await;
     assert_eq!(view_lines(&view)[0], "\tab\tc  ");
 
-    // On, with the default (`tab:→ ,space:·,trail:•,nbsp:◦,eol:¬`, plus the edge
-    // markers, which a line this short never needs): each tab is `→`
+    // On, with the default `tab:→ ,space:·,trail:•,nbsp:◦,eol:¬`: each tab is `→`
     // padded with blanks to its full width (4 cells at col 0, 2 at col 6), trailing
     // spaces `•`, and the line end `¬`.
     let view = redraw_after(&rpc, &mut incoming, ":set list<CR>").await;
@@ -471,20 +470,4 @@ async fn edge_markers_never_cover_the_cursor() {
     let view = redraw_after(&rpc, &mut incoming, "h").await;
     let row: Vec<char> = view_lines(&view)[0].chars().collect();
     assert_eq!(row[w - 1], '»');
-}
-
-/// The default marks a `nowrap` line's hidden content: bemtvi doesn't wrap by
-/// default, so without the markers a long line runs off the edge with no sign.
-#[tokio::test]
-async fn the_default_listchars_marks_content_past_either_edge() {
-    let (rpc, mut incoming) = start(None).await;
-    let w = bare_text_width(&rpc, &mut incoming).await;
-    let long = format!("{}Z", "a".repeat(w + 20));
-    let view = render(&rpc, &mut incoming, &[long.as_str()], &["nowrap", "list"]).await;
-    let row: Vec<char> = view_lines(&view)[0].chars().collect();
-    assert_eq!(row[w - 1], '»', "content past the right edge");
-    let view = redraw_after(&rpc, &mut incoming, "$h").await;
-    let leftcol = view_u64(&view, "leftcol") as usize;
-    let row: Vec<char> = view_lines(&view)[0].chars().collect();
-    assert_eq!(row[leftcol], '«', "content past the left edge");
 }

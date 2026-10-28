@@ -1062,6 +1062,7 @@ impl WindowOptions {
             breakindent: self.breakindent,
             showbreak: self.showbreak.as_str(),
             sbr: self.breakindent_sbr(),
+            eol: self.listchars().is_some_and(|l| l.eol.is_some()),
         }
     }
 
@@ -1180,10 +1181,16 @@ pub struct ListChars {
     pub nbsp: Option<char>,
     /// `eol:c`: one glyph drawn just past the end of each line.
     pub eol: Option<char>,
+    /// `extends:c`: under `nowrap`, drawn on the last visible column when the line
+    /// runs past the right edge.
+    pub extends: Option<char>,
+    /// `precedes:c`: under `nowrap`, drawn on the first visible column when
+    /// `leftcol` hides text on the left.
+    pub precedes: Option<char>,
 }
 
-/// The `'listchars'` keys. `extends`, `precedes` and `conceal` are validated but
-/// not drawn yet (see `docs/plans/2026-10-27-list-and-listchars.md`, Phase 2).
+/// The `'listchars'` keys. `conceal` is validated but not drawn: bemtvi renders no
+/// syntax conceal for it to apply to.
 const LISTCHARS_KEYS: &[&str] = &[
     "tab",
     "space",
@@ -1246,7 +1253,9 @@ pub fn parse_listchars(s: &str) -> Option<ListChars> {
                     "trail" => lcs.trail = Some(c),
                     "nbsp" => lcs.nbsp = Some(c),
                     "eol" => lcs.eol = Some(c),
-                    // `extends` / `precedes` / `conceal`: validated, not drawn yet.
+                    "extends" => lcs.extends = Some(c),
+                    "precedes" => lcs.precedes = Some(c),
+                    // `conceal`: validated; there is no syntax conceal to draw it on.
                     _ => {}
                 }
             }

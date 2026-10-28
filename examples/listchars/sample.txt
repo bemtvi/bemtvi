@@ -6,3 +6,4 @@ Tabs, blanks and other invisible characters, drawn by :set list
 this line ends in three spaces   
 this word gap is a non-breaking space
 col	umns	line	up
+a long line that runs off the right edge of the window, a long line that runs off the right edge of the window, a long line that runs off the right edge of the window, a long line that runs off the right edge of the window, END

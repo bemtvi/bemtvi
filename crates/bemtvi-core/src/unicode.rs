@@ -189,6 +189,9 @@ pub struct WrapOpts<'a> {
     /// line's indent. Default (`false`) is vim's additive prefix: breakindent then the
     /// marker, so the text sits one marker-width past the indent.
     pub sbr: bool,
+    /// `'list'` draws an `eol` glyph one cell past the end of every line, so a line
+    /// takes one cell more than its text (see [`window_wrap_segments`]).
+    pub eol: bool,
 }
 
 /// The `'breakindent'`/`'showbreak'` continuation prefix for `line`: the string drawn
@@ -357,6 +360,40 @@ pub fn wrap_segments_indented(
         end_byte: line.len(),
         start_col: seg_start_col,
     });
+    segs
+}
+
+/// A window's soft-wrap rows for `line`: [`wrap_segments_indented`] under the window's
+/// [`WrapOpts`], plus — when `'list'` draws an `eol` glyph and the line's last row has
+/// no cell left for it — one more, empty row at the line's end for the glyph, as vim
+/// does. Every caller that counts a window's rows (layout, cursor row, scrolling,
+/// `gj`/`gk`, the mouse) goes through this, so the extra row is real to all of them,
+/// not just drawn.
+pub fn window_wrap_segments(
+    line: &str,
+    tabstop: usize,
+    width: usize,
+    cont_indent: usize,
+    wo: WrapOpts,
+) -> Vec<WrapSeg> {
+    let mut segs = wrap_segments_indented(line, tabstop, width, cont_indent, wo.linebreak);
+    if !wo.eol || width == 0 {
+        return segs;
+    }
+    let last = *segs.last().expect("at least one segment");
+    let avail = if last.start_byte == 0 {
+        width
+    } else {
+        width - cont_indent.min(width.saturating_sub(1))
+    };
+    let cols = virtcol(line, line.len(), tabstop);
+    if cols - last.start_col >= avail {
+        segs.push(WrapSeg {
+            start_byte: line.len(),
+            end_byte: line.len(),
+            start_col: cols,
+        });
+    }
     segs
 }
 
@@ -579,6 +616,82 @@ fn tab_glyphs(x: char, y: char, z: Option<char>, w: usize) -> String {
         }
     }
     s
+}
+
+/// The edges of a `nowrap` window that `'listchars'`' `extends` / `precedes` markers
+/// sit on: it shows columns `[leftcol, leftcol + width)`, and its drawn cursor is at
+/// `(line, virtual column)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListEdges {
+    pub leftcol: usize,
+    pub width: usize,
+    pub cursor: (usize, usize),
+}
+
+/// Where `'listchars'`' `extends` / `precedes` markers go on buffer line `line`'s
+/// `nowrap` row: `(column, glyph)` pairs, `extends` first so a `precedes` on the same
+/// column (a one-cell window) wins. `text` is the row's head of the line; `clipped`
+/// says the head stops before the line does, and `eol` that an `eol` glyph follows
+/// the text (it is a cell of the line like any other).
+///
+/// `extends` goes on the last visible column when the line has a cell past it;
+/// `precedes` on the first when `leftcol` hides text and the line still reaches the
+/// window (vim draws no marker on a line scrolled entirely out of view). Neither goes
+/// on the cursor's cell: vim draws them there, which hides the character the cursor
+/// is on whenever it rides an edge (after `$`, or stepping right along a long line).
+pub fn list_edge_marks(
+    text: &str,
+    clipped: bool,
+    eol: bool,
+    tabstop: usize,
+    lcs: &crate::options::ListChars,
+    edges: ListEdges,
+    line: usize,
+) -> Vec<(usize, char)> {
+    let ListEdges {
+        leftcol,
+        width,
+        cursor,
+    } = edges;
+    let mut marks = Vec::new();
+    if width == 0 || (lcs.extends.is_none() && lcs.precedes.is_none()) {
+        return marks;
+    }
+    let cells = virtcol(text, text.len(), tabstop) + usize::from(eol);
+    if let Some(c) = lcs.extends {
+        if clipped || cells > leftcol + width {
+            marks.push((leftcol + width - 1, c));
+        }
+    }
+    if let Some(c) = lcs.precedes {
+        if leftcol > 0 && (clipped || cells > leftcol) {
+            marks.push((leftcol, c));
+        }
+    }
+    marks.retain(|&(col, _)| (line, col) != cursor);
+    marks
+}
+
+/// `row` (a `nowrap` row's drawn text, which starts at column 0) with each
+/// [`list_edge_marks`] marker drawn over the cell it lands on. A marker inside a
+/// multi-cell grapheme (a raw tab, a wide char) takes only its own cell; the
+/// grapheme's other cells become blanks, so every column keeps its place.
+pub fn apply_list_edge_marks(row: &str, tabstop: usize, marks: &[(usize, char)]) -> String {
+    let mut out = row.to_string();
+    for &(col, mark) in marks {
+        let at = byte_at_virtcol(&out, col, tabstop);
+        if at >= out.len() {
+            continue;
+        }
+        let end = next_grapheme(&out, at);
+        let start_col = virtcol(&out, at, tabstop);
+        let w = grapheme_width(&out[at..end], start_col, tabstop).max(1);
+        let mut cell = " ".repeat(col - start_col);
+        cell.push(mark);
+        cell.push_str(&" ".repeat(start_col + w - col - 1));
+        out.replace_range(at..end, &cell);
+    }
+    out
 }
 
 /// `line[from..to]` with every [`ListSub`] inside that range drawn in place of the

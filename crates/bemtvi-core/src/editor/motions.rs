@@ -729,7 +729,7 @@ impl Editor {
         // indent, so gj/gk step the same display rows the window renders.
         let segs_of = |text: &str| {
             let indent = unicode::cont_indent(text, tab, width, wo);
-            unicode::wrap_segments_indented(text, tab, width, indent, wo.linebreak)
+            unicode::window_wrap_segments(text, tab, width, indent, wo)
         };
         let seg_count = |line: usize| segs_of(&buf.line_cow(line)).len();
 
@@ -803,7 +803,7 @@ impl Editor {
             let opts = &self.windows.cur().options;
             let wo = opts.wrap_opts();
             let indent = unicode::cont_indent(&text, tab, width, wo);
-            let segs = unicode::wrap_segments_indented(&text, tab, width, indent, wo.linebreak);
+            let segs = unicode::window_wrap_segments(&text, tab, width, indent, wo);
             let seg = segs
                 .iter()
                 .rposition(|s| self.cursor.col >= s.start_byte)

@@ -70,7 +70,22 @@ end, { desc = "draw every invisible character" })
 --------------------------------------------------------------------------------
 
 --------------------------------------------------------------------------------
--- 5. Read it back, and bad values.
+-- 5. Mark the edges of a line that runs off the window.
+--
+-- Type-this:  :Edges<CR>   then   9G   then   $
+-- See-that:   before `$`, line 9 ends in `»` at the right edge (it continues);
+--             after `$` the window has scrolled right, and lines 1 and 9 start with
+--             `«` at the left edge (text is hidden there). Line 2 is empty and the
+--             short lines are scrolled out of view, so they get no marker.
+--------------------------------------------------------------------------------
+btv.command("Edges", function()
+  btv.wo.wrap = false
+  btv.wo.list = true
+  btv.wo.listchars = "tab:→ ,space:·,trail:•,nbsp:◦,eol:¬,extends:»,precedes:«"
+end, { desc = "mark where a nowrap line runs off an edge" })
+
+--------------------------------------------------------------------------------
+-- 6. Read it back, and bad values.
 --
 -- Type-this:  :set whitespacechars?<CR>
 -- See-that:   `listchars=` and the current value (the alias reports the vim name).

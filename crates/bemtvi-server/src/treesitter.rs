@@ -496,7 +496,7 @@ impl EditHost {
         buffer: BufferId,
         winhl: &WinHl,
         segs: &[crate::redraw::RowSeg],
-        lcs: Option<&bemtvi_core::ListChars>,
+        list: Option<crate::extmarks::ListPaint>,
         styles: &mut StyleTable,
     ) -> Value {
         // A terminal buffer's "syntax" is its vt100 grid colors, not treesitter:
@@ -551,15 +551,14 @@ impl EditHost {
                 // The `'list'` glyphs core drew in place of tabs / blanks (`Whitespace`)
                 // and past the line's end (`eol`, `NonText`). Like the control chars,
                 // they force the merge path.
-                let list = match lcs {
-                    Some(l) => crate::extmarks::list_intervals(b, line_idx, &text, tab, l),
+                let clipped = limit != usize::MAX;
+                let eol = list
+                    .and_then(|l| crate::extmarks::list_eol_span(seg, &text, clipped, tab, l.lcs))
+                    .map(|span| crate::extmarks::list_eol_value(self, span, winhl, styles));
+                let list = match list {
+                    Some(l) => crate::extmarks::list_intervals(b, line_idx, &text, clipped, tab, l),
                     None => Vec::new(),
                 };
-                let eol = lcs
-                    .and_then(|l| {
-                        crate::extmarks::list_eol_span(seg, &text, limit != usize::MAX, tab, l)
-                    })
-                    .map(|span| crate::extmarks::list_eol_value(self, span, winhl, styles));
 
                 // LSP semantic tokens (ADR 0001 bridge #2): a third highlight
                 // source at SEMANTIC_HL_PRIORITY, between treesitter and extmarks.

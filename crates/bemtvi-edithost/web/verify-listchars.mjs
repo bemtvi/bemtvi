@@ -96,6 +96,17 @@ try {
   const def = (await page.evaluate(firstRow)).map((c) => c.ch).join("").trim();
   check("the default draws plain spaces as · and the line end as ¬", def.endsWith("····let·y·=·2;¬"), JSON.stringify(def));
 
+  // Under `nowrap`, `extends` marks the right edge of a line that runs past it.
+  await page.evaluate(() =>
+    window.__bemtvi.execLua(
+      "btv.buf.set_lines(0, 0, -1, false, { string.rep('a', 400) }); " +
+        "vim.wo.wrap = false; vim.wo.listchars = 'extends:»'",
+    ),
+  );
+  await sleep(300);
+  const edge = (await page.evaluate(firstRow)).map((c) => c.ch).join("");
+  check("extends marks a nowrap line that runs off the right edge", edge.includes("»"), JSON.stringify(edge.slice(-20)));
+
   await browser.close();
 } catch (e) {
   console.log("FAIL  harness error:", e.message);

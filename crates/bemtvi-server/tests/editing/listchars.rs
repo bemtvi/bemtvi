@@ -289,3 +289,185 @@ async fn vim_opt_listchars_takes_a_map() {
     let view = render(&rpc, &mut incoming, &["\tx  "], &["tabstop=4"]).await;
     assert_eq!(view_lines(&view)[0], "»   x··");
 }
+
+// ---- Phase 2: `eol` on a full wrapped row, `extends` / `precedes` ----------------
+
+/// The focused window's text width, with the gutters turned off so it is the rect's.
+async fn bare_text_width(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> usize {
+    let view = redraw_after(
+        rpc,
+        incoming,
+        ":set nonumber norelativenumber signcolumn=no foldcolumn=0<CR>",
+    )
+    .await;
+    view_get(&view, "rect")
+        .and_then(Value::as_map)
+        .and_then(|m| m.iter().find(|(k, _)| k.as_str() == Some("width")))
+        .and_then(|(_, v)| v.as_u64())
+        .expect("a window rect width") as usize
+}
+
+/// A wrapped line that exactly fills its last row has no cell left for `eol`, so the
+/// glyph takes a row of its own, as in vim, instead of being cut at the edge.
+#[tokio::test]
+async fn eol_on_a_full_wrapped_row_gets_a_row_of_its_own() {
+    let (rpc, mut incoming) = start(None).await;
+    let w = bare_text_width(&rpc, &mut incoming).await;
+    let full = "a".repeat(w);
+    let view = render(
+        &rpc,
+        &mut incoming,
+        &[full.as_str(), "b"],
+        &["wrap", "list", "listchars=eol:¬"],
+    )
+    .await;
+    let rows = view_lines(&view);
+    assert_eq!(rows[0], full);
+    assert_eq!(rows[1], "¬", "the line end gets the next row: {rows:?}");
+    assert_eq!(
+        view_numbers(&view)[1],
+        Some(1),
+        "that row still belongs to line 1"
+    );
+    assert!(view_continuation(&view)[1], "and is a continuation row");
+    assert_eq!(rows[2], "b¬");
+    assert_eq!(
+        spans_of(&view, 1, "NonText"),
+        vec![(0, 1)],
+        "the glyph on its own row is still NonText"
+    );
+
+    // The row is real to the cursor math: line 2 now sits on screen row 2.
+    let view = redraw_after(&rpc, &mut incoming, "j").await;
+    assert_eq!(view_u64(&view, "cursor_row"), 2);
+    // An Insert cursor at the end of line 1 lands on the line-end row.
+    let view = redraw_after(&rpc, &mut incoming, "kA").await;
+    assert_eq!(view_u64(&view, "cursor_row"), 1);
+    assert_eq!(view_u64(&view, "cursor_screen_col"), 0);
+
+    // Without `eol` the line fits its one row, as before.
+    let view = redraw_after(&rpc, &mut incoming, "<Esc>:set listchars=space:·<CR>").await;
+    let rows = view_lines(&view);
+    assert_eq!(rows[1], "b", "{rows:?}");
+}
+
+/// Under `nowrap`, `extends` marks the last column when the line runs past the
+/// right edge, and `precedes` the first column when `leftcol` hides text on the
+/// left. Both replace the cell they land on, so no column moves.
+#[tokio::test]
+async fn extends_and_precedes_mark_the_edges_of_a_nowrap_row() {
+    let (rpc, mut incoming) = start(None).await;
+    let w = bare_text_width(&rpc, &mut incoming).await;
+    let long = format!("{}Z", "a".repeat(w + 20));
+    let view = render(
+        &rpc,
+        &mut incoming,
+        &[long.as_str(), "short"],
+        &["nowrap", "list", "listchars=extends:»,precedes:«"],
+    )
+    .await;
+    let row: Vec<char> = view_lines(&view)[0].chars().collect();
+    assert_eq!(row[w - 1], '»', "extends on the last visible column");
+    assert_eq!(row[0], 'a', "nothing hidden on the left yet");
+    assert_eq!(
+        view_lines(&view)[1],
+        "short",
+        "a line that fits gets no marker"
+    );
+    assert_eq!(
+        spans_of(&view, 0, "NonText"),
+        vec![((w - 1) as u64, w as u64)]
+    );
+
+    // `$` scrolls right: now text is hidden on the left, none on the right.
+    let view = redraw_after(&rpc, &mut incoming, "$").await;
+    let leftcol = view_u64(&view, "leftcol") as usize;
+    assert!(leftcol > 0);
+    let row: Vec<char> = view_lines(&view)[0].chars().collect();
+    assert_eq!(row[leftcol], '«', "precedes on the first visible column");
+    assert_eq!(
+        *row.last().unwrap(),
+        'Z',
+        "the line's end is on screen: no extends"
+    );
+    assert_eq!(view_u64(&view, "cursor_screen_col") as usize, w + 20);
+
+    // A line exactly as wide as the window doesn't run past it.
+    let exact = "e".repeat(w);
+    let view = render(&rpc, &mut incoming, &[exact.as_str()], &[]).await;
+    assert_eq!(view_lines(&view)[0], exact);
+}
+
+/// A marker that lands inside a multi-cell glyph (a tab's run) replaces only the
+/// cell it is on.
+#[tokio::test]
+async fn extends_inside_a_tab_replaces_only_its_cell() {
+    let (rpc, mut incoming) = start(None).await;
+    let w = bare_text_width(&rpc, &mut incoming).await;
+    // The tab starts two cells before the edge and spans it (tabstop 4, and `w - 2`
+    // is a multiple of 2 but the tab stop after it is further out than `w`).
+    let pad = ((w - 2) / 4) * 4 + 1; // a tab at column `pad` reaches the next stop
+    let line = format!("{}\tafter", "x".repeat(pad));
+    let view = render(
+        &rpc,
+        &mut incoming,
+        &[line.as_str()],
+        &["tabstop=4", "nowrap", "list", "listchars=tab:→─,extends:»"],
+    )
+    .await;
+    let row: Vec<char> = view_lines(&view)[0].chars().collect();
+    // The tab is `→──` (3 cells from `pad`); whichever of its cells is the last
+    // visible column carries the marker, the rest of the run is unchanged.
+    let tab_end = pad + 3;
+    assert!(
+        tab_end >= w,
+        "the tab must span the edge (w={w}, pad={pad})"
+    );
+    assert_eq!(row[w - 1], '»');
+    assert_eq!(row[pad], '→', "the tab's first cell is still its glyph");
+}
+
+/// No edge marker covers the cursor's own cell. vim draws one there, which hides the
+/// character the cursor is on whenever it rides an edge: after `$` on a line whose
+/// `eol` cell is past the edge, or stepping right along a line that continues.
+#[tokio::test]
+async fn edge_markers_never_cover_the_cursor() {
+    let (rpc, mut incoming) = start(None).await;
+    let w = bare_text_width(&rpc, &mut incoming).await;
+    let long = format!("{}Z", "a".repeat(w + 20));
+    let _ = render(
+        &rpc,
+        &mut incoming,
+        &[long.as_str()],
+        &["nowrap", "list", "listchars=eol:¬,extends:»,precedes:«"],
+    )
+    .await;
+
+    // `$`: the cursor is on `Z` at the right edge, the `¬` cell is past it.
+    let view = redraw_after(&rpc, &mut incoming, "$").await;
+    let leftcol = view_u64(&view, "leftcol") as usize;
+    let row: Vec<char> = view_lines(&view)[0].chars().collect();
+    assert_eq!(
+        view_u64(&view, "cursor_screen_col") as usize,
+        leftcol + w - 1
+    );
+    assert_eq!(
+        row[leftcol + w - 1],
+        'Z',
+        "the cursor's character, not a marker"
+    );
+    assert_eq!(row[leftcol], '«', "the other edge keeps its marker");
+    assert!(spans_of(&view, 0, "NonText")
+        .iter()
+        .all(|&(s, _)| s as usize != leftcol + w - 1));
+
+    // Back at the start, the cursor on the last visible column of a line that goes on.
+    let view = redraw_after(&rpc, &mut incoming, &format!("0{w}|")).await;
+    assert_eq!(view_u64(&view, "leftcol"), 0);
+    let row: Vec<char> = view_lines(&view)[0].chars().collect();
+    assert_eq!(row[w - 1], 'a', "the cursor's character, not a marker");
+    // One column left of the cursor, the marker is back.
+    let view = redraw_after(&rpc, &mut incoming, "h").await;
+    let row: Vec<char> = view_lines(&view)[0].chars().collect();
+    assert_eq!(row[w - 1], '»');
+}

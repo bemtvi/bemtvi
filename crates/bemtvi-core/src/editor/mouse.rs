@@ -3015,7 +3015,7 @@ fn wrap_segs(
     if wrap && width > 0 {
         let indent = crate::unicode::cont_indent(text, tabstop, width, wo);
         (
-            crate::unicode::wrap_segments_indented(text, tabstop, width, indent, wo.linebreak),
+            crate::unicode::window_wrap_segments(text, tabstop, width, indent, wo),
             indent,
         )
     } else {

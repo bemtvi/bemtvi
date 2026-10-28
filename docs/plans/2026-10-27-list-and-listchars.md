@@ -1,6 +1,6 @@
 # `'list'` and `'listchars'`: drawing invisible characters
 
-**Status:** Phase 1 done. Phase 2 not started.
+**Status:** Phase 1 and Phase 2 done.
 
 ## Goal
 
@@ -73,8 +73,8 @@ colorscheme doesn't define them, and the web renderer resolves them through
   are: bemtvi's own names, since vim's only make sense if you know ed's `l` command.
   They are `ALIASES` entries in `options.rs`, separate from vim's abbreviations, and
   complete as their own rows.
-- `extends` / `precedes` / `conceal` are accepted (so a vim config sets cleanly) but
-  have no effect until Phase 2. Documented on the option, like `fillchars`'s
+- `extends` / `precedes` / `conceal` are accepted (so a vim config sets cleanly);
+  the first two are drawn in Phase 2. Documented on the option, like `fillchars`'s
   unhonored keys.
 - `list` on with **no** `tab:` entry: vim shows a tab as `^I`, a 2-cell token that
   breaks the width invariant (every cursor column after it shifts). Phase 1 leaves
@@ -89,19 +89,30 @@ colorscheme doesn't define them, and the web renderer resolves them through
 - Known gap, moved to Phase 2: an `eol` glyph on a wrapped line that exactly fills
   its last row is cut at the window edge.
 
-### Phase 2: `extends` / `precedes`, the `^I` form, and `eol` on a full row
+### Phase 2: `extends` / `precedes`, the `^I` form, and `eol` on a full row ✅
 
-- `nowrap`: draw `extends` in the last column when the line continues past the
-  right edge, `precedes` in the first column when `leftcol` hides text on the left.
-  These *replace* a cell rather than adding one, so the cursor-over-marker case
-  needs a decision (vim draws the marker, cursor stays where it is).
-- `list` without `tab:`: either implement `^I` with the width shift threaded through
-  the virtcol math, or keep the documented gap.
-- `wrap`: when a line exactly fills its last row, its `eol` glyph needs a row of its
-  own (vim's behavior) instead of being cut at the edge. That row has to count
-  everywhere rows are counted (`line_text_rows_of`, `screen_rows_between`, the
-  cursor's row, scrolling), not just where they are drawn. Since `eol` is now on by
-  default, this is the most visible of the three.
+- `nowrap` edge markers ✅: `extends` on the last visible column when the line has
+  a cell past it (the `eol` cell counts, as in vim), `precedes` on the first when
+  `leftcol` hides text and the line still reaches the window. Placement is
+  `unicode::list_edge_marks`, shared by core (which draws them over the cell they
+  land on: a marker inside a tab or wide char takes only its own cell, the rest go
+  blank) and the server (which colors that cell `NonText`, above the `Whitespace`
+  glyph). The settled view's edges ride `WindowView.list_edges`; the scroll band
+  gets none, since its rows pan.
+  Decision, departing from vim: **no marker on the cursor's cell.** vim draws it,
+  which hid the character under the cursor whenever it rode an edge (after `$` on a
+  line whose `eol` is past the edge, or stepping right with `l`).
+- `eol` on a full wrapped row ✅: `unicode::window_wrap_segments` adds an empty
+  last segment when the line's last row has no cell left for the glyph, from
+  `WrapOpts.eol`. All eight window callers (layout, cursor row, `gj`/`gk`, the
+  mouse, scrolling) go through it, so the row is counted, not only drawn; an Insert
+  cursor at the line's end lands on it.
+- `^I` — decided against. Drawing it makes a tab's width depend on the window's
+  `'listchars'` at every site that computes a column (~45 across core and server,
+  plus the clients), for a value neither default uses; a missed site misplaces the
+  cursor or a highlight. bemtvi keeps the tab a plain tab and documents it.
+- Found on the way, not taken: `:set` has no `+=` / `-=` / `^=` for any option
+  (`E518`, loud). `vim.opt.listchars:append()` covers the Lua side.
 
 ## Not in scope
 

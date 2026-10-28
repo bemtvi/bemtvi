@@ -83,10 +83,26 @@ btv.test.describe("examples/listchars", function()
     btv.test.expect(row(t, 3)).to_contain("│   indented with a tab")
   end)
 
-  -- 5. ":set whitespacechars? … `listchars=` and the current value …
+  -- 5. "before `$`, line 9 ends in `»` at the right edge … after `$` … lines 1 and
+  --    9 start with `«` at the left edge"
+  btv.test.it("5 — :Edges marks where a nowrap line runs off an edge", function(t)
+    open(t)
+    t:cmd("Edges")
+    t:feed("9G")
+    btv.test.expect(row(t, 9)).to_contain("»")
+    btv.test.expect(row(t, 9)).never.to_contain("«")
+    t:feed("$")
+    btv.test.expect(row(t, 9)).to_contain("«")
+    btv.test.expect(row(t, 9)).to_contain("END¬")
+    btv.test.expect(row(t, 9)).never.to_contain("»")
+    -- The buffer is untouched.
+    btv.test.expect(t:lines()[9]:sub(-3)).to_be("END")
+  end)
+
+  -- 6. ":set whitespacechars? … `listchars=` and the current value …
   --    `E474: Invalid argument: listchars=eol:ab` … the old value is kept.
   --    `:set listchars&` restores the default."
-  btv.test.it("5 — read back, reject a bad value, restore the default", function(t)
+  btv.test.it("6 — read back, reject a bad value, restore the default", function(t)
     local default = "tab:→ ,space:·,trail:•,nbsp:◦,eol:¬"
     open(t)
     t:cmd("set whitespacechars?")

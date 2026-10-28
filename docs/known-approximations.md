@@ -124,17 +124,26 @@ fetch/compile — aren't listed; only the edges that still diverge are.)
   filetype (the ~20 most common languages) when unset. Still, the **bulk** of
   vim's hundreds of options are missing — a write to an unmodeled option is
   recorded but inert.
-- **`'listchars'` gaps.** `list` (also spelled `showwhitespace`) draws `tab`,
-  `space`, `multispace`, `lead`, `leadmultispace`, `trail`, `nbsp` and `eol`. The
-  default departs from neovim's `tab:> ,trail:-,nbsp:+` on purpose: it is
-  `tab:→ ,space:·,trail:•,nbsp:◦,eol:¬`, because neovim's draws nothing for an
-  ordinary space or a line end (so `:set list` changed nothing on a space-indented
-  file) and its `>` / `-` / `+` can't be told from typed text. The glyphs are all in
-  the common monospace fonts (Noto Sans Mono has no `␣` or `↵`). `'listchars'` is also spelled `whitespacechars`. The `extends` / `precedes` (off-screen markers under
-  `nowrap`) and `conceal` keys are accepted but not drawn yet. With `list` on and no
-  `tab:` entry, vim shows a tab as `^I`; bemtvi leaves it as a plain tab. An `eol`
-  glyph on a wrapped line that exactly fills its last row is cut at the window edge
-  rather than wrapping to a row of its own. (Plan:
+- **`'listchars'` departures.** `list` (also spelled `showwhitespace`) draws every
+  key but `conceal`: `tab`, `space`, `multispace`, `lead`, `leadmultispace`,
+  `trail`, `nbsp`, `eol`, and under `nowrap` the `extends` / `precedes` edge
+  markers. `'listchars'` is also spelled `whitespacechars`. Where bemtvi differs:
+  - The default is `tab:→ ,space:·,trail:•,nbsp:◦,eol:¬`, not neovim's
+    `tab:> ,trail:-,nbsp:+`. neovim's draws nothing for an ordinary space or a
+    line end, so `:set list` changed nothing on a space-indented file, and its
+    `>` / `-` / `+` can't be told from typed text. The glyphs are all in the common
+    monospace fonts (Noto Sans Mono has no `␣` or `↵`).
+  - An edge marker never covers the cursor's cell. vim draws it there, which hides
+    the character under the cursor whenever it rides an edge (after `$`, or
+    stepping right along a long line).
+  - With `list` on and no `tab:` entry, vim draws a tab as the 2-cell `^I`; bemtvi
+    keeps it a plain tab. Drawing `^I` would make a tab's width depend on the
+    window's `'listchars'` everywhere a column is computed (cursor, spans, wrap,
+    scrolling, mouse, LSP overlays), for a value neither default uses.
+  - `conceal` is accepted but not drawn: bemtvi renders no syntax conceal.
+
+  `:set listchars+=…` (and `+=` / `-=` / `^=` for any option) is not supported and
+  fails with `E518`; `vim.opt.listchars:append(…)` works. (Plan:
   [`docs/plans/2026-10-27-list-and-listchars.md`](plans/2026-10-27-list-and-listchars.md).)
 - **Keyboard macros are on `<F2>` / `<F3>`, not `q` / `@`, and hold key
   notation.** Recording and playback are complete (`<F2>{reg}` … `<F2>` records,

@@ -237,7 +237,7 @@ impl EditHost {
         buffer: BufferId,
         winhl: &WinHl,
         segs: &[crate::redraw::RowSeg],
-        lcs: Option<&bemtvi_core::ListChars>,
+        list: Option<ListPaint>,
         styles: &mut StyleTable,
     ) -> Value {
         let numbers: Vec<Option<usize>> = segs.iter().map(|s| s.line).collect();
@@ -279,11 +279,12 @@ impl EditHost {
                     text.len(),
                     intervals.len() as u32,
                 ));
-                if let Some(lcs) = lcs {
-                    intervals.extend(list_intervals(b, line_idx, &text, tab, lcs));
+                let clipped = limit != usize::MAX;
+                if let Some(list) = list {
+                    intervals.extend(list_intervals(b, line_idx, &text, clipped, tab, list));
                 }
-                let eol = lcs
-                    .and_then(|l| list_eol_span(seg, &text, limit != usize::MAX, tab, l))
+                let eol = list
+                    .and_then(|l| list_eol_span(seg, &text, clipped, tab, l.lcs))
                     .map(|span| list_eol_value(self, span, winhl, styles));
                 if intervals.is_empty() {
                     return Value::Array(eol.into_iter().collect());
@@ -914,29 +915,65 @@ fn hl_mode_code(mode: HlMode) -> u64 {
     }
 }
 
-/// The `'list'` glyphs core drew onto one row (see `unicode::list_subs`) as
-/// highlight intervals over the buffer bytes they replace, all `Whitespace`. Painted
-/// at the control-char overlay's priority: a glyph isn't buffer content, so no
-/// syntax color or extmark should paint it. `text` is the row's head of buffer line
-/// `line_idx`, as [`RowSeg::text`](crate::redraw::RowSeg::text) returns it.
+/// What a window's `'list'` paints, for the highlight projections: its
+/// `'listchars'`, and the edges its `nowrap` markers sit on (`None` under `wrap`, and
+/// on the scroll band).
+#[derive(Clone, Copy)]
+pub(crate) struct ListPaint<'a> {
+    pub lcs: &'a bemtvi_core::ListChars,
+    pub edges: Option<unicode::ListEdges>,
+}
+
+/// The `'list'` glyphs core drew onto one row as highlight intervals over the buffer
+/// bytes they replace: `Whitespace` for each substitution (`unicode::list_subs`), and
+/// `NonText` for an `extends` / `precedes` marker (`unicode::list_edge_marks`), which
+/// outranks the glyph it is drawn over. Painted at the control-char overlay's
+/// priority: a glyph isn't buffer content, so no syntax color or extmark should paint
+/// it. `text` is the row's head of buffer line `line_idx`, as
+/// [`RowSeg::text`](crate::redraw::RowSeg::text) returns it, and `clipped` whether it
+/// stops short of the line. A marker on the `eol` cell needs no interval: that cell
+/// is `NonText` already ([`list_eol_span`]).
 pub(crate) fn list_intervals(
     buf: &bemtvi_core::Buffer,
     line_idx: usize,
     text: &str,
+    clipped: bool,
     tabstop: usize,
-    lcs: &bemtvi_core::ListChars,
+    list: ListPaint,
 ) -> Vec<HlInterval<'static>> {
-    unicode::list_subs(text, buf.trailing_blank_start(line_idx), tabstop, lcs)
-        .into_iter()
-        .map(|sub| HlInterval {
-            start: sub.start,
-            end: sub.end,
-            group: "Whitespace",
-            priority: bemtvi_core::SPECIAL_KEY_PRIORITY,
-            order: 0,
-            capture: false,
-        })
-        .collect()
+    let lcs = list.lcs;
+    let mut out: Vec<HlInterval<'static>> =
+        unicode::list_subs(text, buf.trailing_blank_start(line_idx), tabstop, lcs)
+            .into_iter()
+            .map(|sub| HlInterval {
+                start: sub.start,
+                end: sub.end,
+                group: "Whitespace",
+                priority: bemtvi_core::SPECIAL_KEY_PRIORITY,
+                order: 0,
+                capture: false,
+            })
+            .collect();
+    if let Some(edges) = list.edges {
+        let eol = lcs.eol.is_some() && !clipped;
+        let text_cells = unicode::virtcol(text, text.len(), tabstop);
+        for (col, _) in unicode::list_edge_marks(text, clipped, eol, tabstop, lcs, edges, line_idx)
+        {
+            if col >= text_cells {
+                continue;
+            }
+            let at = unicode::byte_at_virtcol(text, col, tabstop);
+            out.push(HlInterval {
+                start: at,
+                end: unicode::next_grapheme(text, at),
+                group: "NonText",
+                priority: bemtvi_core::SPECIAL_KEY_PRIORITY,
+                order: 1,
+                capture: false,
+            });
+        }
+    }
+    out
 }
 
 /// The row-local `[start, end)` cell of the `'listchars'` `eol` glyph core drew on

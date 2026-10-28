@@ -593,7 +593,12 @@ impl EditHost {
             win.buffer,
             &win.winhl,
             &segments,
-            win.listchars.as_ref(),
+            win.listchars
+                .as_ref()
+                .map(|lcs| crate::extmarks::ListPaint {
+                    lcs,
+                    edges: win.list_edges,
+                }),
             styles,
         );
         // The browser build highlights *code* JS-side, so it skips the treesitter
@@ -609,7 +614,12 @@ impl EditHost {
             win.buffer,
             &win.winhl,
             &segments,
-            win.listchars.as_ref(),
+            win.listchars
+                .as_ref()
+                .map(|lcs| crate::extmarks::ListPaint {
+                    lcs,
+                    edges: win.list_edges,
+                }),
             styles,
         );
         // Display columns of the `^X` / `<xx>` substitutions, for the wasm renderer
@@ -1231,7 +1241,11 @@ impl EditHost {
         styles: &mut StyleTable,
     ) -> Value {
         let (buffer, winhl, tabstop) = (win.buffer, &win.winhl, win.tabstop);
-        let lcs = win.listchars.as_ref();
+        // No edge markers on the band (see `bemtvi_core::view`): its rows pan.
+        let lcs = win
+            .listchars
+            .as_ref()
+            .map(|lcs| crate::extmarks::ListPaint { lcs, edges: None });
         let RowArrays {
             lines,
             numbers,

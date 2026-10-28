@@ -622,6 +622,10 @@ pub struct WindowView {
     /// The rows' text already carries the glyphs; the server reads this to color
     /// them (`Whitespace`, and `NonText` for `eol`).
     pub listchars: Option<crate::options::ListChars>,
+    /// Where a `nowrap` window's `extends` / `precedes` markers go while `'list'` is
+    /// on, which the server colors `NonText`. `None` under `wrap`, where no line runs
+    /// off an edge.
+    pub list_edges: Option<unicode::ListEdges>,
     /// Whether this window is a **float**: drawn on top of the tiled windows at
     /// its absolute `rect`. The client paints floats in a second, on-top pass (in
     /// list order, which is z-order); a tiled window is `false`.
@@ -970,18 +974,32 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     // overlays are written straight onto the rows they fall on.
     let wrap = w.options.wrap;
     // `'linebreak'` / `'breakindent'` / `'showbreak'` / `'breakindentopt'` only take
-    // effect with `wrap`; all default off. Bundled so the wrap helpers thread one value.
-    let wo = unicode::WrapOpts {
-        linebreak: w.options.linebreak,
-        breakindent: w.options.breakindent,
-        showbreak: w.options.showbreak.as_str(),
-        sbr: w.options.breakindent_sbr(),
-    };
+    // effect with `wrap`; all default off. Bundled so the wrap helpers thread one value,
+    // along with whether `'list'` draws an `eol` cell (which can need a row of its own).
+    let wo = w.options.wrap_opts();
     let tabstop = buf.options.effective_tabstop();
     // The end-of-buffer filler char (`'fillchars'`' `eob`; vim's `~` by default).
     let eob = w.options.fillchars_eob();
     // `'list'`: the glyphs the rows draw invisible characters as (`None` when off).
     let lcs = w.options.listchars();
+    // The cursor to draw: the window's, except that a modeless selection's caret
+    // stands at its head (see `Editor::modeless_caret_head`).
+    let drawn_cursor = match ed.modeless_caret_head().filter(|_| w.focused) {
+        Some(head) => (head.line.min(line_count.saturating_sub(1)), head.col),
+        None => (cur_line, w.cursor.col),
+    };
+    // The settled view's columns, for the `nowrap` `extends` / `precedes` markers, and
+    // the drawn cursor's column (under `nowrap` its virtual column), whose cell no
+    // marker may cover.
+    let edges = (!wrap && lcs.is_some()).then(|| {
+        let (line, col) = drawn_cursor;
+        let head = buf.line_head(line, col.saturating_add(256));
+        unicode::ListEdges {
+            leftcol: w.leftcol,
+            width,
+            cursor: (line, unicode::virtcol(&head, col, tabstop)),
+        }
+    });
     // Closed folds collapse on screen only while `'foldenable'` is on; otherwise
     // every line shows. The scroll band (below) is rendered fold-unaware for now —
     // its geometry helpers don't yet skip folds — so only the settled frame folds.
@@ -1011,6 +1029,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         wo,
         eob,
         lcs.as_ref(),
+        edges,
         &collapsed,
         w.cursor,
         ed.cursor,
@@ -1087,6 +1106,9 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 wo,
                 eob,
                 lcs.as_ref(),
+                // No edge markers on the band: its rows pan under the slide, and a
+                // marker belongs to the settled view's edges.
+                None,
                 // The scroll band ignores folds (its geometry helpers don't skip
                 // them yet); fold-aware scrolling lands in a later phase.
                 if pan_only { &collapsed } else { &[] },
@@ -1187,12 +1209,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     // A cursor parked on a closed fold sits on the single collapsed row, so it has
     // no wrap segments — skip the wrap math (which would otherwise place it on a
     // continuation row that the fold replaced).
-    // The cursor to draw: the window's, except that a modeless selection's caret
-    // stands at its head (see `Editor::modeless_caret_head`).
-    let (cur_line, cur_col) = match ed.modeless_caret_head().filter(|_| w.focused) {
-        Some(head) => (head.line.min(line_count.saturating_sub(1)), head.col),
-        None => (cur_line, w.cursor.col),
-    };
+    let (cur_line, cur_col) = drawn_cursor;
     let cursor_folded = collapsed.iter().any(|f| f.contains(cur_line));
     let (cursor_extra_rows, cursor_seg_col, cursor_prefix) = if wrap && width > 0 && !cursor_folded
     {
@@ -1200,7 +1217,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         // the per-frame projection must not copy a huge wrapped line per window.
         let line = buf.line_cow(cur_line);
         let indent = unicode::cont_indent(&line, tabstop, width, wo);
-        let segs = unicode::wrap_segments_indented(&line, tabstop, width, indent, wo.linebreak);
+        let segs = unicode::window_wrap_segments(&line, tabstop, width, indent, wo);
         let idx = segs
             .iter()
             .rposition(|s| cur_col >= s.start_byte)
@@ -1404,6 +1421,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         signcolumn: w.options.signcolumn,
         padding: pad,
         tabstop: buf.options.effective_tabstop(),
+        list_edges: edges,
         listchars: lcs,
         floating: w.floating,
         border: w.border,
@@ -1498,7 +1516,7 @@ fn line_text_rows_of(
     }
     let text = buf.line_cow(line);
     let indent = unicode::cont_indent(&text, tabstop, width, wo);
-    unicode::wrap_segments_indented(&text, tabstop, width, indent, wo.linebreak).len()
+    unicode::window_wrap_segments(&text, tabstop, width, indent, wo).len()
 }
 
 /// The number of **screen rows** the buffer lines `[base, target)` occupy: each
@@ -1600,13 +1618,15 @@ fn nowrap_row_text(buf: &Buffer, line: usize, reach: usize, tabstop: usize) -> S
 }
 
 /// A `nowrap` row's text ([`nowrap_row_text`]) with the `'list'` glyphs drawn in,
-/// `eol` included only when the row reaches the end of the line.
+/// `eol` included only when the row reaches the end of the line, and the `extends` /
+/// `precedes` markers on the edges `edges` describes.
 fn nowrap_list_text(
     buf: &Buffer,
     line: usize,
     reach: usize,
     tabstop: usize,
     lcs: Option<&ListChars>,
+    edges: Option<unicode::ListEdges>,
 ) -> String {
     let text = nowrap_row_text(buf, line, reach, tabstop);
     let Some(lcs) = lcs else {
@@ -1614,9 +1634,16 @@ fn nowrap_list_text(
     };
     let subs = unicode::list_subs(&text, buf.trailing_blank_start(line), tabstop, lcs);
     let mut out = unicode::apply_list_subs(&text, 0, text.len(), &subs);
-    if let Some(eol) = lcs.eol {
-        if text.len() == buf.line_len(line) {
-            out.push(eol);
+    let clipped = text.len() < buf.line_len(line);
+    let eol = lcs.eol.filter(|_| !clipped);
+    if let Some(eol) = eol {
+        out.push(eol);
+    }
+    if let Some(edges) = edges {
+        let marks =
+            unicode::list_edge_marks(&text, clipped, eol.is_some(), tabstop, lcs, edges, line);
+        if !marks.is_empty() {
+            out = unicode::apply_list_edge_marks(&out, tabstop, &marks);
         }
     }
     out
@@ -1655,6 +1682,7 @@ fn row_skeleton(
     wo: unicode::WrapOpts,
     eob: char,
     lcs: Option<&ListChars>,
+    edges: Option<unicode::ListEdges>,
     folds: &[Fold],
 ) -> Vec<RenderRow> {
     let virt_by_line = buf.virt_lines_by_line();
@@ -1721,7 +1749,7 @@ fn row_skeleton(
             // the client paints it as leading text — `render_rows` shifts this line's
             // overlays right by the prefix width to keep them aligned.
             let (prefix, indent) = unicode::break_prefix(&text, tabstop, width, wo);
-            let segs = unicode::wrap_segments_indented(&text, tabstop, width, indent, wo.linebreak);
+            let segs = unicode::window_wrap_segments(&text, tabstop, width, indent, wo);
             // `'list'` glyphs, worked out once for the whole line: a tab's width and
             // whether a blank is leading / trailing depend on the line, not the row.
             let subs = lcs
@@ -1766,7 +1794,7 @@ fn row_skeleton(
                     line: buf_line,
                     start_col: 0,
                 },
-                nowrap_list_text(buf, buf_line, reach, tabstop, lcs),
+                nowrap_list_text(buf, buf_line, reach, tabstop, lcs, edges),
                 None,
                 usize::MAX,
                 0,
@@ -1818,12 +1846,13 @@ fn render_rows(
     wo: unicode::WrapOpts,
     eob: char,
     lcs: Option<&ListChars>,
+    edges: Option<unicode::ListEdges>,
     folds: &[Fold],
     cursor: Cursor,
     sel_head: Cursor,
 ) -> Vec<RenderRow> {
     let mut rows = row_skeleton(
-        ed, buf, base, height, line_count, wrap, reach, width, tabstop, wo, eob, lcs, folds,
+        ed, buf, base, height, line_count, wrap, reach, width, tabstop, wo, eob, lcs, edges, folds,
     );
     if !focused {
         return rows;

@@ -10,7 +10,7 @@ as a visible glyph. Tabs become `>---`, trailing blanks become `-`, a non-breaki
 space becomes `+`, and so on. The glyphs are painted in the `Whitespace` group, and
 the `eol` marker in `NonText`, as in neovim.
 
-The default is bemtvi's own, `listchars=tab:→ ,space:·,trail:•,nbsp:◦,eol:¬`. neovim's
+The default is bemtvi's own, `listchars=tab:→ ,space:·,trail:•,nbsp:◦,eol:¬,extends:»,precedes:«`. neovim's
 `tab:> ,trail:-,nbsp:+` was the first default, and in use `:set list` then changed
 nothing on a file indented with spaces (no glyph for a plain space), and its glyphs
 are characters real text is full of. The `bemtvi` colorscheme's `Whitespace` was also
@@ -99,6 +99,8 @@ colorscheme doesn't define them, and the web renderer resolves them through
   blank) and the server (which colors that cell `NonText`, above the `Whitespace`
   glyph). The settled view's edges ride `WindowView.list_edges`; the scroll band
   gets none, since its rows pan.
+  They are in the default: bemtvi doesn't wrap by default, so a long line would
+  otherwise run off the window with no sign.
   Decision, departing from vim: **no marker on the cursor's cell.** vim draws it,
   which hid the character under the cursor whenever it rode an edge (after `$` on a
   line whose `eol` is past the edge, or stepping right with `l`).

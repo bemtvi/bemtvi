@@ -547,7 +547,7 @@ async fn list_and_listchars_round_trip_through_set_and_vim_wo() {
     assert_eq!(set_message(&rpc, &mut incoming, "list?").await, "nolist");
     assert_eq!(
         set_message(&rpc, &mut incoming, "listchars?").await,
-        "listchars=tab:→ ,space:·,trail:•,nbsp:◦,eol:¬"
+        "listchars=tab:→ ,space:·,trail:•,nbsp:◦,eol:¬,extends:»,precedes:«"
     );
     assert_eq!(
         exec_lua(&rpc, "return vim.wo.list").await.as_bool(),
@@ -586,7 +586,7 @@ async fn list_and_listchars_round_trip_through_set_and_vim_wo() {
     let _ = set_message(&rpc, &mut incoming, "listchars&").await;
     assert_eq!(
         set_message(&rpc, &mut incoming, "listchars?").await,
-        "listchars=tab:→ ,space:·,trail:•,nbsp:◦,eol:¬"
+        "listchars=tab:→ ,space:·,trail:•,nbsp:◦,eol:¬,extends:»,precedes:«"
     );
 }
 

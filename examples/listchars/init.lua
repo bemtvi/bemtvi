@@ -19,9 +19,11 @@
 --   trail:c            the spaces of a line's trailing run
 --   nbsp:c             a non-breaking space
 --   eol:c              one glyph past the end of every line
+--   extends:c          nowrap: the last column, when the line runs past it
+--   precedes:c         nowrap: the first column, when text is scrolled off the left
 -- ```
 --
--- The default is `tab:→ ,space:·,trail:•,nbsp:◦,eol:¬`: glyphs nobody types, so a drawn
+-- The default is `tab:→ ,space:·,trail:•,nbsp:◦,eol:¬,extends:»,precedes:«`: glyphs nobody types, so a drawn
 -- blank can't be mistaken for text (neovim's `>`/`-`/`+` can). Glyphs are colored
 -- with the `Whitespace` highlight group (`NonText` for `eol`). Drawing never moves
 -- the cursor: a tab's glyphs cover exactly the cells the tab did.
@@ -58,7 +60,7 @@ end, { desc = "toggle 'list'" })
 --------------------------------------------------------------------------------
 btv.command("ListAll", function()
   btv.wo.list = true
-  btv.wo.listchars = "tab:→─,space:·,lead:›,trail:•,nbsp:◦,eol:¬"
+  btv.wo.listchars = "tab:→─,space:·,lead:›,trail:•,nbsp:◦,eol:¬,extends:»,precedes:«"
 end, { desc = "draw every invisible character" })
 
 --------------------------------------------------------------------------------
@@ -70,20 +72,17 @@ end, { desc = "draw every invisible character" })
 --------------------------------------------------------------------------------
 
 --------------------------------------------------------------------------------
--- 5. Mark the edges of a line that runs off the window.
+-- 5. Edge markers: there is more to the line.
 --
--- Type-this:  :Edges<CR>   then   9G   then   $
+-- bemtvi doesn't wrap long lines by default, so the default glyphs include `»` and
+-- `«` for a line that runs off the window.
+--
+-- Type-this:  9G   then   $
 -- See-that:   before `$`, line 9 ends in `»` at the right edge (it continues);
 --             after `$` the window has scrolled right, and lines 1 and 9 start with
 --             `«` at the left edge (text is hidden there). Line 2 is empty and the
---             short lines are scrolled out of view, so they get no marker.
---------------------------------------------------------------------------------
-btv.command("Edges", function()
-  btv.wo.wrap = false
-  btv.wo.list = true
-  btv.wo.listchars = "tab:→ ,space:·,trail:•,nbsp:◦,eol:¬,extends:»,precedes:«"
-end, { desc = "mark where a nowrap line runs off an edge" })
-
+--             short lines are scrolled out of view, so they get no marker. No marker
+--             ever covers the character the cursor is on.
 --------------------------------------------------------------------------------
 -- 6. Read it back, and bad values.
 --

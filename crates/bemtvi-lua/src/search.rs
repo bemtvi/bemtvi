@@ -494,6 +494,21 @@ impl UserData for BtvRegex {
             })
         });
 
+        // `re:find_all(s)` -> `{ s1, e1, s2, e2, … }`: every match's 1-based,
+        // inclusive offsets (`:find`'s convention), found in ONE pass. Looping
+        // `:find(s, init)` instead re-validates the whole string on every call —
+        // quadratic on a long line with many hits.
+        methods.add_method("find_all", |lua, this, text: mlua::LuaString| {
+            let s = text.to_str()?;
+            let hits = this.re.all(&s)?;
+            let out = lua.create_table_with_capacity(hits.len() * 2, 0)?;
+            for (i, hit) in hits.iter().enumerate() {
+                out.raw_set(i * 2 + 1, lua_int((hit.start + 1) as i64))?;
+                out.raw_set(i * 2 + 2, lua_int(hit.end as i64))?;
+            }
+            Ok(out)
+        });
+
         // `re:gsub(s, repl, n?)` -> newstring, count — like `string.gsub`. `repl`
         // is a string (`%0` whole match, `%1`-`%9` captures, `%%` literal), a
         // function called with the captures, or a table keyed by the first capture.

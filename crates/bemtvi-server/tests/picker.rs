@@ -3609,6 +3609,87 @@ async fn live_grep_clips_a_pathologically_long_line_around_the_hit() {
     );
 }
 
+/// A long line with MANY hits (a source map, a minified bundle) is read once, not
+/// once per hit. `rg --vimgrep` repeats the whole line for every hit on it, so a
+/// 1MB line with 2000 hits streamed 2GB into Lua — and each hit then re-copied and
+/// re-scanned the full line — which took a 68k-file Nuxt project's `the` search to
+/// 8GB of output and 4GB of Lua heap. Every hit must still become its own row,
+/// clipped around and highlighting *that* hit.
+#[tokio::test]
+async fn live_grep_reads_a_long_many_hit_line_once_not_once_per_hit() {
+    let _serial = serial_lock().lock().await;
+
+    let dir = temp_dir("picker_grep_flood_cfg");
+    let proj = temp_dir("picker_grep_flood");
+    // 2000 hits, each after 500 bytes of filler: a ~1MB single line.
+    let line = format!("{}zqxneedle", "x".repeat(500)).repeat(2000);
+    std::fs::write(proj.join("bundle.js.map"), format!("{line}\n")).expect("write file");
+
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+
+    let opened = std::time::Instant::now();
+    exec_lua(
+        &rpc,
+        "btv.picker.open('live_grep', { query = 'zqxneedle' })",
+    )
+    .await;
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("live_grep picker opens");
+    let mut total = 0u64;
+    while opened.elapsed() < std::time::Duration::from_secs(5) {
+        total = exec_lua(&rpc, "return btv._picker and btv._picker.nitems or 0")
+            .await
+            .as_u64()
+            .unwrap_or(0);
+        if total >= 2000 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        total,
+        2000,
+        "every hit is a row, promptly ({:?})",
+        opened.elapsed()
+    );
+
+    // Each row is bounded, jumps to its own hit, and highlights it.
+    let report = exec_lua(
+        &rpc,
+        r#"
+        -- `match` is a CHAR range (a clip's `…` is one char, three bytes).
+        local function hit(it)
+          if not it.match then return nil end
+          local a = utf8.offset(it.text, it.match[1])
+          local b = utf8.offset(it.text, it.match[2] + 1) - 1
+          return it.text:sub(a, b)
+        end
+        local bad, longest = {}, 0
+        for i = 1, btv._picker.nitems do
+          local it = btv._picker.items[i]
+          longest = math.max(longest, #it.text)
+          if it.col ~= (i - 1) * 509 + 501 then
+            bad[#bad + 1] = "row " .. i .. " col " .. tostring(it.col)
+          elseif hit(it) ~= "zqxneedle" then
+            bad[#bad + 1] = "row " .. i .. " highlights " .. tostring(hit(it))
+          end
+          if #bad > 3 then break end
+        end
+        return table.concat(bad, "; ") .. "|" .. longest
+        "#,
+    )
+    .await;
+    let report = report.as_str().unwrap_or_default().to_string();
+    let (bad, longest) = report.split_once('|').expect("report");
+    assert_eq!(bad, "", "every row targets and highlights its own hit");
+    assert!(
+        longest.parse::<usize>().unwrap() < 4_000,
+        "rows are clipped, not the whole line: {longest} bytes"
+    );
+}
+
 /// A row's `(head, match start, match end)` are char offsets into an **unbounded
 /// label** — a hit past 65535 chars into a line (a minified bundle, a one-line JSON
 /// blob) is an ordinary row, not a screen coordinate that fits in a `u16`. They used

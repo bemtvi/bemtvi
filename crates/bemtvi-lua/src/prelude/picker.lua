@@ -1218,7 +1218,7 @@ btv.picker.source({
 })
 
 -- live_grep: a dynamic source — re-run per prompt edit, the matcher bypassed. Search
--- falls back through a chain so it works in every mode: `rg --vimgrep` (fast) →
+-- falls back through a chain so it works in every mode: `rg --column` (fast) →
 -- `grep -rn` (any real shell lacking rg) → a transport-agnostic btv.fs walk + in-Lua
 -- substring match. The binaries need a real shell, so the pure web client — where a
 -- hostless spawn fails loud with code -1 — lands on the btv.fs match (which rides the
@@ -1290,19 +1290,23 @@ btv.picker.source({
       end
       return i
     end
-    -- Clip an over-long `body` to a window around the hit at BYTE offsets `s`..`e`
-    -- (`nil` when the leg's dialect found none — the head of the line is kept then),
-    -- marking each cut with `…`. Returns the body and the hit's offsets *within it*.
-    local function clip(body, s, e)
-      if #body <= KEEP * 2 then
-        return body, s, e
+    -- Clip the body `line[base..]` (the line past its indentation) to a window around
+    -- the hit at BYTE offsets `s`..`e` into `line` (`nil` when the leg's dialect found
+    -- none — the head of the body is kept then), marking each cut with `…`. Returns
+    -- the body and the hit's offsets *within it*. It slices `line` directly rather
+    -- than taking a stripped copy first: a megabyte-long line copied once per hit on
+    -- it is the very O(N^2) the clip exists to stop.
+    local function clip(line, base, s, e)
+      if #line - base + 1 <= KEEP * 2 then
+        local shift = base - 1
+        return line:sub(base), s and s - shift, e and e - shift
       end
-      local from = math.max(1, (s or 1) - KEEP)
-      from = from > 1 and boundary(body, from) or 1
-      local to = math.min(#body, (e or 1) + KEEP)
-      to = to < #body and boundary(body, to + 1) - 1 or #body
-      local lead = from > 1 and "…" or ""
-      local out = lead .. body:sub(from, to) .. (to < #body and "…" or "")
+      local from = math.max(base, (s or base) - KEEP)
+      from = from > base and boundary(line, from) or base
+      local to = math.min(#line, (e or base) + KEEP)
+      to = to < #line and boundary(line, to + 1) - 1 or #line
+      local lead = from > base and "…" or ""
+      local out = lead .. line:sub(from, to) .. (to < #line and "…" or "")
       if s then
         local shift = (from - 1) - #lead
         s, e = s - shift, e - shift
@@ -1310,29 +1314,25 @@ btv.picker.source({
       return out, s, e
     end
 
-    -- One parsed hit -> a two-column item: the `path:line:col: ` head, the matched
-    -- line (leading indentation stripped, an over-long one clipped around the hit) as
-    -- the body, and the hit's char range within that body, measured with the leg's
-    -- `find`er. `col` is 1-based and BYTE-based (rg's convention) and stays untouched
-    -- on the item — it is what `confirm` jumps to; only the display body is trimmed.
-    local function emit(find, file, lnum, col, line)
-      local body = line:gsub("^%s+", "")
-      local indent = #line - #body
-      local s, e
-      if find then
-        -- Search from the reported column so a line with several hits highlights the
-        -- one rg pointed at; a pattern that only matches from the line start (`^…`)
-        -- falls back to a search from the beginning rather than losing its highlight.
-        local at = math.max(1, (col or 1) - indent)
-        s, e = find:find(body, at)
-        if not s and at > 1 then
-          s, e = find:find(body)
-        end
+    -- One hit -> a two-column item: the `path:line:col: ` head, the matched line
+    -- (leading `indent` bytes stripped, an over-long one clipped around the hit) as the
+    -- body, and the hit's char range within that body. `s`..`e` are the hit's BYTE
+    -- offsets into `line`, or nil for no highlight. `col` is 1-based and BYTE-based
+    -- (rg's convention) and stays untouched on the item — it is what `confirm` jumps
+    -- to; only the display body is trimmed.
+    local function push_hit(file, lnum, col, line, indent, s, e)
+      -- A hit wholly inside the stripped indentation has nothing left to highlight; one
+      -- straddling it highlights from where the body starts.
+      if s and e <= indent then
+        s, e = nil, nil
+      elseif s and s <= indent then
+        s = indent + 1
       end
       -- Clip before measuring: `charlen` over a megabyte-long body, once per hit on
       -- it, is the same O(N^2) the clip exists to stop.
       local m
-      body, s, e = clip(body, s, e)
+      local body
+      body, s, e = clip(line, indent + 1, s, e)
       if s then
         m = { charlen(body:sub(1, s - 1)) + 1, charlen(body:sub(1, e)) }
       end
@@ -1346,11 +1346,57 @@ btv.picker.source({
       })
     end
 
+    -- One reported hit (`grep`, the `btv.fs` walk: a line per hit, or per matching
+    -- line) -> its row, measuring the hit with the leg's `find`er.
+    local function emit(find, file, lnum, col, line)
+      local indent = #line:match("^%s*")
+      local s, e
+      if find then
+        -- Search from the reported column so a line with several hits highlights the
+        -- one the tool pointed at; a pattern that only matches from the line start
+        -- (`^…`) falls back to a search from the beginning rather than losing its
+        -- highlight.
+        local body = line:sub(indent + 1)
+        local at = math.max(1, (col or 1) - indent)
+        s, e = find:find(body, at)
+        if not s and at > 1 then
+          s, e = find:find(body)
+        end
+        if s then
+          s, e = s + indent, e + indent
+        end
+      end
+      push_hit(file, lnum, col, line, indent, s, e)
+    end
+
+    -- One matching LINE from `rg` -> a row per hit on it. rg prints each matching
+    -- line once (`--column`, not `--vimgrep`, which repeats the whole line for EVERY
+    -- hit: a source map's megabyte line with a thousand hits was a gigabyte of
+    -- output), and the hits are found here in one `find_all` pass with the PCRE `re`
+    -- — the same Rust `regex` dialect rg searched with, so the positions agree with
+    -- what rg would have reported, empty matches included. A line `re` cannot scan
+    -- (invalid UTF-8; a query only rg accepted) still lists, as the one hit rg
+    -- reported, unhighlighted.
+    local function emit_line(file, lnum, col, line)
+      local ok, hits = false, nil
+      if re then
+        ok, hits = pcall(re.find_all, re, line)
+      end
+      if not ok or #hits == 0 then
+        emit(nil, file, lnum, col, line)
+        return
+      end
+      local indent = #line:match("^%s*")
+      for i = 1, #hits, 2 do
+        push_hit(file, lnum, hits[i], line, indent, hits[i], hits[i + 1])
+      end
+    end
+
     -- Stream a grep-like command, parsing `file:lnum[:col]:text` per line; `has_col` for
-    -- rg's `--vimgrep` column. `strip` drops grep's leading "./", and `find` is the
-    -- matcher this tool's dialect is measured with. Returns whether the chain is SETTLED
-    -- here — the tool ran (matches or not), or the run was superseded.
-    local function run(cmd, args, has_col, strip, find)
+    -- rg's `--column`. `strip` drops grep's leading "./", and `on_line(file, lnum, col,
+    -- text)` turns a parsed line into rows. Returns whether the chain is SETTLED here —
+    -- the tool ran (matches or not), or the run was superseded.
+    local function run(cmd, args, has_col, strip, on_line)
       local stream = btv.run_stream({ cmd = cmd, args = args, cwd = ctx.cwd })
       ctx.on_cancel(function()
         cancelled = true
@@ -1369,7 +1415,7 @@ btv.picker.source({
             col = 1
           end
           if file then
-            emit(find, file, lnum, tonumber(col), body)
+            on_line(file, lnum, tonumber(col), body)
           end
         end
       end
@@ -1382,16 +1428,28 @@ btv.picker.source({
     end
 
     -- As in `files`: the boxes prune at rg, and the sink filters every leg's output.
-    local grep_args = { "--vimgrep", "--color=never", "-uu", "-g", "!.git" }
+    local grep_args = {
+      "--column",
+      "--line-number",
+      "--no-heading",
+      "--with-filename",
+      "--color=never",
+      "-uu",
+      "-g",
+      "!.git",
+    }
     for _, a in ipairs(ctx.rg_globs) do
       grep_args[#grep_args + 1] = a
     end
     grep_args[#grep_args + 1] = "--"
     grep_args[#grep_args + 1] = q
-    if run("rg", grep_args, true, false, re) then
+    if run("rg", grep_args, true, false, emit_line) then
       return
     end
-    if run("grep", { "-rnI", "--exclude-dir=.git", "--", q, "." }, false, true, lit) then
+    local function emit_lit(file, lnum, col, line)
+      emit(lit, file, lnum, col, line)
+    end
+    if run("grep", { "-rnI", "--exclude-dir=.git", "--", q, "." }, false, true, emit_lit) then
       return
     end
 

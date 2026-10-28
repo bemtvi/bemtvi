@@ -138,6 +138,25 @@ async fn gmatch_iterates_all_matches() {
     assert_eq!(out, "1,22,333");
 }
 
+/// `re:find_all(s)` hands back every match's position in ONE pass — the flat
+/// `{ s1, e1, s2, e2, … }` list, with `:find`'s 1-based inclusive offsets. Finding
+/// each hit with its own `:find(s, init)` re-validates the whole string per call,
+/// which is quadratic on a long line with many hits.
+#[tokio::test]
+async fn find_all_returns_every_match_position_in_one_pass() {
+    let (rpc, _inc) = server().await;
+    let out = run(
+        &rpc,
+        r#"local s = "1 22 333 x"
+           local hits = btv.regex([[\d+]]):find_all(s)
+           local t = {}
+           for i = 1, #hits, 2 do t[#t+1] = hits[i]..":"..hits[i+1]..":"..s:sub(hits[i], hits[i+1]) end
+           return table.concat(t, ",") .. "|" .. #btv.regex("q"):find_all(s)"#,
+    )
+    .await;
+    assert_eq!(out, "1:1:1,3:4:22,6:8:333|0");
+}
+
 #[tokio::test]
 async fn gmatch_yields_multiple_captures() {
     let (rpc, _inc) = server().await;

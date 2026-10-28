@@ -751,6 +751,8 @@ end
 --                         has none, or nil            (like string.match)
 -- re:gmatch(s)         -> iterator over each match's captures or whole match
 --                                                     (like string.gmatch)
+-- re:find_all(s)       -> { s1, e1, s2, e2, … }: every match's start/end, in
+--                         one pass (a `:find` loop is quadratic on a long string)
 -- re:gsub(s, repl, n?) -> newstring, count            (like string.gsub)
 --     repl is a string (`%0` whole match, `%1`-`%9` captures, `%%` literal `%`),
 --     a function called with the captures (return nil/false to keep the match),

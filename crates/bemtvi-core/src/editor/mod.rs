@@ -57,6 +57,7 @@ mod panel;
 mod persist;
 mod quickfix;
 mod registers;
+mod rows;
 mod sandbox;
 mod search;
 mod select;

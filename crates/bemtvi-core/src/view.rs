@@ -1502,7 +1502,7 @@ fn window_status_ctx(inp: StatusCtxInputs) -> StatuslineCtx {
 
 /// The number of display (text) rows buffer `line` occupies: `1` under `nowrap`
 /// (or for a line that fits), else its soft-wrap segment count. The free-function
-/// mirror of [`Editor::line_text_rows`](crate::Editor), for the band geometry.
+/// mirror of the editor's `RowGeom::line_rows`, for the band geometry.
 fn line_text_rows_of(
     buf: &Buffer,
     line: usize,

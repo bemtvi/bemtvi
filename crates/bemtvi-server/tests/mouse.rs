@@ -803,6 +803,40 @@ async fn wheel_up_scrolls_back_through_wrapped_lines_under_scrolloff() {
     }
 }
 
+/// The same over a split you are *not* in: its stashed caret is parked by that
+/// window's own screen rows. Regression — parked by buffer lines, the caret of a
+/// wrapped split landed below its window, so focusing the split snapped its view
+/// back down to the caret.
+#[tokio::test]
+async fn wheel_up_over_an_unfocused_wrapped_split_parks_by_rows() {
+    let body: String = (1..=60)
+        .map(|i| format!("{i}{}\n", "x".repeat(200)))
+        .collect();
+    let (rpc, _incoming) = start(&body).await;
+    command(&rpc, "set nonumber norelativenumber wrap scrolloff=8").await;
+    feed(&rpc, "40G<C-w>v"); // both splits rest on line 40; the left one is focused
+    let focused = current_win(&rpc).await;
+    let other = all_wins(&rpc)
+        .await
+        .into_iter()
+        .find(|w| *w != focused)
+        .expect("a second window");
+    let top = win_topline(&rpc, other).await;
+    assert!(top > 10, "the split shows line 40 (top {top})");
+    feed_mouse(&rpc, "wheel", "up", 5, 45); // col 45 lands in the right split
+    assert_eq!(
+        win_topline(&rpc, other).await,
+        top - 3,
+        "the split scrolled up"
+    );
+    exec_lua(&rpc, &format!("btv.win.set_current({other})")).await;
+    assert_eq!(
+        win_topline(&rpc, other).await,
+        top - 3,
+        "focusing the split kept its scrolled view"
+    );
+}
+
 /// Wheeling over an *unfocused* split scrolls only that split — focus and the
 /// active window's view stay put (the wheel scrolls a window you are not in).
 #[tokio::test]

@@ -74,15 +74,18 @@ impl Editor {
     /// [`text_height`], feeding the `leftcol` scroll math. Subtracts exactly what the
     /// `width` `view::window_view` projects does, so on-screen and policy agree.
     pub(crate) fn text_width(&self) -> usize {
-        let w = self.windows.cur();
+        self.window_text_width(self.windows.cur(), self.buffer())
+    }
+
+    /// [`text_width`](Self::text_width) for any window `w`, showing `buf`.
+    pub(crate) fn window_text_width(&self, w: &super::windows::Window, buf: &Buffer) -> usize {
         let inset = matches!(&w.float, Some(cfg) if cfg.border != BorderStyle::None) as usize;
         let options = &w.options;
-        let rect_width = w.rect.width;
-        let line_count = self.buffer().line_count();
-        let number_width = self.number_width_for(options, line_count);
+        let number_width = self.number_width_for(options, buf.line_count());
         // `'padding'` insets the whole content box (left + right), matching
         // `window_view`, before the gutter is carved off.
-        rect_width
+        w.rect
+            .width
             .saturating_sub(2 * inset)
             .saturating_sub(options.padding.horizontal())
             .saturating_sub(options.foldcolumn)
@@ -294,7 +297,13 @@ impl Editor {
     /// column (or end-of-line when `$`-sticky), clamped to the line and a grapheme
     /// boundary.
     pub(crate) fn settle_desired_col(&mut self, allow_eol: bool) {
-        let s = self.buffer().line_cow(self.cursor.line);
+        self.cursor.col = self.desired_col_on(self.cursor.line, allow_eol);
+    }
+
+    /// The byte column [`settle_desired_col`](Self::settle_desired_col) would give
+    /// the cursor on `line`, without moving it there.
+    pub(crate) fn desired_col_on(&self, line: usize, allow_eol: bool) -> usize {
+        let s = self.buffer().line_cow(line);
         // Furthest valid resting byte: past-end for insert/allow_eol, otherwise
         // the start of the last grapheme (normal mode can't rest past EOL).
         let max_byte = if allow_eol {
@@ -307,7 +316,7 @@ impl Editor {
         } else {
             unicode::byte_at_virtcol(&s, self.desired_col, self.tabstop()).min(max_byte)
         };
-        self.cursor.col = unicode::floor_grapheme(&s, target);
+        unicode::floor_grapheme(&s, target)
     }
 
     pub(crate) fn clamp_cursor(&mut self) {
@@ -408,39 +417,17 @@ impl Editor {
     /// rows of the edge.
     pub(crate) fn keep_cursor_in_scroll_margin(&mut self, th: usize) {
         let so = scroll_margin(self.windows.cur().options.scrolloff, th);
-        let (top_min, top_max) = self.scroll_band(th, so);
-        if (top_min..=top_max).contains(&self.top) {
+        let max_top = self.scroll_top_for_bottom(self.last_line(), th);
+        let parked = self
+            .row_geom()
+            .park(self.top, th, so, max_top, self.cursor.line, |l| {
+                self.desired_col_on(l, false)
+            });
+        let Some(line) = parked else {
             return; // cursor still outside the margin — leave it (and its curswant) put
-        }
-        // The band is measured in screen rows, so under `wrap` (or `virt_lines`) a
-        // line count from the edge can land far off-screen. Start at the edge the
-        // cursor drifted past and step inward a line at a time until `top` sits in
-        // the cursor's band — re-settling the column each step, since the wrap
-        // segment it lands on moves the band.
-        let down = self.top > top_max;
-        let last = self.last_line();
-        self.cursor.line = if down {
-            self.top
-        } else {
-            self.cursor.line.min(self.top + th).min(last)
         };
-        loop {
-            self.settle_desired_col(false);
-            let (lo, hi) = self.scroll_band(th, so);
-            if (lo..=hi).contains(&self.top) {
-                break;
-            }
-            let next = if down {
-                self.fold_line_end(self.cursor.line) + 1
-            } else {
-                self.fold_line_start(self.cursor.line.saturating_sub(1))
-            };
-            // Out of room (a line taller than the window): rest at the far edge.
-            if (down && next > last) || (!down && next < self.top) || next == self.cursor.line {
-                break;
-            }
-            self.cursor.line = next;
-        }
+        self.cursor.line = line;
+        self.settle_desired_col(false);
         self.preserve_desired = true;
     }
 
@@ -524,24 +511,12 @@ impl Editor {
     }
 
     /// The band of `top` values that keeps the cursor `so` screen rows in from
-    /// either text edge of a `th`-row window, as `(top_min, top_max)`: `top_max`
-    /// keeps `so` rows above it (else scroll up), `top_min` keeps `so` rows below it
-    /// (else scroll down). With `so == 0` this is exactly
-    /// `[scroll_top_for_bottom(cursor, th), cursor.line]` — the historical
-    /// bottom-scroll / cursor-above-top behavior.
-    ///
-    /// `top_min` is capped by the largest useful `top`: the last buffer line resting
-    /// on the bottom text row. The bottom margin is only honored while real content
-    /// sits below the cursor to justify it — never scroll past this to open blank
-    /// rows under end-of-file (vim pins the last line to the bottom edge and lets the
-    /// cursor sit inside the margin there).
+    /// either text edge of a `th`-row window, as `(top_min, top_max)` — see
+    /// [`RowGeom::band`](super::rows::RowGeom::band).
     fn scroll_band(&self, th: usize, so: usize) -> (usize, usize) {
         let max_top = self.scroll_top_for_bottom(self.last_line(), th);
-        let top_max = self.scroll_top_for_row_above(self.cursor.line, so);
-        let top_min = self
-            .scroll_top_for_bottom(self.cursor.line, th - so)
-            .min(max_top);
-        (top_min, top_max)
+        self.row_geom()
+            .band(self.cursor.line, self.cursor_wrap_seg(), th, so, max_top)
     }
 
     /// Scroll the focused window to show as much of the current Visual selection
@@ -577,47 +552,10 @@ impl Editor {
         }
     }
 
-    /// The number of display (text) rows buffer `line` occupies in the focused
-    /// window: `1` under `nowrap` (or for a line that fits), else its soft-wrap
-    /// segment count. The text-row analogue of a line's `virt_lines` count, so the
-    /// viewport math counts wrapped lines as the several screen rows they fill.
-    pub(crate) fn line_text_rows(&self, line: usize) -> usize {
-        let opts = &self.windows.cur().options;
-        if !opts.wrap {
-            return 1;
-        }
-        let width = self.text_width();
-        let buf = self.buffer();
-        if width == 0 || line >= buf.line_count() {
-            return 1;
-        }
-        let text = buf.line_cow(line);
-        let tab = buf.options.effective_tabstop();
-        let wo = opts.wrap_opts();
-        let indent = unicode::cont_indent(&text, tab, width, wo);
-        unicode::window_wrap_segments(&text, tab, width, indent, wo).len()
-    }
-
     /// Which soft-wrap segment the cursor's column falls in (its display-row offset
     /// within its buffer line): `0` under `nowrap` or on the first segment.
     pub(crate) fn cursor_wrap_seg(&self) -> usize {
-        let opts = &self.windows.cur().options;
-        if !opts.wrap {
-            return 0;
-        }
-        let width = self.text_width();
-        if width == 0 {
-            return 0;
-        }
-        let buf = self.buffer();
-        let text = buf.line_cow(self.cursor.line);
-        let tab = buf.options.effective_tabstop();
-        let wo = opts.wrap_opts();
-        let indent = unicode::cont_indent(&text, tab, width, wo);
-        let segs = unicode::window_wrap_segments(&text, tab, width, indent, wo);
-        segs.iter()
-            .rposition(|s| self.cursor.col >= s.start_byte)
-            .unwrap_or(0)
+        self.row_geom().wrap_seg(self.cursor.line, self.cursor.col)
     }
 
     /// The cursor's text row within the focused window's text body, counting the
@@ -629,103 +567,32 @@ impl Editor {
         if self.cursor.line < self.top {
             return 0;
         }
-        let buf = self.buffer();
-        let virt = buf.virt_lines_by_line();
+        let g = self.row_geom();
         let mut rows = 0;
         let mut line = self.top;
         while line < self.cursor.line {
             // A closed fold between `top` and the cursor occupies a single screen
             // row; skip its hidden interior so the count matches the rendered rows.
-            if let Some(f) = self.collapsing_fold_at(line) {
+            if let Some(f) = g.fold_at(line) {
                 rows += 1;
                 line = f.end + 1;
                 continue;
             }
-            rows += self.line_text_rows(line)
-                + virt.get(&line).map_or(0, |r| r.above.len() + r.below.len());
+            rows += g.line_total_rows(line);
             line += 1;
         }
         // The cursor's own row sits *after* its `virt_lines_above` and the wrap
         // segments of its line above the cursor's segment.
-        rows + virt.get(&self.cursor.line).map_or(0, |r| r.above.len()) + self.cursor_wrap_seg()
+        rows + g.virt_above(self.cursor.line) + g.wrap_seg(self.cursor.line, self.cursor.col)
     }
 
     /// The largest `top` (≤ `target`) such that buffer line `target`'s cursor row
-    /// and every line above it down to `top` — each counted with its `virt_lines`
-    /// and soft-wrap rows — fit within `th` screen rows, i.e. the cursor lands on
-    /// the bottom text row. The `virt_lines_below` of `target` (and any wrap
-    /// segments below the cursor's) may spill past the bottom. Used to scroll down
-    /// just enough to reveal a cursor below the fold.
+    /// and every line above it down to `top` fit within `th` screen rows, i.e. the
+    /// cursor lands on the bottom text row (measured at the cursor's wrap segment).
+    /// Used to scroll down just enough to reveal a cursor below the fold.
     fn scroll_top_for_bottom(&self, target: usize, th: usize) -> usize {
-        let virt = self.buffer().virt_lines_by_line();
-        // The target line spends its `virt_lines_above` + the wrap segments up to and
-        // including the cursor's at the bottom of the window; deeper segments and its
-        // `virt_lines_below` overflow.
-        let mut rows = virt.get(&target).map_or(0, |r| r.above.len()) + self.cursor_wrap_seg() + 1;
-        let mut top = target;
-        while top > 0 {
-            let (p, prev_top) = self.rows_of_line_above(top, &virt);
-            if rows + p > th {
-                break;
-            }
-            rows += p;
-            top = prev_top;
-        }
-        top
-    }
-
-    /// One upward step of a scroll-top walk: the screen rows the buffer line just
-    /// above `top` occupies, and the line the walk continues from. A closed fold is
-    /// ONE screen row and the walk steps over its whole hidden range to its start —
-    /// keeping the scroll math in step with the folded rendering; an unfolded line
-    /// counts its soft-wrap rows plus its `virt_lines` above and below (`virt` is
-    /// the caller's [`Buffer::virt_lines_by_line`] map, built once per walk).
-    /// Caller ensures `top > 0`.
-    fn rows_of_line_above(
-        &self,
-        top: usize,
-        virt: &std::collections::BTreeMap<usize, crate::extmark::VirtLineRows>,
-    ) -> (usize, usize) {
-        let prev = top - 1;
-        match self.collapsing_fold_at(prev) {
-            Some(f) => (1, f.start),
-            None => (
-                self.line_text_rows(prev)
-                    + virt.get(&prev).map_or(0, |r| r.above.len() + r.below.len()),
-                prev,
-            ),
-        }
-    }
-
-    /// The largest `top` (≤ `target`) that keeps at least `above` screen rows above
-    /// the cursor's row on line `target` — the top-margin (`'scrolloff'`) analogue of
-    /// [`scroll_top_for_bottom`](Self::scroll_top_for_bottom). Walks up from `target`,
-    /// counting each preceding line's `virt_lines` and soft-wrap rows (a closed fold
-    /// as one row), until `above` rows have accumulated or the buffer top is reached.
-    /// With `above == 0` it returns `target` (the cursor on the top text row, no
-    /// margin) so a zero `scrolloff` leaves the historical behavior untouched.
-    fn scroll_top_for_row_above(&self, target: usize, above: usize) -> usize {
-        // The cursor sits on `target`, so the wrap segments preceding it already
-        // count toward the margin.
-        self.scroll_top_for_row_above_seg(target, above, self.cursor_wrap_seg())
-    }
-
-    /// [`scroll_top_for_row_above`](Self::scroll_top_for_row_above) measured from the
-    /// `seg`-th display row of `target` rather than the cursor's own row — `seg = 0`
-    /// asks for the margin above the *line's first* row, which is what a scroll limit
-    /// (as opposed to a cursor-visibility bound) wants.
-    fn scroll_top_for_row_above_seg(&self, target: usize, above: usize, seg: usize) -> usize {
-        let virt = self.buffer().virt_lines_by_line();
-        // Rows already above the row within its own line: the line's `virt_lines_above`
-        // and the wrap segments preceding `seg`.
-        let mut rows = virt.get(&target).map_or(0, |r| r.above.len()) + seg;
-        let mut top = target;
-        while rows < above && top > 0 {
-            let (p, prev_top) = self.rows_of_line_above(top, &virt);
-            rows += p;
-            top = prev_top;
-        }
-        top
+        self.row_geom()
+            .top_for_bottom(target, self.cursor_wrap_seg(), th)
     }
 
     /// The deepest `top` an explicit viewport scroll (`<C-e>`, the mouse wheel) may
@@ -742,7 +609,7 @@ impl Editor {
     /// the buffer's end to the top row, unchanged.
     pub(crate) fn max_scroll_top(&self, th: usize) -> usize {
         let so = scroll_margin(self.windows.cur().options.scrolloff, th);
-        self.scroll_top_for_row_above_seg(self.last_line(), so, 0)
+        self.row_geom().top_for_row_above(self.last_line(), 0, so)
     }
 
     /// Keep the cursor's screen column within the focused window's text area by

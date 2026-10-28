@@ -2392,36 +2392,56 @@ impl Editor {
                     let w = t.get(win);
                     self.buffer_modifiable(w.buffer) && w.saved_cursors.is_empty()
                 });
-            let Some(tree) = self.tree_of_window_mut(win) else {
+            let Some((old_top, cursor)) = self
+                .tree_of_window(win)
+                .map(|(_, t)| (t.get(win).saved_top, t.get(win).saved_cursor))
+            else {
                 return;
             };
-            let w = tree.get_mut(win);
-            let so = super::cursor::scroll_margin(w.options.scrolloff, th);
-            let old_top = w.saved_top;
             let limit = max_top.max(old_top) as i64;
             let new_top = (old_top as i64 + delta).clamp(0, limit) as usize;
             if new_top == old_top {
                 return;
             }
-            let top_edge = new_top + so;
-            let bottom = (new_top + th).saturating_sub(1).saturating_sub(so);
+            // Park the caret by the window's own screen rows, as the focused branch
+            // does: it keeps its column, measured clamped to each line it tries.
+            let parked = if keep_caret {
+                None
+            } else {
+                self.window_row_geom(win).and_then(|g| {
+                    let so = self.tree_of_window(win).map_or(0, |(_, t)| {
+                        super::cursor::scroll_margin(t.get(win).options.scrolloff, th)
+                    });
+                    // The same end-of-buffer cap `ensure_visible` applies on focus.
+                    let seg = g.wrap_seg(cursor.line, cursor.col);
+                    let end_top = g.top_for_bottom(last, seg, th);
+                    let buf = self.window_buffer(win)?;
+                    let buf = &self.buffers.get(buf).buffer;
+                    g.park(new_top, th, so, end_top, cursor.line, |l| {
+                        cursor.col.min(buf.line_cow(l).trim_end_matches('\n').len())
+                    })
+                })
+            };
+            let Some(tree) = self.tree_of_window_mut(win) else {
+                return;
+            };
+            let w = tree.get_mut(win);
             w.saved_top = new_top;
             if keep_caret {
                 let (buffer, cursor, leftcol) = (w.buffer, w.saved_cursor, w.saved_leftcol);
                 self.detach_unfocused_view(win, buffer, cursor, (old_top, leftcol));
                 return;
             }
-            if w.saved_cursor.line < top_edge {
-                w.saved_cursor.line = top_edge.min(last);
-            } else if w.saved_cursor.line > bottom {
-                w.saved_cursor.line = bottom.min(last);
+            if let Some(line) = parked {
+                w.saved_cursor.line = line;
             }
         }
     }
 
-    /// The deepest `top` the wheel scrolls window `win`, `th` text rows tall, to: the
-    /// focused window's [`max_scroll_top`](Self::max_scroll_top), and for another the
-    /// last line less its `'scrolloff'` (its layout isn't the live one to measure).
+    /// The deepest `top` the wheel scrolls window `win`, `th` text rows tall, to: far
+    /// enough that its last line keeps its `'scrolloff'` rows above it — the focused
+    /// window's [`max_scroll_top`](Self::max_scroll_top), measured the same way for
+    /// another from its own layout.
     pub(crate) fn wheel_max_top(&self, win: WindowId, th: usize) -> usize {
         if win == self.current_window_id() {
             return self.max_scroll_top(th);
@@ -2429,7 +2449,11 @@ impl Editor {
         let so = self.tree_of_window(win).map_or(0, |(_, t)| {
             super::cursor::scroll_margin(t.get(win).options.scrolloff, th)
         });
-        self.window_last_line(win).saturating_sub(so)
+        let last = self.window_last_line(win);
+        self.window_row_geom(win)
+            .map_or(last.saturating_sub(so), |g| {
+                g.top_for_row_above(last, 0, so)
+            })
     }
 
     /// Scroll window `win` horizontally by `delta` columns (negative = left),

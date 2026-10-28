@@ -408,16 +408,39 @@ impl Editor {
     /// rows of the edge.
     pub(crate) fn keep_cursor_in_scroll_margin(&mut self, th: usize) {
         let so = scroll_margin(self.windows.cur().options.scrolloff, th);
-        let top_edge = self.top + so;
-        let bottom = (self.top + th).saturating_sub(1).saturating_sub(so);
-        if self.cursor.line < top_edge {
-            self.cursor.line = top_edge.min(self.last_line());
-        } else if self.cursor.line > bottom {
-            self.cursor.line = bottom.min(self.last_line());
-        } else {
+        let (top_min, top_max) = self.scroll_band(th, so);
+        if (top_min..=top_max).contains(&self.top) {
             return; // cursor still outside the margin — leave it (and its curswant) put
         }
-        self.settle_desired_col(false);
+        // The band is measured in screen rows, so under `wrap` (or `virt_lines`) a
+        // line count from the edge can land far off-screen. Start at the edge the
+        // cursor drifted past and step inward a line at a time until `top` sits in
+        // the cursor's band — re-settling the column each step, since the wrap
+        // segment it lands on moves the band.
+        let down = self.top > top_max;
+        let last = self.last_line();
+        self.cursor.line = if down {
+            self.top
+        } else {
+            self.cursor.line.min(self.top + th).min(last)
+        };
+        loop {
+            self.settle_desired_col(false);
+            let (lo, hi) = self.scroll_band(th, so);
+            if (lo..=hi).contains(&self.top) {
+                break;
+            }
+            let next = if down {
+                self.fold_line_end(self.cursor.line) + 1
+            } else {
+                self.fold_line_start(self.cursor.line.saturating_sub(1))
+            };
+            // Out of room (a line taller than the window): rest at the far edge.
+            if (down && next > last) || (!down && next < self.top) || next == self.cursor.line {
+                break;
+            }
+            self.cursor.line = next;
+        }
         self.preserve_desired = true;
     }
 
@@ -485,22 +508,7 @@ impl Editor {
         // the margin selects where the pointer is instead of scrolling the buffer.
         let so = self.scroll_margin_now(th);
 
-        // The largest useful `top`: the last buffer line resting on the bottom text
-        // row. The bottom scrolloff margin is only honored while real content sits
-        // below the cursor to justify it — never scroll past this to open blank rows
-        // under end-of-file (vim pins the last line to the bottom edge and lets the
-        // cursor sit inside the margin there).
-        let max_top = self.scroll_top_for_bottom(self.last_line(), th);
-
-        // The band of acceptable `top` values that keeps the cursor `so` rows in from
-        // either text edge: `top_max` keeps `so` rows above it (else scroll up),
-        // `top_min` keeps `so` rows below it (else scroll down), capped by `max_top`.
-        // With `so == 0` this is exactly `[scroll_top_for_bottom(cursor, th),
-        // cursor.line]` — the historical bottom-scroll / cursor-above-top behavior.
-        let top_max = self.scroll_top_for_row_above(self.cursor.line, so);
-        let top_min = self
-            .scroll_top_for_bottom(self.cursor.line, th - so)
-            .min(max_top);
+        let (top_min, top_max) = self.scroll_band(th, so);
         // Panic-safe clamp: a pathological `virt_lines` layout could invert the
         // bounds, in which case keeping the cursor visible (the bottom target) wins.
         self.top = if top_min <= top_max {
@@ -513,6 +521,27 @@ impl Editor {
         // one, so every motion that calls `ensure_visible` also keeps the cursor's
         // column on screen under `nowrap`.
         self.ensure_visible_horizontal();
+    }
+
+    /// The band of `top` values that keeps the cursor `so` screen rows in from
+    /// either text edge of a `th`-row window, as `(top_min, top_max)`: `top_max`
+    /// keeps `so` rows above it (else scroll up), `top_min` keeps `so` rows below it
+    /// (else scroll down). With `so == 0` this is exactly
+    /// `[scroll_top_for_bottom(cursor, th), cursor.line]` — the historical
+    /// bottom-scroll / cursor-above-top behavior.
+    ///
+    /// `top_min` is capped by the largest useful `top`: the last buffer line resting
+    /// on the bottom text row. The bottom margin is only honored while real content
+    /// sits below the cursor to justify it — never scroll past this to open blank
+    /// rows under end-of-file (vim pins the last line to the bottom edge and lets the
+    /// cursor sit inside the margin there).
+    fn scroll_band(&self, th: usize, so: usize) -> (usize, usize) {
+        let max_top = self.scroll_top_for_bottom(self.last_line(), th);
+        let top_max = self.scroll_top_for_row_above(self.cursor.line, so);
+        let top_min = self
+            .scroll_top_for_bottom(self.cursor.line, th - so)
+            .min(max_top);
+        (top_min, top_max)
     }
 
     /// Scroll the focused window to show as much of the current Visual selection

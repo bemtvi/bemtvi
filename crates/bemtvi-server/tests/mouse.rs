@@ -778,6 +778,31 @@ async fn wheel_up_scrolls_back() {
     assert_eq!(cursor(&rpc).await.0, 8, "cursor stayed visible throughout");
 }
 
+/// Wheel-up under `wrap` + `'scrolloff'` keeps scrolling up: the cursor is parked
+/// on the margin by *screen rows*. Regression — parked by buffer lines, a cursor on
+/// three-row wrapped lines landed below the window and the redraw's scrolloff pass
+/// dragged the view back down every notch, so the wheel could not scroll up again.
+#[tokio::test]
+async fn wheel_up_scrolls_back_through_wrapped_lines_under_scrolloff() {
+    let body: String = (1..=60)
+        .map(|i| format!("{i}{}\n", "x".repeat(200)))
+        .collect();
+    let (rpc, _incoming) = start(&body).await;
+    let win = current_win(&rpc).await;
+    command(&rpc, "set nonumber norelativenumber wrap scrolloff=8").await;
+    feed(&rpc, "40G");
+    let top = win_topline(&rpc, win).await;
+    assert!(top > 10, "40G scrolled the view down (top {top})");
+    for n in 1..=3u64 {
+        feed_mouse(&rpc, "wheel", "up", 5, 10);
+        assert_eq!(
+            win_topline(&rpc, win).await,
+            top - 3 * n,
+            "wheel-up #{n} scrolled 3 lines up"
+        );
+    }
+}
+
 /// Wheeling over an *unfocused* split scrolls only that split — focus and the
 /// active window's view stay put (the wheel scrolls a window you are not in).
 #[tokio::test]

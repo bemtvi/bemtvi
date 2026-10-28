@@ -206,3 +206,33 @@ async fn a_count_on_ctrl_e_scrolls_that_many_lines() {
         Value::from(1)
     );
 }
+
+#[tokio::test]
+async fn ctrl_y_scrolls_back_up_through_wrapped_lines_under_scrolloff() {
+    // Regression: with `wrap` and a `'scrolloff'` margin, scrolling back up got stuck.
+    // `<C-y>` parked the cursor `scrolloff` *buffer lines* from the bottom, but each
+    // line here wraps to three rows, so that line sat far below the window and the
+    // per-redraw `ensure_visible` dragged `top` straight back down — every press a
+    // bounce to the same spot. The cursor must be parked by screen rows.
+    let body: String = (1..=60)
+        .map(|i| format!("{i}{}\n", "x".repeat(200)))
+        .collect();
+    let path = write_temp("so_wrap_up", "txt", &body);
+    let (rpc, _incoming) = start(Some(path)).await;
+    feed(
+        &rpc,
+        ":set nonumber<CR>:set norelativenumber<CR>:set wrap<CR>:set scrolloff=8<CR>",
+    );
+    feed(&rpc, "30G");
+    let topline = || async { exec_lua(&rpc, "return btv.win.saveview().topline").await };
+    let start = topline().await.as_u64().unwrap();
+    assert!(start > 10, "30G scrolled the view down (top {start})");
+    for n in 1..=5u64 {
+        feed(&rpc, "<C-y>");
+        assert_eq!(
+            topline().await.as_u64().unwrap(),
+            start - n,
+            "<C-y> #{n} scrolled the view up one line"
+        );
+    }
+}

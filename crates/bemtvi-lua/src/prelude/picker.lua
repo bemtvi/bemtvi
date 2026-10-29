@@ -440,6 +440,12 @@ end
 -- that classifies the row, and leaving the body alone keeps the fuzzy-match highlight
 -- readable over it. The selected row keeps its selection background either way.
 --
+-- A row pushed with `low = true` is **deprioritized**: the list shows every normal row
+-- before every low one, each group in its own order (stream order with no query, match
+-- order under one), so a source can keep vendored or generated hits findable without
+-- burying the rest. A `btv.picker.scorer` reorders rows within each group, never across.
+-- A low row still counts toward `max_results`.
+--
 -- `filter = true` gives the picker the include/exclude glob boxes (`<C-g>`), and is
 -- what every candidate's `path` is then tested against — declare it on any source
 -- whose items are paths. A source that shells out to `rg` should also splice
@@ -801,11 +807,14 @@ function btv._picker_run(gen, query, include, exclude)
     -- Per-row highlight groups (`push { hl = … }`): one name per item, `""` for an
     -- unpainted row. nil until a row declares one, exactly like `layouts`.
     local hls = nil
+    -- Deprioritized rows (`push { low = true }`): one boolean per item, nil until a
+    -- row is marked, exactly like `hls`.
+    local lows = nil
     local pushed = 0 -- this run's result count, for the cap (p.items is session-wide)
     local flush_pending = false -- an end-of-tick flush is already scheduled
     local function flush()
       if batched > 0 then
-        btv._picker_push(gen, labels, keys, paths, rows, cols, layouts, hls)
+        btv._picker_push(gen, labels, keys, paths, rows, cols, layouts, hls, lows)
         labels, keys, batched = {}, {}, 0
         if paths then
           paths = {}
@@ -815,6 +824,7 @@ function btv._picker_run(gen, query, include, exclude)
         end
         layouts = nil
         hls = nil
+        lows = nil
       end
     end
     -- Cross a *partial* batch at the end of the tick it was pushed on, so results
@@ -927,6 +937,17 @@ function btv._picker_run(gen, query, include, exclude)
         hls[batched] = tostring(entry.hl)
       elseif hls then
         hls[batched] = ""
+      end
+      if entry.low then
+        if not lows then
+          lows = {}
+          for j = 1, batched - 1 do
+            lows[j] = false
+          end
+        end
+        lows[batched] = true
+      elseif lows then
+        lows[batched] = false
       end
       keys[batched] = p.nitems
       if paths then

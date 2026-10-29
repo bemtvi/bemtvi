@@ -5354,3 +5354,232 @@ async fn files_and_grep_fs_fallback_failures_are_reported() {
         "both fallback failures reach the source's rejection: {notes:?}"
     );
 }
+
+// --- Deprioritized rows (`push { low = true }`): a two-tier view ---------------------
+
+/// Poll the open picker until it lists `want` rows, returning the last frame's rows.
+async fn poll_rows(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: usize,
+) -> Vec<String> {
+    let mut items = Vec::new();
+    for _ in 0..100 {
+        if let Some(map) = poll_menu(rpc, incoming).await {
+            items = menu_items(&menu_of(&map));
+            if items.len() == want {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    items
+}
+
+/// A source streaming `batches` (each a list of `{text, low}`) one tick apart, so each
+/// batch crosses to the server on its own and lands in a separate `menu_push`.
+fn batched_source(batches: &str) -> String {
+    format!(
+        r#"
+local function later() return btv.promise.new(function(res) btv.timer(res, 5) end) end
+btv.picker.source {{
+  name = "tiers",
+  items = btv.async(function(ctx)
+    for _, batch in ipairs({batches}) do
+      for _, row in ipairs(batch) do ctx.push {{ text = row[1], low = row[2] }} end
+      btv.await(later())
+    end
+  end),
+  confirm = function(item) _G.picked = item.text end,
+}}
+"#
+    )
+}
+
+#[tokio::test]
+async fn low_rows_list_after_every_normal_row_in_stream_order() {
+    // Passthrough (no query): low and normal rows interleave across three batches;
+    // the view puts every normal row first, and keeps each tier in stream order.
+    let dir = temp_dir("picker_low_passthrough");
+    let src = batched_source(
+        r#"{
+      { { "vendor/a", true }, { "src/one", false } },
+      { { "vendor/b", true }, { "src/two", false } },
+      { { "src/three", false }, { "vendor/c", true } },
+    }"#,
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+    exec_lua(&rpc, "btv.picker.open('tiers')").await;
+    assert_eq!(
+        poll_rows(&rpc, &mut incoming, 6).await,
+        vec![
+            "src/one",
+            "src/two",
+            "src/three",
+            "vendor/a",
+            "vendor/b",
+            "vendor/c"
+        ]
+    );
+    // The bare count readout: every candidate is shown, low ones included.
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu"));
+    assert_eq!(
+        map_get(&menu, "status").and_then(Value::as_str),
+        Some("6"),
+        "no matched/total split for an unfiltered tiered list"
+    );
+}
+
+#[tokio::test]
+async fn a_better_matching_low_row_still_lists_after_every_normal_match() {
+    // `lib` is the best possible match for the query `lib`, `l_i_b` a poor one —
+    // the tier wins over the score. A second batch streams under the live query and
+    // keeps the partition; re-typing the query (a full re-rank) keeps it too.
+    let dir = temp_dir("picker_low_filtered");
+    let src = r#"
+local function later() return btv.promise.new(function(res) btv.timer(res, 5) end) end
+btv.picker.source {
+  name = "tiers",
+  items = btv.async(function(ctx)
+    ctx.push { text = "lib", low = true }
+    ctx.push { text = "l_i_b" }
+    btv.await(btv.wait_for(function() return _G.go end, { tries = 200, interval = 5 }))
+    ctx.push { text = "libb", low = true }
+    ctx.push { text = "l-i-b" }
+    btv.await(later())
+  end),
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    exec_lua(&rpc, "btv.picker.open('tiers')").await;
+    poll_rows(&rpc, &mut incoming, 2).await;
+    feed(&rpc, "lib");
+    assert_eq!(
+        poll_rows(&rpc, &mut incoming, 2).await,
+        vec!["l_i_b", "lib"]
+    );
+
+    exec_lua(&rpc, "_G.go = true").await;
+    assert_eq!(
+        poll_rows(&rpc, &mut incoming, 4).await,
+        vec!["l_i_b", "l-i-b", "lib", "libb"],
+        "streamed matches join their own tier"
+    );
+
+    feed(&rpc, "<BS>b");
+    let rows = poll_rows(&rpc, &mut incoming, 4).await;
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    assert!(
+        rows[..2].iter().all(|r| r.contains('_') || r.contains('-')),
+        "a re-rank keeps every normal row above the low ones: {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_cursor_stays_on_its_low_row_when_a_normal_row_lands_above_it() {
+    // The caret stands on the third low row; a normal row then arrives and is listed
+    // above the whole low tier. Confirm must take the row the caret was showing, not
+    // whatever slid into its view slot.
+    let dir = temp_dir("picker_low_cursor");
+    let src = r#"
+btv.picker.source {
+  name = "tiers",
+  items = btv.async(function(ctx)
+    for _, t in ipairs({ "low1", "low2", "low3" }) do ctx.push { text = t, low = true } end
+    btv.await(btv.wait_for(function() return _G.go end, { tries = 200, interval = 5 }))
+    ctx.push { text = "normal" }
+  end),
+  confirm = function(item) _G.picked = item.text end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    exec_lua(&rpc, "btv.picker.open('tiers')").await;
+    assert_eq!(
+        poll_rows(&rpc, &mut incoming, 3).await,
+        vec!["low1", "low2", "low3"]
+    );
+    feed(&rpc, "<C-n><C-n>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu"));
+    assert_eq!(menu_selected(&menu), Some(2));
+
+    exec_lua(&rpc, "_G.go = true").await;
+    assert_eq!(
+        poll_rows(&rpc, &mut incoming, 4).await,
+        vec!["normal", "low1", "low2", "low3"]
+    );
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu"));
+    assert_eq!(
+        menu_selected(&menu),
+        Some(3),
+        "the caret moved down with its row"
+    );
+    feed(&rpc, "<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return _G.picked").await.as_str(),
+        Some("low3")
+    );
+}
+
+#[tokio::test]
+async fn a_100k_flood_of_mixed_tiers_stays_fast_and_partitioned() {
+    // Every third row is low. The stream splits passthrough once and appends O(1) per
+    // row after that; a query over the lot re-ranks and partitions in one pass.
+    let dir = temp_dir("picker_low_100k");
+    let src = r#"
+btv.picker.source {
+  name = "huge",
+  items = function(ctx)
+    for i = 1, 100000 do ctx.push { text = "item-" .. i, n = i, low = i % 3 == 0 } end
+  end,
+  confirm = function(item) _G.picked = item.n end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    let opened = std::time::Instant::now();
+    exec_lua(&rpc, "btv.picker.open('huge')").await;
+    let mut total = 0u64;
+    for _ in 0..200 {
+        total = exec_lua(&rpc, "return btv._picker and btv._picker.nitems or 0")
+            .await
+            .as_u64()
+            .unwrap_or(0);
+        if total >= 100000 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(total, 100000);
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu"));
+    assert!(
+        map_get(&menu, "status")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.ends_with("100000") && !s.contains('/')),
+        "the whole list is in the view"
+    );
+    assert_eq!(&menu_items(&menu)[..3], ["item-1", "item-2", "item-4"]);
+
+    // `item-9999` is low (9999 = 3 × 3333) and the query's exact match, yet the top
+    // of the list is all normal rows — the dozens of `item-9999?` / `item-?9999` ones.
+    feed(&rpc, "item-9999");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("filtered"));
+    let rows = menu_items(&menu);
+    let is_low = |r: &String| r["item-".len()..].parse::<u32>().unwrap() % 3 == 0;
+    assert!(!rows.is_empty() && !rows.iter().any(is_low), "{rows:?}");
+    assert!(
+        opened.elapsed() < std::time::Duration::from_secs(10),
+        "100k mixed-tier stream + query stayed responsive ({:?})",
+        opened.elapsed()
+    );
+    feed(&rpc, "9");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("filtered"));
+    assert_eq!(
+        menu_items(&menu),
+        vec!["item-99999"],
+        "a low row still matches"
+    );
+    feed(&rpc, "<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return _G.picked").await.as_u64(),
+        Some(99999)
+    );
+}

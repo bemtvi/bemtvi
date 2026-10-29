@@ -293,6 +293,12 @@ pub struct MenuItem {
     /// than a row with text: clients draw it as a line across the list. Always
     /// [`disabled`](Self::disabled) too. `false` for every other row.
     pub separator: bool,
+    /// A **deprioritized** picker row (`ctx.push { low = true }`, or a path the
+    /// `deprioritize` globs match): the view lists every normal row before every low
+    /// one, each tier keeping its own order — stream order in passthrough, rank order
+    /// under a query. Lets vendored / generated hits (`node_modules/`, lockfiles) stay
+    /// findable without burying the project's own. `false` for every non-picker row.
+    pub low: bool,
 }
 
 impl MenuItem {
@@ -317,6 +323,7 @@ impl MenuItem {
             sort_key: None,
             disabled: false,
             separator: false,
+            low: false,
         }
     }
 }
@@ -642,8 +649,8 @@ impl PromptSet {
 }
 
 /// An open menu. `all_items` holds every candidate (fixed for `select`, growing as
-/// a picker source streams); `filtered` indexes into it in ranked/visible order
-/// and `cursor` highlights a row **within `filtered`**.
+/// a picker source streams); `filtered` then `low` index into it in ranked/visible
+/// order and `cursor` highlights a row **within that view**.
 #[derive(Clone)]
 pub(crate) struct Menu {
     /// Which orchestration owns this menu — decides input-grab and confirm
@@ -673,10 +680,27 @@ pub(crate) struct Menu {
     /// is materialized, so streaming stays O(1) per item. `Some(idx)` is an active
     /// static query: ranked `all_items` indices, recomputed once per query edit and
     /// extended incrementally as new items stream (never re-ranked per batch).
+    ///
+    /// Once a [`MenuItem::low`] row is in play, `filtered` holds only the **normal**
+    /// tier and [`low`](Menu::low) the deprioritized one, displayed after it — see
+    /// [`Menu::item_at`]. A passthrough view that receives its first low row is
+    /// materialized into the two tiers then ([`split`](Menu::split)), so a source
+    /// that never marks a row keeps the zero-cost path.
     filtered: Option<Vec<usize>>,
-    /// Matched-char spans (`char` ranges) parallel to `filtered` when it is `Some`;
-    /// empty in passthrough.
+    /// Matched-char spans (`char` ranges) parallel to `filtered` when it is ranked;
+    /// empty in passthrough, split or not.
     match_spans: Vec<Vec<Range<usize>>>,
+    /// The **low tier**: the `all_items` indices of [`MenuItem::low`] rows, shown after
+    /// every row of `filtered`, in the same order `filtered` would have given them
+    /// (stream order in passthrough, rank order under a query). Empty when no low row
+    /// is in the view — always, for every menu but a picker.
+    low: Vec<usize>,
+    /// Matched-char spans parallel to `low`, under a ranked query only.
+    low_spans: Vec<Vec<Range<usize>>>,
+    /// Whether `filtered` is `Some` only because a passthrough view had to be split
+    /// into tiers — the view is still unranked (no query, or a dynamic source), so
+    /// there are no spans and no re-ranker runs over it.
+    split: bool,
     /// The highlighted row, as an index into the effective view (`filtered` when
     /// `Some`, else `all_items`).
     cursor: usize,
@@ -796,6 +820,9 @@ impl Menu {
             all_items: Vec::new(),
             filtered: None,
             match_spans: Vec::new(),
+            low: Vec::new(),
+            low_spans: Vec::new(),
+            split: false,
             cursor: 0,
             selected_active: false,
             selection_chosen: false,
@@ -861,13 +888,57 @@ impl Menu {
     fn view_len(&self) -> usize {
         self.filtered
             .as_ref()
-            .map_or(self.all_items.len(), |f| f.len())
+            .map_or(self.all_items.len(), |f| f.len() + self.low.len())
     }
 
     /// The `all_items` index displayed at view row `i` (caller ensures `i` is in
-    /// range). O(1) — passthrough is the identity, a query maps through `filtered`.
+    /// range). O(1) — passthrough is the identity, a materialized view maps through
+    /// `filtered` and then, past its end, through the low tier.
     fn item_at(&self, i: usize) -> usize {
-        self.filtered.as_ref().map_or(i, |f| f[i])
+        match &self.filtered {
+            None => i,
+            Some(f) => f.get(i).copied().unwrap_or_else(|| self.low[i - f.len()]),
+        }
+    }
+
+    /// The matched-char spans of view row `i` — empty unless the view is ranked.
+    fn spans_at(&self, i: usize) -> &[Range<usize>] {
+        let Some(f) = &self.filtered else {
+            return &[];
+        };
+        let spans = match i.checked_sub(f.len()) {
+            None => self.match_spans.get(i),
+            Some(j) => self.low_spans.get(j),
+        };
+        spans.map_or(&[], |s| s.as_slice())
+    }
+
+    /// Whether the view is a ranked query (`filtered` holds match order and spans),
+    /// as opposed to passthrough — split into tiers or not.
+    fn ranked(&self) -> bool {
+        self.filtered.is_some() && !self.split
+    }
+
+    /// Materialize passthrough into its two tiers (stream order within each): the
+    /// switch made when the first [`MenuItem::low`] row arrives, or when an emptied
+    /// query lands on a list that holds some. O(n) once, then
+    /// [`extend_view`](Menu::extend_view) appends O(1) per item.
+    fn split_passthrough(&mut self) {
+        let (low, high): (Vec<usize>, Vec<usize>) =
+            (0..self.all_items.len()).partition(|&i| self.all_items[i].low);
+        self.filtered = Some(high);
+        self.low = low;
+        self.match_spans.clear();
+        self.low_spans.clear();
+        self.split = true;
+    }
+
+    /// Drop both tiers' bookkeeping — the low rows and the split flag — before the
+    /// view is rebuilt.
+    fn clear_tiers(&mut self) {
+        self.low.clear();
+        self.low_spans.clear();
+        self.split = false;
     }
 
     /// The query the matcher ranks against: a picker's input-grab `prompt`, or — for
@@ -908,25 +979,38 @@ impl Menu {
         self.all_items.clear();
         self.filtered = refilter.then(Vec::new);
         self.match_spans.clear();
+        self.clear_tiers();
         self.items_gen = gen;
         self.cursor = 0;
     }
 
     /// Recompute the ranked view from scratch against the current query (a static
-    /// query edit). An empty query drops to passthrough (`None`) — no per-item work.
+    /// query edit). An empty query drops to passthrough (`None`) — no per-item work,
+    /// unless the list holds [`MenuItem::low`] rows, which split it into tiers. A
+    /// query ranks, then stable-partitions the ranking by tier: a low row never
+    /// outranks a normal one, however much better it matches.
     fn refilter(&mut self) {
+        self.clear_tiers();
         let query = self.match_query();
         if query.is_empty() {
             self.filtered = None;
             self.match_spans.clear();
+            if self.all_items.iter().any(|i| i.low) {
+                self.split_passthrough();
+            }
         } else {
             let candidates: Vec<&str> = self.all_items.iter().map(|i| i.label.as_str()).collect();
             let ranked = crate::fuzzy::rank(query, &candidates);
             let mut idx = Vec::with_capacity(ranked.len());
             let mut spans = Vec::with_capacity(ranked.len());
             for (i, s) in ranked {
-                idx.push(i);
-                spans.push(s);
+                if self.all_items[i].low {
+                    self.low.push(i);
+                    self.low_spans.push(s);
+                } else {
+                    idx.push(i);
+                    spans.push(s);
+                }
             }
             self.filtered = Some(idx);
             self.match_spans = spans;
@@ -937,25 +1021,58 @@ impl Menu {
 
     /// Fold the newly-appended `all_items[new_start..]` into the view **without**
     /// re-ranking everything — O(batch), the key to streaming 100k+ candidates.
-    /// Passthrough needs nothing (the view *is* `all_items`); an active query matches
-    /// only the new items and appends the matches.
+    /// Passthrough needs nothing (the view *is* `all_items`) until the first
+    /// [`MenuItem::low`] row arrives, which splits it into tiers once; a split view
+    /// appends each new item to its tier, and an active query matches only the new
+    /// items and appends each match to its tier.
+    ///
+    /// A normal row lands *above* the low tier, so a caret standing on a low row is
+    /// moved down with it — it stays on the row it showed. Row 0 is the exception:
+    /// that is the picker's resting "top" (where it opens and where a new run puts it),
+    /// and it stays the top.
     fn extend_view(&mut self, new_start: usize) {
         if self.filtered.is_none() {
+            if self.all_items[new_start..].iter().any(|i| i.low) {
+                // Every row before `new_start` is normal (or the view would already
+                // be split), so they keep their positions — and the caret its row.
+                self.split_passthrough();
+            }
             self.clamp_cursor();
             return;
         }
-        let query = self.match_query().to_string();
-        let candidates: Vec<&str> = self.all_items[new_start..]
-            .iter()
-            .map(|i| i.label.as_str())
-            .collect();
-        let ranked = crate::fuzzy::rank(&query, &candidates);
-        let filtered = self.filtered.as_mut().unwrap();
-        for (i, spans) in ranked {
-            filtered.push(new_start + i);
-            self.match_spans.push(spans);
+        let old_high = self.filtered.as_ref().map_or(0, Vec::len);
+        if self.split {
+            let filtered = self.filtered.as_mut().unwrap();
+            for i in new_start..self.all_items.len() {
+                if self.all_items[i].low {
+                    self.low.push(i);
+                } else {
+                    filtered.push(i);
+                }
+            }
+        } else {
+            let query = self.match_query().to_string();
+            let candidates: Vec<&str> = self.all_items[new_start..]
+                .iter()
+                .map(|i| i.label.as_str())
+                .collect();
+            let ranked = crate::fuzzy::rank(&query, &candidates);
+            let filtered = self.filtered.as_mut().unwrap();
+            for (i, spans) in ranked {
+                if self.all_items[new_start + i].low {
+                    self.low.push(new_start + i);
+                    self.low_spans.push(spans);
+                } else {
+                    filtered.push(new_start + i);
+                    self.match_spans.push(spans);
+                }
+            }
+            self.rank_dirty = true;
         }
-        self.rank_dirty = true;
+        let added_high = self.filtered.as_ref().map_or(0, Vec::len) - old_high;
+        if self.cursor > 0 && self.cursor >= old_high && !self.low.is_empty() {
+            self.cursor += added_high;
+        }
         self.clamp_cursor();
     }
 
@@ -1010,11 +1127,7 @@ impl Menu {
     fn follow_identity(&mut self, identity: Option<usize>) {
         match identity {
             Some(item) => {
-                if let Some(at) = self
-                    .filtered
-                    .as_ref()
-                    .and_then(|f| f.iter().position(|&i| i == item))
-                {
+                if let Some(at) = (0..self.view_len()).find(|&i| self.item_at(i) == item) {
                     self.cursor = at;
                 }
             }
@@ -1022,14 +1135,16 @@ impl Menu {
         }
     }
 
-    /// Reorder the first `keys.len()` rows of the view by **descending** key,
-    /// keeping the parallel `filtered` / `match_spans` in lockstep. Stable, so rows
-    /// the keys tie keep their existing order rather than shuffling frame to frame.
+    /// Reorder the first `keys.len()` rows of one tier — the normal one
+    /// (`filtered`), or with `low` the deprioritized one — by **descending** key,
+    /// keeping the tier's parallel spans in lockstep. Stable, so rows the keys tie
+    /// keep their existing order rather than shuffling frame to frame. A reorder never
+    /// crosses tiers, which is what keeps a scorer from lifting a low row.
     ///
     /// Shared by both re-rankers ([`Editor::settle_picker_rank`] and
     /// [`Editor::settle_complete_rank`]); neither touches the tail beyond
     /// `keys.len()`, which keeps native order.
-    fn reorder_head_by_keys(&mut self, keys: &[f64]) {
+    fn reorder_head_by_keys(&mut self, keys: &[f64], low: bool) {
         let n = keys.len();
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by(|&a, &b| {
@@ -1037,14 +1152,21 @@ impl Menu {
                 .partial_cmp(&keys[a])
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let filtered = self.filtered.as_mut().expect("caller checked");
-        let head: Vec<usize> = order.iter().map(|&p| filtered[p]).collect();
-        filtered[..n].copy_from_slice(&head);
-        let spans: Vec<_> = order
+        let (rows, spans) = if low {
+            (&mut self.low, &mut self.low_spans)
+        } else {
+            (
+                self.filtered.as_mut().expect("caller checked"),
+                &mut self.match_spans,
+            )
+        };
+        let head: Vec<usize> = order.iter().map(|&p| rows[p]).collect();
+        rows[..n].copy_from_slice(&head);
+        let moved: Vec<_> = order
             .iter()
-            .map(|&p| std::mem::take(&mut self.match_spans[p]))
+            .map(|&p| std::mem::take(&mut spans[p]))
             .collect();
-        for (slot, v) in self.match_spans[..n].iter_mut().zip(spans) {
+        for (slot, v) in spans[..n].iter_mut().zip(moved) {
             *slot = v;
         }
     }
@@ -1188,7 +1310,7 @@ impl Editor {
         let Some(menu) = self.menu.as_ref() else {
             return;
         };
-        if menu.kind != MenuKind::Picker || !menu.rank_dirty || menu.filtered.is_none() {
+        if menu.kind != MenuKind::Picker || !menu.rank_dirty || !menu.ranked() {
             return;
         }
         let query = menu.match_query().to_string();
@@ -1196,36 +1318,45 @@ impl Editor {
         let failure = self.with_sandbox(|ed, sb| {
             let menu = ed.menu.as_mut().expect("checked above");
             menu.rank_dirty = false;
-            let filtered = menu.filtered.as_ref().expect("checked above");
-            let n = filtered.len().min(RERANK_LIMIT);
-
-            // The native score each row already earned, so an expression can nudge
-            // the order instead of reinventing matching. One extra native pass over
-            // at most RERANK_LIMIT labels — nanoseconds each, next to microseconds
-            // per sandbox call.
-            let labels: Vec<&str> = filtered[..n]
-                .iter()
-                .map(|&i| menu.all_items[i].label.as_str())
-                .collect();
-            let mut scores = vec![0i64; n];
-            for (pos, sc, _) in crate::fuzzy::rank_scored(&query, &labels) {
-                scores[pos] = sc as i64;
-            }
-
-            let mut keys = Vec::with_capacity(n);
-            for (pos, label) in labels.iter().enumerate() {
-                let got = match sb.as_mut() {
-                    Some(engine) => engine.call_score(handle, label, &query, scores[pos]),
-                    None => Err(SandboxError::Unavailable),
-                };
-                match got {
-                    Ok(k) => keys.push(k),
-                    Err(err) => return Some(err),
+            // Each tier is re-ranked on its own, so a scorer can reorder the low rows
+            // among themselves but never lift one over a normal row. The budget is
+            // shared: the low tier gets whatever the normal one left of RERANK_LIMIT.
+            let high = menu.filtered.as_ref().expect("checked above");
+            let n_high = high.len().min(RERANK_LIMIT);
+            let n_low = menu.low.len().min(RERANK_LIMIT - n_high);
+            let mut tier_keys: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+            for (tier, rows) in [&high[..n_high], &menu.low[..n_low]]
+                .into_iter()
+                .enumerate()
+            {
+                // The native score each row already earned, so an expression can
+                // nudge the order instead of reinventing matching. One extra native
+                // pass over at most RERANK_LIMIT labels — nanoseconds each, next to
+                // microseconds per sandbox call.
+                let labels: Vec<&str> = rows
+                    .iter()
+                    .map(|&i| menu.all_items[i].label.as_str())
+                    .collect();
+                let mut scores = vec![0i64; labels.len()];
+                for (pos, sc, _) in crate::fuzzy::rank_scored(&query, &labels) {
+                    scores[pos] = sc as i64;
+                }
+                for (pos, label) in labels.iter().enumerate() {
+                    let got = match sb.as_mut() {
+                        Some(engine) => engine.call_score(handle, label, &query, scores[pos]),
+                        None => Err(SandboxError::Unavailable),
+                    };
+                    match got {
+                        Ok(k) => tier_keys[tier].push(k),
+                        Err(err) => return Some(err),
+                    }
                 }
             }
 
             let menu = ed.menu.as_mut().expect("checked above");
-            menu.reorder_head_by_keys(&keys);
+            let [high_keys, low_keys] = tier_keys;
+            menu.reorder_head_by_keys(&high_keys, false);
+            menu.reorder_head_by_keys(&low_keys, true);
             None
         });
 
@@ -1305,7 +1436,7 @@ impl Editor {
 
             let menu = ed.menu.as_mut().expect("checked above");
             let chosen = menu.chosen_identity();
-            menu.reorder_head_by_keys(&keys);
+            menu.reorder_head_by_keys(&keys, false);
             menu.follow_identity(chosen);
             None
         });
@@ -2147,6 +2278,7 @@ impl Editor {
         // stays in the prompt but is not re-applied — it already produced these rows).
         snap.filtered = None;
         snap.match_spans.clear();
+        snap.clear_tiers();
         snap.cursor = menu.cursor - lo;
         snap.selected_active = true;
         snap.marked = marked;
@@ -2692,12 +2824,7 @@ impl Editor {
         (start..end)
             .map(|i| {
                 let item = &m.all_items[m.item_at(i)];
-                let spans: &[Range<usize>] = if m.filtered.is_some() {
-                    &m.match_spans[i]
-                } else {
-                    &[]
-                };
-                (item.label.as_str(), spans)
+                (item.label.as_str(), m.spans_at(i))
             })
             .collect()
     }

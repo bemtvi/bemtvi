@@ -5913,17 +5913,17 @@ async fn the_git_pickers_honour_gitignore_and_the_others_do_not() {
     );
 }
 
-/// A `PATH` holding every executable the real one does except `rg`, so a source's
-/// `rg` spawn fails (`-1`) and its fallback leg runs. Process-wide: hold
+/// A `PATH` holding every executable the real one does except `masked`, so a source's
+/// spawn of one fails (`-1`) and its fallback leg runs. Process-wide: hold
 /// `serial_lock` while it is installed. Restores the old `PATH` on drop.
 #[cfg(unix)]
-struct PathWithoutRg {
+struct PathWithout {
     old: std::ffi::OsString,
 }
 
 #[cfg(unix)]
-impl PathWithoutRg {
-    fn install(name: &str) -> Self {
+impl PathWithout {
+    fn install(name: &str, masked: &[&str]) -> Self {
         let old = std::env::var_os("PATH").unwrap_or_default();
         let farm = temp_dir(name);
         for d in std::env::split_paths(&old) {
@@ -5933,18 +5933,19 @@ impl PathWithoutRg {
             for e in entries.flatten() {
                 let file = e.file_name();
                 let link = farm.join(&file);
-                if file != "rg" && !link.exists() {
+                let hidden = masked.iter().any(|m| file == *m);
+                if !hidden && !link.exists() {
                     let _ = std::os::unix::fs::symlink(e.path(), link);
                 }
             }
         }
         std::env::set_var("PATH", &farm);
-        PathWithoutRg { old }
+        PathWithout { old }
     }
 }
 
 #[cfg(unix)]
-impl Drop for PathWithoutRg {
+impl Drop for PathWithout {
     fn drop(&mut self) {
         std::env::set_var("PATH", &self.old);
     }
@@ -5962,7 +5963,7 @@ async fn without_rg_the_git_pickers_fall_back_to_git_and_still_honour_gitignore(
     let proj = gitignore_tree("picker_git_norg_tree");
     let (rpc, mut incoming) = start(&dir, "").await;
     command(&rpc, &format!("cd {}", proj.display())).await;
-    let _path = PathWithoutRg::install("picker_git_norg_path");
+    let _path = PathWithout::install("picker_git_norg_path", &["rg"]);
     // The mask really took: rg can no longer run.
     exec_lua(
         &rpc,
@@ -6006,5 +6007,34 @@ async fn the_everyday_keys_respect_gitignore_and_the_shifted_ones_search_everyth
     assert_eq!(
         opened.as_str(),
         Some("files_git files live_grep_git live_grep")
+    );
+}
+
+/// The last leg — neither `rg` nor `git` can run, as in the pure web client: the `_git`
+/// pickers walk the tree over `btv.fs` with the walk honouring the ignore files, so
+/// they still list the same set.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_or_git_the_git_pickers_walk_and_still_honour_gitignore() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_walk_cfg");
+    let proj = gitignore_tree("picker_git_walk_tree");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_git_walk_path", &["rg", "git"]);
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "files_git", "", 3).await,
+        [".gitignore", ".hidden.txt", "visible.txt"],
+        "the walk lists the same set rg did"
+    );
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep_git", "zqxneedle", 2).await,
+        [".hidden.txt", "visible.txt"],
+        "btv.fs.grep searches the same set rg did"
     );
 }

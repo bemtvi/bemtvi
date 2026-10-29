@@ -1364,18 +1364,6 @@ local function git_worktree(cwd)
   return (r.code == 0 and btv.str.trim(r.stdout or "") == "true") and "yes" or "no"
 end
 
--- The last leg of a `.gitignore`-respecting picker, reached when neither `rg` nor
--- `git` could run (the pure web client). The `btv.fs` walk has no ignore matcher yet,
--- and listing ignored files would break the one promise these pickers make, so it
--- says so instead.
-local function gitignore_walk_unsupported(name)
-  error(
-    name
-      .. ": no rg or git here, and the btv.fs walk cannot honour .gitignore yet — use the unrestricted picker",
-    0
-  )
-end
-
 -- files: a static source — file paths streamed in, fuzzy-matched locally. An
 -- btv.async source: iterate the run_stream's batches with btv.await_each, pushing each
 -- path; returning ends the run. The stream is reaped on close via on_cancel.
@@ -1399,8 +1387,9 @@ end
 -- fallback chain keeps that promise rather than quietly listing ignored files: with no
 -- rg, `git ls-files --cached --others --exclude-standard` inside a work tree, plain
 -- `find` outside one (there is no `.gitignore` to honour there, which is also what rg
--- does), and a loud error where neither can run. Both are built by `files_source`, so
--- the pair cannot drift.
+-- does), and the `btv.fs` walk reading the ignore files itself where neither can run
+-- (`btv.fs.walk{ gitignore = true }`). Both are built by `files_source`, so the pair
+-- cannot drift.
 local function files_source(name, title, gitignore)
   return {
     name = name,
@@ -1478,14 +1467,13 @@ local function files_source(name, title, gitignore)
       then
         return
       end
-      if gitignore then
-        gitignore_walk_unsupported(name)
-      end
       -- No shell / no rg / no find (the pure web client): walk the tree over btv.fs.
-      -- `hidden = true` keeps this leg unrestricted like the two above (the walk's
-      -- default `skip` already prunes `.git`).
+      -- `hidden = true` keeps dotfiles in like the legs above (the walk's default
+      -- `skip` already prunes `.git`), and `gitignore` has the walk read the ignore
+      -- files as rg would for `files_git`.
       -- A failed walk rejects the run (the picker reports it), unless the picker closed.
-      local ok, files = pcall(btv.await, btv.fs.walk(ctx.cwd, { hidden = true }))
+      local ok, files =
+        pcall(btv.await, btv.fs.walk(ctx.cwd, { hidden = true, gitignore = gitignore }))
       if not ok then
         if cancelled then
           return
@@ -1538,8 +1526,9 @@ btv.picker.source(files_source("files_git", "Find Files", true))
 -- live_grep_git is the same search respecting `.gitignore` (and `.ignore` /
 -- `.rgignore`): `rg --hidden`, dotfiles still searched. With no rg it keeps the
 -- promise like `files_git` does — `git grep --untracked` (tracked plus untracked,
--- ignored excluded) inside a work tree, plain `grep` outside one, a loud error where
--- neither can run. Both come from `grep_source`.
+-- ignored excluded) inside a work tree, plain `grep` outside one, and the
+-- `.gitignore`-aware `btv.fs` walk where neither can run. Both come from
+-- `grep_source`.
 local function grep_source(name, title, gitignore)
   return {
     name = name,
@@ -1779,15 +1768,14 @@ local function grep_source(name, title, gitignore)
       then
         return
       end
-      if gitignore then
-        gitignore_walk_unsupported(name)
-      end
 
       -- No shell / no rg / no grep (the pure web client): a transport-agnostic btv.fs walk
-      -- + in-Lua substring match. Performance isn't a concern — the pure-client trees are
-      -- small and the picker caps results; pushes for a superseded query are dropped by the
+      -- + in-Lua substring match, the walk honouring the ignore files for
+      -- `live_grep_git`. Performance isn't a concern — the pure-client trees are small
+      -- and the picker caps results; pushes for a superseded query are dropped by the
       -- sink.
-      local ok, matches = pcall(btv.await, btv.fs.grep(ctx.cwd, q, { hidden = true }))
+      local ok, matches =
+        pcall(btv.await, btv.fs.grep(ctx.cwd, q, { hidden = true, gitignore = gitignore }))
       if not ok then
         if cancelled then
           return

@@ -4695,6 +4695,16 @@ pub(crate) fn install_runtime_api(
             crate::glob::LuaGlob::compile(&pattern, opts.as_ref())
         })?,
     )?;
+    // `btv._gitignore(text)` -> (matcher, errors): one ignore file compiled with
+    // ripgrep's semantics (`crate::gitignore`), plus the messages for any line it had
+    // to skip.
+    btv.set(
+        "_gitignore",
+        lua.create_function(|_, text: mlua::Value| {
+            let text = crate::glob::candidate("btv.fs.gitignore", "text", &text)?;
+            crate::gitignore::LuaGitignore::compile(&text.to_string_lossy())
+        })?,
+    )?;
     // `btv._glob_set(patterns, opts?)` -> a compiled `LuaGlobSet` userdata testing a
     // path against every pattern in one `RegexSet` pass (`:test`/`:matches`).
     btv.set(

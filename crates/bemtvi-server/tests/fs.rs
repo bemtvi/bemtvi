@@ -753,3 +753,142 @@ async fn hash_file_defaults_to_sha256_and_rejects_unknown_algo() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// `btv.fs.gitignore` compiles one ignore file with ripgrep's semantics: the last
+/// matching line decides, `!` whitelists, a trailing `/` matches only a directory, and
+/// a line it cannot compile is skipped and reported rather than failing the file.
+#[tokio::test]
+async fn gitignore_matcher_follows_rgs_semantics() {
+    let (rpc, _incoming) = start().await;
+    let got = exec_lua(
+        &rpc,
+        r#"local m, errs = btv.fs.gitignore("*.log\n!keep.log\nbuild/\n/top.txt\na{b\n")
+           local function s(v) return tostring(v) end
+           return table.concat({
+             s(m:match("debug.log")), s(m:match("keep.log")), s(m:match("a/b/x.log")),
+             s(m:match("build", true)), s(m:match("build", false)),
+             s(m:match("top.txt")), s(m:match("sub/top.txt")), s(m:match("main.rs")),
+             s(#errs),
+           }, ",")"#,
+    )
+    .await;
+    assert_eq!(
+        got.as_str(),
+        Some("ignore,whitelist,ignore,ignore,nil,ignore,nil,nil,1")
+    );
+}
+
+/// A repository exercising every rule the `.gitignore`-aware walk composes; returns the
+/// root. See `walk_with_gitignore_prunes_what_rg_would` for what each file proves.
+fn ignore_fixture(tag: &str) -> std::path::PathBuf {
+    let root = temp_dir(tag);
+    let w = |rel: &str, body: &str| {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    };
+    w(".git/info/exclude", "secret.txt\n");
+    w(".gitignore", "*.log\n!keep.log\n/build/\ngen/\n");
+    w(".ignore", "notes.md\n!b.log\n");
+    for f in [
+        "a.log",
+        "b.log",
+        "keep.log",
+        "build/out.txt",
+        "src/build/x.txt",
+        "src/gen/y.txt",
+        "src/z.tmp",
+        "src/c.log",
+        "z.tmp",
+        "secret.txt",
+        "notes.md",
+        "main.rs",
+        ".hidden",
+    ] {
+        w(f, "x\n");
+    }
+    w("src/.gitignore", "*.tmp\n/anch.txt\n");
+    w("src/anch.txt", "x\n");
+    w("src/deep/anch.txt", "x\n");
+    root
+}
+
+async fn walk_sorted(rpc: &Rpc, dir: &std::path::Path) -> String {
+    exec_lua(
+        rpc,
+        &format!(
+            "_G.out = nil\n\
+             btv.async(function()\n\
+               local files = btv.await(btv.fs.walk(\"{d}\", {{ hidden = true, gitignore = true }}))\n\
+               for i, f in ipairs(files) do files[i] = f:gsub('\\\\', '/') end\n\
+               table.sort(files)\n\
+               _G.out = table.concat(files, \",\")\n\
+             end)()",
+            d = q(dir)
+        ),
+    )
+    .await;
+    poll_settled(rpc, "return _G.out")
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `btv.fs.walk{ gitignore = true }` prunes exactly what `rg --files --hidden` does:
+///
+/// - `a.log` by `*.log`; `keep.log` back by `!keep.log`; `b.log` back by `.ignore`'s
+///   `!b.log`, because `.ignore` outranks `.gitignore` whatever the depth;
+/// - `build/` only at the root (`/build/` is anchored), so `src/build/x.txt` stays;
+///   `gen/` at any depth;
+/// - `src/.gitignore`'s `*.tmp` takes `src/z.tmp` but not the root's `z.tmp`, and its
+///   anchored `/anch.txt` takes `src/anch.txt` but not `src/deep/anch.txt`;
+/// - `secret.txt` by `.git/info/exclude`, `notes.md` by `.ignore`.
+#[tokio::test]
+async fn walk_with_gitignore_prunes_what_rg_would() {
+    let (rpc, _incoming) = start().await;
+    let root = ignore_fixture("fs_walk_gitignore");
+    let want =
+        ".gitignore,.hidden,.ignore,b.log,keep.log,main.rs,src/.gitignore,src/build/x.txt,src/deep/anch.txt,z.tmp";
+    assert_eq!(walk_sorted(&rpc, &root).await, want);
+
+    // The gold standard, where it is installed: rg's own listing of the same tree.
+    if let Ok(out) = std::process::Command::new("rg")
+        .args(["--files", "--hidden", "-g", "!.git"])
+        .current_dir(&root)
+        .output()
+    {
+        let mut rg: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.replace('\\', "/"))
+            .collect();
+        rg.sort();
+        assert_eq!(rg.join(","), want, "rg lists the same set");
+    }
+}
+
+/// Walking a subdirectory still honours the repository's ignore files ABOVE it, each
+/// against the path from its own directory: the root's `*.log` takes `src/c.log`,
+/// while its anchored `/build/` does not reach `src/build`.
+#[tokio::test]
+async fn walk_with_gitignore_honours_the_files_above_the_walked_dir() {
+    let (rpc, _incoming) = start().await;
+    let root = ignore_fixture("fs_walk_gitignore_sub");
+    assert_eq!(
+        walk_sorted(&rpc, &root.join("src")).await,
+        ".gitignore,build/x.txt,deep/anch.txt"
+    );
+}
+
+/// Outside a repository a `.gitignore` is not honoured — rg needs a repository for
+/// one — while a `.ignore` still is.
+#[tokio::test]
+async fn walk_with_gitignore_outside_a_repo_honours_only_dot_ignore() {
+    let (rpc, _incoming) = start().await;
+    let root = temp_dir("fs_walk_gitignore_norepo");
+    fs::write(root.join(".gitignore"), "a.log\n").unwrap();
+    fs::write(root.join(".ignore"), "b.log\n").unwrap();
+    fs::write(root.join("a.log"), "x").unwrap();
+    fs::write(root.join("b.log"), "x").unwrap();
+    assert_eq!(walk_sorted(&rpc, &root).await, ".gitignore,.ignore,a.log");
+}

@@ -25,6 +25,7 @@
 
 mod convert;
 mod fswire;
+mod gitignore;
 mod gitwire;
 mod glob;
 mod host;

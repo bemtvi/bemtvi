@@ -210,6 +210,11 @@ regex = "1.13.1"
 # Unix-hosted client Windows paths. Owning the regex makes path style an explicit
 # option. Pure Rust and wasm-safe (aho-corasick / bstr / regex-automata).
 globset = { version = "0.4.20", default-features = false }
+# `.gitignore` semantics for the `btv.fs` walk (`btv.fs.gitignore`): ripgrep's own
+# matcher, so negation, anchoring and `**` behave exactly as in `rg`. Only its
+# `gitignore` module is used — the walker stays the Lua one over `btv.fs`, which is
+# what reaches a daemon and OPFS. Same project as globset.
+ignore = { version = "0.4.33", default-features = false }
 portable-pty = "0.9.0"
 vt100 = "0.16.2"
 tree-sitter = "0.26.13"

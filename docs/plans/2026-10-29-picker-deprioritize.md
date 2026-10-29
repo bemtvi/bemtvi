@@ -187,7 +187,7 @@ Tests (`tests/picker.rs`):
   `_git` pickers omit the first and list the second, the unrestricted ones list
   both; the `git` fallback leg (rg masked off `PATH`) gives the same set.
 
-## Phase 5 — `.gitignore` in the `btv.fs` walk (web / no-shell parity)
+## Phase 5 — `.gitignore` in the `btv.fs` walk (web / no-shell parity) (done)
 
 The tier-1 remote rule: the pure web client has no `rg` / `git`, so the `_git`
 pickers must still honour `.gitignore` there rather than fail.
@@ -196,7 +196,7 @@ pickers must still honour `.gitignore` there rather than fail.
   through): read each directory's `.gitignore` (plus the repo's `.git/info/exclude`)
   over `btv.fs` as the walk descends, and prune with a gitignore matcher. Match
   semantics come from the Rust `ignore` crate's `gitignore` builder (exposed as a
-  small `btv.fs.gitignore(lines, root)` matcher) rather than a hand-rolled Lua
+  small `btv.fs.gitignore(text)` matcher) rather than a hand-rolled Lua
   parser, so negation, anchoring and `**` behave exactly as in `rg`.
 - Verify in both builds: native (`--test daemon_fs`) and wasm-eligible
   (`--no-default-features` + a `verify-*.mjs` browser check listing a `_git` picker

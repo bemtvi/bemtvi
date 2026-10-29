@@ -16,8 +16,9 @@ File finding and grepping come in pairs:
 - `files_git` / `live_grep_git` respect `.gitignore` (and `.ignore` / `.rgignore`)
   — `rg --hidden`, so a dotfile like `.github/workflows/ci.yml` is still found and
   only ignored paths drop out. Without `rg` they fall back to `git ls-files` /
-  `git grep` inside a work tree, so the ignore rules hold on every machine. These are
-  the everyday `<leader>ff` / `<leader>fg`.
+  `git grep` inside a work tree, and with neither (the pure web client) to a `btv.fs`
+  walk that reads the ignore files itself (`btv.fs.walk{ gitignore = true }`) — so the
+  ignore rules hold everywhere. These are the everyday `<leader>ff` / `<leader>fg`.
 - `files` / `live_grep` search **unrestricted** — the equivalent of `rg -uu`
   (`--no-ignore --hidden`), so a `.gitignore`d build artifact is still findable. The
   one exclusion is `.git` itself. These are `<leader>fF` / `<leader>fG`.

@@ -154,3 +154,36 @@ async fn btv_fs_read_missing_rejects_over_the_wire() {
         exec_lua(&rpc, "return tostring(_G.__e)").await.as_str(),
     );
 }
+
+/// The `.gitignore`-aware walk runs over the wire too: every `readdir` and every ignore
+/// file it reads is a `luafs_op` to the daemon, so the pruned listing can only have come
+/// from the daemon's tree — what the pure web client's `files_git` relies on.
+#[tokio::test]
+async fn btv_fs_walk_honours_gitignore_over_the_wire() {
+    let dir = temp_dir("daemon_luafs_walk_gitignore");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+    std::fs::write(dir.join(".gitignore"), "node_modules/\n*.log\n").unwrap();
+    for f in ["node_modules/pkg/index.js", "debug.log", "main.rs", ".env"] {
+        std::fs::write(dir.join(f), "x").unwrap();
+    }
+    let dir_str = dir.to_string_lossy().replace('\\', "\\\\");
+    let (rpc, _incoming) = spawn_with_daemon_luafs().await;
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.walked = nil\n\
+             btv.async(function()\n\
+               local files = btv.await(btv.fs.walk(\"{dir_str}\", {{ hidden = true, gitignore = true }}))\n\
+               table.sort(files)\n\
+               _G.walked = table.concat(files, \",\")\n\
+             end)()"
+        ),
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "_G.walked", ".env,.gitignore,main.rs").await,
+        "the daemon-side walk pruned node_modules/ and *.log, got {:?}",
+        exec_lua(&rpc, "return _G.walked").await
+    );
+}

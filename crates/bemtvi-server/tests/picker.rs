@@ -5331,6 +5331,7 @@ async fn files_and_grep_fs_fallback_failures_are_reported() {
              btv.promise.try(src.items, {
                push = function() end, on_cancel = function() end,
                query = query, cwd = "/", rg_globs = {},
+               passes = { { tier = "all", rg_globs = {} } }, begin_pass = function() end,
              }):catch(function(e) btv.notify(name .. ": " .. tostring(e)) end)
            end
            run("files", "")
@@ -5581,5 +5582,243 @@ btv.picker.source {
     assert_eq!(
         exec_lua(&rpc, "return _G.picked").await.as_u64(),
         Some(99999)
+    );
+}
+
+// --- Deprioritized paths (`btv.picker.setup{ deprioritize }`) and two-pass search --
+
+/// A filterable source pushing a fixed list of paths in this order, so the expected
+/// order is exact whatever binary the machine has.
+const PATHS_SRC: &str = r#"
+btv.picker.source {
+  name = "paths",
+  filter = true,
+  items = function(ctx)
+    for _, p in ipairs({
+      "node_modules/a.js", "yarn.lock", "src/main.rs", "dist/x.js", "build.rs",
+      "src/distance.rs", "pkg.egg-info/PKG-INFO", "src/lockfile.rs", "app.min.js",
+    }) do ctx.push { text = p, path = p } end
+  end,
+}
+"#;
+
+#[tokio::test]
+async fn the_default_list_pushes_vendored_paths_below_the_rest_but_not_look_alikes() {
+    let dir = temp_dir("picker_deprio_default");
+    let (rpc, mut incoming) = start(&dir, PATHS_SRC).await;
+    exec_lua(&rpc, "btv.picker.open('paths')").await;
+    assert_eq!(
+        poll_rows(&rpc, &mut incoming, 9).await,
+        vec![
+            // look-alikes of `dist/`, `build/` and the lockfiles stay normal
+            "src/main.rs",
+            "build.rs",
+            "src/distance.rs",
+            "src/lockfile.rs",
+            // in stream order below them
+            "node_modules/a.js",
+            "yarn.lock",
+            "dist/x.js",
+            "pkg.egg-info/PKG-INFO",
+            "app.min.js",
+        ]
+    );
+    // Under a query too: `s` matches all nine, the normal four lead.
+    feed(&rpc, "s");
+    let rows = poll_rows(&rpc, &mut incoming, 9).await;
+    let mut head = rows[..4].to_vec();
+    head.sort();
+    assert_eq!(
+        head,
+        vec![
+            "build.rs",
+            "src/distance.rs",
+            "src/lockfile.rs",
+            "src/main.rs"
+        ],
+        "{rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn setup_deprioritize_replaces_the_list_on_the_next_open() {
+    let dir = temp_dir("picker_deprio_setup");
+    let (rpc, mut incoming) = start(&dir, PATHS_SRC).await;
+    exec_lua(&rpc, "btv.picker.setup({ deprioritize = {} })").await;
+    exec_lua(&rpc, "btv.picker.open('paths')").await;
+    assert_eq!(
+        poll_rows(&rpc, &mut incoming, 9).await[..3],
+        ["node_modules/a.js", "yarn.lock", "src/main.rs"],
+        "an empty list is pure stream order"
+    );
+    feed(&rpc, "<Esc>");
+    exec_lua(&rpc, "btv.picker.setup({ deprioritize = { 'src/' } })").await;
+    exec_lua(&rpc, "btv.picker.open('paths')").await;
+    let rows = poll_rows(&rpc, &mut incoming, 9).await;
+    assert_eq!(
+        rows[6..],
+        ["src/main.rs", "src/distance.rs", "src/lockfile.rs"],
+        "the replaced list, not the default, decides: {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_source_is_handed_the_two_passes_and_the_sink_keeps_each_ones_tier() {
+    let dir = temp_dir("picker_deprio_passes");
+    let src = r#"
+btv.picker.setup({ deprioritize = { "node_modules/" } })
+btv.picker.source {
+  name = "passes",
+  filter = true,
+  items = function(ctx)
+    _G.passes = ctx.passes
+    -- Each pass pushes BOTH tiers: the sink must keep only the pass's own.
+    ctx.begin_pass(ctx.passes[1])
+    ctx.push { text = "node_modules/early.js", path = "node_modules/early.js" }
+    ctx.push { text = "src/a.rs", path = "src/a.rs" }
+    ctx.begin_pass(ctx.passes[2])
+    ctx.push { text = "src/again.rs", path = "src/again.rs" }
+    ctx.push { text = "node_modules/late.js", path = "node_modules/late.js" }
+  end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    exec_lua(&rpc, "btv.picker.open('passes')").await;
+    assert_eq!(
+        poll_rows(&rpc, &mut incoming, 2).await,
+        vec!["src/a.rs", "node_modules/late.js"]
+    );
+    let passes = exec_lua(
+        &rpc,
+        "return btv.json.encode(btv.tbl.map(function(p) \
+           return p.tier .. ' ' .. table.concat(p.rg_globs, ' ') end, _G.passes))",
+    )
+    .await;
+    assert_eq!(
+        passes.as_str(),
+        Some(
+            r#"["normal -g !**/node_modules -g !**/node_modules/**","low -g **/node_modules -g **/node_modules/**"]"#
+        )
+    );
+
+    // With an include box in force the low pass searches the box's includes alone
+    // (rg ORs positive globs; the union would search more than either).
+    feed(&rpc, "<Esc>");
+    exec_lua(
+        &rpc,
+        "btv.picker.open('passes', { include = 'src/', exclude = '*.md' })",
+    )
+    .await;
+    poll_rows(&rpc, &mut incoming, 1).await;
+    let passes = exec_lua(
+        &rpc,
+        "return btv.json.encode(btv.tbl.map(function(p) \
+           return p.tier .. ' ' .. table.concat(p.rg_globs, ' ') end, _G.passes))",
+    )
+    .await;
+    assert_eq!(
+        passes.as_str(),
+        Some(concat!(
+            r#"["normal -g **/src -g **/src/** -g !**/*.md -g !**/node_modules -g !**/node_modules/**","#,
+            r#""low -g **/src -g **/src/** -g !**/*.md"]"#
+        ))
+    );
+}
+
+/// A small project with a vendored tree and a lockfile beside real sources, every file
+/// holding `zqxneedle`.
+fn deprio_tree(name: &str) -> std::path::PathBuf {
+    let proj = temp_dir(name);
+    std::fs::create_dir(proj.join(".git")).expect("mkdir .git");
+    std::fs::create_dir_all(proj.join("node_modules/pkg")).expect("mkdir node_modules");
+    std::fs::create_dir(proj.join("src")).expect("mkdir src");
+    for f in [
+        "node_modules/pkg/index.js",
+        "yarn.lock",
+        "src/main.rs",
+        "build.rs",
+    ] {
+        std::fs::write(proj.join(f), "zqxneedle\n").expect("write file");
+    }
+    proj
+}
+
+#[tokio::test]
+async fn shipped_files_and_live_grep_list_vendored_paths_last() {
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_deprio_shipped_cfg");
+    let proj = deprio_tree("picker_deprio_shipped");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+
+    let low = |r: &str| r.starts_with("node_modules") || r.starts_with("yarn.lock");
+    exec_lua(&rpc, "btv.picker.open('files')").await;
+    let rows = poll_rows(&rpc, &mut incoming, 4).await;
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    assert!(
+        !rows[..2].iter().any(|r| low(r)) && rows[2..].iter().all(|r| low(r)),
+        "{rows:?}"
+    );
+    feed(&rpc, "<Esc>");
+
+    exec_lua(&rpc, "btv.picker.open('live_grep')").await;
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("live_grep opens");
+    feed(&rpc, "zqxneedle");
+    let rows = poll_rows(&rpc, &mut incoming, 4).await;
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    assert!(
+        !rows[..2].iter().any(|r| low(r)) && rows[2..].iter().all(|r| low(r)),
+        "{rows:?}"
+    );
+}
+
+/// The point of the two passes: a tree whose deprioritized hits alone exceed the cap
+/// still lists the project's own hit, because rg searched it first. Needs `rg` (the
+/// `grep` leg is one pass by design).
+#[tokio::test]
+async fn a_capped_live_grep_still_finds_the_normal_hit_under_a_flood_of_low_ones() {
+    if std::process::Command::new("rg")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skip: rg not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_deprio_cap_cfg");
+    // The low hits sit where a one-pass walk meets them first — 500 minified files at
+    // the root — and the real hits are buried four directories down.
+    let proj = temp_dir("picker_deprio_cap");
+    std::fs::create_dir(proj.join(".git")).expect("mkdir .git");
+    let deep = proj.join("src/a/b/c");
+    std::fs::create_dir_all(&deep).expect("mkdir src/a/b/c");
+    for f in ["main.rs", "lib.rs"] {
+        std::fs::write(deep.join(f), "zqxneedle\n").expect("write file");
+    }
+    for i in 0..500 {
+        std::fs::write(proj.join(format!("f{i}.min.js")), "zqxneedle\n").expect("write file");
+    }
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    exec_lua(&rpc, "btv.picker._sources.live_grep.max_results = 5").await;
+    exec_lua(&rpc, "btv.picker.open('live_grep')").await;
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("live_grep opens");
+    feed(&rpc, "zqxneedle");
+    let rows = poll_rows(&rpc, &mut incoming, 5).await;
+    assert_eq!(rows.len(), 5, "{rows:?}");
+    let mut head = rows[..2].to_vec();
+    head.sort();
+    assert_eq!(
+        head,
+        [
+            "src/a/b/c/lib.rs:1:1: zqxneedle",
+            "src/a/b/c/main.rs:1:1: zqxneedle"
+        ],
+        "{rows:?}"
     );
 }

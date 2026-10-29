@@ -99,7 +99,7 @@ Tests (`tests/picker.rs`):
 - `btv.picker.scorer` reorders within a tier but cannot lift a low row above a
   normal one.
 
-## Phase 3 — Lua: `btv.picker.setup({ deprioritize = … })`
+## Phase 3 — Lua: `btv.picker.setup({ deprioritize = … })` (done)
 
 `bemtvi-lua/src/prelude/picker.lua`.
 
@@ -118,20 +118,29 @@ Tests (`tests/picker.rs`):
   same point, and only for the same `filter = true` sources, as include/exclude —
   and marks `low`. One glob-set test per row, like `exclude` already does; bench
   it on the 100k flood.
-- **Low rows are capped at 90k per run** (requested 2026-10-29), so they can never
-  starve the normal tier: past the low cap a low row is dropped at the sink — before
-  it is stored or counted — and the job keeps running, so a normal hit found late
-  still lands. The overall 100k cap (normal + kept low) still reaps the job, which
-  leaves the normal tier at least 10k slots. Overridable per source
-  (`max_low_results`).
-- The drop must be cheap, not just bounded: the sink runs per *hit*, after a source
-  has already parsed (and `live_grep` fanned out) the line. Give sources a per-path
-  pre-check, `ctx.wants(path)` (include/exclude + "is this a capped low path"), so
-  `live_grep` skips a capped low path's line before `find_all`. `rg` still walks the
-  low directories (CPU/IO, not memory); a two-pass search — normal globs first, the
-  deprioritized ones second — would remove even that, and stays a follow-up.
-- Tests: a source streaming 95k low rows then normal ones shows every normal row
-  (first) and exactly 90k low rows; the 100k flood stays within its time bound.
+- **Two-pass search, normal paths first** (revised 2026-10-29, replacing a 90k
+  low-row cap): the hits that matter are found before the low ones, so the 100k cap
+  can only ever be filled by low rows once every normal hit is in, and `rg` never
+  walks a low directory on the first pass at all.
+  - `ctx.passes` — the runs a source should make, in order: `{ tier = "normal",
+    rg_globs = … }` (the box globs plus every deprioritize glob *negated*, so `rg`
+    prunes `node_modules/`) then `{ tier = "low", rg_globs = … }` (the box globs
+    plus the deprioritize globs as *includes*; when the include box is non-empty the
+    box's own includes are used alone instead, since `rg` ORs positive globs and the
+    union would search more than either). One `{ tier = "all", rg_globs =
+    ctx.rg_globs }` pass when the list is empty.
+  - `ctx.begin_pass(pass)` tells the sink which pass is running: a row of the
+    *other* tier is dropped (before the cap), so the glob set — not `rg`'s reading
+    of the same globs — decides each path's tier and nothing lists twice.
+  - `files` / `live_grep` loop their `rg` leg over `ctx.passes`. The `btv.fs`
+    walk legs get their list in one piece and push the normal rows first. The
+    `find` / `grep` legs stay single-pass and rely on the core's tiers for order —
+    their known limit is the old one, low rows can fill the cap first.
+  - A source that ignores `ctx.passes` still has its rows marked `low` and ordered
+    by the core.
+- Tests: the pass globs a source is handed; the sink dropping a cross-tier row in a
+  pass; with `rg`, a capped `live_grep` over a tree whose low hits alone exceed the
+  cap still lists the `src/` hit (skip-if-missing `rg`).
 - Default list (globs; directory names match as whole path segments):
   - JS/TS: `node_modules/`, `bower_components/`, `jspm_packages/`, `.yarn/`,
     `.pnpm-store/`, `.nuxt/`, `.output/`, `.next/`, `.svelte-kit/`, `.angular/`,
@@ -208,7 +217,7 @@ pickers must still honour `.gitignore` there rather than fail.
 
 ## Out of scope
 
-- The two-pass (normal-first) `rg` search that would stop `rg` walking the low
-  directories at all.
+- Two-pass `find` / `grep` fallback legs (converting the globs to `find -path` /
+  `--exclude-dir` reliably is its own project).
 - More than two tiers / numeric priorities — a `low` flag covers the requirement;
   widen to a small integer later if a real use appears.

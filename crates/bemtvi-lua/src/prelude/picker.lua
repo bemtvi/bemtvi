@@ -150,14 +150,16 @@ end
 --     metacharacter (`src/**`, `*.lock`) is taken as written, since the user has said
 --     what they mean.
 --
--- A trailing `/` (`vendor/`) is dropped first — it only ever meant "the directory".
+-- A trailing `/` (`vendor/`, `*.egg-info/`) is dropped first — it only ever meant
+-- "the directory", so it also makes a globbed name a directory.
 local function expand_pattern(pat)
+  local dir = pat:find("/+$") ~= nil
   pat = pat:gsub("/+$", "")
   if pat == "" then
     return {}
   end
   local anchored = pat:find("/", 1, true) and pat or ("**/" .. pat)
-  if btv.glob.is_glob(pat) then
+  if btv.glob.is_glob(pat) and not dir then
     return { anchored }
   end
   return { anchored, anchored .. "/**" }
@@ -173,10 +175,11 @@ end
 -- and to ripgrep's `-g`, which read a bare name differently:
 --
 -- ```
--- *.lock     ->  **/*.lock                 no `/` ⇒ matches at any depth
--- target     ->  **/target, **/target/**   a plain name is also a directory
--- vendor/    ->  **/vendor, **/vendor/**   a trailing `/` only meant "directory"
--- src/**     ->  src/**                    already a glob ⇒ taken as written
+-- *.lock       ->  **/*.lock                          no `/` ⇒ matches at any depth
+-- target       ->  **/target, **/target/**            a plain name is also a directory
+-- vendor/      ->  **/vendor, **/vendor/**            a trailing `/` only meant "directory"
+-- *.egg-info/  ->  **/*.egg-info, **/*.egg-info/**    …glob or not
+-- src/**       ->  src/**                             already a glob ⇒ taken as written
 -- ```
 --
 -- ```lua
@@ -240,6 +243,118 @@ end
 -- these are cross-picker defaults, not any one source's business.
 btv.picker._config = btv.picker._config or { include = nil, exclude = nil, history = 20 }
 
+-- The shipped values a config extends rather than retypes (see `btv.picker.setup`).
+--
+-- `deprioritize` is the list of paths every filterable picker lists *after* the rest:
+-- generated and vendored trees, lockfiles, minified files and source maps — what a
+-- search hits by the thousand and a reader almost never wants first. Test files are
+-- deliberately absent; add them if your tests are noise to you.
+btv.picker.defaults = {
+  deprioritize = {
+    -- JS / TS
+    "node_modules/",
+    "bower_components/",
+    "jspm_packages/",
+    ".yarn/",
+    ".pnpm-store/",
+    ".nuxt/",
+    ".output/",
+    ".next/",
+    ".svelte-kit/",
+    ".angular/",
+    ".expo/",
+    ".docusaurus/",
+    ".vercel/",
+    ".netlify/",
+    ".serverless/",
+    ".turbo/",
+    ".parcel-cache/",
+    ".vite/",
+    ".cache/",
+    "storybook-static/",
+    "coverage/",
+    ".nyc_output/",
+    -- Python
+    ".venv/",
+    "venv/",
+    "__pycache__/",
+    "site-packages/",
+    ".pytest_cache/",
+    ".mypy_cache/",
+    ".ruff_cache/",
+    ".tox/",
+    ".nox/",
+    ".eggs/",
+    "*.egg-info/",
+    ".ipynb_checkpoints/",
+    -- build output
+    "dist/",
+    "build/",
+    "out/",
+    "target/",
+    "_build/",
+    "vendor/",
+    -- other toolchains and editors
+    ".gradle/",
+    ".dart_tool/",
+    "Pods/",
+    "DerivedData/",
+    ".stack-work/",
+    ".terraform/",
+    ".bundle/",
+    ".sass-cache/",
+    ".direnv/",
+    ".idea/",
+    ".vscode/",
+    -- lockfiles
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
+    "deno.lock",
+    "Cargo.lock",
+    "poetry.lock",
+    "Pipfile.lock",
+    "uv.lock",
+    "pdm.lock",
+    "pixi.lock",
+    "go.sum",
+    "go.work.sum",
+    "Gemfile.lock",
+    "composer.lock",
+    "mix.lock",
+    "pubspec.lock",
+    "Podfile.lock",
+    "Package.resolved",
+    "packages.lock.json",
+    "gradle.lockfile",
+    "flake.lock",
+    ".terraform.lock.hcl",
+    "renv.lock",
+    "conan.lock",
+    "shard.lock",
+    -- minified / maps
+    "*.min.js",
+    "*.min.css",
+    "*.map",
+  },
+}
+
+-- The deprioritize globs, expanded and compiled once per `setup` rather than once per
+-- run (a live_grep run is a keystroke): `{ pats = …, set = … }`, `set` nil for an
+-- empty list.
+local deprioritized_cache = nil
+local function deprioritized()
+  if not deprioritized_cache then
+    local list = btv.picker._config.deprioritize or btv.picker.defaults.deprioritize
+    local pats = btv.picker.patterns(list)
+    deprioritized_cache = { pats = pats, set = #pats > 0 and btv.glob.set(pats) or nil }
+  end
+  return deprioritized_cache
+end
+
 -- The persisted store. The prelude attributes to no runtimepath entry, so the
 -- namespace is passed explicitly — `"picker"` is reserved for exactly this. Opened
 -- lazily so a session that never opens a filterable picker never touches shada.
@@ -277,6 +392,11 @@ end
 --     `target/`" knob: set it once and every `files` / `live_grep` opens narrowed.
 --   * `history` — how many past lines each box keeps for `<C-Up>` / `<C-Down>`
 --     (default 20). `0` disables the history *and* its persistence.
+--   * `deprioritize` — the paths filterable pickers list *after* every other row, in
+--     the include/exclude glob syntax. It REPLACES the shipped list
+--     (`btv.picker.defaults.deprioritize`); `{}` turns deprioritizing off. Matching
+--     paths are not hidden, only pushed down — see `btv.picker.source` for how a
+--     source searches them second.
 --
 -- These are the LOW end of the precedence ladder — a line you actually typed
 -- (recalled from history) and an explicit `btv.picker.open{ include = … }` both win,
@@ -285,7 +405,12 @@ end
 --
 -- ```lua
 -- btv.picker.setup({
---   exclude = { "target/", "node_modules/", "*.min.js" },
+--   exclude = { "target/", "*.min.js" },
+--   -- the shipped list, plus test files
+--   deprioritize = btv.list.extend(
+--     btv.tbl.deepcopy(btv.picker.defaults.deprioritize),
+--     { "*test*" }
+--   ),
 -- })
 -- ```
 function btv.picker.setup(opts)
@@ -304,6 +429,10 @@ function btv.picker.setup(opts)
       error("btv.picker.setup: history must be a non-negative number", 2)
     end
     btv.picker._config.history = math.floor(opts.history)
+  end
+  if opts.deprioritize ~= nil then
+    btv.picker._config.deprioritize = filter_line(opts.deprioritize, "deprioritize")
+    deprioritized_cache = nil
   end
 end
 
@@ -452,6 +581,27 @@ end
 -- `ctx.rg_globs` into its argv so the tool prunes the tree instead of streaming paths
 -- the sink is about to drop. Without it the filter keys are an echoed no-op, since
 -- there would be nothing to filter on.
+--
+-- A filterable source's paths are also tested against the `deprioritize` globs
+-- (`btv.picker.setup`): a match is pushed as a `low` row. To keep those from filling
+-- `max_results` before the rest are found, a source can search in **passes** —
+-- `ctx.passes` lists them in order, each a `{ tier, rg_globs }` table:
+--
+-- ```lua
+-- for _, pass in ipairs(ctx.passes) do
+--   ctx.begin_pass(pass)              -- the sink now keeps only this pass's tier
+--   run_rg(pass.rg_globs)             -- the box globs plus this pass's own
+-- end
+-- ```
+--
+-- The first pass is `tier = "normal"`, with the deprioritize globs negated so `rg`
+-- skips those trees entirely; the second is `tier = "low"`, limited to them. With an
+-- empty list there is one `tier = "all"` pass whose `rg_globs` equal `ctx.rg_globs`.
+-- During a pass the sink drops a row of the other tier — the glob set, not the tool,
+-- decides a path's tier — so a source can also push one in-hand list once per pass.
+-- `ctx.begin_pass(nil)` keeps every row again. A source that ignores `ctx.passes`
+-- still gets its low rows listed last; it just searches them in whatever order it
+-- finds them.
 --
 -- `resumable = false` opts the source out of `btv.picker.resume()` (`<leader>fr`):
 -- opening it never overwrites the resume slot, so a transient internal picker (the
@@ -771,6 +921,38 @@ function btv._picker_run(gen, query, include, exclude)
       rg_globs[#rg_globs + 1] = a
     end
 
+    -- Deprioritized paths, for a filterable source only (they are paths). `passes` is
+    -- the order a source should search in: the normal paths (low globs negated, so
+    -- `rg` prunes them), then the low ones (low globs as includes). rg ORs positive
+    -- globs, so with an include box in force the low pass keeps just the box's
+    -- includes — narrower than the union, and the sink drops the normal rows it
+    -- re-finds. Exclusions come last in both: rg lets the later glob win.
+    local low = p.source.filter and deprioritized() or { pats = {} }
+    local low_set = low.set
+    local passes
+    if low_set then
+      local normal_globs = rg_glob_args(include_pats, false)
+      for _, a in ipairs(rg_glob_args(exclude_pats, true)) do
+        normal_globs[#normal_globs + 1] = a
+      end
+      for _, a in ipairs(rg_glob_args(low.pats, true)) do
+        normal_globs[#normal_globs + 1] = a
+      end
+      local low_globs = rg_glob_args(#include_pats > 0 and include_pats or low.pats, false)
+      for _, a in ipairs(rg_glob_args(exclude_pats, true)) do
+        low_globs[#low_globs + 1] = a
+      end
+      passes = {
+        { tier = "normal", rg_globs = normal_globs },
+        { tier = "low", rg_globs = low_globs },
+      }
+    else
+      passes = { { tier = "all", rg_globs = rg_globs } }
+    end
+    -- The pass in progress (`ctx.begin_pass`); nil until a source names one, which
+    -- keeps every row whatever its tier.
+    local pass_tier = nil
+
     local ctx = {
       query = query,
       cwd = vim.fn.getcwd(),
@@ -778,6 +960,10 @@ function btv._picker_run(gen, query, include, exclude)
       include = include_pats,
       exclude = exclude_pats,
       rg_globs = rg_globs,
+      passes = passes,
+      begin_pass = function(pass)
+        pass_tier = pass and pass.tier or nil
+      end,
       -- A source registers a reaper for its in-flight job; the next run (or close)
       -- invokes it. Only the *current* run of the *active* picker registers — the
       -- identity check (`btv._picker == p`) drops a registration from a run whose
@@ -876,6 +1062,18 @@ function btv._picker_run(gen, query, include, exclude)
         end
         if exclude_set and exclude_set:test(path) then
           return
+        end
+        -- The tier is the glob set's call, never the tool's: a pass drops the other
+        -- tier's rows (they belong to the other pass), so a path rg reads slightly
+        -- differently can't list twice — and, before the cap, can't spend it.
+        if low_set then
+          local is_low = low_set:test(path)
+          if (pass_tier == "normal" and is_low) or (pass_tier == "low" and not is_low) then
+            return
+          end
+          if is_low and not entry.low then
+            entry.low = true
+          end
         end
       end
       -- Result cap: a broad query can stream forever — reap the job once this run
@@ -1208,13 +1406,23 @@ btv.picker.source({
     -- streaming paths the sink would drop — on a `node_modules`-sized directory that
     -- is the difference between the results arriving and the cap filling with noise.
     -- The sink still tests every path, so this only ever removes what it would too.
-    local files_args = { "--files", "--color=never", "-uu", "-g", "!.git" }
-    for _, a in ipairs(ctx.rg_globs) do
-      files_args[#files_args + 1] = a
+    -- One `rg` per pass (`ctx.passes`): the normal paths, then the deprioritized
+    -- ones, so the hits that matter are all in before the low ones can fill the cap.
+    -- Only the first pass can find rg missing; the chain falls through from there.
+    for i, pass in ipairs(ctx.passes) do
+      local files_args = { "--files", "--color=never", "-uu", "-g", "!.git" }
+      for _, a in ipairs(pass.rg_globs) do
+        files_args[#files_args + 1] = a
+      end
+      ctx.begin_pass(pass)
+      if not run("rg", files_args) then
+        break
+      elseif cancelled or i == #ctx.passes then
+        return
+      end
     end
-    if run("rg", files_args) then
-      return
-    end
+    -- `find` streams in one pass; the widget still lists the low rows last.
+    ctx.begin_pass(nil)
     if run("find", { ".", "-type", "f", "-not", "-path", "*/.git/*" }, true) then
       return
     end
@@ -1229,8 +1437,13 @@ btv.picker.source({
       end
       error(type(files) == "table" and files.message or files, 0)
     end
-    for _, f in ipairs(files) do
-      ctx.push({ text = f, path = f })
+    -- The walk's list is in hand, so it is pushed once per pass — the sink keeps each
+    -- pass's own tier — and the normal paths reach the cap first, as with rg.
+    for _, pass in ipairs(ctx.passes) do
+      ctx.begin_pass(pass)
+      for _, f in ipairs(files) do
+        ctx.push({ text = f, path = f })
+      end
     end
   end),
   confirm = function(item, mode, layer)
@@ -1448,28 +1661,35 @@ btv.picker.source({
       return cancelled or exit == nil or exit.code ~= -1
     end
 
-    -- As in `files`: the boxes prune at rg, and the sink filters every leg's output.
-    local grep_args = {
-      "--column",
-      "--line-number",
-      "--no-heading",
-      "--with-filename",
-      "--color=never",
-      "-uu",
-      "-g",
-      "!.git",
-    }
-    for _, a in ipairs(ctx.rg_globs) do
-      grep_args[#grep_args + 1] = a
-    end
-    grep_args[#grep_args + 1] = "--"
-    grep_args[#grep_args + 1] = q
-    if run("rg", grep_args, true, false, emit_line) then
-      return
+    -- As in `files`: the boxes prune at rg, the sink filters every leg's output, and
+    -- rg runs once per pass so the normal paths' hits all land before the low ones.
+    for i, pass in ipairs(ctx.passes) do
+      local grep_args = {
+        "--column",
+        "--line-number",
+        "--no-heading",
+        "--with-filename",
+        "--color=never",
+        "-uu",
+        "-g",
+        "!.git",
+      }
+      for _, a in ipairs(pass.rg_globs) do
+        grep_args[#grep_args + 1] = a
+      end
+      grep_args[#grep_args + 1] = "--"
+      grep_args[#grep_args + 1] = q
+      ctx.begin_pass(pass)
+      if not run("rg", grep_args, true, false, emit_line) then
+        break
+      elseif cancelled or i == #ctx.passes then
+        return
+      end
     end
     local function emit_lit(file, lnum, col, line)
       emit(lit, file, lnum, col, line)
     end
+    ctx.begin_pass(nil)
     if run("grep", { "-rnI", "--exclude-dir=.git", "--", q, "." }, false, true, emit_lit) then
       return
     end
@@ -1485,8 +1705,11 @@ btv.picker.source({
       end
       error(type(matches) == "table" and matches.message or matches, 0)
     end
-    for _, m in ipairs(matches) do
-      emit(lit, m.path, m.row, m.col, m.text)
+    for _, pass in ipairs(ctx.passes) do
+      ctx.begin_pass(pass)
+      for _, m in ipairs(matches) do
+        emit(lit, m.path, m.row, m.col, m.text)
+      end
     end
   end),
   confirm = function(item, mode, layer)

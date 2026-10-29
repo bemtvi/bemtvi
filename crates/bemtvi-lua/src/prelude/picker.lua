@@ -1349,6 +1349,33 @@ end
 -- ----- built-in sources ------------------------------------------------------
 -- Shipped defaults exercising the three source shapes; a config can register more.
 
+-- Whether `cwd` is inside a git work tree, for the `.gitignore`-respecting pickers'
+-- fallback when `rg` is missing: `"yes"`, `"no"` (git ran and said not a repo — there
+-- is no `.gitignore` to honour, so the plain legs list the right set), or `"nogit"`
+-- (git could not run). Probed rather than read off the git leg's exit code because a
+-- failed `git grep` exits 128 inside a repo too (a bad pattern), and falling through
+-- to plain `grep` there would search ignored files.
+local function git_worktree(cwd)
+  local r =
+    btv.await(btv.run({ cmd = "git", args = { "rev-parse", "--is-inside-work-tree" }, cwd = cwd }))
+  if r.code == -1 then
+    return "nogit"
+  end
+  return (r.code == 0 and btv.str.trim(r.stdout or "") == "true") and "yes" or "no"
+end
+
+-- The last leg of a `.gitignore`-respecting picker, reached when neither `rg` nor
+-- `git` could run (the pure web client). The `btv.fs` walk has no ignore matcher yet,
+-- and listing ignored files would break the one promise these pickers make, so it
+-- says so instead.
+local function gitignore_walk_unsupported(name)
+  error(
+    name
+      .. ": no rg or git here, and the btv.fs walk cannot honour .gitignore yet — use the unrestricted picker",
+    0
+  )
+end
+
 -- files: a static source — file paths streamed in, fuzzy-matched locally. An
 -- btv.async source: iterate the run_stream's batches with btv.await_each, pushing each
 -- path; returning ends the run. The stream is reaped on close via on_cancel.
@@ -1366,90 +1393,122 @@ end
 -- `find` / `btv.fs` steps already do. Narrowing is the **exclude box**'s job (`<C-g>`)
 -- rather than a different default: it is per-search, so hiding `target/` this time
 -- never makes a file unfindable the next.
-btv.picker.source({
-  name = "files",
-  title = "Find Files",
-  layer = "main", -- a picked file opens in the main editor, never a focused dock
-  preview = "file", -- the preview pane shows the file's head
-  filter = true, -- items are paths: give it the include/exclude boxes
-  items = btv.async(function(ctx)
-    local cancelled = false
-    -- Stream a listing command's stdout as candidates. Returns whether the chain is
-    -- SETTLED here — the tool ran (whatever it listed), or the run was superseded.
-    -- `strip` removes `find`'s leading "./" so its paths match rg's relative style.
-    local function run(cmd, args, strip)
-      local stream = btv.run_stream({ cmd = cmd, args = args, cwd = ctx.cwd })
-      -- Reap the job when the picker closes, so a confirmed/cancelled picker doesn't
-      -- leave a process streaming paths into the void. Sequential steps each arm this
-      -- for the only stream that can still be running.
-      ctx.on_cancel(function()
-        cancelled = true
-        stream:kill()
-      end)
-      for batch in btv.await_each(stream) do
-        for _, l in ipairs(batch) do
-          if strip then
-            l = l:gsub("^%./", "")
-          end
-          if l ~= "" then
-            ctx.push({ text = l, path = l })
+--
+-- files_git is the same picker respecting `.gitignore` (and `.ignore` / `.rgignore`):
+-- `rg --files --hidden`, so dotfiles still list and only ignored paths drop out. Its
+-- fallback chain keeps that promise rather than quietly listing ignored files: with no
+-- rg, `git ls-files --cached --others --exclude-standard` inside a work tree, plain
+-- `find` outside one (there is no `.gitignore` to honour there, which is also what rg
+-- does), and a loud error where neither can run. Both are built by `files_source`, so
+-- the pair cannot drift.
+local function files_source(name, title, gitignore)
+  return {
+    name = name,
+    title = title,
+    layer = "main", -- a picked file opens in the main editor, never a focused dock
+    preview = "file", -- the preview pane shows the file's head
+    filter = true, -- items are paths: give it the include/exclude boxes
+    items = btv.async(function(ctx)
+      local cancelled = false
+      -- Stream a listing command's stdout as candidates. Returns whether the chain is
+      -- SETTLED here — the tool ran (whatever it listed), or the run was superseded.
+      -- `strip` removes `find`'s leading "./" so its paths match rg's relative style.
+      local function run_files(cmd, args, strip)
+        local stream = btv.run_stream({ cmd = cmd, args = args, cwd = ctx.cwd })
+        -- Reap the job when the picker closes, so a confirmed/cancelled picker doesn't
+        -- leave a process streaming paths into the void. Sequential steps each arm this
+        -- for the only stream that can still be running.
+        ctx.on_cancel(function()
+          cancelled = true
+          stream:kill()
+        end)
+        for batch in btv.await_each(stream) do
+          for _, l in ipairs(batch) do
+            if strip then
+              l = l:gsub("^%./", "")
+            end
+            if l ~= "" then
+              ctx.push({ text = l, path = l })
+            end
           end
         end
+        -- The child's exit status is the canonical "did this tool exist" signal:
+        -- `-1` is a spawn failure (no such binary) or our own `:kill()`. Anything
+        -- else means it ran, so an empty listing is its ANSWER and the chain stops.
+        local exit = stream:exit()
+        return cancelled or exit == nil or exit.code ~= -1
       end
-      -- The child's exit status is the canonical "did this tool exist" signal:
-      -- `-1` is a spawn failure (no such binary) or our own `:kill()`. Anything
-      -- else means it ran, so an empty listing is its ANSWER and the chain stops.
-      local exit = stream:exit()
-      return cancelled or exit == nil or exit.code ~= -1
-    end
-    -- The filter boxes ride along as `-g` arguments so rg prunes the tree rather than
-    -- streaming paths the sink would drop — on a `node_modules`-sized directory that
-    -- is the difference between the results arriving and the cap filling with noise.
-    -- The sink still tests every path, so this only ever removes what it would too.
-    -- One `rg` per pass (`ctx.passes`): the normal paths, then the deprioritized
-    -- ones, so the hits that matter are all in before the low ones can fill the cap.
-    -- Only the first pass can find rg missing; the chain falls through from there.
-    for i, pass in ipairs(ctx.passes) do
-      local files_args = { "--files", "--color=never", "-uu", "-g", "!.git" }
-      for _, a in ipairs(pass.rg_globs) do
-        files_args[#files_args + 1] = a
+      -- The filter boxes ride along as `-g` arguments so rg prunes the tree rather than
+      -- streaming paths the sink would drop — on a `node_modules`-sized directory that
+      -- is the difference between the results arriving and the cap filling with noise.
+      -- The sink still tests every path, so this only ever removes what it would too.
+      -- One `rg` per pass (`ctx.passes`): the normal paths, then the deprioritized
+      -- ones, so the hits that matter are all in before the low ones can fill the cap.
+      -- Only the first pass can find rg missing; the chain falls through from there.
+      for i, pass in ipairs(ctx.passes) do
+        local files_args =
+          { "--files", "--color=never", gitignore and "--hidden" or "-uu", "-g", "!.git" }
+        for _, a in ipairs(pass.rg_globs) do
+          files_args[#files_args + 1] = a
+        end
+        ctx.begin_pass(pass)
+        if not run_files("rg", files_args) then
+          break
+        elseif cancelled or i == #ctx.passes then
+          return
+        end
       end
-      ctx.begin_pass(pass)
-      if not run("rg", files_args) then
-        break
-      elseif cancelled or i == #ctx.passes then
-        return
-      end
-    end
-    -- `find` streams in one pass; the widget still lists the low rows last.
-    ctx.begin_pass(nil)
-    if run("find", { ".", "-type", "f", "-not", "-path", "*/.git/*" }, true) then
-      return
-    end
-    -- No shell / no rg / no find (the pure web client): walk the tree over btv.fs.
-    -- `hidden = true` keeps this leg unrestricted like the two above (the walk's
-    -- default `skip` already prunes `.git`).
-    -- A failed walk rejects the run (the picker reports it), unless the picker closed.
-    local ok, files = pcall(btv.await, btv.fs.walk(ctx.cwd, { hidden = true }))
-    if not ok then
+      -- The fallbacks stream in one pass; the widget still lists the low rows last.
+      ctx.begin_pass(nil)
+      local repo = gitignore and git_worktree(ctx.cwd) or "no"
       if cancelled then
         return
       end
-      error(type(files) == "table" and files.message or files, 0)
-    end
-    -- The walk's list is in hand, so it is pushed once per pass — the sink keeps each
-    -- pass's own tier — and the normal paths reach the cap first, as with rg.
-    for _, pass in ipairs(ctx.passes) do
-      ctx.begin_pass(pass)
-      for _, f in ipairs(files) do
-        ctx.push({ text = f, path = f })
+      if repo == "yes" then
+        -- Tracked plus untracked-but-not-ignored, relative to `cwd` like rg's. Inside a
+        -- work tree git's answer is final, empty or not.
+        run_files(
+          "git",
+          { "-c", "core.quotePath=false", "ls-files", "--cached", "--others", "--exclude-standard" }
+        )
+        return
       end
-    end
-  end),
-  confirm = function(item, mode, layer)
-    btv.picker.edit(item, mode, layer)
-  end,
-})
+      if
+        repo == "no" and run_files("find", { ".", "-type", "f", "-not", "-path", "*/.git/*" }, true)
+      then
+        return
+      end
+      if gitignore then
+        gitignore_walk_unsupported(name)
+      end
+      -- No shell / no rg / no find (the pure web client): walk the tree over btv.fs.
+      -- `hidden = true` keeps this leg unrestricted like the two above (the walk's
+      -- default `skip` already prunes `.git`).
+      -- A failed walk rejects the run (the picker reports it), unless the picker closed.
+      local ok, files = pcall(btv.await, btv.fs.walk(ctx.cwd, { hidden = true }))
+      if not ok then
+        if cancelled then
+          return
+        end
+        error(type(files) == "table" and files.message or files, 0)
+      end
+      -- The walk's list is in hand, so it is pushed once per pass — the sink keeps each
+      -- pass's own tier — and the normal paths reach the cap first, as with rg.
+      for _, pass in ipairs(ctx.passes) do
+        ctx.begin_pass(pass)
+        for _, f in ipairs(files) do
+          ctx.push({ text = f, path = f })
+        end
+      end
+    end),
+    confirm = function(item, mode, layer)
+      btv.picker.edit(item, mode, layer)
+    end,
+  }
+end
+
+btv.picker.source(files_source("files", "Find All Files", false))
+btv.picker.source(files_source("files_git", "Find Files", true))
 
 -- live_grep: a dynamic source — re-run per prompt edit, the matcher bypassed. Search
 -- falls back through a chain so it works in every mode: `rg --column` (fast) →
@@ -1475,247 +1534,281 @@ btv.picker.source({
 -- A pathologically long body (a minified bundle's single line) is clipped to a
 -- window around the hit, marked `…` — see `KEEP` below.
 -- The include/exclude boxes (`<C-g>`) narrow a single search without changing that.
-btv.picker.source({
-  name = "live_grep",
-  title = "Live Grep",
-  layer = "main", -- a grep hit opens in the main editor, never a focused dock
-  dynamic = true,
-  filter = true, -- hits carry a path: give it the include/exclude boxes
-  preview = "location", -- scroll the pane to the match and range-highlight it
-  items = btv.async(function(ctx)
-    if ctx.query == "" then
-      return
-    end
-    local q = ctx.query
-    local cancelled = false
+--
+-- live_grep_git is the same search respecting `.gitignore` (and `.ignore` /
+-- `.rgignore`): `rg --hidden`, dotfiles still searched. With no rg it keeps the
+-- promise like `files_git` does — `git grep --untracked` (tracked plus untracked,
+-- ignored excluded) inside a work tree, plain `grep` outside one, a loud error where
+-- neither can run. Both come from `grep_source`.
+local function grep_source(name, title, gitignore)
+  return {
+    name = name,
+    title = title,
+    layer = "main", -- a grep hit opens in the main editor, never a focused dock
+    dynamic = true,
+    filter = true, -- hits carry a path: give it the include/exclude boxes
+    preview = "location", -- scroll the pane to the match and range-highlight it
+    items = btv.async(function(ctx)
+      if ctx.query == "" then
+        return
+      end
+      local q = ctx.query
+      local cancelled = false
 
-    -- How far each hit RUNS: every leg reports where a match starts, none reports
-    -- where it ends, and the row wants the whole hit highlighted — so the query is
-    -- re-matched against the line to measure it. Which dialect depends on the leg, and
-    -- a mismatched dialect could mark the wrong text: `rg` searches with the Rust
-    -- `regex` crate, so its hits are measured with the same PCRE (`re`); `grep` (a BRE)
-    -- and the `btv.fs` walk (a literal substring) are measured literally (`lit`), which
-    -- agrees with them for any query without metacharacters and simply finds nothing —
-    -- leaving the row unhighlighted rather than mismarked — for one with. Either is nil
-    -- when the query doesn't compile (rg then errored out too).
-    local function matcher(opts)
-      local ok, r = pcall(btv.regex, q, opts)
-      return ok and r or nil
-    end
-    local re, lit = matcher(), matcher({ plain = true })
+      -- How far each hit RUNS: every leg reports where a match starts, none reports
+      -- where it ends, and the row wants the whole hit highlighted — so the query is
+      -- re-matched against the line to measure it. Which dialect depends on the leg, and
+      -- a mismatched dialect could mark the wrong text: `rg` searches with the Rust
+      -- `regex` crate, so its hits are measured with the same PCRE (`re`); `grep` (a BRE)
+      -- and the `btv.fs` walk (a literal substring) are measured literally (`lit`), which
+      -- agrees with them for any query without metacharacters and simply finds nothing —
+      -- leaving the row unhighlighted rather than mismarked — for one with. Either is nil
+      -- when the query doesn't compile (rg then errored out too).
+      local function matcher(opts)
+        local ok, r = pcall(btv.regex, q, opts)
+        return ok and r or nil
+      end
+      local re, lit = matcher(), matcher({ plain = true })
 
-    -- How much of a body survives on either side of the hit. A minified bundle or a
-    -- one-line JSON blob is a *single* line of hundreds of thousands of bytes, and it
-    -- arrives once per hit on it: uncut, those rows sit in the item list, cross the
-    -- bridge, and are re-shipped whole on every frame the picker paints — for a body
-    -- the widget windows down to the row's width anyway (seconds per keystroke on a
-    -- 1MB line). `KEEP` is bytes, and wider than any terminal, so an ordinary source
-    -- line is returned untouched.
-    local KEEP = 1024
-    -- The first byte index at or after `i` that STARTS a char, so a clip never cuts a
-    -- multi-byte char in half (grep's output is bytes, and needn't be valid UTF-8 —
-    -- hence the scan rather than `utf8.offset`, which errors on a stray continuation).
-    local function boundary(s, i)
-      for j = i, math.min(i + 3, #s) do
-        local b = s:byte(j)
-        if b < 0x80 or b >= 0xC0 then
-          return j
+      -- How much of a body survives on either side of the hit. A minified bundle or a
+      -- one-line JSON blob is a *single* line of hundreds of thousands of bytes, and it
+      -- arrives once per hit on it: uncut, those rows sit in the item list, cross the
+      -- bridge, and are re-shipped whole on every frame the picker paints — for a body
+      -- the widget windows down to the row's width anyway (seconds per keystroke on a
+      -- 1MB line). `KEEP` is bytes, and wider than any terminal, so an ordinary source
+      -- line is returned untouched.
+      local KEEP = 1024
+      -- The first byte index at or after `i` that STARTS a char, so a clip never cuts a
+      -- multi-byte char in half (grep's output is bytes, and needn't be valid UTF-8 —
+      -- hence the scan rather than `utf8.offset`, which errors on a stray continuation).
+      local function boundary(s, i)
+        for j = i, math.min(i + 3, #s) do
+          local b = s:byte(j)
+          if b < 0x80 or b >= 0xC0 then
+            return j
+          end
         end
+        return i
       end
-      return i
-    end
-    -- Clip the body `line[base..]` (the line past its indentation) to a window around
-    -- the hit at BYTE offsets `s`..`e` into `line` (`nil` when the leg's dialect found
-    -- none — the head of the body is kept then), marking each cut with `…`. Returns
-    -- the body and the hit's offsets *within it*. It slices `line` directly rather
-    -- than taking a stripped copy first: a megabyte-long line copied once per hit on
-    -- it is the very O(N^2) the clip exists to stop.
-    local function clip(line, base, s, e)
-      if #line - base + 1 <= KEEP * 2 then
-        local shift = base - 1
-        return line:sub(base), s and s - shift, e and e - shift
-      end
-      local from = math.max(base, (s or base) - KEEP)
-      from = from > base and boundary(line, from) or base
-      local to = math.min(#line, (e or base) + KEEP)
-      to = to < #line and boundary(line, to + 1) - 1 or #line
-      local lead = from > base and "…" or ""
-      local out = lead .. line:sub(from, to) .. (to < #line and "…" or "")
-      if s then
-        local shift = (from - 1) - #lead
-        s, e = s - shift, e - shift
-      end
-      return out, s, e
-    end
-
-    -- One hit -> a two-column item: the `path:line:col: ` head, the matched line
-    -- (leading `indent` bytes stripped, an over-long one clipped around the hit) as the
-    -- body, and the hit's char range within that body. `s`..`e` are the hit's BYTE
-    -- offsets into `line`, or nil for no highlight. `col` is 1-based and BYTE-based
-    -- (rg's convention) and stays untouched on the item — it is what `confirm` jumps
-    -- to; only the display body is trimmed.
-    local function push_hit(file, lnum, col, line, indent, s, e)
-      -- A hit wholly inside the stripped indentation has nothing left to highlight; one
-      -- straddling it highlights from where the body starts.
-      if s and e <= indent then
-        s, e = nil, nil
-      elseif s and s <= indent then
-        s = indent + 1
-      end
-      -- Clip before measuring: `charlen` over a megabyte-long body, once per hit on
-      -- it, is the same O(N^2) the clip exists to stop.
-      local m
-      local body
-      body, s, e = clip(line, indent + 1, s, e)
-      if s then
-        m = { charlen(body:sub(1, s - 1)) + 1, charlen(body:sub(1, e)) }
-      end
-      ctx.push({
-        head = file .. ":" .. lnum .. ":" .. (col or 1) .. ": ",
-        text = body,
-        match = m,
-        path = file,
-        row = tonumber(lnum),
-        col = tonumber(col),
-      })
-    end
-
-    -- One reported hit (`grep`, the `btv.fs` walk: a line per hit, or per matching
-    -- line) -> its row, measuring the hit with the leg's `find`er.
-    local function emit(find, file, lnum, col, line)
-      local indent = #line:match("^%s*")
-      local s, e
-      if find then
-        -- Search from the reported column so a line with several hits highlights the
-        -- one the tool pointed at; a pattern that only matches from the line start
-        -- (`^…`) falls back to a search from the beginning rather than losing its
-        -- highlight.
-        local body = line:sub(indent + 1)
-        local at = math.max(1, (col or 1) - indent)
-        s, e = find:find(body, at)
-        if not s and at > 1 then
-          s, e = find:find(body)
+      -- Clip the body `line[base..]` (the line past its indentation) to a window around
+      -- the hit at BYTE offsets `s`..`e` into `line` (`nil` when the leg's dialect found
+      -- none — the head of the body is kept then), marking each cut with `…`. Returns
+      -- the body and the hit's offsets *within it*. It slices `line` directly rather
+      -- than taking a stripped copy first: a megabyte-long line copied once per hit on
+      -- it is the very O(N^2) the clip exists to stop.
+      local function clip(line, base, s, e)
+        if #line - base + 1 <= KEEP * 2 then
+          local shift = base - 1
+          return line:sub(base), s and s - shift, e and e - shift
         end
+        local from = math.max(base, (s or base) - KEEP)
+        from = from > base and boundary(line, from) or base
+        local to = math.min(#line, (e or base) + KEEP)
+        to = to < #line and boundary(line, to + 1) - 1 or #line
+        local lead = from > base and "…" or ""
+        local out = lead .. line:sub(from, to) .. (to < #line and "…" or "")
         if s then
-          s, e = s + indent, e + indent
+          local shift = (from - 1) - #lead
+          s, e = s - shift, e - shift
+        end
+        return out, s, e
+      end
+
+      -- One hit -> a two-column item: the `path:line:col: ` head, the matched line
+      -- (leading `indent` bytes stripped, an over-long one clipped around the hit) as the
+      -- body, and the hit's char range within that body. `s`..`e` are the hit's BYTE
+      -- offsets into `line`, or nil for no highlight. `col` is 1-based and BYTE-based
+      -- (rg's convention) and stays untouched on the item — it is what `confirm` jumps
+      -- to; only the display body is trimmed.
+      local function push_hit(file, lnum, col, line, indent, s, e)
+        -- A hit wholly inside the stripped indentation has nothing left to highlight; one
+        -- straddling it highlights from where the body starts.
+        if s and e <= indent then
+          s, e = nil, nil
+        elseif s and s <= indent then
+          s = indent + 1
+        end
+        -- Clip before measuring: `charlen` over a megabyte-long body, once per hit on
+        -- it, is the same O(N^2) the clip exists to stop.
+        local m
+        local body
+        body, s, e = clip(line, indent + 1, s, e)
+        if s then
+          m = { charlen(body:sub(1, s - 1)) + 1, charlen(body:sub(1, e)) }
+        end
+        ctx.push({
+          head = file .. ":" .. lnum .. ":" .. (col or 1) .. ": ",
+          text = body,
+          match = m,
+          path = file,
+          row = tonumber(lnum),
+          col = tonumber(col),
+        })
+      end
+
+      -- One reported hit (`grep`, the `btv.fs` walk: a line per hit, or per matching
+      -- line) -> its row, measuring the hit with the leg's `find`er.
+      local function emit(find, file, lnum, col, line)
+        local indent = #line:match("^%s*")
+        local s, e
+        if find then
+          -- Search from the reported column so a line with several hits highlights the
+          -- one the tool pointed at; a pattern that only matches from the line start
+          -- (`^…`) falls back to a search from the beginning rather than losing its
+          -- highlight.
+          local body = line:sub(indent + 1)
+          local at = math.max(1, (col or 1) - indent)
+          s, e = find:find(body, at)
+          if not s and at > 1 then
+            s, e = find:find(body)
+          end
+          if s then
+            s, e = s + indent, e + indent
+          end
+        end
+        push_hit(file, lnum, col, line, indent, s, e)
+      end
+
+      -- One matching LINE from `rg` -> a row per hit on it. rg prints each matching
+      -- line once (`--column`, not `--vimgrep`, which repeats the whole line for EVERY
+      -- hit: a source map's megabyte line with a thousand hits was a gigabyte of
+      -- output), and the hits are found here in one `find_all` pass with the PCRE `re`
+      -- — the same Rust `regex` dialect rg searched with, so the positions agree with
+      -- what rg would have reported, empty matches included. A line `re` cannot scan
+      -- (invalid UTF-8; a query only rg accepted) still lists, as the one hit rg
+      -- reported, unhighlighted.
+      local function emit_line(file, lnum, col, line)
+        local ok, hits = false, nil
+        if re then
+          ok, hits = pcall(re.find_all, re, line)
+        end
+        if not ok or #hits == 0 then
+          emit(nil, file, lnum, col, line)
+          return
+        end
+        local indent = #line:match("^%s*")
+        for i = 1, #hits, 2 do
+          push_hit(file, lnum, hits[i], line, indent, hits[i], hits[i + 1])
         end
       end
-      push_hit(file, lnum, col, line, indent, s, e)
-    end
 
-    -- One matching LINE from `rg` -> a row per hit on it. rg prints each matching
-    -- line once (`--column`, not `--vimgrep`, which repeats the whole line for EVERY
-    -- hit: a source map's megabyte line with a thousand hits was a gigabyte of
-    -- output), and the hits are found here in one `find_all` pass with the PCRE `re`
-    -- — the same Rust `regex` dialect rg searched with, so the positions agree with
-    -- what rg would have reported, empty matches included. A line `re` cannot scan
-    -- (invalid UTF-8; a query only rg accepted) still lists, as the one hit rg
-    -- reported, unhighlighted.
-    local function emit_line(file, lnum, col, line)
-      local ok, hits = false, nil
-      if re then
-        ok, hits = pcall(re.find_all, re, line)
-      end
-      if not ok or #hits == 0 then
-        emit(nil, file, lnum, col, line)
-        return
-      end
-      local indent = #line:match("^%s*")
-      for i = 1, #hits, 2 do
-        push_hit(file, lnum, hits[i], line, indent, hits[i], hits[i + 1])
-      end
-    end
-
-    -- Stream a grep-like command, parsing `file:lnum[:col]:text` per line; `has_col` for
-    -- rg's `--column`. `strip` drops grep's leading "./", and `on_line(file, lnum, col,
-    -- text)` turns a parsed line into rows. Returns whether the chain is SETTLED here —
-    -- the tool ran (matches or not), or the run was superseded.
-    local function run(cmd, args, has_col, strip, on_line)
-      local stream = btv.run_stream({ cmd = cmd, args = args, cwd = ctx.cwd })
-      ctx.on_cancel(function()
-        cancelled = true
-        stream:kill()
-      end)
-      for batch in btv.await_each(stream) do
-        for _, l in ipairs(batch) do
-          if strip then
-            l = l:gsub("^%./", "")
-          end
-          local file, lnum, col, body
-          if has_col then
-            file, lnum, col, body = l:match("^(.-):(%d+):(%d+):(.*)$")
-          else
-            file, lnum, body = l:match("^(.-):(%d+):(.*)$")
-            col = 1
-          end
-          if file then
-            on_line(file, lnum, tonumber(col), body)
+      -- Stream a grep-like command, parsing `file:lnum[:col]:text` per line; `has_col` for
+      -- rg's `--column`. `strip` drops grep's leading "./", and `on_line(file, lnum, col,
+      -- text)` turns a parsed line into rows. Returns whether the chain is SETTLED here —
+      -- the tool ran (matches or not), or the run was superseded.
+      local function run(cmd, args, has_col, strip, on_line)
+        local stream = btv.run_stream({ cmd = cmd, args = args, cwd = ctx.cwd })
+        ctx.on_cancel(function()
+          cancelled = true
+          stream:kill()
+        end)
+        for batch in btv.await_each(stream) do
+          for _, l in ipairs(batch) do
+            if strip then
+              l = l:gsub("^%./", "")
+            end
+            local file, lnum, col, body
+            if has_col then
+              file, lnum, col, body = l:match("^(.-):(%d+):(%d+):(.*)$")
+            else
+              file, lnum, body = l:match("^(.-):(%d+):(.*)$")
+              col = 1
+            end
+            if file then
+              on_line(file, lnum, tonumber(col), body)
+            end
           end
         end
+        -- The child's exit status is the canonical "did this tool exist" signal: `-1`
+        -- is a spawn failure (no such binary) or our own `:kill()`. rg/grep exit `1`
+        -- on zero matches — a real answer, so the chain stops and the picker settles
+        -- empty instead of grinding the whole tree twice more.
+        local exit = stream:exit()
+        return cancelled or exit == nil or exit.code ~= -1
       end
-      -- The child's exit status is the canonical "did this tool exist" signal: `-1`
-      -- is a spawn failure (no such binary) or our own `:kill()`. rg/grep exit `1`
-      -- on zero matches — a real answer, so the chain stops and the picker settles
-      -- empty instead of grinding the whole tree twice more.
-      local exit = stream:exit()
-      return cancelled or exit == nil or exit.code ~= -1
-    end
 
-    -- As in `files`: the boxes prune at rg, the sink filters every leg's output, and
-    -- rg runs once per pass so the normal paths' hits all land before the low ones.
-    for i, pass in ipairs(ctx.passes) do
-      local grep_args = {
-        "--column",
-        "--line-number",
-        "--no-heading",
-        "--with-filename",
-        "--color=never",
-        "-uu",
-        "-g",
-        "!.git",
-      }
-      for _, a in ipairs(pass.rg_globs) do
-        grep_args[#grep_args + 1] = a
+      -- As in `files`: the boxes prune at rg, the sink filters every leg's output, and
+      -- rg runs once per pass so the normal paths' hits all land before the low ones.
+      for i, pass in ipairs(ctx.passes) do
+        local grep_args = {
+          "--column",
+          "--line-number",
+          "--no-heading",
+          "--with-filename",
+          "--color=never",
+          gitignore and "--hidden" or "-uu",
+          "-g",
+          "!.git",
+        }
+        for _, a in ipairs(pass.rg_globs) do
+          grep_args[#grep_args + 1] = a
+        end
+        grep_args[#grep_args + 1] = "--"
+        grep_args[#grep_args + 1] = q
+        ctx.begin_pass(pass)
+        if not run("rg", grep_args, true, false, emit_line) then
+          break
+        elseif cancelled or i == #ctx.passes then
+          return
+        end
       end
-      grep_args[#grep_args + 1] = "--"
-      grep_args[#grep_args + 1] = q
-      ctx.begin_pass(pass)
-      if not run("rg", grep_args, true, false, emit_line) then
-        break
-      elseif cancelled or i == #ctx.passes then
-        return
+      local function emit_lit(file, lnum, col, line)
+        emit(lit, file, lnum, col, line)
       end
-    end
-    local function emit_lit(file, lnum, col, line)
-      emit(lit, file, lnum, col, line)
-    end
-    ctx.begin_pass(nil)
-    if run("grep", { "-rnI", "--exclude-dir=.git", "--", q, "." }, false, true, emit_lit) then
-      return
-    end
-
-    -- No shell / no rg / no grep (the pure web client): a transport-agnostic btv.fs walk
-    -- + in-Lua substring match. Performance isn't a concern — the pure-client trees are
-    -- small and the picker caps results; pushes for a superseded query are dropped by the
-    -- sink.
-    local ok, matches = pcall(btv.await, btv.fs.grep(ctx.cwd, q, { hidden = true }))
-    if not ok then
+      ctx.begin_pass(nil)
+      local repo = gitignore and git_worktree(ctx.cwd) or "no"
       if cancelled then
         return
       end
-      error(type(matches) == "table" and matches.message or matches, 0)
-    end
-    for _, pass in ipairs(ctx.passes) do
-      ctx.begin_pass(pass)
-      for _, m in ipairs(matches) do
-        emit(lit, m.path, m.row, m.col, m.text)
+      if repo == "yes" then
+        -- Inside a work tree git's answer is final: matches, none (exit 1), or an error
+        -- (exit 128, a pattern it rejects) — never a fall through to plain `grep`,
+        -- which would search the ignored files.
+        run(
+          "git",
+          { "grep", "-n", "--column", "-I", "--untracked", "--no-color", "-e", q },
+          true,
+          false,
+          emit_lit
+        )
+        return
       end
-    end
-  end),
-  confirm = function(item, mode, layer)
-    btv.picker.edit(item, mode, layer)
-  end,
-})
+      if
+        repo == "no"
+        and run("grep", { "-rnI", "--exclude-dir=.git", "--", q, "." }, false, true, emit_lit)
+      then
+        return
+      end
+      if gitignore then
+        gitignore_walk_unsupported(name)
+      end
+
+      -- No shell / no rg / no grep (the pure web client): a transport-agnostic btv.fs walk
+      -- + in-Lua substring match. Performance isn't a concern — the pure-client trees are
+      -- small and the picker caps results; pushes for a superseded query are dropped by the
+      -- sink.
+      local ok, matches = pcall(btv.await, btv.fs.grep(ctx.cwd, q, { hidden = true }))
+      if not ok then
+        if cancelled then
+          return
+        end
+        error(type(matches) == "table" and matches.message or matches, 0)
+      end
+      for _, pass in ipairs(ctx.passes) do
+        ctx.begin_pass(pass)
+        for _, m in ipairs(matches) do
+          emit(lit, m.path, m.row, m.col, m.text)
+        end
+      end
+    end),
+    confirm = function(item, mode, layer)
+      btv.picker.edit(item, mode, layer)
+    end,
+  }
+end
+
+btv.picker.source(grep_source("live_grep", "Live Grep (All Files)", false))
+btv.picker.source(grep_source("live_grep_git", "Live Grep", true))
 
 -- buffers: a static, in-memory source — the focused layer's open buffers, no
 -- process spawn. A plain synchronous source: it pushes in a loop and returns (no
@@ -2194,7 +2287,8 @@ btv.picker.source({
 })
 
 -- ----- default leader maps ---------------------------------------------------
--- Bind the three shipped sources to `<leader>f{f,g,b}` out of the box. Registered
+-- Bind the shipped sources to `<leader>f…` out of the box. The everyday `ff` / `fg`
+-- respect `.gitignore`; the shifted `fF` / `fG` search everything. Registered
 -- on VimEnter (after `init.lua` runs) so `<leader>` expands with the user's
 -- `mapleader` — not the default `\` it would carry if set at prelude-load, before
 -- the config sets mapleader. `default = true` puts each at the overridable rung, so
@@ -2206,8 +2300,10 @@ btv.picker.source({
 btv.autocmd.create("VimEnter", {
   callback = function()
     for _, m in ipairs({
-      { "<leader>ff", "files", "Find files" },
-      { "<leader>fg", "live_grep", "Live grep" },
+      { "<leader>ff", "files_git", "Find files" },
+      { "<leader>fF", "files", "Find all files (ignored too)" },
+      { "<leader>fg", "live_grep_git", "Live grep" },
+      { "<leader>fG", "live_grep", "Live grep all files (ignored too)" },
       { "<leader>fb", "buffers", "Find buffers" },
       { "<leader>fk", "keymaps", "Find keymaps" },
       { "<leader>fd", "diagnostics", "Find diagnostics" },

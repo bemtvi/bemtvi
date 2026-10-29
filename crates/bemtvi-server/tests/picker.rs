@@ -235,13 +235,14 @@ async fn built_in_sources_carry_titles() {
     let titles = exec_lua(
         &rpc,
         "local s = btv.picker._sources\n\
-         return (s.files.title or '?') .. '|' .. (s.live_grep.title or '?')\n\
+         return (s.files_git.title or '?') .. '|' .. (s.files.title or '?')\n\
+           .. '|' .. (s.live_grep_git.title or '?') .. '|' .. (s.live_grep.title or '?')\n\
            .. '|' .. (s.buffers.title or '?')",
     )
     .await;
     assert_eq!(
         titles.as_str(),
-        Some("Find Files|Live Grep|Buffers"),
+        Some("Find Files|Find All Files|Live Grep|Live Grep (All Files)|Buffers"),
         "the built-in pickers are titled"
     );
 }
@@ -5820,5 +5821,190 @@ async fn a_capped_live_grep_still_finds_the_normal_hit_under_a_flood_of_low_ones
             "src/a/b/c/main.rs:1:1: zqxneedle"
         ],
         "{rows:?}"
+    );
+}
+
+// --- `.gitignore`-respecting `files_git` / `live_grep_git` -------------------------
+
+/// Whether `git` can run here; the `_git` fixtures need a real work tree.
+fn have_git() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+/// A git work tree with an ignored directory, a hidden file that is NOT ignored, and a
+/// plain one — every file holding `zqxneedle`.
+fn gitignore_tree(name: &str) -> std::path::PathBuf {
+    let proj = temp_dir(name);
+    let ok = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&proj)
+        .status()
+        .expect("git init")
+        .success();
+    assert!(ok, "git init");
+    std::fs::write(proj.join(".gitignore"), "ignored_dir/\n").expect("write .gitignore");
+    std::fs::create_dir(proj.join("ignored_dir")).expect("mkdir ignored_dir");
+    for f in ["ignored_dir/x.txt", ".hidden.txt", "visible.txt"] {
+        std::fs::write(proj.join(f), "zqxneedle\n").expect("write file");
+    }
+    proj
+}
+
+/// Every row of `source` once it settles — `files` style rows are paths, `live_grep`
+/// rows are `path:…` heads (reduced to the path here).
+async fn settled_paths(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    source: &str,
+    query: &str,
+    want: usize,
+) -> Vec<String> {
+    exec_lua(rpc, &format!("btv.picker.open('{source}')")).await;
+    poll_menu(rpc, incoming).await.expect("picker opens");
+    if !query.is_empty() {
+        feed(rpc, query);
+    }
+    let rows = poll_rows(rpc, incoming, want).await;
+    feed(rpc, "<Esc>");
+    let mut paths: Vec<String> = rows
+        .iter()
+        .map(|r| r.split(':').next().unwrap_or(r).to_string())
+        .collect();
+    paths.sort();
+    paths
+}
+
+#[tokio::test]
+async fn the_git_pickers_honour_gitignore_and_the_others_do_not() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_cfg");
+    let proj = gitignore_tree("picker_git_tree");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "files_git", "", 3).await,
+        [".gitignore", ".hidden.txt", "visible.txt"],
+        "files_git drops the ignored dir and keeps the dotfile"
+    );
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "files", "", 4).await,
+        [
+            ".gitignore",
+            ".hidden.txt",
+            "ignored_dir/x.txt",
+            "visible.txt"
+        ]
+    );
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep_git", "zqxneedle", 2).await,
+        [".hidden.txt", "visible.txt"]
+    );
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep", "zqxneedle", 3).await,
+        [".hidden.txt", "ignored_dir/x.txt", "visible.txt"]
+    );
+}
+
+/// A `PATH` holding every executable the real one does except `rg`, so a source's
+/// `rg` spawn fails (`-1`) and its fallback leg runs. Process-wide: hold
+/// `serial_lock` while it is installed. Restores the old `PATH` on drop.
+#[cfg(unix)]
+struct PathWithoutRg {
+    old: std::ffi::OsString,
+}
+
+#[cfg(unix)]
+impl PathWithoutRg {
+    fn install(name: &str) -> Self {
+        let old = std::env::var_os("PATH").unwrap_or_default();
+        let farm = temp_dir(name);
+        for d in std::env::split_paths(&old) {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let file = e.file_name();
+                let link = farm.join(&file);
+                if file != "rg" && !link.exists() {
+                    let _ = std::os::unix::fs::symlink(e.path(), link);
+                }
+            }
+        }
+        std::env::set_var("PATH", &farm);
+        PathWithoutRg { old }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PathWithoutRg {
+    fn drop(&mut self) {
+        std::env::set_var("PATH", &self.old);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_the_git_pickers_fall_back_to_git_and_still_honour_gitignore() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_norg_cfg");
+    let proj = gitignore_tree("picker_git_norg_tree");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithoutRg::install("picker_git_norg_path");
+    // The mask really took: rg can no longer run.
+    exec_lua(
+        &rpc,
+        "btv.run({ cmd = 'rg', args = { '--version' } }):next(function(r) _G.rg = r.code end)",
+    )
+    .await;
+    let mut rg = Value::Nil;
+    for _ in 0..100 {
+        rg = exec_lua(&rpc, "return _G.rg").await;
+        if !rg.is_nil() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(rg.as_i64(), Some(-1), "rg is masked off PATH");
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "files_git", "", 3).await,
+        [".gitignore", ".hidden.txt", "visible.txt"],
+        "git ls-files lists the same set rg did"
+    );
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep_git", "zqxneedle", 2).await,
+        [".hidden.txt", "visible.txt"],
+        "git grep searches the same set rg did"
+    );
+}
+
+#[tokio::test]
+async fn the_everyday_keys_respect_gitignore_and_the_shifted_ones_search_everything() {
+    let dir = temp_dir("picker_git_keys");
+    let (rpc, _incoming) = start(&dir, "vim.g.mapleader = ','").await;
+    // Record what each default map opens instead of spawning a search.
+    exec_lua(
+        &rpc,
+        "_G.opened = {}; btv.picker.open = function(n) table.insert(_G.opened, n) end",
+    )
+    .await;
+    feed(&rpc, ",ff,fF,fg,fG");
+    let opened = exec_lua(&rpc, "return table.concat(_G.opened, ' ')").await;
+    assert_eq!(
+        opened.as_str(),
+        Some("files_git files live_grep_git live_grep")
     );
 }

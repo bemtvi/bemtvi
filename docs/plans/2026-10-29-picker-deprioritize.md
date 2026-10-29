@@ -166,7 +166,7 @@ Tests (`tests/picker.rs`):
   down; `setup({ deprioritize = {} })` restores pure stream / fuzzy order; a
   replaced list takes effect on the next open.
 
-## Phase 4 — `files_git` and `live_grep_git`
+## Phase 4 — `files_git` and `live_grep_git` (done)
 
 - `files_git`: `rg --files --hidden -g !.git` (no `-u`: `.gitignore`, `.ignore`
   and `.rgignore` are honoured). `live_grep_git`: the Phase-1 `live_grep` leg with

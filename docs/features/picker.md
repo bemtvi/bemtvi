@@ -7,14 +7,22 @@ navigation, and a generation token that drops a stale response for a query you'v
 already typed past. No input loop runs in Lua — a source is just a thin driver
 that *streams candidates in* and *handles confirm*.
 
-It ships with a set of built-in sources — `files`, `live_grep`, `buffers`,
-`curbuf`, `diagnostics`, `keymaps`, `marks`, `jumplist`, `pickers` — and
-registering your own is a few lines.
+It ships with a set of built-in sources — `files`, `files_git`, `live_grep`,
+`live_grep_git`, `buffers`, `curbuf`, `diagnostics`, `keymaps`, `marks`,
+`jumplist`, `pickers` — and registering your own is a few lines.
 
-`files` and `live_grep` search **unrestricted** by default — the equivalent of
-`rg -uu` (`--no-ignore --hidden`), so a `.gitignore`d build artifact or a dotfile
-like `.github/workflows/ci.yml` is still findable. The one exclusion is `.git`
-itself. Narrowing a search is the [filter boxes](#include--exclude-filters)' job
+File finding and grepping come in pairs:
+
+- `files_git` / `live_grep_git` respect `.gitignore` (and `.ignore` / `.rgignore`)
+  — `rg --hidden`, so a dotfile like `.github/workflows/ci.yml` is still found and
+  only ignored paths drop out. Without `rg` they fall back to `git ls-files` /
+  `git grep` inside a work tree, so the ignore rules hold on every machine. These are
+  the everyday `<leader>ff` / `<leader>fg`.
+- `files` / `live_grep` search **unrestricted** — the equivalent of `rg -uu`
+  (`--no-ignore --hidden`), so a `.gitignore`d build artifact is still findable. The
+  one exclusion is `.git` itself. These are `<leader>fF` / `<leader>fG`.
+
+Either way, narrowing a search is the [filter boxes](#include--exclude-filters)' job
 (`<C-g>`) — per-search, so hiding `target/` this time never makes a file
 unfindable the next.
 
@@ -24,8 +32,10 @@ The built-in sources are bound out of the box, plus a **resume** map:
 
 | Map | Source |
 | --- | --- |
-| `<leader>ff` | `files` — fuzzy file finder |
-| `<leader>fg` | `live_grep` — live grep |
+| `<leader>ff` | `files_git` — fuzzy file finder, `.gitignore` respected |
+| `<leader>fF` | `files` — fuzzy file finder over every file, ignored ones too |
+| `<leader>fg` | `live_grep_git` — live grep, `.gitignore` respected |
+| `<leader>fG` | `live_grep` — live grep over every file, ignored ones too |
 | `<leader>fb` | `buffers` — open buffers (scoped to the focused layer, like `:ls`) |
 | `<leader>f/` | `curbuf` — fuzzy find in the current buffer |
 | `<leader>fd` | `diagnostics` — diagnostics |

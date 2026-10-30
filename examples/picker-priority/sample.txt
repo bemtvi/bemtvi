@@ -1,0 +1,8 @@
+picker-priority sample
+
+This directory is a tiny project with the usual noise beside it: a vendored
+`node_modules/`, a built `dist/`, a `yarn.lock`, and an ignored `generated/`
+(written when the example loads). Every one of them calls the same function, so
+a single live grep hits them all.
+
+Follow the numbered notes in init.lua.

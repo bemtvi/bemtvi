@@ -363,7 +363,8 @@ local one.
 
 ## Include / exclude filters
 
-`files` and `live_grep` carry two glob boxes, the way VSCode's search panel does —
+`files`, `files_git`, `live_grep` and `live_grep_git` carry two glob boxes, the way
+VSCode's search panel does —
 **files to include** and **files to exclude**. `<C-g>` reveals them and steps
 through the three editable lines (query → include → exclude); typing goes to
 whichever has focus.
@@ -426,6 +427,7 @@ Two conveniences make a typed pattern mean what you meant:
 | `*.lock` | any `.lock` file, at any depth |
 | `target` | the `target` entry **and** everything under it, at any depth |
 | `vendor/` | same — a trailing `/` just says "the directory" |
+| `*.egg-info/` | every `*.egg-info` directory and everything under it — the trailing `/` makes even a glob a directory |
 | `src/**` | taken as written; a pattern with a `/` is anchored at the search root |
 
 A picker can also open already scoped, which is what a dedicated map usually wants:
@@ -443,6 +445,69 @@ btv.picker.open("live_grep", { exclude = "vendor/, **/*.min.js", filters = "open
 Any source whose items carry a `path` can have the boxes by declaring
 `filter = true` — see [Writing a source](#writing-a-source). On a source without
 it, `<C-g>` says so rather than presenting boxes that would filter nothing.
+
+## Vendored paths last — deprioritize
+
+A search over a real project hits `node_modules/`, build output, lockfiles and source
+maps by the thousand, and the hits you wanted — the project's own sources — end up
+under them. So every filterable picker lists those paths **after** the rest. Nothing
+is hidden (that is the exclude box's job): a `yarn.lock` hit is still there, below
+`src/`. Each group keeps its own order — the order found with no query, match order
+under one — so a better-matching vendored file never jumps a project file.
+
+```
+┌─ Live Grep ──────────────────────────────────┐
+│ > useAuth                               412  │
+├──────────────────────────────────────────────┤
+│ src/composables/auth.ts:3:17: export func…   │  ← the project's own hits first
+│ src/pages/login.vue:12:9: const { user } …   │
+│ node_modules/@nuxt/auth/dist/index.mjs:88…   │  ← then the vendored ones
+│ .output/server/chunks/auth.mjs.map:1:4410…   │
+└──────────────────────────────────────────────┘
+```
+
+The shipped list is `btv.picker.defaults.deprioritize`: the JS/TS, Python and
+build-output trees (`node_modules/`, `.nuxt/`, `.output/`, `dist/`, `build/`,
+`target/`, `.venv/`, `__pycache__/`, `vendor/`, …), editor and toolchain directories,
+every common lockfile, and `*.min.js` / `*.min.css` / `*.map`. Test files are **not**
+on it — plenty of people grep their tests on purpose. `btv.picker.setup` replaces the
+list, in the same glob syntax as the exclude box; extend the shipped one rather than
+retyping it:
+
+```lua
+btv.picker.setup({
+  deprioritize = btv.list.extend(
+    btv.tbl.deepcopy(btv.picker.defaults.deprioritize),
+    { "*test*", "*_spec.lua" }
+  ),
+})
+
+btv.picker.setup({ deprioritize = {} })   -- turn it off: pure stream / match order
+```
+
+Ordering alone would not stop a `node_modules`-heavy tree from filling the result cap
+before the project's hits were even found, so the shipped `files` / `live_grep`
+pickers search in **two passes**: `rg` first with the deprioritized globs excluded —
+it never enters `node_modules/` — then a second run over just those paths. The
+`btv.fs` walk fallback (the web client) pushes its list the same way, normal paths
+first. Only the `find` / `grep` fallbacks, for a machine with neither `rg` nor (for
+the `_git` pickers) `git`, search in one pass; their rows are still ordered.
+
+A source can use the same machinery. A row pushed with `low = true` lists after the
+rest; a source with `filter = true` gets its paths tested against the deprioritize
+list automatically, and can search in the same two passes through `ctx.passes`:
+
+```lua
+items = btv.async(function(ctx)
+  for _, pass in ipairs(ctx.passes) do   -- normal paths first, then the low ones
+    ctx.begin_pass(pass)                 -- the sink keeps only this pass's tier
+    run_my_tool(pass.rg_globs)           -- the box globs plus this pass's own
+  end
+end),
+```
+
+`btv.picker.scorer` re-ranks within each group and never lifts a deprioritized row
+above the rest.
 
 ## Try it
 
@@ -466,6 +531,17 @@ BEMTVI_CONFIG=examples/picker-filters \
 It ships the mess a real project has — a `target/` artifact, a `vendor/` lock file,
 a dotfile — and walks through defaults, editing a box, what each pattern shape
 means, the `<C-Up>` history, pre-scoped pickers, and a custom filterable source.
+
+Deprioritizing and the `.gitignore` pickers have a third,
+[`examples/picker-priority`](https://github.com/bemtvi/bemtvi/tree/main/examples/picker-priority):
+
+```sh
+BEMTVI_CONFIG=examples/picker-priority \
+  cargo run -p bemtvi -- examples/picker-priority/sample.txt
+```
+
+It shows the default ordering, extending the list with test files, and `<leader>fg`
+versus `<leader>fG` on an ignored file.
 
 ## How it works (in brief)
 

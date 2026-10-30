@@ -202,7 +202,7 @@ pickers must still honour `.gitignore` there rather than fail.
   (`--no-default-features` + a `verify-*.mjs` browser check listing a `_git` picker
   over OPFS).
 
-## Phase 6 — docs, example, config cleanup
+## Phase 6 — docs, example, config cleanup (done, but for the config — not found on this machine)
 
 - `docs/features/picker.md`: deprioritization, the setup key, the two `_git`
   pickers and their keys; the book pages via the prelude docstrings (markdown

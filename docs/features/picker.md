@@ -506,6 +506,12 @@ items = btv.async(function(ctx)
 end),
 ```
 
+A tool that honours `.gitignore` takes `pass.rg_excludes` instead of `rg_globs`: rg
+lets a positive `-g` override the ignore files, so the low pass's includes would
+re-include an ignored `node_modules/`. The negations alone are safe, and the sink
+applies the include box and the tier; `pass.keeps(path)` says whether a path belongs
+to the pass, for a source that lists first and searches only its own.
+
 `btv.picker.scorer` re-ranks within each group and never lifts a deprioritized row
 above the rest.
 

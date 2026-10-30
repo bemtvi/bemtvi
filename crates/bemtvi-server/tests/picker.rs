@@ -6071,3 +6071,27 @@ async fn modeless_ctrl_p_opens_the_gitignore_file_picker() {
     let opened = exec_lua(&rpc, "return table.concat(_G.opened, ' ')").await;
     assert_eq!(opened.as_str(), Some("files_git"));
 }
+
+#[tokio::test]
+async fn yalc_packages_are_deprioritized_by_default() {
+    // `.yalc/` holds locally-published packages (yalc's store copy), as vendored as
+    // `node_modules/`.
+    let dir = temp_dir("picker_deprio_yalc");
+    let src = r#"
+btv.picker.source {
+  name = "paths",
+  filter = true,
+  items = function(ctx)
+    for _, p in ipairs({ ".yalc/my-lib/index.js", "src/app.ts" }) do
+      ctx.push { text = p, path = p }
+    end
+  end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    exec_lua(&rpc, "btv.picker.open('paths')").await;
+    assert_eq!(
+        poll_rows(&rpc, &mut incoming, 2).await,
+        vec!["src/app.ts", ".yalc/my-lib/index.js"]
+    );
+}

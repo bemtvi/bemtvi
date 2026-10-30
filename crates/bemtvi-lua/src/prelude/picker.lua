@@ -257,6 +257,7 @@ btv.picker.defaults = {
     "jspm_packages/",
     ".yarn/",
     ".pnpm-store/",
+    ".yalc/",
     ".nuxt/",
     ".output/",
     ".next/",

@@ -143,7 +143,7 @@ Tests (`tests/picker.rs`):
   cap still lists the `src/` hit (skip-if-missing `rg`).
 - Default list (globs; directory names match as whole path segments):
   - JS/TS: `node_modules/`, `bower_components/`, `jspm_packages/`, `.yarn/`,
-    `.pnpm-store/`, `.nuxt/`, `.output/`, `.next/`, `.svelte-kit/`, `.angular/`,
+    `.pnpm-store/`, `.yalc/`, `.nuxt/`, `.output/`, `.next/`, `.svelte-kit/`, `.angular/`,
     `.expo/`, `.docusaurus/`, `.vercel/`, `.netlify/`, `.serverless/`, `.turbo/`,
     `.parcel-cache/`, `.vite/`, `.cache/`, `storybook-static/`, `coverage/`,
     `.nyc_output/`

@@ -6095,3 +6095,58 @@ btv.picker.source {
         vec!["src/app.ts", ".yalc/my-lib/index.js"]
     );
 }
+
+/// A `.gitignore`d path that is ALSO on the deprioritize list (`node_modules/`, the common
+/// case) stays out of the `_git` pickers. The low pass must not hand rg the deprioritize
+/// globs as `-g` includes: rg lets an include glob override `.gitignore`, which
+/// re-included the very tree the user ignored.
+#[tokio::test]
+async fn the_git_pickers_keep_an_ignored_deprioritized_tree_out() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_ignored_low_cfg");
+    let proj = temp_dir("picker_git_ignored_low");
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&proj)
+        .status()
+        .expect("git init")
+        .success());
+    std::fs::write(proj.join(".gitignore"), "node_modules/\nsrc/gen/\n").unwrap();
+    std::fs::create_dir_all(proj.join("node_modules/pkg")).unwrap();
+    std::fs::create_dir_all(proj.join("src/gen")).unwrap();
+    // A low path that is NOT ignored, so the low pass still has something to find.
+    for f in [
+        "node_modules/pkg/x.js",
+        "src/a.js",
+        "src/gen/g.js",
+        "yarn.lock",
+    ] {
+        std::fs::write(proj.join(f), "zqxneedle\n").unwrap();
+    }
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "files_git", "", 3).await,
+        [".gitignore", "src/a.js", "yarn.lock"]
+    );
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep_git", "zqxneedle", 2).await,
+        ["src/a.js", "yarn.lock"]
+    );
+
+    // The include box is the same trap: `src/**` handed to rg as `-g` would bring the
+    // ignored `src/gen/` back.
+    exec_lua(&rpc, "btv.picker.open('files_git', { include = 'src/**' })").await;
+    let rows = poll_rows(&rpc, &mut incoming, 1).await;
+    feed(&rpc, "<Esc>");
+    assert_eq!(
+        rows,
+        ["src/a.js"],
+        "the include box narrows, it never re-includes"
+    );
+}

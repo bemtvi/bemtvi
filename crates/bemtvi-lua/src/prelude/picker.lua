@@ -598,6 +598,13 @@ end
 -- The first pass is `tier = "normal"`, with the deprioritize globs negated so `rg`
 -- skips those trees entirely; the second is `tier = "low"`, limited to them. With an
 -- empty list there is one `tier = "all"` pass whose `rg_globs` equal `ctx.rg_globs`.
+--
+-- A tool that honours ignore files must not be handed `rg_globs` (or `ctx.rg_globs`):
+-- rg lets a positive `-g` override `.gitignore`, so the low pass's includes would
+-- bring an ignored `node_modules/` back. Such a source uses `pass.rg_excludes` — the
+-- pass's negations alone — and lets the sink apply the include box and the tier;
+-- `pass.keeps(path)` says whether a path belongs to the pass, for a source that lists
+-- candidates first and searches only its own.
 -- During a pass the sink drops a row of the other tier — the glob set, not the tool,
 -- decides a path's tier — so a source can also push one in-hand list once per pass.
 -- `ctx.begin_pass(nil)` keeps every row again. A source that ignores `ctx.passes`
@@ -928,8 +935,16 @@ function btv._picker_run(gen, query, include, exclude)
     -- globs, so with an include box in force the low pass keeps just the box's
     -- includes — narrower than the union, and the sink drops the normal rows it
     -- re-finds. Exclusions come last in both: rg lets the later glob win.
+    --
+    -- Each pass also carries `rg_excludes` — its NEGATED globs alone — for a tool that
+    -- honours ignore files: rg lets a positive `-g` override `.gitignore`, so handing
+    -- it `rg_globs` would re-include an ignored `node_modules/` (or, from the include
+    -- box, an ignored `src/gen/`). With only the negations, the sink's include test
+    -- and `keeps` do the narrowing. `keeps(path)` says whether a path belongs to the
+    -- pass's tier, so such a source can list candidates once and search just its own.
     local low = p.source.filter and deprioritized() or { pats = {} }
     local low_set = low.set
+    local box_excludes = rg_glob_args(exclude_pats, true)
     local passes
     if low_set then
       local normal_globs = rg_glob_args(include_pats, false)
@@ -943,12 +958,39 @@ function btv._picker_run(gen, query, include, exclude)
       for _, a in ipairs(rg_glob_args(exclude_pats, true)) do
         low_globs[#low_globs + 1] = a
       end
+      local normal_excludes = rg_glob_args(exclude_pats, true)
+      for _, a in ipairs(rg_glob_args(low.pats, true)) do
+        normal_excludes[#normal_excludes + 1] = a
+      end
       passes = {
-        { tier = "normal", rg_globs = normal_globs },
-        { tier = "low", rg_globs = low_globs },
+        {
+          tier = "normal",
+          rg_globs = normal_globs,
+          rg_excludes = normal_excludes,
+          keeps = function(path)
+            return not low_set:test(path)
+          end,
+        },
+        {
+          tier = "low",
+          rg_globs = low_globs,
+          rg_excludes = box_excludes,
+          keeps = function(path)
+            return low_set:test(path)
+          end,
+        },
       }
     else
-      passes = { { tier = "all", rg_globs = rg_globs } }
+      passes = {
+        {
+          tier = "all",
+          rg_globs = rg_globs,
+          rg_excludes = box_excludes,
+          keeps = function()
+            return true
+          end,
+        },
+      }
     end
     -- The pass in progress (`ctx.begin_pass`); nil until a source names one, which
     -- keeps every row whatever its tier.
@@ -1438,7 +1480,9 @@ local function files_source(name, title, gitignore)
       for i, pass in ipairs(ctx.passes) do
         local files_args =
           { "--files", "--color=never", gitignore and "--hidden" or "-uu", "-g", "!.git" }
-        for _, a in ipairs(pass.rg_globs) do
+        -- Honouring `.gitignore`, rg gets the negations only: a positive `-g` would
+        -- override the ignore files. The sink applies the include box and the tier.
+        for _, a in ipairs(gitignore and pass.rg_excludes or pass.rg_globs) do
           files_args[#files_args + 1] = a
         end
         ctx.begin_pass(pass)
@@ -1719,24 +1763,79 @@ local function grep_source(name, title, gitignore)
 
       -- As in `files`: the boxes prune at rg, the sink filters every leg's output, and
       -- rg runs once per pass so the normal paths' hits all land before the low ones.
-      for i, pass in ipairs(ctx.passes) do
-        local grep_args = {
+      local scope = gitignore and "--hidden" or "-uu"
+      local function grep_args(globs, files)
+        local args = {
           "--column",
           "--line-number",
           "--no-heading",
           "--with-filename",
           "--color=never",
-          gitignore and "--hidden" or "-uu",
+          scope,
           "-g",
           "!.git",
         }
-        for _, a in ipairs(pass.rg_globs) do
-          grep_args[#grep_args + 1] = a
+        for _, a in ipairs(globs) do
+          args[#args + 1] = a
         end
-        grep_args[#grep_args + 1] = "--"
-        grep_args[#grep_args + 1] = q
+        args[#args + 1] = "--"
+        args[#args + 1] = q
+        for _, f in ipairs(files or {}) do
+          args[#args + 1] = f
+        end
+        return args
+      end
+      -- The low pass of a `.gitignore`-respecting search. rg would let the
+      -- deprioritize globs, as `-g` includes, override `.gitignore` — re-including an
+      -- ignored `node_modules/` — so instead list the files rg would search (ignore
+      -- rules on, negations only), keep this pass's own, and search exactly those, a
+      -- chunk of paths per run so no command line grows unbounded. The common case —
+      -- every low tree ignored — lists nothing and searches nothing.
+      local CHUNK = 200
+      local function grep_listed(pass)
+        local list_args = { "--files", "--color=never", scope, "-g", "!.git" }
+        for _, a in ipairs(pass.rg_excludes) do
+          list_args[#list_args + 1] = a
+        end
+        local r = btv.await(btv.run({ cmd = "rg", args = list_args, cwd = ctx.cwd }))
+        if cancelled then
+          return true
+        end
+        if r.code == -1 then
+          return false
+        end
+        local files = {}
+        for l in (r.stdout or ""):gmatch("[^\r\n]+") do
+          if pass.keeps(l) then
+            files[#files + 1] = l
+          end
+        end
+        for from = 1, #files, CHUNK do
+          local chunk = { table.unpack(files, from, math.min(from + CHUNK - 1, #files)) }
+          run("rg", grep_args({}, chunk), true, false, emit_line)
+          if cancelled then
+            return true
+          end
+        end
+        return true
+      end
+      for i, pass in ipairs(ctx.passes) do
         ctx.begin_pass(pass)
-        if not run("rg", grep_args, true, false, emit_line) then
+        local ran
+        if gitignore and pass.tier == "low" then
+          ran = grep_listed(pass)
+        else
+          -- Honouring `.gitignore`, rg gets the negations only (see `grep_listed`);
+          -- the sink applies the include box.
+          ran = run(
+            "rg",
+            grep_args(gitignore and pass.rg_excludes or pass.rg_globs),
+            true,
+            false,
+            emit_line
+          )
+        end
+        if not ran then
           break
         elseif cancelled or i == #ctx.passes then
           return

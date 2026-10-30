@@ -6038,3 +6038,36 @@ async fn without_rg_or_git_the_git_pickers_walk_and_still_honour_gitignore() {
         "btv.fs.grep searches the same set rg did"
     );
 }
+
+/// Record each `btv.picker.open` instead of running it — the keymap tests ask WHICH
+/// picker a key opens, not what the search finds.
+const RECORD_OPENS: &str =
+    "_G.opened = {}; btv.picker.open = function(n) table.insert(_G.opened, n) end";
+
+#[tokio::test]
+async fn helix_space_f_and_space_slash_open_the_gitignore_pickers() {
+    let dir = temp_dir("picker_git_helix");
+    let (rpc, _incoming) = start(&dir, "").await;
+    command(&rpc, "helix").await;
+    exec_lua(&rpc, RECORD_OPENS).await;
+    feed(&rpc, "<Space>f");
+    feed(&rpc, "<Space>/");
+    let opened = exec_lua(&rpc, "return table.concat(_G.opened, ' ')").await;
+    assert_eq!(opened.as_str(), Some("files_git live_grep_git"));
+}
+
+#[tokio::test]
+async fn modeless_ctrl_p_opens_the_gitignore_file_picker() {
+    let dir = temp_dir("picker_git_modeless");
+    let (rpc, _incoming) = start(&dir, "").await;
+    command(&rpc, "set modeless").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.o.modeless").await.as_bool(),
+        Some(true),
+        "modeless took"
+    );
+    exec_lua(&rpc, RECORD_OPENS).await;
+    feed(&rpc, "<C-p>");
+    let opened = exec_lua(&rpc, "return table.concat(_G.opened, ' ')").await;
+    assert_eq!(opened.as_str(), Some("files_git"));
+}

@@ -65,8 +65,9 @@ end
 actions.palette = function()
   btv.picker.open("commands")
 end
+-- "Go to file" respects `.gitignore`, as an editor's quick-open does.
 actions.files = function()
-  btv.picker.open("files")
+  btv.picker.open("files_git")
 end
 actions.close = function()
   btv.cmd("bdelete")

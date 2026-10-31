@@ -130,6 +130,11 @@ edit one given file:
 
 `.enable_commands([...])` gives commands back.
 
+`SessionOptions::views_only()` is all of that with no file, for an app whose editor only
+shows what its plugins put in views, a diff say. Opening or writing any file fails with
+`E5801: this editor edits no files`. A plugin mounts its view with
+`view:mount({ here = true })`, so it's the editor's one window and `:q` quits.
+
 ```sh
 cargo run -p bemtvi-mitsuami --example single_file [file]
 ```
@@ -157,9 +162,13 @@ needs. The app's `on_event` handler runs on the UI thread with the editor free, 
 can drive the editor straight back.
 
 The other way, `EditorHandle` has `command` (an ex command, whatever the mode),
-`exec_lua` (a future of what the chunk returns), `open(path)`, `focus()`,
+`exec_lua` (a future of what the chunk returns), `exec_lua_with` (the same, with arguments
+as the chunk's `...`, so the app's values needn't be quoted into its source), `open(path)`, `focus()`,
 `request_quit()` (`:qa`, which refuses while a buffer is unsaved, as a window's close
 button wants) and `quit_now()` (`:qall!`).
+
+An app can build the `Editor` anywhere on the UI thread, not only in a view: a C ABI's
+call has no current mitsuami `Ui`, and it uses the one it's built in.
 
 ## Its lifetime
 

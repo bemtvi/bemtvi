@@ -125,3 +125,41 @@ async fn the_connection_survives_a_failed_chunk() {
         "and the connection still serves requests"
     );
 }
+
+/// `args` are the chunk's `...`, whole: nothing in them needs quoting.
+#[tokio::test]
+async fn args_reach_the_chunk_as_its_varargs() {
+    let (rpc, _incoming) = start().await;
+    let text = "a\"b\\c\r\n]]é";
+    let result = rpc
+        .request(
+            "nvim_exec_lua",
+            vec![
+                Value::from("local text, n, list = ...; return { text, n + 1, list[2] }"),
+                Value::Array(vec![
+                    Value::from(text),
+                    Value::from(41),
+                    Value::Array(vec![Value::from("x"), Value::from("y")]),
+                ]),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        Value::Array(vec![Value::from(text), Value::from(42), Value::from("y")])
+    );
+}
+
+#[tokio::test]
+async fn args_that_are_not_a_list_fail_the_request() {
+    let (rpc, _incoming) = start().await;
+    let err = rpc
+        .request(
+            "nvim_exec_lua",
+            vec![Value::from("return 1"), Value::from(1)],
+        )
+        .await
+        .expect_err("args must be a list");
+    assert!(err.to_string().contains("args must be a list"), "{err}");
+}

@@ -2311,3 +2311,18 @@ async fn indenting_shifts_the_insert_start_with_the_text() {
     feed(&rpc, "<End>x<C-]><C-u>");
     assert_eq!(lines(&rpc).await, vec!["\t\u{4e2d}"]);
 }
+
+/// A chunk switching models turns one off and the other on, in the order it wrote them,
+/// though options and Helix actions drain from queues of their own.
+#[tokio::test]
+async fn switching_between_modeless_and_helix_in_one_chunk() {
+    let (rpc, _incoming) = start_as("gui", "text\n").await;
+    exec_lua(&rpc, "btv.o.modeless = true").await;
+    assert_eq!(mode(&rpc).await, "i");
+
+    exec_lua(&rpc, "btv.o.modeless = false; btv.helix.enable()").await;
+    assert_eq!(mode(&rpc).await, "hn", "modeless to Helix");
+
+    exec_lua(&rpc, "btv.helix.disable(); btv.o.modeless = true").await;
+    assert_eq!(mode(&rpc).await, "i", "Helix to modeless");
+}

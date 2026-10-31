@@ -345,9 +345,9 @@ pub struct ServerInit {
     /// prelude, nor the client's `nvim_exec_lua`), and `:command` refuses to define one.
     /// `false` (the default): any code may define commands, as ever.
     pub startup_user_commands_only: bool,
-    /// Lock the editor to its startup file ([`Self::file`], required): no other file is
-    /// opened, switched to or written, and no new file buffer made (`E5801`); views,
-    /// panels, floats, quickfix lists and terminals work as ever. See
+    /// Lock the editor to its startup file ([`Self::file`]), or to none without one: no
+    /// other file is opened, switched to or written, and no new file buffer made
+    /// (`E5801`); views, panels, floats, quickfix lists and terminals work as ever. See
     /// `Editor::lock_to_buffer`. `false` (the default) for every other editor.
     pub single_file: bool,
     /// Turn the plugin manager off: every `btv.plugins` call raises `E5805` (plugins under
@@ -4508,12 +4508,10 @@ where
     // session still installs the fs so a later `:edit` / `:write` routes through it.
     let deferred_open = host_fs_async.as_ref().and(init.file.clone());
     // The file a single-file editor is locked to, as given, for Lua (below).
-    let locked_file = init.single_file.then(|| init.file.clone()).flatten();
-    // A single-file editor is locked to the file it starts on, so it needs one.
-    anyhow::ensure!(
-        !init.single_file || init.file.is_some(),
-        "a single-file editor needs the file it edits (ServerInit::file)"
-    );
+    // Empty when it's locked to no file, only showing views.
+    let locked_file = init
+        .single_file
+        .then(|| init.file.clone().unwrap_or_default());
     let mut editor = match (&host_fs_async, init.file) {
         // Daemon fs: start empty regardless of `file`; the fetch task below loads it.
         // A daemon session also does buffer I/O off-tick — `:w` snapshots and enqueues

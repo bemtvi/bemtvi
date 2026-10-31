@@ -1080,7 +1080,8 @@ local function launch_path_picker(before, dirs_only)
   -- offers that file and browses for nothing: other files' names would only be refused.
   local locked = btv._locked_file()
   if locked then
-    if dirs_only then
+    -- Empty: locked to no file at all, an editor that only shows an app's views.
+    if dirs_only or locked == "" then
       return {}
     end
     -- Escaped for the command line where `\` isn't the separator (`fnameescape`); the

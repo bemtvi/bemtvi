@@ -1966,15 +1966,24 @@ impl Editor {
         true
     }
 
-    /// `E5801`, naming the file the editor is locked to.
+    /// `E5801`, naming the file the editor is locked to, if it has one: the first buffer
+    /// of an editor that only shows an app's views has none, and never gets one.
     pub(crate) fn echo_locked(&mut self, locked: BufferId) {
-        let name = self
+        let message = self.locked_message(locked);
+        self.echo(message);
+    }
+
+    /// What [`Self::echo_locked`] says.
+    pub fn locked_message(&self, locked: BufferId) -> String {
+        match self
             .buffers
             .map
             .get(&locked)
             .and_then(|b| b.buffer.path.as_ref())
-            .map_or_else(|| "one file".to_owned(), |p| p.display().to_string());
-        self.echo(format!("E5801: this editor only edits {name}"));
+        {
+            Some(path) => format!("E5801: this editor only edits {}", path.display()),
+            None => "E5801: this editor edits no files".to_owned(),
+        }
     }
 
     pub fn find_buffer_by_path(&self, path: &Path) -> Option<BufferId> {

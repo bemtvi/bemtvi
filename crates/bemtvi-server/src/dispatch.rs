@@ -297,23 +297,14 @@ impl EditHost {
             // `nvim_exec_lua(code[, args])`: evaluate a Lua chunk and return its
             // value over RPC — the entry point for synchronous getters like
             // `vim.diagnostic.get`. Effects the chunk queued (LSP ops, panel,
-            // commands) drain afterward, exactly like a `:lua` chunk. `args` is
-            // accepted only as an empty list: nothing threads values into the
-            // chunk, so a non-empty `args` fails the request loudly rather than
-            // evaluating with its parameters silently missing.
+            // commands) drain afterward, exactly like a `:lua` chunk. `args` reach the chunk
+            // as its `...`, so a caller's values needn't be quoted into its source.
             "nvim_exec_lua" => {
-                let has_args = match params.get(1) {
-                    None | Some(Value::Nil) => false,
-                    Some(Value::Array(a)) => !a.is_empty(),
-                    Some(_) => true,
+                let args = match params.get(1) {
+                    None | Some(Value::Nil) => &[][..],
+                    Some(Value::Array(args)) => &args[..],
+                    Some(_) => return Err("nvim_exec_lua: args must be a list".to_string()),
                 };
-                if has_args {
-                    return Err(
-                        "nvim_exec_lua: args are not supported — pass an empty list and \
-                         interpolate values into the chunk instead"
-                            .to_string(),
-                    );
-                }
                 let code = text(params.first());
                 // Refresh the buffer mirror before the eval: this is the one
                 // synchronous-getter entry that reads buffer state *before* its
@@ -325,7 +316,7 @@ impl EditHost {
                 // sees the buffer current NOW, not whatever the last autocmd left (this
                 // runs before the trailing `run_pending`, so it can't rely on that).
                 self.refresh_cur_buf_snapshot();
-                let result = self.lua.eval_to_value(&code);
+                let result = self.lua.eval_to_value_with(&code, args);
                 // Drain first, either way: a chunk that raised halfway may already have
                 // queued effects, and those are as real as the ones a chunk that finished
                 // queued. The error is an answer to this one request, not a rollback.

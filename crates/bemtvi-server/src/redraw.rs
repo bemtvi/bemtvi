@@ -2878,15 +2878,8 @@ impl EditHost {
         // An editor locked to one file reads no other (a global mark's, a jumplist
         // entry's): the pane says so instead.
         if let Some(locked) = self.editor.locked_buffer() {
-            let file = self
-                .editor
-                .buffer_path(locked)
-                .map_or_else(|| "one file".to_owned(), |f| f.display().to_string());
-            self.store_preview(
-                p,
-                vec![format!("E5801: this editor only edits {file}")],
-                false,
-            );
+            let message = self.editor.locked_message(locked);
+            self.store_preview(p, vec![message], false);
             return;
         }
         // Off-tick fs (daemon / web): the file isn't open and can't be read

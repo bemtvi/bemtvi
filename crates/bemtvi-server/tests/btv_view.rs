@@ -1516,3 +1516,21 @@ async fn view_name_holds_while_an_autocmd_is_firing() {
             .as_str()
     );
 }
+
+/// `mount{ here = true }` takes the current window: no other window or tab is left, the
+/// empty buffer the editor started on is out of the way, and `:q` quits.
+#[tokio::test]
+async fn mount_here_takes_the_current_window() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"vw = btv.view.create({ name = "v" }); vw:set_lines({ "shown" }); vw:mount({ here = true })"#,
+    )
+    .await;
+    assert_eq!(win_count(&rpc).await, 1);
+    assert_eq!(tab_count(&rpc).await, 1);
+    let shown = exec_lua(&rpc, "return btv.buf.lines(0, 0, -1)[1]").await;
+    assert_eq!(shown.as_str(), Some("shown"));
+    let same = exec_lua(&rpc, "return vw:winid() == btv.win.current()").await;
+    assert_eq!(same.as_bool(), Some(true));
+}

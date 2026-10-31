@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use bemtvi_gpu::{report_session_error, Answer, Client, CursorShape, Effect};
 use mitsuami::prelude::{
-    clipboard_text, node_ref, open_file, save_file, signal, sleep, spawn_local, Cursor,
+    clipboard_text, node_ref, on_cleanup, open_file, save_file, signal, sleep, spawn_local, Cursor,
     ElementBuilder, GpuSurface, OpenFile, Rect, SaveFile, Signal, SurfaceHandle, SurfaceSize,
     SystemCursor,
 };
@@ -228,9 +228,15 @@ impl App {
         // the one running — so a strong hold would keep the client forever. That task
         // ends itself once the editor is unmounted, or it would wait on a `wake` that
         // never comes again (see `pump_loop`).
-        spawn_local(Self::pump_loop(Rc::downgrade(&this), wake));
-        spawn_local(Self::paint_loop(Rc::downgrade(&this)));
-        spawn_local(Self::timer_loop(Rc::downgrade(&this)));
+        //
+        // On `ui`, not the current one: an app may build the editor outside any view or
+        // task, from a C ABI's call say, where there's none.
+        let tasks = [
+            ui.spawn_local(Self::pump_loop(Rc::downgrade(&this), wake)),
+            ui.spawn_local(Self::paint_loop(Rc::downgrade(&this))),
+            ui.spawn_local(Self::timer_loop(Rc::downgrade(&this))),
+        ];
+        on_cleanup(move || tasks.iter().for_each(|task| task.cancel()));
 
         let surface = node_ref();
         if autofocus {

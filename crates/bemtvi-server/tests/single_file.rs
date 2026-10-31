@@ -9,8 +9,9 @@ use std::path::PathBuf;
 use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
-    attach, await_lines, exec_lua, feed, lines, map_get, menu_items, menu_of, message_after,
-    panel_is_open, poll_menu, spawn, spawn_with_daemon_fs_init, temp_dir, DaemonFs,
+    attach, await_lines, command, exec_lua, feed, lines, map_get, menu_items, menu_of,
+    message_after, panel_is_open, poll_menu, spawn, spawn_with_daemon_fs_init, start_attached,
+    temp_dir, write_temp, DaemonFs,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -200,15 +201,35 @@ async fn unlocked_by_default() {
     assert_eq!(f.current_file().await, f.other);
 }
 
+/// Locked with no file (`SessionOptions::views_only`): no file opens or gets written, it
+/// says so, and views work. The buffer it starts on stays nameless.
 #[tokio::test]
-async fn a_lock_without_a_file_fails_to_start() {
+async fn a_lock_without_a_file_opens_no_file() {
     let init = ServerInit {
         single_file: true,
         ..Default::default()
     };
-    let (rpc, _incoming) = spawn(init);
-    let answer = rpc.request("nvim_get_mode", vec![]).await;
-    assert!(answer.is_err(), "the server never came up: {answer:?}");
+    let (rpc, _incoming) = start_attached(init, 80, 24).await;
+    let other = write_temp("single_file_none", "txt", "other\n");
+    let name = "return btv.buf.name(0)";
+
+    command(&rpc, &format!("edit {}", other)).await;
+    assert_eq!(exec_lua(&rpc, name).await.as_str(), Some(""));
+
+    command(&rpc, &format!("write {}", other)).await;
+    assert_eq!(std::fs::read_to_string(&other).unwrap(), "other\n");
+    assert_eq!(exec_lua(&rpc, name).await.as_str(), Some(""));
+
+    command(&rpc, "enew").await;
+    assert_eq!(exec_lua(&rpc, name).await.as_str(), Some(""));
+
+    exec_lua(
+        &rpc,
+        r#"vw = btv.view.create({ name = "v" }); vw:set_lines({ "shown" }); vw:mount({ here = true })"#,
+    )
+    .await;
+    let shown = exec_lua(&rpc, "return btv.buf.lines(0, 0, -1)[1]").await;
+    assert_eq!(shown.as_str(), Some("shown"));
 }
 
 /// A write's target is checked by the path the OS will write, not only by the name the

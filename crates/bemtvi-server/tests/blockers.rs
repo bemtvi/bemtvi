@@ -660,32 +660,20 @@ async fn string_width_and_character_builtins() {
 
 // ===================== nvim_exec_lua args contract ==========================
 
-/// `nvim_exec_lua` takes `args` only as an empty list: bemtvi has no channel that
-/// threads values into the chunk, so a non-empty `args` must fail the request
-/// loudly — silently evaluating the chunk with its parameters missing would make
-/// every `...`-read a nil (the no-silent-stub rule). The empty-args form (what
-/// every harness `exec_lua` call sends) keeps working.
+/// A chunk reads its args as `...` (`exec_lua_errors.rs` has the rest).
 #[tokio::test]
-async fn exec_lua_with_args_errors_loudly() {
+async fn exec_lua_with_args_passes_them() {
     let dir = temp_dir("exec_lua_args");
     let (rpc, _incoming) = start_with_config(&dir, "").await;
-
-    let r = rpc
+    let result = rpc
         .request(
             "nvim_exec_lua",
-            vec![Value::from("return 1"), Value::Array(vec![Value::from(1)])],
+            vec![
+                Value::from("local a, b = ...; return a + b"),
+                Value::Array(vec![Value::from(40), Value::from(2)]),
+            ],
         )
-        .await;
-    assert!(
-        r.is_err(),
-        "non-empty args must fail the request loudly, got {r:?}"
-    );
-
-    // The supported empty-args form still evaluates.
-    let ok = exec_lua(&rpc, "return 1").await;
-    assert_eq!(
-        ok.as_i64(),
-        Some(1),
-        "empty-args exec_lua should still work"
-    );
+        .await
+        .expect("a chunk with args runs");
+    assert_eq!(result.as_i64(), Some(42));
 }

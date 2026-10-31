@@ -443,7 +443,8 @@ impl Editor {
             if let Some(v) = self.views.get_mut(&view_id) {
                 v.mount = Some(mount);
             }
-            if placeholder != buf {
+            // An editor locked to its first buffer keeps it, and says nothing about it here.
+            if placeholder != buf && self.locked_buffer() != Some(placeholder) {
                 self.delete_buffer(placeholder, true);
             }
         } else {

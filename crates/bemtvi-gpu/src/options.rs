@@ -110,8 +110,13 @@ impl SessionOptions {
     /// The rest is as [`Self::new`] sets it, and an app can change it: `config`, `shada`,
     /// `host`, more commands to disable, or [`Self::enable_commands`] to give some back.
     pub fn single_file(path: impl Into<String>) -> SessionOptions {
+        SessionOptions::views_only().file(path)
+    }
+
+    /// [`Self::single_file`] with no file at all, for an app whose editor only shows what
+    /// its plugins put in views (a diff, a blame): no file opens, shows or gets written.
+    pub fn views_only() -> SessionOptions {
         SessionOptions::new()
-            .file(path)
             .lock_to_file(true)
             .user_commands_from_startup_only(true)
             .disable_commands(SINGLE_FILE_DISABLED_COMMANDS.iter().copied())
@@ -215,7 +220,7 @@ impl SessionOptions {
         self
     }
 
-    /// Lock the editor to its file ([`Self::file`], which it then needs): no other file
+    /// Lock the editor to its file ([`Self::file`]), or to none without one: no other file
     /// is opened, switched to or written, and no new file buffer made — whether a
     /// command, a key, a plugin or a jump asks — with `E5801`. Views, panels, floats,
     /// quickfix lists and terminals work as ever.

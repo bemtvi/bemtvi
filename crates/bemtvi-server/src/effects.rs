@@ -628,6 +628,18 @@ impl EditHost {
         self.editor.end_scroll_gesture(edited);
     }
 
+    /// A Helix verb Lua fired, opening the insert session it may have left Normal for.
+    /// An unknown name fails loud.
+    fn apply_helix_action(&mut self, action: &str, count: Option<usize>) {
+        let was_insert = self.editor.mode.is_insert();
+        if let Err(e) = self.editor.apply_helix_action(action, count) {
+            self.editor.echo(format!("E5108: {e}"));
+        }
+        if !was_insert {
+            self.editor.begin_insert_session();
+        }
+    }
+
     fn apply_lua_effects_inner(&mut self) {
         // Refresh the autocmd cache before running any queued command, so a
         // `btv.cmd('edit …')` (which runs through `editor.command` here, not the
@@ -731,14 +743,29 @@ impl EditHost {
         );
         // Helix actions a `helix`-bucket keymap fired (`btv._helix_action`): apply each
         // named verb (with its optional count) to the editor. Unknown names fail loud.
+        //
+        // Turning Helix on waits for the option writes below, when nothing in this batch
+        // needs it sooner: options and these actions drain from queues of their own, so
+        // `btv.o.modeless = false; btv.helix.enable()` would otherwise find `'modeless'`
+        // still on and be refused. Turning it off stays first, for the other way round.
+        // The last of the two a chunk asked for wins, and a Helix verb after an enable
+        // runs in Helix, as it was written.
+        let mut enable_helix = false;
         for (action, count) in self.lua.take_helix_actions() {
-            let was_insert = self.editor.mode.is_insert();
-            if let Err(e) = self.editor.apply_helix_action(&action, count) {
-                self.editor.echo(format!("E5108: {e}"));
+            match action.as_str() {
+                "enable_helix" => {
+                    enable_helix = true;
+                    continue;
+                }
+                "disable_helix" => enable_helix = false,
+                "smart_case_on" | "smart_case_off" => {}
+                _ if enable_helix => {
+                    enable_helix = false;
+                    self.apply_helix_action("enable_helix", None);
+                }
+                _ => {}
             }
-            if !was_insert {
-                self.editor.begin_insert_session();
-            }
+            self.apply_helix_action(&action, count);
         }
         // Command lines Lua asked to open (`btv.cmdline.open`).
         for (kind, text) in self.lua.take_cmdline_opens() {
@@ -1017,6 +1044,9 @@ impl EditHost {
                 OptionValue::String(s) => OptionScalar::Str(s),
             };
             self.editor.set_global_option_from_lua(&op.name, value);
+        }
+        if enable_helix {
+            self.apply_helix_action("enable_helix", None);
         }
         // Per-workspace option overrides from `btv.wso`: set (`Some`) or clear (`None`) the
         // override in the editor's workspace overlay (which wins over the global value). An

@@ -318,6 +318,8 @@ local FLOAT_BORDER =
 -- that dock (`opts.size` columns/rows); `opts.tab = true` mounts it as the sole window of
 -- a fresh tab page (no split — the view fills the tab; closing it closes the tab);
 -- `opts.split = "vsplit"|"split"` mounts it in a split of the main editor area;
+-- `opts.here = true` mounts it in the current window, in place of what that shows (no new
+-- window or tab: `:q` of a sole window quits the editor);
 -- `opts.float = { … }` mounts it in a floating window. Mounting focuses the view.
 --
 -- The float table takes `width` / `height` (inner size; required) — cells (a
@@ -342,6 +344,8 @@ function View:mount(opts)
     btv.view._mount_dock(self.id, opts.dock, opts.size)
   elseif opts.tab then
     btv.view._mount_tab(self.id)
+  elseif opts.here then
+    self:place_in(btv.win.current())
   elseif opts.split then
     btv.view._mount_split(self.id, opts.split ~= "split")
   elseif opts.float then
@@ -397,9 +401,9 @@ function View:mount(opts)
   return self
 end
 
--- `:place_in(win)` — adopt the reserved restore slot `win` for this view: retarget that
--- placeholder window (minted by a session restore for a persisted view) to this view's
--- backing buffer, instead of opening a fresh window like `:mount`. This is what the `place`
+-- `:place_in(win)` — retarget window `win` to this view's backing buffer, instead of
+-- opening a fresh window like `:mount`: a session restore's reserved slot (a placeholder
+-- window for a persisted view), or any other. This is what the `place`
 -- argument handed to an `btv.view.on_restore` handler calls
 -- (`place = function(view) view:place_in(win) end`), so a plugin rarely calls it directly.
 function View:place_in(win)

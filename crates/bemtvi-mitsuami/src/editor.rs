@@ -227,15 +227,24 @@ impl EditorHandle {
     }
 
     /// Run Lua in the editor and resolve to what it returns (a chunk that raises
-    /// resolves to the error). Values go into the chunk as text: the editor takes no
-    /// arguments with it.
+    /// resolves to the error).
     pub fn exec_lua(
         &self,
         code: &str,
     ) -> impl std::future::Future<Output = Result<Value>> + 'static {
+        self.exec_lua_with(code, Vec::new())
+    }
+
+    /// [`Self::exec_lua`], with `args` as the chunk's `...`, so the app's values needn't
+    /// be quoted into its source: `local path = ...; return btv.fs.exists(path)`.
+    pub fn exec_lua_with(
+        &self,
+        code: &str,
+        args: Vec<Value>,
+    ) -> impl std::future::Future<Output = Result<Value>> + 'static {
         let client = self.client();
         let code = code.to_owned();
-        async move { client?.exec_lua(&code).await }
+        async move { client?.exec_lua_with(&code, args).await }
     }
 
     /// Open a file in the editor, as `:edit` does.

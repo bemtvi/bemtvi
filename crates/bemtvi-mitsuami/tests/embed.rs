@@ -911,4 +911,76 @@ async fn the_preset_gives_commands_back(app: TestApp) {
     assert!(!close(&handle));
 }
 
+/// An app can build the editor outside any view or task, as a C ABI's call does: a test's
+/// body has no current `Ui`.
+#[mitsuami_test::test]
+async fn builds_outside_a_view(app: TestApp) {
+    let handle = EditorHandle::new();
+    let editor = Editor::new(session(), || {}).handle(handle.clone());
+    let owner = Owner::new_root();
+    let node = owner.with(|| editor.build(app.ui()));
+    app.mount(move || Adopted(node));
+    assert_eq!(lua(&app, &handle, "return 1 + 1").await, Value::from(2));
+    owner.dispose();
+    assert!(!close(&handle));
+}
+
+/// A node already built, mounted as a view.
+struct Adopted(NodeId);
+
+impl View for Adopted {
+    fn build(self, _: &Ui) -> NodeId {
+        self.0
+    }
+}
+
+/// `exec_lua_with`'s arguments arrive whole.
+#[mitsuami_test::test]
+async fn exec_lua_with_passes_arguments(app: TestApp) {
+    let (handle, _) = mount(&app, session()).await;
+    let text = "a\"b\\c\r\n]]é";
+    let result = wait(
+        &app,
+        handle.exec_lua_with("local text = ...; return text", vec![Value::from(text)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, Value::from(text));
+    assert!(!close(&handle));
+}
+
+/// `SessionOptions::views_only`: the single-file preset with no file at all. Views work,
+/// no file opens, and it says why.
+#[mitsuami_test::test]
+async fn the_views_only_preset(app: TestApp) {
+    let dir = bemtvi_test_harness::temp_dir("embed_views_only");
+    let other = dir.join("other.txt");
+    std::fs::write(&other, "other\n").unwrap();
+    let session = SessionOptions::views_only()
+        .config(Config::None)
+        .shada(Shada::Off)
+        .spawn()
+        .unwrap();
+    let (handle, _) = mount(&app, session).await;
+
+    lua(
+        &app,
+        &handle,
+        r#"vw = btv.view.create({ name = "v" }); vw:set_lines({ "shown" }); vw:mount({ here = true })"#,
+    )
+    .await;
+    assert_eq!(lines(&app, &handle).await, ["shown"]);
+
+    handle.open(&other).unwrap();
+    // A later request lands after the command: the two go in order.
+    assert_eq!(lines(&app, &handle).await, ["shown"]);
+    handle.command("enew").unwrap();
+    assert_eq!(lines(&app, &handle).await, ["shown"]);
+    assert_eq!(
+        lua(&app, &handle, "return btv.command_disabled('terminal') and btv.plugins.disabled() and btv.lsp.disabled()").await,
+        Value::from(true),
+    );
+    assert!(!close(&handle));
+}
+
 mitsuami_test::main!();

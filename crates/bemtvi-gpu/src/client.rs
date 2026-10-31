@@ -226,10 +226,19 @@ impl ClientHandle {
         &self,
         code: &str,
     ) -> impl std::future::Future<Output = Result<Value>> + Send + 'static {
+        self.exec_lua_with(code, Vec::new())
+    }
+
+    /// [`Self::exec_lua`], with `args` as the chunk's `...`.
+    pub fn exec_lua_with(
+        &self,
+        code: &str,
+        args: Vec<Value>,
+    ) -> impl std::future::Future<Output = Result<Value>> + Send + 'static {
         let rpc = self.rpc();
         let code = Value::from(code);
         async move {
-            rpc?.request("nvim_exec_lua", vec![code, Value::Array(Vec::new())])
+            rpc?.request("nvim_exec_lua", vec![code, Value::Array(args)])
                 .await
         }
     }

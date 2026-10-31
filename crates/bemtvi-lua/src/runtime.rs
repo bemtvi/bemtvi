@@ -1862,6 +1862,29 @@ impl LuaRuntime {
         lua_to_rmpv(&value)
     }
 
+    /// [`Self::eval_to_value`], with `args` as the chunk's `...`. A chunk taking some is
+    /// statements (`local a = ...; return a`), not an expression.
+    pub fn eval_to_value_with(
+        &self,
+        chunk: &str,
+        args: &[rmpv::Value],
+    ) -> mlua::Result<rmpv::Value> {
+        if args.is_empty() {
+            return self.eval_to_value(chunk);
+        }
+        let args = args
+            .iter()
+            .map(|arg| crate::convert::rmpv_to_lua(&self.lua, arg))
+            .collect::<mlua::Result<mlua::MultiValue>>()?;
+        let function = self
+            .lua
+            .load(chunk)
+            .set_name("=nvim_exec_lua")
+            .into_function()?;
+        let value: mlua::Value = function.call(args)?;
+        lua_to_rmpv(&value)
+    }
+
     /// Mirror a buffer's diagnostics into `btv._diagnostics[bufnr]` as the plain
     /// data `vim.diagnostic.get` reads back (the Rust→Lua state mirror). Called on
     /// every `publishDiagnostics`; keyed by `bufnr`, so it never goes stale on a

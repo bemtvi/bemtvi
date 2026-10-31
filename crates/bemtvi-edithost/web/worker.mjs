@@ -571,8 +571,18 @@ async function landRealFsReply() {
 
 // Path → OPFS handle. OPFS has one root directory (`getDirectory`); a path descends it
 // component by component. Leading `/` and `.` segments are dropped (the editor's paths
-// are absolute-looking but OPFS has no real root prefix).
-const splitPath = (path) => String(path).split("/").filter((s) => s.length && s !== ".");
+// are absolute-looking but OPFS has no real root prefix). A `..` segment pops the one
+// before it (none at the root, as `/..` is `/`): OPFS has no `..` entry — a handle lookup
+// by that name throws a TypeError — and no symlinks, so resolving it lexically is exact.
+// (A submodule's `.git` file names its git dir as `../.git/modules/<name>`.)
+const splitPath = (path) => {
+  const parts = [];
+  for (const s of String(path).split("/")) {
+    if (s === "..") parts.pop();
+    else if (s.length && s !== ".") parts.push(s);
+  }
+  return parts;
+};
 
 async function opfsDir(parts, create) {
   let dir = await navigator.storage.getDirectory();
@@ -696,7 +706,10 @@ const joinPath = (a, b) => `${String(a).replace(/\/+$/, "")}/${b}`;
 // `Error`s carrying an explicit `.code` for the semantic cases (EISDIR / ENOTEMPTY / EILSEQ / …);
 // a raw OPFS `DOMException` is mapped by name. Anything unrecognized is `EIO` (never silent).
 function errCode(e) {
-  if (e && e.code) return e.code;
+  // Only OUR string codes: every DOMException also has a legacy NUMERIC `.code`
+  // (NotFoundError is 8), which would shadow the name mapping below and reach the
+  // editor as `EIO`, so a missing parent directory would not read as ENOENT.
+  if (e && typeof e.code === "string" && e.code) return e.code;
   switch (e && e.name) {
     case "NotFoundError": return "ENOENT";
     case "TypeMismatchError": return "ENOTDIR";

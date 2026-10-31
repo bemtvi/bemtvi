@@ -41,9 +41,9 @@ btv.g.mapleader = " "
 --             and LSP are off (`btv.plugins.disabled()`, `btv.lsp.disabled()`).
 --
 -- Type-this:  <Space>f   (normal mode: this config maps it to the files picker)
--- See-that:   E5803: the files picker is disabled in this editor. So are buffers,
---             diagnostics and live_grep; the other pickers still open. (Plain bemtvi
---             opens it.)
+-- See-that:   E5803: the files picker is disabled in this editor. So are files_git,
+--             buffers, diagnostics, live_grep and live_grep_git; the other pickers
+--             still open. (Plain bemtvi opens it.)
 --
 -- Type-this:  :<Tab>
 -- See-that:   the disabled commands aren't offered.

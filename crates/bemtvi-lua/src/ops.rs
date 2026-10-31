@@ -2564,6 +2564,8 @@ pub struct PickerPush {
     /// server resolves it against the live colorscheme per frame; `None` (an empty
     /// string on the wire) for an unpainted row.
     pub hl: Option<String>,
+    /// A **deprioritized** row (`push { low = true }`): listed after every normal row.
+    pub low: bool,
 }
 
 /// One row of an LSP-driven picker (goto/references/symbols), as the server hands it

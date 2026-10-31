@@ -12,7 +12,14 @@ use crate::Session;
 /// The pickers [`SessionOptions::single_file`] takes away: those that reach past the one
 /// file — the open buffers, the workspace's diagnostics, finding files, and grepping
 /// them.
-pub const SINGLE_FILE_DISABLED_PICKERS: &[&str] = &["buffers", "diagnostics", "files", "live_grep"];
+pub const SINGLE_FILE_DISABLED_PICKERS: &[&str] = &[
+    "buffers",
+    "diagnostics",
+    "files",
+    "files_git",
+    "live_grep",
+    "live_grep_git",
+];
 
 /// The commands [`SessionOptions::single_file`] disables: what the single-file lock
 /// doesn't already cover. Running code (`:lua`, `:=`, `:source`, `:command`, and the

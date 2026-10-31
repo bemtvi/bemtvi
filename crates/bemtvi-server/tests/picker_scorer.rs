@@ -186,3 +186,28 @@ async fn a_nan_sort_key_is_refused() {
     );
     assert_eq!(menu_items(&menu_of(&map)), vec!["aa1", "aa2", "aa3"]);
 }
+
+#[tokio::test]
+async fn a_scorer_reorders_within_a_tier_but_never_lifts_a_low_row() {
+    let dir = temp_dir("scorer_tiers");
+    let init = r#"
+btv.picker.source {
+  name = "rows",
+  items = function(ctx)
+    ctx.push { text = "aa1" }
+    ctx.push { text = "aa2" }
+    ctx.push { text = "aa3", low = true }
+    ctx.push { text = "aa4", low = true }
+  end,
+}
+btv.picker.scorer([[ (label == "aa4" and 1000 or 0) + (label == "aa2" and 10 or 0) ]])
+"#;
+    let (rpc, mut incoming) = start(&dir, init).await;
+    exec_lua(&rpc, "btv.picker.open('rows')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+    feed(&rpc, "aa");
+    let map = poll_menu(&rpc, &mut incoming).await.expect("filtered menu");
+    // aa2 promoted among the normal rows, aa4 among the low ones — but aa4's 1000
+    // does not carry it over aa1 / aa2.
+    assert_eq!(menu_items(&menu_of(&map)), vec!["aa2", "aa1", "aa4", "aa3"]);
+}

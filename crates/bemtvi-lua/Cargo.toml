@@ -37,6 +37,8 @@ sha2.workspace = true
 # The PCRE engine for `btv.buf.search` (the `regexsyntax=pcre` dialect) — the same
 # `regex` crate the core search uses, so the two agree. Pure Rust, wasm-safe.
 regex.workspace = true
+# `btv.fs.gitignore`: ripgrep's `.gitignore` matcher for the `btv.fs` walk. Pure Rust.
+ignore.workspace = true
 # The real vim regexp engine backing `vim.fn.substitute` and `vim.regex` — vim's
 # magic dialect including `\zs`/`\ze`, look-around and in-pattern back-references,
 # which the previous RE2 translator could not represent. Also the `vim` dialect of

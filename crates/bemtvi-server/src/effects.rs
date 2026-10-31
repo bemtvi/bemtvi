@@ -1565,6 +1565,8 @@ impl EditHost {
                     // diagnostics row); resolved against the live colorscheme at
                     // projection time, not here.
                     hl: p.hl,
+                    // Listed after every normal row (`push { low = true }`).
+                    low: p.low,
                     ..bemtvi_core::MenuItem::new(p.label, p.key)
                 })
                 .collect();

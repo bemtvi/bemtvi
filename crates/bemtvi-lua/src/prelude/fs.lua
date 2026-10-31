@@ -71,6 +71,201 @@ function btv.fs.readdir(path)
   return run_fs({ op = "readdir", path = path })
 end
 
+-- `btv.fs.gitignore(text)` -> a matcher for one ignore file's contents (a `.gitignore`,
+-- `.ignore`, `.rgignore` or `.git/info/exclude`), plus the list of messages for lines
+-- it had to skip (an invalid glob — git and rg skip those too). The semantics are
+-- ripgrep's own (the `ignore` crate), so negation, anchoring, directory-only patterns
+-- and `**` decide exactly as `rg` does.
+--
+-- `matcher:match(path, is_dir)` -> `"ignore"`, `"whitelist"` (a `!negated` line) or
+-- `nil` (no line matches). `path` is relative to the ignore file's own directory and
+-- `/`-separated; `is_dir` matters for a `build/`-style pattern. The last matching line
+-- decides, as in git.
+--
+-- ```lua
+-- local m = btv.fs.gitignore("*.log\n!keep.log\nbuild/\n")
+-- m:match("debug.log")       --> "ignore"
+-- m:match("keep.log")        --> "whitelist"
+-- m:match("build", true)     --> "ignore"
+-- m:match("src/main.rs")     --> nil
+-- ```
+function btv.fs.gitignore(text)
+  if type(text) ~= "string" then
+    error("btv.fs.gitignore: text must be a string, got " .. type(text), 2)
+  end
+  return btv._gitignore(text)
+end
+
+-- Ignore-file kinds in ripgrep's precedence, highest first: a `.rgignore` decision
+-- beats a `.ignore` one, which beats a `.gitignore`, which beats `.git/info/exclude` —
+-- whatever their depth. Within one kind the deepest file decides.
+local IGNORE_KINDS = { ".rgignore", ".ignore", ".gitignore", "exclude" }
+local IGNORE_FILES = { [".rgignore"] = true, [".ignore"] = true, [".gitignore"] = true }
+
+-- `p` without trailing separators, its root (`"/"`, `"C:\\"`) kept whole.
+local function trim_seps(p)
+  local root = btv.utils.path_root(p)
+  local pat = btv.utils.path_style() == "windows" and "[/\\]+$" or "/+$"
+  return root .. p:sub(#root + 1):gsub(pat, "")
+end
+
+-- The parent of an absolute directory (spelled without trailing separators), or nil
+-- at the filesystem root (or for a relative one).
+local function parent_dir(p)
+  local root = btv.utils.path_root(p)
+  if root == "" or p == root then
+    return nil
+  end
+  local d = btv.utils.dirname(p)
+  if d == "" or d == p then
+    return root
+  end
+  return d
+end
+
+-- Read one ignore file for the walk. A file that is not there (`ENOENT`, as for a
+-- repository without `info/exclude`, or one deleted mid-walk) has no rules. Any other
+-- failure skips the file with a warning naming it, once a session — as rg warns and
+-- walks on — rather than either silently listing everything it would have ignored or
+-- failing a whole picker over one unreadable file (a root-owned `.git`, an ancestor's
+-- `.ignore`). A file that is not a regular one once symlinks are followed is skipped
+-- the same way, unread: a checkout unpacked from an archive can carry a FIFO (a read
+-- no writer ever answers parks an fs worker for good, and over a daemon every `btv.fs`
+-- op queued behind it) or a link to `/dev/zero` (read until the editor runs out of
+-- memory).
+local function read_ignore(path)
+  local function fail(err)
+    local code = type(err) == "table" and err.code
+    if code == "ENOENT" or code == "ENOTDIR" then
+      return nil
+    end
+    local msg = type(err) == "table" and (err.message or err.code) or tostring(err)
+    btv.notify_once(
+      "btv.fs.walk: skipping ignore file " .. path .. ": " .. tostring(msg),
+      btv.log.levels.WARN
+    )
+    return nil
+  end
+  local sok, st = pcall(btv.await, btv.fs.stat(path))
+  if not sok then
+    return fail(st)
+  end
+  -- `S_IFMT` bits: `0` where the fs reports none (OPFS), `S_IFREG` for a regular file.
+  local fmt = (st.mode or 0) & 0xF000
+  if st.type ~= "file" or (fmt ~= 0 and fmt ~= 0x8000) then
+    return fail("not a regular file")
+  end
+  local ok, text = pcall(btv.await, btv.fs.read(path))
+  if ok then
+    return text
+  end
+  return fail(text)
+end
+
+-- The `info/exclude` of the repository whose `.git` entry `git` sits in `abs`. A `.git`
+-- directory holds it directly; a `.git` FILE (a linked worktree or a submodule) points
+-- at the real git dir with `gitdir: <path>`, and a worktree's git dir names the main
+-- repository's in `commondir` — the one whose `info/exclude` applies, as rg resolves it.
+local function exclude_path(abs, git)
+  local dotgit = btv.utils.path_join(abs, ".git")
+  if git.type == "directory" then
+    return btv.utils.path_join(dotgit, "info", "exclude")
+  elseif git.type ~= "file" then
+    return nil
+  end
+  local text = read_ignore(dotgit)
+  local gitdir = text and text:match("^gitdir: ([^\r\n]+)")
+  if not gitdir then
+    return nil
+  end
+  if btv.utils.path_root(gitdir) == "" then
+    gitdir = btv.utils.path_join(abs, gitdir)
+  end
+  local common = gitdir
+  local cd = read_ignore(btv.utils.path_join(gitdir, "commondir"))
+  cd = cd and cd:match("^([^\r\n]+)")
+  if cd then
+    common = btv.utils.path_root(cd) == "" and btv.utils.path_join(gitdir, cd) or cd
+  end
+  return btv.utils.path_join(common, "info", "exclude")
+end
+
+-- The ignore layers one directory contributes, from its `entries`: one per ignore file
+-- present (`.gitignore` only `in_repo`, as rg needs a repository to honour one), plus
+-- the repository's `info/exclude` when the directory is a repository root and
+-- `exclude` asks for it. `place` says where the layer's directory sits relative to the
+-- walk root — `{ base = "a/b" }` below it (`""` the root itself), `{ prefix = "sub/" }`
+-- above it.
+local function dir_layers(abs, entries, in_repo, place, exclude)
+  local layers = {}
+  local function add(kind, path)
+    local text = path and read_ignore(path)
+    if type(text) == "string" then
+      local m, errs = btv.fs.gitignore(text)
+      -- A line that does not compile is skipped, as rg and git skip it — and warned
+      -- about once a session per file and message, as rg warns, not dropped unseen.
+      for _, err in ipairs(errs) do
+        btv.notify_once("btv.fs.walk: " .. path .. ": " .. err, btv.log.levels.WARN)
+      end
+      layers[#layers + 1] = { kind = kind, m = m, base = place.base, prefix = place.prefix }
+    end
+  end
+  for _, e in ipairs(entries) do
+    if e.type == "file" and IGNORE_FILES[e.name] and (e.name ~= ".gitignore" or in_repo) then
+      add(e.name, btv.utils.path_join(abs, e.name))
+    elseif e.name == ".git" and exclude then
+      add("exclude", exclude_path(abs, e))
+    end
+  end
+  return layers
+end
+
+local function has_git(entries)
+  for _, e in ipairs(entries) do
+    if e.name == ".git" then
+      return true
+    end
+  end
+  return false
+end
+
+-- `layers` without the git kinds (`.gitignore`, `info/exclude`): what still applies
+-- inside a nested repository, whose root is where an enclosing repository's git rules
+-- stop (as in git, and rg).
+local function drop_git_layers(layers)
+  local kept = {}
+  for _, l in ipairs(layers) do
+    if l.kind ~= ".gitignore" and l.kind ~= "exclude" then
+      kept[#kept + 1] = l
+    end
+  end
+  return kept
+end
+
+-- Whether `posix` (a `/`-separated path relative to the walk root) is ignored by the
+-- `layers` in force (deepest first), by kind precedence then depth.
+local function ignored(layers, posix, is_dir)
+  for _, kind in ipairs(IGNORE_KINDS) do
+    for _, l in ipairs(layers) do
+      if l.kind == kind then
+        local path
+        if l.prefix then
+          path = l.prefix .. posix
+        elseif l.base == "" then
+          path = posix
+        else
+          path = posix:sub(#l.base + 2)
+        end
+        local r = l.m:match(path, is_dir)
+        if r then
+          return r == "ignore"
+        end
+      end
+    end
+  end
+  return false
+end
+
 -- `btv.fs.walk(dir[, opts])` -> promise of a LIST of file paths relative to `dir`, a
 -- recursive directory listing built from readdir. The transport-agnostic file
 -- enumeration the codebase reaches for when `rg`/`fd` aren't available (the pure web
@@ -81,36 +276,113 @@ end
 -- opts:
 --
 -- ```
--- max     cap on files returned (default 50000) — a runaway guard on huge trees
--- hidden  include dotfiles / dotdirs (default false)
--- skip    set of directory basenames to prune (default { [".git"] = true })
+-- max        cap on files returned (default 50000) — a runaway guard on huge trees
+-- hidden     include dotfiles / dotdirs (default false)
+-- skip       set of directory basenames to prune (default { [".git"] = true })
+-- gitignore  honour ignore files the way `rg` does (default false)
 -- ```
 --
--- An unreadable subdirectory is skipped (not fatal). MUST be awaited inside `btv.async`.
+-- With `gitignore = true` the walk reads each directory's `.gitignore`, `.ignore` and
+-- `.rgignore` as it descends (and those of the directories above `dir`), plus the
+-- repository's `info/exclude` at a repository root, and prunes what they
+-- ignore — negation, anchoring and precedence as in `rg`, through `btv.fs.gitignore`.
+-- As in `rg`, a `.gitignore` counts only inside a git repository (a directory with a
+-- `.git` at or above it) and not above that repository's root, while `.ignore` /
+-- `.rgignore` count anywhere. A nested repository (a submodule) starts afresh: the
+-- enclosing repository's git rules stop at its root. The global git excludes file
+-- (`core.excludesFile`) is not read. Directories with no ignore file cost nothing extra.
+--
+-- An unreadable subdirectory is skipped (not fatal); an ignore file that exists but
+-- cannot be read, or is not a regular file, is skipped with a warning naming it (once
+-- a session), as `rg` warns and walks on. MUST be awaited inside `btv.async`.
 function btv.fs.walk(dir, opts)
   opts = opts or {}
   local max = opts.max or 50000
   local hidden = opts.hidden or false
   local skip = opts.skip or { [".git"] = true }
+  local gitignore = opts.gitignore or false
   return btv.async(function()
     local out = {}
-    -- Relative subdirs still to visit; "" is `dir` itself.
-    local stack = { "" }
+    -- The layers above `dir` and whether `dir` already sits in a repository: walk up,
+    -- nearest first, until the filesystem root. A relative `dir` is resolved against
+    -- the working directory first, as the fs ops resolve it.
+    local root_layers, root_in_repo = {}, false
+    if gitignore then
+      local chain, prefix = {}, ""
+      local cur = trim_seps(btv.fname.modify(dir, ":p"))
+      local up = parent_dir(cur)
+      while up do
+        prefix = btv.utils.basename(cur) .. "/" .. prefix
+        local ok, entries = pcall(btv.await, btv.fs.readdir(up))
+        chain[#chain + 1] = { abs = up, entries = ok and entries or {}, prefix = prefix }
+        cur, up = up, parent_dir(up)
+      end
+      local repo_at = nil -- index of the nearest ancestor holding `.git`
+      for i, a in ipairs(chain) do
+        if has_git(a.entries) then
+          repo_at = i
+          break
+        end
+      end
+      root_in_repo = repo_at ~= nil
+      for i, a in ipairs(chain) do
+        for _, l in
+          ipairs(
+            dir_layers(
+              a.abs,
+              a.entries,
+              repo_at ~= nil and i <= repo_at,
+              { prefix = a.prefix },
+              i == repo_at
+            )
+          )
+        do
+          root_layers[#root_layers + 1] = l
+        end
+      end
+    end
+    -- Subdirs still to visit: their path relative to `dir` (session separator), the
+    -- same path `/`-separated for the matchers, the ignore layers in force there
+    -- (deepest first), and whether they are inside a repository. `""` is `dir` itself.
+    local stack = { { rel = "", posix = "", layers = root_layers, in_repo = root_in_repo } }
     while #stack > 0 and #out < max do
-      local rel = table.remove(stack)
+      local item = table.remove(stack)
+      local rel = item.rel
       local abs = rel == "" and dir or btv.utils.path_join(dir, rel)
       -- Skip a directory we can't read (permissions / vanished mid-walk) rather
       -- than aborting the whole enumeration.
       local ok, entries = pcall(btv.await, btv.fs.readdir(abs))
       if ok then
+        local layers, in_repo = item.layers, item.in_repo
+        if gitignore then
+          local repo_root = has_git(entries)
+          in_repo = in_repo or repo_root
+          if repo_root then
+            layers = drop_git_layers(layers)
+          end
+          local own = dir_layers(abs, entries, in_repo, { base = item.posix }, repo_root)
+          if #own > 0 then
+            for _, l in ipairs(layers) do
+              own[#own + 1] = l
+            end
+            layers = own
+          end
+        end
         for _, e in ipairs(entries) do
           if hidden or e.name:sub(1, 1) ~= "." then
             local child = rel == "" and e.name or btv.utils.path_join(rel, e.name)
-            if e.type == "directory" then
+            local posix = item.posix == "" and e.name or (item.posix .. "/" .. e.name)
+            local is_dir = e.type == "directory"
+            -- An ignored directory is pruned here, so it is never entered.
+            local pruned = gitignore
+              and (is_dir or e.type == "file")
+              and ignored(layers, posix, is_dir)
+            if not pruned and is_dir then
               if not skip[e.name] then
-                stack[#stack + 1] = child
+                stack[#stack + 1] =
+                  { rel = child, posix = posix, layers = layers, in_repo = in_repo }
               end
-            elseif e.type == "file" and #out < max then
+            elseif not pruned and e.type == "file" and #out < max then
               out[#out + 1] = child
             end
           end
@@ -128,7 +400,8 @@ end
 -- fs seam as every other `btv.fs` op, so it works against local disk, a daemon, and OPFS.
 -- Walks `dir` (`btv.fs.walk`), reads each file (`btv.fs.read_text`), and matches `query` as a
 -- LITERAL substring per line. Binary / unreadable files (read_text rejects) are skipped.
--- `opts` pass through to `btv.fs.walk` (max / hidden / skip). MUST be awaited inside `btv.async`.
+-- `opts` pass through to `btv.fs.walk` (max / hidden / skip / gitignore). MUST be awaited
+-- inside `btv.async`.
 function btv.fs.grep(dir, query, opts)
   return btv.async(function()
     local out = {}

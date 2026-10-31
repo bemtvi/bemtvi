@@ -3958,7 +3958,7 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
-    // `btv._picker_push(gen, labels, keys, paths, rows, cols, layouts, hls)`: queue a BATCH
+    // `btv._picker_push(gen, labels, keys, paths, rows, cols, layouts, hls, lows)`: queue a BATCH
     // of streamed picker candidates ([`PickerPush`]) — parallel arrays, stamped with
     // the run `gen`eration. Batching keeps a 100k-result stream to ~one bridge
     // crossing per source chunk instead of one per item. `paths` (and, for the
@@ -3967,13 +3967,15 @@ pub(crate) fn install_runtime_api(
     // target. `layouts` is present only for a source pushing two-column rows
     // (live_grep): a flat run of four ints per row — head length, match start, match
     // end and pinned-tag length, all char offsets into the label. `hls` is present only for a source painting
-    // its rows: one highlight-group name per row, `""` for an unpainted one. The server
+    // its rows: one highlight-group name per row, `""` for an unpainted one. `lows` is
+    // present only for a source that deprioritized some row: one boolean per row. The server
     // drops a batch whose `gen` is behind the live query and feeds the rest into the
     // open picker.
     let sh = shared.clone();
-    // `(gen, labels, keys, paths, rows, cols, layouts, hls)` — the parallel-array push
-    // batch; `paths`/`rows`/`cols` are `Some` only for a preview-carrying picker,
-    // `layouts` only for a two-column source and `hls` only for a painting one.
+    // `(gen, labels, keys, paths, rows, cols, layouts, hls, lows)` — the parallel-array
+    // push batch; `paths`/`rows`/`cols` are `Some` only for a preview-carrying picker,
+    // `layouts` only for a two-column source, `hls` only for a painting one and `lows`
+    // only for one that deprioritized a row.
     type PushArgs = (
         u64,
         Vec<String>,
@@ -3983,11 +3985,12 @@ pub(crate) fn install_runtime_api(
         Option<Vec<usize>>,
         Option<Vec<u32>>,
         Option<Vec<String>>,
+        Option<Vec<bool>>,
     );
     btv.set(
         "_picker_push",
         lua.create_function(
-            move |_, (gen, labels, keys, paths, rows, cols, layouts, hls): PushArgs| {
+            move |_, (gen, labels, keys, paths, rows, cols, layouts, hls, lows): PushArgs| {
                 let mut sh = sh.borrow_mut();
                 sh.picker_pushes.reserve(labels.len());
                 for (i, (label, key)) in labels.into_iter().zip(keys).enumerate() {
@@ -4027,6 +4030,7 @@ pub(crate) fn install_runtime_api(
                         .and_then(|hs| hs.get(i))
                         .filter(|h| !h.is_empty())
                         .cloned();
+                    let low = lows.as_ref().and_then(|ls| ls.get(i)).copied() == Some(true);
                     sh.picker_pushes.push(PickerPush {
                         gen,
                         label,
@@ -4034,6 +4038,7 @@ pub(crate) fn install_runtime_api(
                         preview,
                         layout,
                         hl,
+                        low,
                     });
                 }
                 Ok(())
@@ -4688,6 +4693,16 @@ pub(crate) fn install_runtime_api(
         lua.create_function(|_, (pattern, opts): (mlua::Value, Option<Table>)| {
             let pattern = crate::glob::pattern("btv.glob.compile", &pattern)?;
             crate::glob::LuaGlob::compile(&pattern, opts.as_ref())
+        })?,
+    )?;
+    // `btv._gitignore(text)` -> (matcher, errors): one ignore file compiled with
+    // ripgrep's semantics (`crate::gitignore`), plus the messages for any line it had
+    // to skip.
+    btv.set(
+        "_gitignore",
+        lua.create_function(|_, text: mlua::Value| {
+            let text = crate::glob::candidate("btv.fs.gitignore", "text", &text)?;
+            crate::gitignore::LuaGitignore::compile(&text.to_string_lossy())
         })?,
     )?;
     // `btv._glob_set(patterns, opts?)` -> a compiled `LuaGlobSet` userdata testing a

@@ -7,14 +7,29 @@ navigation, and a generation token that drops a stale response for a query you'v
 already typed past. No input loop runs in Lua — a source is just a thin driver
 that *streams candidates in* and *handles confirm*.
 
-It ships with a set of built-in sources — `files`, `live_grep`, `buffers`,
-`curbuf`, `diagnostics`, `keymaps`, `marks`, `jumplist`, `pickers` — and
-registering your own is a few lines.
+It ships with a set of built-in sources — `files`, `files_git`, `live_grep`,
+`live_grep_git`, `buffers`, `curbuf`, `diagnostics`, `keymaps`, `marks`,
+`jumplist`, `pickers` — and registering your own is a few lines.
 
-`files` and `live_grep` search **unrestricted** by default — the equivalent of
-`rg -uu` (`--no-ignore --hidden`), so a `.gitignore`d build artifact or a dotfile
-like `.github/workflows/ci.yml` is still findable. The one exclusion is `.git`
-itself. Narrowing a search is the [filter boxes](#include--exclude-filters)' job
+File finding and grepping come in pairs:
+
+- `files_git` / `live_grep_git` respect `.gitignore` (and `.ignore` / `.rgignore`)
+  — `rg --hidden`, so a dotfile like `.github/workflows/ci.yml` is still found and
+  only ignored paths drop out. Without `rg` they fall back to `git ls-files` /
+  `git grep` inside a work tree, to plain `find` / `grep` outside every repository
+  (no `.git` at or above the directory, so, as for rg, no `.gitignore` applies), and
+  otherwise (git missing or refusing the repository, or the pure web client) to a
+  `btv.fs` walk that reads the ignore files itself (`btv.fs.walk{ gitignore = true }`)
+  — so the ignore rules hold everywhere. The `git grep` leg needs git 2.19 or later
+  (`--column`); with an older git, `live_grep_git` says so instead of searching. A
+  basic `grep` (busybox, stock Alpine: no `--null`, `-I` or `--exclude-dir`) still
+  works, but a file name holding `:<digits>:` is cut short there. These are the everyday `<leader>ff` /
+  `<leader>fg`.
+- `files` / `live_grep` search **unrestricted** — the equivalent of `rg -uu`
+  (`--no-ignore --hidden`), so a `.gitignore`d build artifact is still findable. The
+  one exclusion is `.git` itself. These are `<leader>fF` / `<leader>fG`.
+
+Either way, narrowing a search is the [filter boxes](#include--exclude-filters)' job
 (`<C-g>`) — per-search, so hiding `target/` this time never makes a file
 unfindable the next.
 
@@ -24,8 +39,10 @@ The built-in sources are bound out of the box, plus a **resume** map:
 
 | Map | Source |
 | --- | --- |
-| `<leader>ff` | `files` — fuzzy file finder |
-| `<leader>fg` | `live_grep` — live grep |
+| `<leader>ff` | `files_git` — fuzzy file finder, `.gitignore` respected |
+| `<leader>fF` | `files` — fuzzy file finder over every file, ignored ones too |
+| `<leader>fg` | `live_grep_git` — live grep, `.gitignore` respected |
+| `<leader>fG` | `live_grep` — live grep over every file, ignored ones too |
 | `<leader>fb` | `buffers` — open buffers (scoped to the focused layer, like `:ls`) |
 | `<leader>f/` | `curbuf` — fuzzy find in the current buffer |
 | `<leader>fd` | `diagnostics` — diagnostics |
@@ -352,7 +369,8 @@ local one.
 
 ## Include / exclude filters
 
-`files` and `live_grep` carry two glob boxes, the way VSCode's search panel does —
+`files`, `files_git`, `live_grep` and `live_grep_git` carry two glob boxes, the way
+VSCode's search panel does —
 **files to include** and **files to exclude**. `<C-g>` reveals them and steps
 through the three editable lines (query → include → exclude); typing goes to
 whichever has focus.
@@ -415,6 +433,7 @@ Two conveniences make a typed pattern mean what you meant:
 | `*.lock` | any `.lock` file, at any depth |
 | `target` | the `target` entry **and** everything under it, at any depth |
 | `vendor/` | same — a trailing `/` just says "the directory" |
+| `*.egg-info/` | every `*.egg-info` directory and everything under it — the trailing `/` makes even a glob a directory |
 | `src/**` | taken as written; a pattern with a `/` is anchored at the search root |
 
 A picker can also open already scoped, which is what a dedicated map usually wants:
@@ -432,6 +451,76 @@ btv.picker.open("live_grep", { exclude = "vendor/, **/*.min.js", filters = "open
 Any source whose items carry a `path` can have the boxes by declaring
 `filter = true` — see [Writing a source](#writing-a-source). On a source without
 it, `<C-g>` says so rather than presenting boxes that would filter nothing.
+
+## Vendored paths last — deprioritize
+
+A search over a real project hits `node_modules/`, build output, lockfiles and source
+maps by the thousand, and the hits you wanted — the project's own sources — end up
+under them. So every filterable picker lists those paths **after** the rest. Nothing
+is hidden (that is the exclude box's job): a `yarn.lock` hit is still there, below
+`src/`. Each group keeps its own order — the order found with no query, match order
+under one — so a better-matching vendored file never jumps a project file.
+
+```
+┌─ Live Grep ──────────────────────────────────┐
+│ > useAuth                               412  │
+├──────────────────────────────────────────────┤
+│ src/composables/auth.ts:3:17: export func…   │  ← the project's own hits first
+│ src/pages/login.vue:12:9: const { user } …   │
+│ node_modules/@nuxt/auth/dist/index.mjs:88…   │  ← then the vendored ones
+│ .output/server/chunks/auth.mjs.map:1:4410…   │
+└──────────────────────────────────────────────┘
+```
+
+The shipped list is `btv.picker.defaults.deprioritize`: the JS/TS, Python and
+build-output trees (`node_modules/`, `.nuxt/`, `.output/`, `dist/`, `build/`,
+`target/`, `.venv/`, `__pycache__/`, `vendor/`, …), editor and toolchain directories,
+every common lockfile, and `*.min.js` / `*.min.css` / `*.map`. Test files are **not**
+on it — plenty of people grep their tests on purpose. `btv.picker.setup` replaces the
+list, in the same glob syntax as the exclude box; extend the shipped one rather than
+retyping it:
+
+```lua
+btv.picker.setup({
+  deprioritize = btv.list.extend(
+    btv.tbl.deepcopy(btv.picker.defaults.deprioritize),
+    { "*test*", "*_spec.lua" }
+  ),
+})
+
+btv.picker.setup({ deprioritize = {} })   -- turn it off: pure stream / match order
+```
+
+Ordering alone would not stop a `node_modules`-heavy tree from filling the result cap
+before the project's hits were even found, so the shipped `files` / `live_grep`
+pickers search in **two passes**: `rg` first with the deprioritized globs excluded —
+it never enters `node_modules/` — then a second run over just those paths. The
+`btv.fs` walk fallback (the web client) pushes its list the same way, normal paths
+first. Only the fallbacks on a machine without `rg` — `find` / `grep`, and
+`git ls-files` / `git grep` for the `_git` pickers inside a work tree — search in one
+pass; their rows are still ordered.
+
+A source can use the same machinery. A row pushed with `low = true` lists after the
+rest; a source with `filter = true` gets its paths tested against the deprioritize
+list automatically, and can search in the same two passes through `ctx.passes`:
+
+```lua
+items = btv.async(function(ctx)
+  for _, pass in ipairs(ctx.passes) do   -- normal paths first, then the low ones
+    ctx.begin_pass(pass)                 -- the sink keeps only this pass's tier
+    run_my_tool(pass.rg_globs)           -- the box globs plus this pass's own
+  end
+end),
+```
+
+A tool that honours `.gitignore` takes `pass.rg_excludes` instead of `rg_globs`: rg
+lets a positive `-g` override the ignore files, so the low pass's includes would
+re-include an ignored `node_modules/`. The negations alone are safe, and the sink
+applies the include box and the tier; `pass.keeps(path)` says whether a path belongs
+to the pass, for a source that lists first and searches only its own.
+
+`btv.picker.scorer` re-ranks within each group and never lifts a deprioritized row
+above the rest.
 
 ## Try it
 
@@ -455,6 +544,17 @@ BEMTVI_CONFIG=examples/picker-filters \
 It ships the mess a real project has — a `target/` artifact, a `vendor/` lock file,
 a dotfile — and walks through defaults, editing a box, what each pattern shape
 means, the `<C-Up>` history, pre-scoped pickers, and a custom filterable source.
+
+Deprioritizing and the `.gitignore` pickers have a third,
+[`examples/picker-priority`](https://github.com/bemtvi/bemtvi/tree/main/examples/picker-priority):
+
+```sh
+BEMTVI_CONFIG=examples/picker-priority \
+  cargo run -p bemtvi -- examples/picker-priority/sample.txt
+```
+
+It shows the default ordering, extending the list with test files, and `<leader>fg`
+versus `<leader>fG` on an ignored file.
 
 ## How it works (in brief)
 

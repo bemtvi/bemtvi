@@ -235,13 +235,14 @@ async fn built_in_sources_carry_titles() {
     let titles = exec_lua(
         &rpc,
         "local s = btv.picker._sources\n\
-         return (s.files.title or '?') .. '|' .. (s.live_grep.title or '?')\n\
+         return (s.files_git.title or '?') .. '|' .. (s.files.title or '?')\n\
+           .. '|' .. (s.live_grep_git.title or '?') .. '|' .. (s.live_grep.title or '?')\n\
            .. '|' .. (s.buffers.title or '?')",
     )
     .await;
     assert_eq!(
         titles.as_str(),
-        Some("Find Files|Live Grep|Buffers"),
+        Some("Find Files|Find All Files|Live Grep|Live Grep (All Files)|Buffers"),
         "the built-in pickers are titled"
     );
 }
@@ -5331,6 +5332,7 @@ async fn files_and_grep_fs_fallback_failures_are_reported() {
              btv.promise.try(src.items, {
                push = function() end, on_cancel = function() end,
                query = query, cwd = "/", rg_globs = {},
+               passes = { { tier = "all", rg_globs = {} } }, begin_pass = function() end,
              }):catch(function(e) btv.notify(name .. ": " .. tostring(e)) end)
            end
            run("files", "")
@@ -5352,5 +5354,1396 @@ async fn files_and_grep_fs_fallback_failures_are_reported() {
     assert!(
         notes.contains("walk exploded") && notes.contains("grep exploded"),
         "both fallback failures reach the source's rejection: {notes:?}"
+    );
+}
+
+// --- Deprioritized rows (`push { low = true }`): a two-tier view ---------------------
+
+/// Poll the open picker until it lists `want` rows, returning the last frame's rows.
+async fn poll_rows(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: usize,
+) -> Vec<String> {
+    let mut items = Vec::new();
+    for _ in 0..100 {
+        if let Some(map) = poll_menu(rpc, incoming).await {
+            items = menu_items(&menu_of(&map));
+            if items.len() == want {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    items
+}
+
+/// A source streaming `batches` (each a list of `{text, low}`) one tick apart, so each
+/// batch crosses to the server on its own and lands in a separate `menu_push`.
+fn batched_source(batches: &str) -> String {
+    format!(
+        r#"
+local function later() return btv.promise.new(function(res) btv.timer(res, 5) end) end
+btv.picker.source {{
+  name = "tiers",
+  items = btv.async(function(ctx)
+    for _, batch in ipairs({batches}) do
+      for _, row in ipairs(batch) do ctx.push {{ text = row[1], low = row[2] }} end
+      btv.await(later())
+    end
+  end),
+  confirm = function(item) _G.picked = item.text end,
+}}
+"#
+    )
+}
+
+#[tokio::test]
+async fn low_rows_list_after_every_normal_row_in_stream_order() {
+    // Passthrough (no query): low and normal rows interleave across three batches;
+    // the view puts every normal row first, and keeps each tier in stream order.
+    let dir = temp_dir("picker_low_passthrough");
+    let src = batched_source(
+        r#"{
+      { { "vendor/a", true }, { "src/one", false } },
+      { { "vendor/b", true }, { "src/two", false } },
+      { { "src/three", false }, { "vendor/c", true } },
+    }"#,
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+    exec_lua(&rpc, "btv.picker.open('tiers')").await;
+    assert_eq!(
+        poll_rows(&rpc, &mut incoming, 6).await,
+        vec![
+            "src/one",
+            "src/two",
+            "src/three",
+            "vendor/a",
+            "vendor/b",
+            "vendor/c"
+        ]
+    );
+    // The bare count readout: every candidate is shown, low ones included. All six rows
+    // can land a frame before the run's finish does (a spinner still turning), so wait
+    // for the settled readout rather than reading the next frame.
+    let mut status = String::new();
+    for _ in 0..200 {
+        if let Some(map) = poll_menu(&rpc, &mut incoming).await {
+            status = menu_status(&menu_of(&map));
+            if status == "6" {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        status, "6",
+        "no matched/total split for an unfiltered tiered list"
+    );
+}
+
+#[tokio::test]
+async fn a_better_matching_low_row_still_lists_after_every_normal_match() {
+    // `lib` is the best possible match for the query `lib`, `l_i_b` a poor one —
+    // the tier wins over the score. A second batch streams under the live query and
+    // keeps the partition; re-typing the query (a full re-rank) keeps it too.
+    let dir = temp_dir("picker_low_filtered");
+    let src = r#"
+local function later() return btv.promise.new(function(res) btv.timer(res, 5) end) end
+btv.picker.source {
+  name = "tiers",
+  items = btv.async(function(ctx)
+    ctx.push { text = "lib", low = true }
+    ctx.push { text = "l_i_b" }
+    btv.await(btv.wait_for(function() return _G.go end, { tries = 200, interval = 5 }))
+    ctx.push { text = "libb", low = true }
+    ctx.push { text = "l-i-b" }
+    btv.await(later())
+  end),
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    exec_lua(&rpc, "btv.picker.open('tiers')").await;
+    poll_rows(&rpc, &mut incoming, 2).await;
+    feed(&rpc, "lib");
+    assert_eq!(
+        poll_rows(&rpc, &mut incoming, 2).await,
+        vec!["l_i_b", "lib"]
+    );
+
+    exec_lua(&rpc, "_G.go = true").await;
+    assert_eq!(
+        poll_rows(&rpc, &mut incoming, 4).await,
+        vec!["l_i_b", "l-i-b", "lib", "libb"],
+        "streamed matches join their own tier"
+    );
+
+    feed(&rpc, "<BS>b");
+    let rows = poll_rows(&rpc, &mut incoming, 4).await;
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    assert!(
+        rows[..2].iter().all(|r| r.contains('_') || r.contains('-')),
+        "a re-rank keeps every normal row above the low ones: {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_cursor_stays_on_its_low_row_when_a_normal_row_lands_above_it() {
+    // The caret stands on the third low row; a normal row then arrives and is listed
+    // above the whole low tier. Confirm must take the row the caret was showing, not
+    // whatever slid into its view slot.
+    let dir = temp_dir("picker_low_cursor");
+    let src = r#"
+btv.picker.source {
+  name = "tiers",
+  items = btv.async(function(ctx)
+    for _, t in ipairs({ "low1", "low2", "low3" }) do ctx.push { text = t, low = true } end
+    btv.await(btv.wait_for(function() return _G.go end, { tries = 200, interval = 5 }))
+    ctx.push { text = "normal" }
+  end),
+  confirm = function(item) _G.picked = item.text end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    exec_lua(&rpc, "btv.picker.open('tiers')").await;
+    assert_eq!(
+        poll_rows(&rpc, &mut incoming, 3).await,
+        vec!["low1", "low2", "low3"]
+    );
+    feed(&rpc, "<C-n><C-n>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu"));
+    assert_eq!(menu_selected(&menu), Some(2));
+
+    exec_lua(&rpc, "_G.go = true").await;
+    assert_eq!(
+        poll_rows(&rpc, &mut incoming, 4).await,
+        vec!["normal", "low1", "low2", "low3"]
+    );
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu"));
+    assert_eq!(
+        menu_selected(&menu),
+        Some(3),
+        "the caret moved down with its row"
+    );
+    feed(&rpc, "<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return _G.picked").await.as_str(),
+        Some("low3")
+    );
+}
+
+#[tokio::test]
+async fn a_100k_flood_of_mixed_tiers_stays_fast_and_partitioned() {
+    // Every third row is low. The stream splits passthrough once and appends O(1) per
+    // row after that; a query over the lot re-ranks and partitions in one pass.
+    let dir = temp_dir("picker_low_100k");
+    let src = r#"
+btv.picker.source {
+  name = "huge",
+  items = function(ctx)
+    for i = 1, 100000 do ctx.push { text = "item-" .. i, n = i, low = i % 3 == 0 } end
+  end,
+  confirm = function(item) _G.picked = item.n end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    let opened = std::time::Instant::now();
+    exec_lua(&rpc, "btv.picker.open('huge')").await;
+    let mut total = 0u64;
+    for _ in 0..200 {
+        total = exec_lua(&rpc, "return btv._picker and btv._picker.nitems or 0")
+            .await
+            .as_u64()
+            .unwrap_or(0);
+        if total >= 100000 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(total, 100000);
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu"));
+    assert!(
+        map_get(&menu, "status")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.ends_with("100000") && !s.contains('/')),
+        "the whole list is in the view"
+    );
+    assert_eq!(&menu_items(&menu)[..3], ["item-1", "item-2", "item-4"]);
+
+    // `item-9999` is low (9999 = 3 × 3333) and the query's exact match, yet the top
+    // of the list is all normal rows — the dozens of `item-9999?` / `item-?9999` ones.
+    feed(&rpc, "item-9999");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("filtered"));
+    let rows = menu_items(&menu);
+    let is_low = |r: &String| r["item-".len()..].parse::<u32>().unwrap() % 3 == 0;
+    assert!(!rows.is_empty() && !rows.iter().any(is_low), "{rows:?}");
+    assert!(
+        opened.elapsed() < std::time::Duration::from_secs(10),
+        "100k mixed-tier stream + query stayed responsive ({:?})",
+        opened.elapsed()
+    );
+    feed(&rpc, "9");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("filtered"));
+    assert_eq!(
+        menu_items(&menu),
+        vec!["item-99999"],
+        "a low row still matches"
+    );
+    feed(&rpc, "<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return _G.picked").await.as_u64(),
+        Some(99999)
+    );
+}
+
+// --- Deprioritized paths (`btv.picker.setup{ deprioritize }`) and two-pass search --
+
+/// A filterable source pushing a fixed list of paths in this order, so the expected
+/// order is exact whatever binary the machine has.
+const PATHS_SRC: &str = r#"
+btv.picker.source {
+  name = "paths",
+  filter = true,
+  items = function(ctx)
+    for _, p in ipairs({
+      "node_modules/a.js", "yarn.lock", "src/main.rs", "dist/x.js", "build.rs",
+      "src/distance.rs", "pkg.egg-info/PKG-INFO", "src/lockfile.rs", "app.min.js",
+    }) do ctx.push { text = p, path = p } end
+  end,
+}
+"#;
+
+#[tokio::test]
+async fn the_default_list_pushes_vendored_paths_below_the_rest_but_not_look_alikes() {
+    let dir = temp_dir("picker_deprio_default");
+    let (rpc, mut incoming) = start(&dir, PATHS_SRC).await;
+    exec_lua(&rpc, "btv.picker.open('paths')").await;
+    assert_eq!(
+        poll_rows(&rpc, &mut incoming, 9).await,
+        vec![
+            // look-alikes of `dist/`, `build/` and the lockfiles stay normal
+            "src/main.rs",
+            "build.rs",
+            "src/distance.rs",
+            "src/lockfile.rs",
+            // in stream order below them
+            "node_modules/a.js",
+            "yarn.lock",
+            "dist/x.js",
+            "pkg.egg-info/PKG-INFO",
+            "app.min.js",
+        ]
+    );
+    // Under a query too: `s` matches all nine, the normal four lead.
+    feed(&rpc, "s");
+    let rows = poll_rows(&rpc, &mut incoming, 9).await;
+    let mut head = rows[..4].to_vec();
+    head.sort();
+    assert_eq!(
+        head,
+        vec![
+            "build.rs",
+            "src/distance.rs",
+            "src/lockfile.rs",
+            "src/main.rs"
+        ],
+        "{rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn setup_deprioritize_replaces_the_list_on_the_next_open() {
+    let dir = temp_dir("picker_deprio_setup");
+    let (rpc, mut incoming) = start(&dir, PATHS_SRC).await;
+    exec_lua(&rpc, "btv.picker.setup({ deprioritize = {} })").await;
+    exec_lua(&rpc, "btv.picker.open('paths')").await;
+    assert_eq!(
+        poll_rows(&rpc, &mut incoming, 9).await[..3],
+        ["node_modules/a.js", "yarn.lock", "src/main.rs"],
+        "an empty list is pure stream order"
+    );
+    feed(&rpc, "<Esc>");
+    exec_lua(&rpc, "btv.picker.setup({ deprioritize = { 'src/' } })").await;
+    exec_lua(&rpc, "btv.picker.open('paths')").await;
+    let rows = poll_rows(&rpc, &mut incoming, 9).await;
+    assert_eq!(
+        rows[6..],
+        ["src/main.rs", "src/distance.rs", "src/lockfile.rs"],
+        "the replaced list, not the default, decides: {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_source_is_handed_the_two_passes_and_the_sink_keeps_each_ones_tier() {
+    let dir = temp_dir("picker_deprio_passes");
+    let src = r#"
+btv.picker.setup({ deprioritize = { "node_modules/" } })
+btv.picker.source {
+  name = "passes",
+  filter = true,
+  items = function(ctx)
+    _G.passes = ctx.passes
+    -- Each pass pushes BOTH tiers: the sink must keep only the pass's own.
+    ctx.begin_pass(ctx.passes[1])
+    ctx.push { text = "node_modules/early.js", path = "node_modules/early.js" }
+    ctx.push { text = "src/a.rs", path = "src/a.rs" }
+    ctx.begin_pass(ctx.passes[2])
+    ctx.push { text = "src/again.rs", path = "src/again.rs" }
+    ctx.push { text = "node_modules/late.js", path = "node_modules/late.js" }
+  end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    exec_lua(&rpc, "btv.picker.open('passes')").await;
+    assert_eq!(
+        poll_rows(&rpc, &mut incoming, 2).await,
+        vec!["src/a.rs", "node_modules/late.js"]
+    );
+    let passes = exec_lua(
+        &rpc,
+        "return btv.json.encode(btv.tbl.map(function(p) \
+           return p.tier .. ' ' .. table.concat(p.rg_globs, ' ') end, _G.passes))",
+    )
+    .await;
+    assert_eq!(
+        passes.as_str(),
+        Some(
+            r#"["normal -g !**/node_modules -g !**/node_modules/**","low -g **/node_modules -g **/node_modules/**"]"#
+        )
+    );
+
+    // With an include box in force the low pass searches the box's includes alone
+    // (rg ORs positive globs; the union would search more than either).
+    feed(&rpc, "<Esc>");
+    exec_lua(
+        &rpc,
+        "btv.picker.open('passes', { include = 'src/', exclude = '*.md' })",
+    )
+    .await;
+    poll_rows(&rpc, &mut incoming, 1).await;
+    let passes = exec_lua(
+        &rpc,
+        "return btv.json.encode(btv.tbl.map(function(p) \
+           return p.tier .. ' ' .. table.concat(p.rg_globs, ' ') end, _G.passes))",
+    )
+    .await;
+    assert_eq!(
+        passes.as_str(),
+        Some(concat!(
+            r#"["normal -g **/src -g **/src/** -g !**/*.md -g !**/node_modules -g !**/node_modules/**","#,
+            r#""low -g **/src -g **/src/** -g !**/*.md"]"#
+        ))
+    );
+}
+
+/// A small project with a vendored tree and a lockfile beside real sources, every file
+/// holding `zqxneedle`.
+fn deprio_tree(name: &str) -> std::path::PathBuf {
+    let proj = temp_dir(name);
+    std::fs::create_dir(proj.join(".git")).expect("mkdir .git");
+    std::fs::create_dir_all(proj.join("node_modules/pkg")).expect("mkdir node_modules");
+    std::fs::create_dir(proj.join("src")).expect("mkdir src");
+    for f in [
+        "node_modules/pkg/index.js",
+        "yarn.lock",
+        "src/main.rs",
+        "build.rs",
+    ] {
+        std::fs::write(proj.join(f), "zqxneedle\n").expect("write file");
+    }
+    proj
+}
+
+#[tokio::test]
+async fn shipped_files_and_live_grep_list_vendored_paths_last() {
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_deprio_shipped_cfg");
+    let proj = deprio_tree("picker_deprio_shipped");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+
+    let low = |r: &str| r.starts_with("node_modules") || r.starts_with("yarn.lock");
+    exec_lua(&rpc, "btv.picker.open('files')").await;
+    let rows = poll_rows(&rpc, &mut incoming, 4).await;
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    assert!(
+        !rows[..2].iter().any(|r| low(r)) && rows[2..].iter().all(|r| low(r)),
+        "{rows:?}"
+    );
+    feed(&rpc, "<Esc>");
+
+    exec_lua(&rpc, "btv.picker.open('live_grep')").await;
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("live_grep opens");
+    feed(&rpc, "zqxneedle");
+    let rows = poll_rows(&rpc, &mut incoming, 4).await;
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    assert!(
+        !rows[..2].iter().any(|r| low(r)) && rows[2..].iter().all(|r| low(r)),
+        "{rows:?}"
+    );
+}
+
+/// The point of the two passes: a tree whose deprioritized hits alone exceed the cap
+/// still lists the project's own hit, because rg searched it first. Needs `rg` (the
+/// `grep` leg is one pass by design).
+#[tokio::test]
+async fn a_capped_live_grep_still_finds_the_normal_hit_under_a_flood_of_low_ones() {
+    if std::process::Command::new("rg")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skip: rg not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_deprio_cap_cfg");
+    // The low hits sit where a one-pass walk meets them first — 500 minified files at
+    // the root — and the real hits are buried four directories down.
+    let proj = temp_dir("picker_deprio_cap");
+    std::fs::create_dir(proj.join(".git")).expect("mkdir .git");
+    let deep = proj.join("src/a/b/c");
+    std::fs::create_dir_all(&deep).expect("mkdir src/a/b/c");
+    for f in ["main.rs", "lib.rs"] {
+        std::fs::write(deep.join(f), "zqxneedle\n").expect("write file");
+    }
+    for i in 0..500 {
+        std::fs::write(proj.join(format!("f{i}.min.js")), "zqxneedle\n").expect("write file");
+    }
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    exec_lua(&rpc, "btv.picker._sources.live_grep.max_results = 5").await;
+    exec_lua(&rpc, "btv.picker.open('live_grep')").await;
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("live_grep opens");
+    feed(&rpc, "zqxneedle");
+    let rows = poll_rows(&rpc, &mut incoming, 5).await;
+    assert_eq!(rows.len(), 5, "{rows:?}");
+    let mut head = rows[..2].to_vec();
+    head.sort();
+    assert_eq!(
+        head,
+        [
+            "src/a/b/c/lib.rs:1:1: zqxneedle",
+            "src/a/b/c/main.rs:1:1: zqxneedle"
+        ],
+        "{rows:?}"
+    );
+}
+
+// --- `.gitignore`-respecting `files_git` / `live_grep_git` -------------------------
+
+/// Whether `git` can run here; the `_git` fixtures need a real work tree.
+fn have_git() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+/// A git work tree with an ignored directory, a hidden file that is NOT ignored, and a
+/// plain one — every file holding `zqxneedle`.
+fn gitignore_tree(name: &str) -> std::path::PathBuf {
+    let proj = temp_dir(name);
+    let ok = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&proj)
+        .status()
+        .expect("git init")
+        .success();
+    assert!(ok, "git init");
+    std::fs::write(proj.join(".gitignore"), "ignored_dir/\n").expect("write .gitignore");
+    std::fs::create_dir(proj.join("ignored_dir")).expect("mkdir ignored_dir");
+    for f in ["ignored_dir/x.txt", ".hidden.txt", "visible.txt"] {
+        std::fs::write(proj.join(f), "zqxneedle\n").expect("write file");
+    }
+    proj
+}
+
+/// Every row of `source` once it settles — `files` style rows are paths, `live_grep`
+/// rows are `path:…` heads (reduced to the path here).
+async fn settled_paths(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    source: &str,
+    query: &str,
+    want: usize,
+) -> Vec<String> {
+    exec_lua(rpc, &format!("btv.picker.open('{source}')")).await;
+    poll_menu(rpc, incoming).await.expect("picker opens");
+    if !query.is_empty() {
+        feed(rpc, query);
+    }
+    let rows = poll_rows(rpc, incoming, want).await;
+    feed(rpc, "<Esc>");
+    let mut paths: Vec<String> = rows
+        .iter()
+        .map(|r| r.split(':').next().unwrap_or(r).to_string())
+        .collect();
+    paths.sort();
+    paths
+}
+
+#[tokio::test]
+async fn the_git_pickers_honour_gitignore_and_the_others_do_not() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_cfg");
+    let proj = gitignore_tree("picker_git_tree");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "files_git", "", 3).await,
+        [".gitignore", ".hidden.txt", "visible.txt"],
+        "files_git drops the ignored dir and keeps the dotfile"
+    );
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "files", "", 4).await,
+        [
+            ".gitignore",
+            ".hidden.txt",
+            "ignored_dir/x.txt",
+            "visible.txt"
+        ]
+    );
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep_git", "zqxneedle", 2).await,
+        [".hidden.txt", "visible.txt"]
+    );
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep", "zqxneedle", 3).await,
+        [".hidden.txt", "ignored_dir/x.txt", "visible.txt"]
+    );
+}
+
+/// A `PATH` holding every executable the real one does except `masked`, so a source's
+/// spawn of one fails (`-1`) and its fallback leg runs. Process-wide: hold
+/// `serial_lock` while it is installed. Restores the old `PATH` on drop.
+#[cfg(unix)]
+struct PathWithout {
+    old: std::ffi::OsString,
+}
+
+#[cfg(unix)]
+impl PathWithout {
+    fn install(name: &str, masked: &[&str]) -> Self {
+        let old = std::env::var_os("PATH").unwrap_or_default();
+        let farm = temp_dir(name);
+        for d in std::env::split_paths(&old) {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let file = e.file_name();
+                let link = farm.join(&file);
+                let hidden = masked.iter().any(|m| file == *m);
+                if !hidden && !link.exists() {
+                    let _ = std::os::unix::fs::symlink(e.path(), link);
+                }
+            }
+        }
+        std::env::set_var("PATH", &farm);
+        PathWithout { old }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PathWithout {
+    fn drop(&mut self) {
+        std::env::set_var("PATH", &self.old);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_the_git_pickers_fall_back_to_git_and_still_honour_gitignore() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_norg_cfg");
+    let proj = gitignore_tree("picker_git_norg_tree");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_git_norg_path", &["rg"]);
+    // The mask really took: rg can no longer run.
+    exec_lua(
+        &rpc,
+        "btv.run({ cmd = 'rg', args = { '--version' } }):next(function(r) _G.rg = r.code end)",
+    )
+    .await;
+    let mut rg = Value::Nil;
+    for _ in 0..100 {
+        rg = exec_lua(&rpc, "return _G.rg").await;
+        if !rg.is_nil() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(rg.as_i64(), Some(-1), "rg is masked off PATH");
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "files_git", "", 3).await,
+        [".gitignore", ".hidden.txt", "visible.txt"],
+        "git ls-files lists the same set rg did"
+    );
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep_git", "zqxneedle", 2).await,
+        [".hidden.txt", "visible.txt"],
+        "git grep searches the same set rg did"
+    );
+}
+
+#[tokio::test]
+async fn the_everyday_keys_respect_gitignore_and_the_shifted_ones_search_everything() {
+    let dir = temp_dir("picker_git_keys");
+    let (rpc, _incoming) = start(&dir, "vim.g.mapleader = ','").await;
+    // Record what each default map opens instead of spawning a search.
+    exec_lua(
+        &rpc,
+        "_G.opened = {}; btv.picker.open = function(n) table.insert(_G.opened, n) end",
+    )
+    .await;
+    feed(&rpc, ",ff,fF,fg,fG");
+    let opened = exec_lua(&rpc, "return table.concat(_G.opened, ' ')").await;
+    assert_eq!(
+        opened.as_str(),
+        Some("files_git files live_grep_git live_grep")
+    );
+}
+
+/// The last leg — neither `rg` nor `git` can run, as in the pure web client: the `_git`
+/// pickers walk the tree over `btv.fs` with the walk honouring the ignore files, so
+/// they still list the same set.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_or_git_the_git_pickers_walk_and_still_honour_gitignore() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_walk_cfg");
+    let proj = gitignore_tree("picker_git_walk_tree");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_git_walk_path", &["rg", "git"]);
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "files_git", "", 3).await,
+        [".gitignore", ".hidden.txt", "visible.txt"],
+        "the walk lists the same set rg did"
+    );
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep_git", "zqxneedle", 2).await,
+        [".hidden.txt", "visible.txt"],
+        "btv.fs.grep searches the same set rg did"
+    );
+}
+
+/// Record each `btv.picker.open` instead of running it — the keymap tests ask WHICH
+/// picker a key opens, not what the search finds.
+const RECORD_OPENS: &str =
+    "_G.opened = {}; btv.picker.open = function(n) table.insert(_G.opened, n) end";
+
+#[tokio::test]
+async fn helix_space_f_and_space_slash_open_the_gitignore_pickers() {
+    let dir = temp_dir("picker_git_helix");
+    let (rpc, _incoming) = start(&dir, "").await;
+    command(&rpc, "helix").await;
+    exec_lua(&rpc, RECORD_OPENS).await;
+    feed(&rpc, "<Space>f");
+    feed(&rpc, "<Space>/");
+    let opened = exec_lua(&rpc, "return table.concat(_G.opened, ' ')").await;
+    assert_eq!(opened.as_str(), Some("files_git live_grep_git"));
+}
+
+#[tokio::test]
+async fn modeless_ctrl_p_opens_the_gitignore_file_picker() {
+    let dir = temp_dir("picker_git_modeless");
+    let (rpc, _incoming) = start(&dir, "").await;
+    command(&rpc, "set modeless").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.o.modeless").await.as_bool(),
+        Some(true),
+        "modeless took"
+    );
+    exec_lua(&rpc, RECORD_OPENS).await;
+    feed(&rpc, "<C-p>");
+    let opened = exec_lua(&rpc, "return table.concat(_G.opened, ' ')").await;
+    assert_eq!(opened.as_str(), Some("files_git"));
+}
+
+#[tokio::test]
+async fn yalc_packages_are_deprioritized_by_default() {
+    // `.yalc/` holds locally-published packages (yalc's store copy), as vendored as
+    // `node_modules/`.
+    let dir = temp_dir("picker_deprio_yalc");
+    let src = r#"
+btv.picker.source {
+  name = "paths",
+  filter = true,
+  items = function(ctx)
+    for _, p in ipairs({ ".yalc/my-lib/index.js", "src/app.ts" }) do
+      ctx.push { text = p, path = p }
+    end
+  end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    exec_lua(&rpc, "btv.picker.open('paths')").await;
+    assert_eq!(
+        poll_rows(&rpc, &mut incoming, 2).await,
+        vec!["src/app.ts", ".yalc/my-lib/index.js"]
+    );
+}
+
+/// A `.gitignore`d path that is ALSO on the deprioritize list (`node_modules/`, the common
+/// case) stays out of the `_git` pickers. The low pass must not hand rg the deprioritize
+/// globs as `-g` includes: rg lets an include glob override `.gitignore`, which
+/// re-included the very tree the user ignored.
+#[tokio::test]
+async fn the_git_pickers_keep_an_ignored_deprioritized_tree_out() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_ignored_low_cfg");
+    let proj = temp_dir("picker_git_ignored_low");
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&proj)
+        .status()
+        .expect("git init")
+        .success());
+    std::fs::write(proj.join(".gitignore"), "node_modules/\nsrc/gen/\n").unwrap();
+    std::fs::create_dir_all(proj.join("node_modules/pkg")).unwrap();
+    std::fs::create_dir_all(proj.join("src/gen")).unwrap();
+    // A low path that is NOT ignored, so the low pass still has something to find.
+    for f in [
+        "node_modules/pkg/x.js",
+        "src/a.js",
+        "src/gen/g.js",
+        "yarn.lock",
+    ] {
+        std::fs::write(proj.join(f), "zqxneedle\n").unwrap();
+    }
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "files_git", "", 3).await,
+        [".gitignore", "src/a.js", "yarn.lock"]
+    );
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep_git", "zqxneedle", 2).await,
+        ["src/a.js", "yarn.lock"]
+    );
+
+    // The include box is the same trap: `src/**` handed to rg as `-g` would bring the
+    // ignored `src/gen/` back.
+    exec_lua(&rpc, "btv.picker.open('files_git', { include = 'src/**' })").await;
+    let rows = poll_rows(&rpc, &mut incoming, 1).await;
+    feed(&rpc, "<Esc>");
+    assert_eq!(
+        rows,
+        ["src/a.js"],
+        "the include box narrows, it never re-includes"
+    );
+}
+
+/// The `git grep` fallback lists a non-ASCII path as the file's real name. git quotes
+/// such a path (`"caf\303\251.txt"`) unless `core.quotePath` is off, which made a row
+/// whose path names no file: confirm and the preview opened nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_the_git_grep_leg_lists_a_non_ascii_path_unquoted() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_quote_cfg");
+    let proj = temp_dir("picker_git_quote");
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&proj)
+        .status()
+        .expect("git init")
+        .success());
+    std::fs::write(proj.join("café.txt"), "zqxneedle\n").unwrap();
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_git_quote_path", &["rg"]);
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep_git", "zqxneedle", 1).await,
+        ["café.txt"]
+    );
+}
+
+/// git refusing a repository it can read (another user's checkout: "dubious
+/// ownership", exit 128 — the same code as "not a repository") must not drop the `_git`
+/// pickers to plain `find` / `grep`, which list the ignored files. Without rg they
+/// walk instead, the walk reading the ignore files as rg does. git's own test hook
+/// stands in for the other owner.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_a_repo_git_refuses_still_honours_gitignore() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_dubious_cfg");
+    let proj = gitignore_tree("picker_git_dubious_tree");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_git_dubious_path", &["rg"]);
+    struct Unset;
+    impl Drop for Unset {
+        fn drop(&mut self) {
+            std::env::remove_var("GIT_TEST_ASSUME_DIFFERENT_OWNER");
+        }
+    }
+    std::env::set_var("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1");
+    let _unset = Unset;
+    let refused = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(&proj)
+        .output()
+        .expect("git rev-parse");
+    assert_eq!(refused.status.code(), Some(128), "git refuses the repo");
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "files_git", "", 3).await,
+        [".gitignore", ".hidden.txt", "visible.txt"]
+    );
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep_git", "zqxneedle", 2).await,
+        [".hidden.txt", "visible.txt"]
+    );
+}
+
+/// A repository's own config is not trusted to run code: `git ls-files` runs the
+/// `core.fsmonitor` command a checkout's `.git/config` names, so a project unpacked
+/// from an archive could run anything the moment `<leader>ff` fell back to git. The
+/// git legs switch the hook off.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_the_git_legs_never_run_the_repos_fsmonitor_hook() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_fsmon_cfg");
+    let proj = gitignore_tree("picker_git_fsmon_tree");
+    let marker = temp_dir("picker_git_fsmon_marker").join("ran");
+    let hook = dir.join("hook.sh");
+    std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["config", "core.fsmonitor"])
+        .arg(&hook)
+        .current_dir(&proj)
+        .status()
+        .expect("git config")
+        .success());
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_git_fsmon_path", &["rg"]);
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "files_git", "", 3).await,
+        [".gitignore", ".hidden.txt", "visible.txt"]
+    );
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep_git", "zqxneedle", 2).await,
+        [".hidden.txt", "visible.txt"]
+    );
+    assert!(!marker.exists(), "the repo's fsmonitor hook ran");
+}
+
+/// Whether `pid` is a live (non-zombie) process.
+#[cfg(target_os = "linux")]
+fn pid_alive(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| s.rsplit(')').next().map(|r| r.trim_start().to_string()))
+        .is_some_and(|r| !r.starts_with('Z'))
+}
+
+/// `live_grep_git`'s low pass lists the tree (`rg --files`) before searching it. That
+/// listing must be reaped like every other leg when the query moves on or the picker
+/// closes — otherwise a fast typist stacks one full-tree listing per keystroke, each
+/// running to completion in the background.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn live_grep_gits_low_pass_listing_is_killed_when_the_picker_closes() {
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_grep_git_list_reap_cfg");
+    let proj = temp_dir("picker_grep_git_list_reap");
+    std::fs::write(proj.join("a.txt"), "zqxneedle\n").unwrap();
+    let pidfile = proj.join("listing.pid");
+    // The normal pass's search finishes at once; the low pass's `rg --files` stalls,
+    // writing its pid first. Both spawn primitives are wrapped, whichever one a leg uses.
+    let init = format!(
+        r#"
+local pidfile = {pidfile:?}
+local function swap(spec)
+  if spec.cmd ~= "rg" then return spec end
+  for _, a in ipairs(spec.args or {{}}) do
+    if a == "--files" then
+      return {{ cmd = "sh", args = {{ "-c", "echo $$ > '" .. pidfile .. "'; exec sleep 30" }}, cwd = spec.cwd }}
+    end
+  end
+  return {{ cmd = "sh", args = {{ "-c", "exit 1" }}, cwd = spec.cwd }}
+end
+local run, run_stream = btv.run, btv.run_stream
+btv.run = function(spec) return run(swap(spec)) end
+btv.run_stream = function(spec) return run_stream(swap(spec)) end
+"#
+    );
+    let (rpc, mut incoming) = start(&dir, &init).await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    exec_lua(&rpc, "btv.picker.open('live_grep_git')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("opens");
+    feed(&rpc, "zqxneedle");
+    let mut pid = None;
+    for _ in 0..300 {
+        if let Some(p) = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            pid = Some(p);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let pid = pid.expect("the low pass's listing started");
+    assert!(pid_alive(pid));
+    feed(&rpc, "<Esc>");
+    let mut alive = true;
+    for _ in 0..100 {
+        alive = pid_alive(pid);
+        if !alive {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    if alive {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+    }
+    assert!(
+        !alive,
+        "closing the picker must kill the low pass's in-flight listing"
+    );
+}
+
+/// Run `git args…` in `dir` with a throwaway identity, asserting it succeeds unless
+/// `may_fail` (a merge expected to conflict).
+#[cfg(unix)]
+fn git_in(dir: &std::path::Path, args: &[&str], may_fail: bool) {
+    let ok = std::process::Command::new("git")
+        .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git")
+        .status
+        .success();
+    assert!(ok || may_fail, "git {args:?}");
+}
+
+/// Without rg, `files_git` lists what `git ls-files` knows the way rg would list the
+/// tree: a conflicted file once (not once per merge stage), a tracked file deleted
+/// from disk not at all, and a name git would C-quote (`"`, `\`) as the file it is.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_files_git_lists_each_file_once_as_named_and_not_deleted_ones() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_lsfiles_cfg");
+    let proj = temp_dir("picker_git_lsfiles");
+    git_in(&proj, &["init", "-q"], false);
+    std::fs::write(proj.join("f.txt"), "base\n").unwrap();
+    std::fs::write(proj.join("gone.txt"), "x\n").unwrap();
+    git_in(&proj, &["add", "."], false);
+    git_in(&proj, &["commit", "-qm", "base"], false);
+    git_in(&proj, &["checkout", "-qb", "a"], false);
+    std::fs::write(proj.join("f.txt"), "a\n").unwrap();
+    git_in(&proj, &["commit", "-qam", "a"], false);
+    git_in(&proj, &["checkout", "-qb", "b", "HEAD~1"], false);
+    std::fs::write(proj.join("f.txt"), "b\n").unwrap();
+    git_in(&proj, &["commit", "-qam", "b"], false);
+    git_in(&proj, &["merge", "-q", "a"], true);
+    std::fs::remove_file(proj.join("gone.txt")).unwrap();
+    std::fs::write(proj.join("q\"x.txt"), "x\n").unwrap();
+    std::fs::write(proj.join("back\\slash.txt"), "x\n").unwrap();
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_git_lsfiles_path", &["rg"]);
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "files_git", "", 3).await,
+        ["back\\slash.txt", "f.txt", "q\"x.txt"]
+    );
+}
+
+/// A path holding `:N:N:` is one path: every live-grep leg (rg; and without rg, `git
+/// grep` and `grep`) reports the file name NUL-terminated, so the row's head and the
+/// file it opens are the whole name, not its first segment.
+#[cfg(unix)]
+#[tokio::test]
+async fn live_grep_keeps_a_path_holding_colons_whole_on_every_leg() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_grep_colon_cfg");
+    let proj = temp_dir("picker_grep_colon");
+    git_in(&proj, &["init", "-q"], false);
+    std::fs::write(proj.join("c:1:2:x.txt"), "zqxneedle\n").unwrap();
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+
+    async fn first_row(
+        rpc: &Rpc,
+        incoming: &mut UnboundedReceiver<Incoming>,
+        source: &str,
+    ) -> String {
+        exec_lua(rpc, &format!("btv.picker.open('{source}')")).await;
+        poll_menu(rpc, incoming).await.expect("picker opens");
+        feed(rpc, "zqxneedle");
+        let rows = poll_rows(rpc, incoming, 1).await;
+        feed(rpc, "<Esc>");
+        rows.first().cloned().unwrap_or_default()
+    }
+    let row = first_row(&rpc, &mut incoming, "live_grep").await;
+    assert!(row.starts_with("c:1:2:x.txt:1:1:"), "rg leg: {row:?}");
+
+    let _path = PathWithout::install("picker_grep_colon_path", &["rg"]);
+    let row = first_row(&rpc, &mut incoming, "live_grep_git").await;
+    assert!(row.starts_with("c:1:2:x.txt:1:1:"), "git grep leg: {row:?}");
+    let row = first_row(&rpc, &mut incoming, "live_grep").await;
+    assert!(row.starts_with("c:1:2:x.txt:1:1:"), "grep leg: {row:?}");
+}
+
+/// Without rg, `git ls-files` failing inside a work tree (a corrupt index: `rev-parse`
+/// still says "a work tree") is reported, naming git, instead of settling `files_git`
+/// on an empty list that reads as "this repository has no files".
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_files_git_reports_git_ls_files_failing() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_lsfail_cfg");
+    let proj = gitignore_tree("picker_git_lsfail");
+    std::fs::write(proj.join(".git/index"), "garbage\n").unwrap();
+    let (rpc, mut incoming) = start(
+        &dir,
+        "_G.notes = {}\nbtv.notify = function(m) table.insert(_G.notes, tostring(m)) end\n",
+    )
+    .await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_git_lsfail_path", &["rg"]);
+
+    exec_lua(&rpc, "btv.picker.open('files_git')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("picker opens");
+    let mut notes = String::new();
+    for _ in 0..100 {
+        notes = exec_lua(&rpc, "return table.concat(_G.notes, '|')")
+            .await
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if !notes.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    feed(&rpc, "<Esc>");
+    assert!(
+        notes.contains("files_git") && notes.contains("git ls-files failed"),
+        "the failure is reported: {notes:?}"
+    );
+}
+
+/// `live_grep_git`'s low pass searches the listed low files a chunk per `rg` run; a
+/// chunk whose `rg` cannot be spawned (a command line too long for the OS, say) is
+/// reported, not silently dropped along with every hit in its files.
+#[tokio::test]
+async fn live_grep_git_reports_a_low_chunk_that_cannot_spawn() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    // Serial: it needs rg on PATH, which the `PathWithout` tests mask process-wide.
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_lowchunk_cfg");
+    let proj = temp_dir("picker_git_lowchunk");
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&proj)
+        .status()
+        .expect("git init")
+        .success());
+    for f in ["a.js", "yarn.lock"] {
+        std::fs::write(proj.join(f), "zqxneedle\n").unwrap();
+    }
+    // The chunk run (the one naming `yarn.lock`) fails to spawn, as an over-long
+    // command line would.
+    let init = r#"_G.notes = {}
+        btv.notify = function(m) table.insert(_G.notes, tostring(m)) end
+        local real = btv.run_stream
+        btv.run_stream = function(spec)
+          for _, a in ipairs(spec.args or {}) do
+            if spec.cmd == "rg" and a == "yarn.lock" then
+              return {
+                next = function() return btv.promise.resolve(nil) end,
+                kill = function() end,
+                exit = function() return { code = -1, stderr = "" } end,
+              }
+            end
+          end
+          return real(spec)
+        end
+    "#;
+    let (rpc, mut incoming) = start(&dir, init).await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    exec_lua(&rpc, "btv.picker.open('live_grep_git')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("picker opens");
+    feed(&rpc, "zqxneedle");
+    let mut notes = String::new();
+    for _ in 0..100 {
+        notes = exec_lua(&rpc, "return table.concat(_G.notes, '|')")
+            .await
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if !notes.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    feed(&rpc, "<Esc>");
+    assert!(
+        notes.contains("live_grep_git") && notes.contains("rg"),
+        "the dropped chunk is reported: {notes:?}"
+    );
+}
+
+/// `git ls-files --deduplicate` is git 2.31+; an older git (Debian 11 ships 2.30,
+/// Ubuntu 20.04 2.25) rejects it (`unknown option`, exit 129). `files_git` without rg
+/// must still list the work tree there, each conflicted file once, rather than fail.
+/// A wrapper `git` refusing the flag stands in for the old version.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_files_git_works_on_a_git_without_ls_files_deduplicate() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_olddedup_cfg");
+    let proj = temp_dir("picker_git_olddedup");
+    git_in(&proj, &["init", "-q"], false);
+    std::fs::write(proj.join("f.txt"), "base\n").unwrap();
+    git_in(&proj, &["add", "."], false);
+    git_in(&proj, &["commit", "-qm", "base"], false);
+    git_in(&proj, &["checkout", "-qb", "a"], false);
+    std::fs::write(proj.join("f.txt"), "a\n").unwrap();
+    git_in(&proj, &["commit", "-qam", "a"], false);
+    git_in(&proj, &["checkout", "-qb", "b", "HEAD~1"], false);
+    std::fs::write(proj.join("f.txt"), "b\n").unwrap();
+    git_in(&proj, &["commit", "-qam", "b"], false);
+    git_in(&proj, &["merge", "-q", "a"], true);
+    std::fs::write(proj.join("new.txt"), "x\n").unwrap();
+    let real_git = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("locate git")
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_git_olddedup_path", &["rg", "git"]);
+    let farm = std::path::PathBuf::from(std::env::var_os("PATH").unwrap());
+    let wrapper = farm.join("git");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = --deduplicate ]; then\n    \
+             echo \"error: unknown option \\`deduplicate'\" >&2\n    exit 129\n  fi\ndone\n\
+             exec '{real_git}' \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "files_git", "", 2).await,
+        ["f.txt", "new.txt"]
+    );
+}
+
+/// Put an executable `name` script into the `PathWithout` farm currently on `PATH`.
+#[cfg(unix)]
+fn farm_script(name: &str, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let farm = std::path::PathBuf::from(std::env::var_os("PATH").unwrap());
+    let path = farm.join(name);
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Where `sh` finds `cmd` on the real `PATH`.
+#[cfg(unix)]
+fn real_bin(cmd: &str) -> String {
+    let out = std::process::Command::new("sh")
+        .args(["-c", &format!("command -v {cmd}")])
+        .output()
+        .expect("locate binary")
+        .stdout;
+    String::from_utf8(out).unwrap().trim().to_string()
+}
+
+/// busybox `grep` (stock Alpine) has no long options at all — no `--null`, no
+/// `--exclude-dir` — and no `-I`: it prints its usage and exits 1, the same code as
+/// "no match". Without rg, `live_grep` must still find hits there rather than settle
+/// empty on every query, and still skip what those flags skipped: hits under `.git/`
+/// and in binary files. A wrapper `grep` refusing what busybox refuses stands in for it.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_live_grep_works_on_busybox_grep() {
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_grep_nonull_cfg");
+    let proj = temp_dir("picker_grep_nonull");
+    std::fs::write(proj.join("a.txt"), "zqxneedle\n").unwrap();
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    std::fs::write(proj.join(".git/config"), "zqxneedle\n").unwrap();
+    std::fs::write(proj.join("bin.dat"), b"zqxneedle\0\x01\n").unwrap();
+    let real_grep = real_bin("grep");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_grep_nonull_path", &["rg", "grep"]);
+    farm_script(
+        "grep",
+        &format!(
+            "#!/bin/sh\nfor a in \"$@\"; do\n  case \"$a\" in\n    --) ;;\n    \
+             --*) echo \"grep: unrecognized option: ${{a#--}}\" >&2; exit 1 ;;\n    \
+             -*I*) echo \"grep: invalid option -- 'I'\" >&2; exit 1 ;;\n  esac\ndone\n\
+             exec '{real_grep}' -a \"$@\"\n"
+        ),
+    );
+
+    // `-a`: busybox has no binary-file detection, so a hit in one prints its raw line.
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep", "zqx.eedle", 1).await,
+        ["a.txt"]
+    );
+}
+
+/// `git grep --column` is git 2.19+; an older git rejects it (exit 129) and the leg
+/// would settle empty — every query reading "no matches". Without rg, `live_grep_git`
+/// in a repository checks git's version first and says what to install instead.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_live_grep_git_reports_a_git_too_old_for_column() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_oldcol_cfg");
+    let proj = temp_dir("picker_git_oldcol");
+    git_in(&proj, &["init", "-q"], false);
+    std::fs::write(proj.join("a.txt"), "zqxneedle\n").unwrap();
+    let real_git = real_bin("git");
+    let init = r#"_G.notes = {}
+        btv.notify = function(m) table.insert(_G.notes, tostring(m)) end
+    "#;
+    let (rpc, mut incoming) = start(&dir, init).await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_git_oldcol_path", &["rg", "git"]);
+    farm_script(
+        "git",
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version 2.17.1'; exit 0; fi\n\
+             for a in \"$@\"; do\n  if [ \"$a\" = --column ]; then\n    \
+             echo \"error: unknown option \\`column'\" >&2\n    exit 129\n  fi\ndone\n\
+             exec '{real_git}' \"$@\"\n"
+        ),
+    );
+    exec_lua(&rpc, "btv.picker.open('live_grep_git')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("picker opens");
+    feed(&rpc, "zqxneedle");
+    let mut notes = String::new();
+    for _ in 0..100 {
+        notes = exec_lua(&rpc, "return table.concat(_G.notes, '|')")
+            .await
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if !notes.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    feed(&rpc, "<Esc>");
+    assert!(
+        notes.contains("2.17.1") && notes.contains("2.19"),
+        "the old git is named, with the version to install: {notes:?}"
+    );
+}
+
+/// Outside any repository there is no `.gitignore` to honour (rg needs a `.git` at or
+/// above a directory to read one), so without rg `live_grep_git` searches with plain
+/// `grep` as `live_grep` does — a regex search a keystroke can kill — not the
+/// `btv.fs` walk, a literal match read file by file in Lua that a keystroke cannot
+/// stop. The query here only matches as a regex.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_live_grep_git_outside_a_repo_searches_with_grep() {
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_norepo_cfg");
+    let proj = temp_dir("picker_git_norepo");
+    std::fs::write(proj.join("a.txt"), "zqxneedle\n").unwrap();
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    assert!(
+        !proj.ancestors().any(|a| a.join(".git").exists()),
+        "the fixture must sit outside any repository"
+    );
+    let _path = PathWithout::install("picker_git_norepo_path", &["rg"]);
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep_git", "zqx.eedle", 1).await,
+        ["a.txt"]
     );
 }

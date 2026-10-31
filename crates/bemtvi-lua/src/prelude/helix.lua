@@ -164,18 +164,19 @@ set("gi", function()
 end, "Go to implementation")
 
 -- The space (`<space>`) leader menu — Helix's file/search/LSP commands, mapped onto
--- bemtvi's native pickers (`btv.picker.open`) and LSP verbs (`btv.lsp.*`).
+-- bemtvi's native pickers (`btv.picker.open`) and LSP verbs (`btv.lsp.*`). The file
+-- picker and global search respect `.gitignore`, as Helix's do.
 local function pick(source)
   return function()
     btv.picker.open(source)
   end
 end
 
-set("<Space>f", pick("files"), "Find files")
+set("<Space>f", pick("files_git"), "Find files")
 set("<Space>b", pick("buffers"), "Find buffers")
 set("<Space>j", pick("jumplist"), "Jumplist")
 set("<Space>'", pick("marks"), "Marks")
-set("<Space>/", pick("live_grep"), "Global search")
+set("<Space>/", pick("live_grep_git"), "Global search")
 set("<Space>k", function()
   btv.lsp.hover()
 end, "Hover documentation")

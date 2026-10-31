@@ -16,9 +16,15 @@ File finding and grepping come in pairs:
 - `files_git` / `live_grep_git` respect `.gitignore` (and `.ignore` / `.rgignore`)
   — `rg --hidden`, so a dotfile like `.github/workflows/ci.yml` is still found and
   only ignored paths drop out. Without `rg` they fall back to `git ls-files` /
-  `git grep` inside a work tree, and with neither (the pure web client) to a `btv.fs`
-  walk that reads the ignore files itself (`btv.fs.walk{ gitignore = true }`) — so the
-  ignore rules hold everywhere. These are the everyday `<leader>ff` / `<leader>fg`.
+  `git grep` inside a work tree, to plain `find` / `grep` outside every repository
+  (no `.git` at or above the directory, so, as for rg, no `.gitignore` applies), and
+  otherwise (git missing or refusing the repository, or the pure web client) to a
+  `btv.fs` walk that reads the ignore files itself (`btv.fs.walk{ gitignore = true }`)
+  — so the ignore rules hold everywhere. The `git grep` leg needs git 2.19 or later
+  (`--column`); with an older git, `live_grep_git` says so instead of searching. A
+  basic `grep` (busybox, stock Alpine: no `--null`, `-I` or `--exclude-dir`) still
+  works, but a file name holding `:<digits>:` is cut short there. These are the everyday `<leader>ff` /
+  `<leader>fg`.
 - `files` / `live_grep` search **unrestricted** — the equivalent of `rg -uu`
   (`--no-ignore --hidden`), so a `.gitignore`d build artifact is still findable. The
   one exclusion is `.git` itself. These are `<leader>fF` / `<leader>fG`.
@@ -490,8 +496,9 @@ before the project's hits were even found, so the shipped `files` / `live_grep`
 pickers search in **two passes**: `rg` first with the deprioritized globs excluded —
 it never enters `node_modules/` — then a second run over just those paths. The
 `btv.fs` walk fallback (the web client) pushes its list the same way, normal paths
-first. Only the `find` / `grep` fallbacks, for a machine with neither `rg` nor (for
-the `_git` pickers) `git`, search in one pass; their rows are still ordered.
+first. Only the fallbacks on a machine without `rg` — `find` / `grep`, and
+`git ls-files` / `git grep` for the `_git` pickers inside a work tree — search in one
+pass; their rows are still ordered.
 
 A source can use the same machinery. A row pushed with `low = true` lists after the
 rest; a source with `filter = true` gets its paths tested against the deprioritize

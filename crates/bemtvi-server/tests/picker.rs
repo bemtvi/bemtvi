@@ -5423,11 +5423,21 @@ async fn low_rows_list_after_every_normal_row_in_stream_order() {
             "vendor/c"
         ]
     );
-    // The bare count readout: every candidate is shown, low ones included.
-    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu"));
+    // The bare count readout: every candidate is shown, low ones included. All six rows
+    // can land a frame before the run's finish does (a spinner still turning), so wait
+    // for the settled readout rather than reading the next frame.
+    let mut status = String::new();
+    for _ in 0..200 {
+        if let Some(map) = poll_menu(&rpc, &mut incoming).await {
+            status = menu_status(&menu_of(&map));
+            if status == "6" {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     assert_eq!(
-        map_get(&menu, "status").and_then(Value::as_str),
-        Some("6"),
+        status, "6",
         "no matched/total split for an unfiltered tiered list"
     );
 }
@@ -6148,5 +6158,592 @@ async fn the_git_pickers_keep_an_ignored_deprioritized_tree_out() {
         rows,
         ["src/a.js"],
         "the include box narrows, it never re-includes"
+    );
+}
+
+/// The `git grep` fallback lists a non-ASCII path as the file's real name. git quotes
+/// such a path (`"caf\303\251.txt"`) unless `core.quotePath` is off, which made a row
+/// whose path names no file: confirm and the preview opened nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_the_git_grep_leg_lists_a_non_ascii_path_unquoted() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_quote_cfg");
+    let proj = temp_dir("picker_git_quote");
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&proj)
+        .status()
+        .expect("git init")
+        .success());
+    std::fs::write(proj.join("café.txt"), "zqxneedle\n").unwrap();
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_git_quote_path", &["rg"]);
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep_git", "zqxneedle", 1).await,
+        ["café.txt"]
+    );
+}
+
+/// git refusing a repository it can read (another user's checkout: "dubious
+/// ownership", exit 128 — the same code as "not a repository") must not drop the `_git`
+/// pickers to plain `find` / `grep`, which list the ignored files. Without rg they
+/// walk instead, the walk reading the ignore files as rg does. git's own test hook
+/// stands in for the other owner.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_a_repo_git_refuses_still_honours_gitignore() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_dubious_cfg");
+    let proj = gitignore_tree("picker_git_dubious_tree");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_git_dubious_path", &["rg"]);
+    struct Unset;
+    impl Drop for Unset {
+        fn drop(&mut self) {
+            std::env::remove_var("GIT_TEST_ASSUME_DIFFERENT_OWNER");
+        }
+    }
+    std::env::set_var("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1");
+    let _unset = Unset;
+    let refused = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(&proj)
+        .output()
+        .expect("git rev-parse");
+    assert_eq!(refused.status.code(), Some(128), "git refuses the repo");
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "files_git", "", 3).await,
+        [".gitignore", ".hidden.txt", "visible.txt"]
+    );
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep_git", "zqxneedle", 2).await,
+        [".hidden.txt", "visible.txt"]
+    );
+}
+
+/// A repository's own config is not trusted to run code: `git ls-files` runs the
+/// `core.fsmonitor` command a checkout's `.git/config` names, so a project unpacked
+/// from an archive could run anything the moment `<leader>ff` fell back to git. The
+/// git legs switch the hook off.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_the_git_legs_never_run_the_repos_fsmonitor_hook() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_fsmon_cfg");
+    let proj = gitignore_tree("picker_git_fsmon_tree");
+    let marker = temp_dir("picker_git_fsmon_marker").join("ran");
+    let hook = dir.join("hook.sh");
+    std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["config", "core.fsmonitor"])
+        .arg(&hook)
+        .current_dir(&proj)
+        .status()
+        .expect("git config")
+        .success());
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_git_fsmon_path", &["rg"]);
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "files_git", "", 3).await,
+        [".gitignore", ".hidden.txt", "visible.txt"]
+    );
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep_git", "zqxneedle", 2).await,
+        [".hidden.txt", "visible.txt"]
+    );
+    assert!(!marker.exists(), "the repo's fsmonitor hook ran");
+}
+
+/// Whether `pid` is a live (non-zombie) process.
+#[cfg(target_os = "linux")]
+fn pid_alive(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| s.rsplit(')').next().map(|r| r.trim_start().to_string()))
+        .is_some_and(|r| !r.starts_with('Z'))
+}
+
+/// `live_grep_git`'s low pass lists the tree (`rg --files`) before searching it. That
+/// listing must be reaped like every other leg when the query moves on or the picker
+/// closes — otherwise a fast typist stacks one full-tree listing per keystroke, each
+/// running to completion in the background.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn live_grep_gits_low_pass_listing_is_killed_when_the_picker_closes() {
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_grep_git_list_reap_cfg");
+    let proj = temp_dir("picker_grep_git_list_reap");
+    std::fs::write(proj.join("a.txt"), "zqxneedle\n").unwrap();
+    let pidfile = proj.join("listing.pid");
+    // The normal pass's search finishes at once; the low pass's `rg --files` stalls,
+    // writing its pid first. Both spawn primitives are wrapped, whichever one a leg uses.
+    let init = format!(
+        r#"
+local pidfile = {pidfile:?}
+local function swap(spec)
+  if spec.cmd ~= "rg" then return spec end
+  for _, a in ipairs(spec.args or {{}}) do
+    if a == "--files" then
+      return {{ cmd = "sh", args = {{ "-c", "echo $$ > '" .. pidfile .. "'; exec sleep 30" }}, cwd = spec.cwd }}
+    end
+  end
+  return {{ cmd = "sh", args = {{ "-c", "exit 1" }}, cwd = spec.cwd }}
+end
+local run, run_stream = btv.run, btv.run_stream
+btv.run = function(spec) return run(swap(spec)) end
+btv.run_stream = function(spec) return run_stream(swap(spec)) end
+"#
+    );
+    let (rpc, mut incoming) = start(&dir, &init).await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    exec_lua(&rpc, "btv.picker.open('live_grep_git')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("opens");
+    feed(&rpc, "zqxneedle");
+    let mut pid = None;
+    for _ in 0..300 {
+        if let Some(p) = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            pid = Some(p);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let pid = pid.expect("the low pass's listing started");
+    assert!(pid_alive(pid));
+    feed(&rpc, "<Esc>");
+    let mut alive = true;
+    for _ in 0..100 {
+        alive = pid_alive(pid);
+        if !alive {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    if alive {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+    }
+    assert!(
+        !alive,
+        "closing the picker must kill the low pass's in-flight listing"
+    );
+}
+
+/// Run `git args…` in `dir` with a throwaway identity, asserting it succeeds unless
+/// `may_fail` (a merge expected to conflict).
+#[cfg(unix)]
+fn git_in(dir: &std::path::Path, args: &[&str], may_fail: bool) {
+    let ok = std::process::Command::new("git")
+        .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git")
+        .status
+        .success();
+    assert!(ok || may_fail, "git {args:?}");
+}
+
+/// Without rg, `files_git` lists what `git ls-files` knows the way rg would list the
+/// tree: a conflicted file once (not once per merge stage), a tracked file deleted
+/// from disk not at all, and a name git would C-quote (`"`, `\`) as the file it is.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_files_git_lists_each_file_once_as_named_and_not_deleted_ones() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_lsfiles_cfg");
+    let proj = temp_dir("picker_git_lsfiles");
+    git_in(&proj, &["init", "-q"], false);
+    std::fs::write(proj.join("f.txt"), "base\n").unwrap();
+    std::fs::write(proj.join("gone.txt"), "x\n").unwrap();
+    git_in(&proj, &["add", "."], false);
+    git_in(&proj, &["commit", "-qm", "base"], false);
+    git_in(&proj, &["checkout", "-qb", "a"], false);
+    std::fs::write(proj.join("f.txt"), "a\n").unwrap();
+    git_in(&proj, &["commit", "-qam", "a"], false);
+    git_in(&proj, &["checkout", "-qb", "b", "HEAD~1"], false);
+    std::fs::write(proj.join("f.txt"), "b\n").unwrap();
+    git_in(&proj, &["commit", "-qam", "b"], false);
+    git_in(&proj, &["merge", "-q", "a"], true);
+    std::fs::remove_file(proj.join("gone.txt")).unwrap();
+    std::fs::write(proj.join("q\"x.txt"), "x\n").unwrap();
+    std::fs::write(proj.join("back\\slash.txt"), "x\n").unwrap();
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_git_lsfiles_path", &["rg"]);
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "files_git", "", 3).await,
+        ["back\\slash.txt", "f.txt", "q\"x.txt"]
+    );
+}
+
+/// A path holding `:N:N:` is one path: every live-grep leg (rg; and without rg, `git
+/// grep` and `grep`) reports the file name NUL-terminated, so the row's head and the
+/// file it opens are the whole name, not its first segment.
+#[cfg(unix)]
+#[tokio::test]
+async fn live_grep_keeps_a_path_holding_colons_whole_on_every_leg() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_grep_colon_cfg");
+    let proj = temp_dir("picker_grep_colon");
+    git_in(&proj, &["init", "-q"], false);
+    std::fs::write(proj.join("c:1:2:x.txt"), "zqxneedle\n").unwrap();
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+
+    async fn first_row(
+        rpc: &Rpc,
+        incoming: &mut UnboundedReceiver<Incoming>,
+        source: &str,
+    ) -> String {
+        exec_lua(rpc, &format!("btv.picker.open('{source}')")).await;
+        poll_menu(rpc, incoming).await.expect("picker opens");
+        feed(rpc, "zqxneedle");
+        let rows = poll_rows(rpc, incoming, 1).await;
+        feed(rpc, "<Esc>");
+        rows.first().cloned().unwrap_or_default()
+    }
+    let row = first_row(&rpc, &mut incoming, "live_grep").await;
+    assert!(row.starts_with("c:1:2:x.txt:1:1:"), "rg leg: {row:?}");
+
+    let _path = PathWithout::install("picker_grep_colon_path", &["rg"]);
+    let row = first_row(&rpc, &mut incoming, "live_grep_git").await;
+    assert!(row.starts_with("c:1:2:x.txt:1:1:"), "git grep leg: {row:?}");
+    let row = first_row(&rpc, &mut incoming, "live_grep").await;
+    assert!(row.starts_with("c:1:2:x.txt:1:1:"), "grep leg: {row:?}");
+}
+
+/// Without rg, `git ls-files` failing inside a work tree (a corrupt index: `rev-parse`
+/// still says "a work tree") is reported, naming git, instead of settling `files_git`
+/// on an empty list that reads as "this repository has no files".
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_files_git_reports_git_ls_files_failing() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_lsfail_cfg");
+    let proj = gitignore_tree("picker_git_lsfail");
+    std::fs::write(proj.join(".git/index"), "garbage\n").unwrap();
+    let (rpc, mut incoming) = start(
+        &dir,
+        "_G.notes = {}\nbtv.notify = function(m) table.insert(_G.notes, tostring(m)) end\n",
+    )
+    .await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_git_lsfail_path", &["rg"]);
+
+    exec_lua(&rpc, "btv.picker.open('files_git')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("picker opens");
+    let mut notes = String::new();
+    for _ in 0..100 {
+        notes = exec_lua(&rpc, "return table.concat(_G.notes, '|')")
+            .await
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if !notes.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    feed(&rpc, "<Esc>");
+    assert!(
+        notes.contains("files_git") && notes.contains("git ls-files failed"),
+        "the failure is reported: {notes:?}"
+    );
+}
+
+/// `live_grep_git`'s low pass searches the listed low files a chunk per `rg` run; a
+/// chunk whose `rg` cannot be spawned (a command line too long for the OS, say) is
+/// reported, not silently dropped along with every hit in its files.
+#[tokio::test]
+async fn live_grep_git_reports_a_low_chunk_that_cannot_spawn() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    // Serial: it needs rg on PATH, which the `PathWithout` tests mask process-wide.
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_lowchunk_cfg");
+    let proj = temp_dir("picker_git_lowchunk");
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&proj)
+        .status()
+        .expect("git init")
+        .success());
+    for f in ["a.js", "yarn.lock"] {
+        std::fs::write(proj.join(f), "zqxneedle\n").unwrap();
+    }
+    // The chunk run (the one naming `yarn.lock`) fails to spawn, as an over-long
+    // command line would.
+    let init = r#"_G.notes = {}
+        btv.notify = function(m) table.insert(_G.notes, tostring(m)) end
+        local real = btv.run_stream
+        btv.run_stream = function(spec)
+          for _, a in ipairs(spec.args or {}) do
+            if spec.cmd == "rg" and a == "yarn.lock" then
+              return {
+                next = function() return btv.promise.resolve(nil) end,
+                kill = function() end,
+                exit = function() return { code = -1, stderr = "" } end,
+              }
+            end
+          end
+          return real(spec)
+        end
+    "#;
+    let (rpc, mut incoming) = start(&dir, init).await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    exec_lua(&rpc, "btv.picker.open('live_grep_git')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("picker opens");
+    feed(&rpc, "zqxneedle");
+    let mut notes = String::new();
+    for _ in 0..100 {
+        notes = exec_lua(&rpc, "return table.concat(_G.notes, '|')")
+            .await
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if !notes.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    feed(&rpc, "<Esc>");
+    assert!(
+        notes.contains("live_grep_git") && notes.contains("rg"),
+        "the dropped chunk is reported: {notes:?}"
+    );
+}
+
+/// `git ls-files --deduplicate` is git 2.31+; an older git (Debian 11 ships 2.30,
+/// Ubuntu 20.04 2.25) rejects it (`unknown option`, exit 129). `files_git` without rg
+/// must still list the work tree there, each conflicted file once, rather than fail.
+/// A wrapper `git` refusing the flag stands in for the old version.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_files_git_works_on_a_git_without_ls_files_deduplicate() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_olddedup_cfg");
+    let proj = temp_dir("picker_git_olddedup");
+    git_in(&proj, &["init", "-q"], false);
+    std::fs::write(proj.join("f.txt"), "base\n").unwrap();
+    git_in(&proj, &["add", "."], false);
+    git_in(&proj, &["commit", "-qm", "base"], false);
+    git_in(&proj, &["checkout", "-qb", "a"], false);
+    std::fs::write(proj.join("f.txt"), "a\n").unwrap();
+    git_in(&proj, &["commit", "-qam", "a"], false);
+    git_in(&proj, &["checkout", "-qb", "b", "HEAD~1"], false);
+    std::fs::write(proj.join("f.txt"), "b\n").unwrap();
+    git_in(&proj, &["commit", "-qam", "b"], false);
+    git_in(&proj, &["merge", "-q", "a"], true);
+    std::fs::write(proj.join("new.txt"), "x\n").unwrap();
+    let real_git = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("locate git")
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_git_olddedup_path", &["rg", "git"]);
+    let farm = std::path::PathBuf::from(std::env::var_os("PATH").unwrap());
+    let wrapper = farm.join("git");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = --deduplicate ]; then\n    \
+             echo \"error: unknown option \\`deduplicate'\" >&2\n    exit 129\n  fi\ndone\n\
+             exec '{real_git}' \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "files_git", "", 2).await,
+        ["f.txt", "new.txt"]
+    );
+}
+
+/// Put an executable `name` script into the `PathWithout` farm currently on `PATH`.
+#[cfg(unix)]
+fn farm_script(name: &str, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let farm = std::path::PathBuf::from(std::env::var_os("PATH").unwrap());
+    let path = farm.join(name);
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Where `sh` finds `cmd` on the real `PATH`.
+#[cfg(unix)]
+fn real_bin(cmd: &str) -> String {
+    let out = std::process::Command::new("sh")
+        .args(["-c", &format!("command -v {cmd}")])
+        .output()
+        .expect("locate binary")
+        .stdout;
+    String::from_utf8(out).unwrap().trim().to_string()
+}
+
+/// busybox `grep` (stock Alpine) has no long options at all — no `--null`, no
+/// `--exclude-dir` — and no `-I`: it prints its usage and exits 1, the same code as
+/// "no match". Without rg, `live_grep` must still find hits there rather than settle
+/// empty on every query, and still skip what those flags skipped: hits under `.git/`
+/// and in binary files. A wrapper `grep` refusing what busybox refuses stands in for it.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_live_grep_works_on_busybox_grep() {
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_grep_nonull_cfg");
+    let proj = temp_dir("picker_grep_nonull");
+    std::fs::write(proj.join("a.txt"), "zqxneedle\n").unwrap();
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    std::fs::write(proj.join(".git/config"), "zqxneedle\n").unwrap();
+    std::fs::write(proj.join("bin.dat"), b"zqxneedle\0\x01\n").unwrap();
+    let real_grep = real_bin("grep");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_grep_nonull_path", &["rg", "grep"]);
+    farm_script(
+        "grep",
+        &format!(
+            "#!/bin/sh\nfor a in \"$@\"; do\n  case \"$a\" in\n    --) ;;\n    \
+             --*) echo \"grep: unrecognized option: ${{a#--}}\" >&2; exit 1 ;;\n    \
+             -*I*) echo \"grep: invalid option -- 'I'\" >&2; exit 1 ;;\n  esac\ndone\n\
+             exec '{real_grep}' -a \"$@\"\n"
+        ),
+    );
+
+    // `-a`: busybox has no binary-file detection, so a hit in one prints its raw line.
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep", "zqx.eedle", 1).await,
+        ["a.txt"]
+    );
+}
+
+/// `git grep --column` is git 2.19+; an older git rejects it (exit 129) and the leg
+/// would settle empty — every query reading "no matches". Without rg, `live_grep_git`
+/// in a repository checks git's version first and says what to install instead.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_live_grep_git_reports_a_git_too_old_for_column() {
+    if !have_git() {
+        eprintln!("skip: git not installed");
+        return;
+    }
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_oldcol_cfg");
+    let proj = temp_dir("picker_git_oldcol");
+    git_in(&proj, &["init", "-q"], false);
+    std::fs::write(proj.join("a.txt"), "zqxneedle\n").unwrap();
+    let real_git = real_bin("git");
+    let init = r#"_G.notes = {}
+        btv.notify = function(m) table.insert(_G.notes, tostring(m)) end
+    "#;
+    let (rpc, mut incoming) = start(&dir, init).await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    let _path = PathWithout::install("picker_git_oldcol_path", &["rg", "git"]);
+    farm_script(
+        "git",
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version 2.17.1'; exit 0; fi\n\
+             for a in \"$@\"; do\n  if [ \"$a\" = --column ]; then\n    \
+             echo \"error: unknown option \\`column'\" >&2\n    exit 129\n  fi\ndone\n\
+             exec '{real_git}' \"$@\"\n"
+        ),
+    );
+    exec_lua(&rpc, "btv.picker.open('live_grep_git')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("picker opens");
+    feed(&rpc, "zqxneedle");
+    let mut notes = String::new();
+    for _ in 0..100 {
+        notes = exec_lua(&rpc, "return table.concat(_G.notes, '|')")
+            .await
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if !notes.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    feed(&rpc, "<Esc>");
+    assert!(
+        notes.contains("2.17.1") && notes.contains("2.19"),
+        "the old git is named, with the version to install: {notes:?}"
+    );
+}
+
+/// Outside any repository there is no `.gitignore` to honour (rg needs a `.git` at or
+/// above a directory to read one), so without rg `live_grep_git` searches with plain
+/// `grep` as `live_grep` does — a regex search a keystroke can kill — not the
+/// `btv.fs` walk, a literal match read file by file in Lua that a keystroke cannot
+/// stop. The query here only matches as a regex.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_rg_live_grep_git_outside_a_repo_searches_with_grep() {
+    let _serial = serial_lock().lock().await;
+    let dir = temp_dir("picker_git_norepo_cfg");
+    let proj = temp_dir("picker_git_norepo");
+    std::fs::write(proj.join("a.txt"), "zqxneedle\n").unwrap();
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+    assert!(
+        !proj.ancestors().any(|a| a.join(".git").exists()),
+        "the fixture must sit outside any repository"
+    );
+    let _path = PathWithout::install("picker_git_norepo_path", &["rg"]);
+
+    assert_eq!(
+        settled_paths(&rpc, &mut incoming, "live_grep_git", "zqx.eedle", 1).await,
+        ["a.txt"]
     );
 }

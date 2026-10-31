@@ -1392,19 +1392,99 @@ end
 -- ----- built-in sources ------------------------------------------------------
 -- Shipped defaults exercising the three source shapes; a config can register more.
 
--- Whether `cwd` is inside a git work tree, for the `.gitignore`-respecting pickers'
--- fallback when `rg` is missing: `"yes"`, `"no"` (git ran and said not a repo — there
--- is no `.gitignore` to honour, so the plain legs list the right set), or `"nogit"`
--- (git could not run). Probed rather than read off the git leg's exit code because a
--- failed `git grep` exits 128 inside a repo too (a bad pattern), and falling through
--- to plain `grep` there would search ignored files.
+local GIT_ESCAPES = { a = "\a", b = "\b", t = "\t", n = "\n", v = "\v", f = "\f", r = "\r" }
+
+-- A path as git prints it -> the path. git C-quotes a name holding `"`, `\` or a
+-- control char (`core.quotePath=false` only spares the non-ASCII bytes): wrapped in
+-- `"`, with `\"`, `\\`, `\t`-style escapes and `\ooo` octal bytes. An unquoted name
+-- never starts with `"` (that `"` would have been quoted), so it passes through.
+local function git_unquote(l)
+  if #l < 2 or l:sub(1, 1) ~= '"' or l:sub(-1) ~= '"' then
+    return l
+  end
+  local out, i, n = {}, 2, #l - 1
+  while i <= n do
+    local c = l:sub(i, i)
+    if c ~= "\\" then
+      out[#out + 1] = c
+      i = i + 1
+    else
+      local oct = l:match("^[0-7][0-7][0-7]", i + 1)
+      if oct then
+        out[#out + 1] = string.char(tonumber(oct, 8) % 256)
+        i = i + 4
+      else
+        local e = l:sub(i + 1, i + 1)
+        out[#out + 1] = GIT_ESCAPES[e] or e
+        i = i + 2
+      end
+    end
+  end
+  return table.concat(out)
+end
+
+-- Whether git will answer for `cwd` as a work tree, for the `.gitignore`-respecting
+-- pickers' fallback when `rg` is missing. Probed rather than read off the git leg's
+-- exit code because a failed `git grep` exits 128 inside a repo too (a bad pattern).
+-- A "no" is not yet "not a repository": see `under_dotgit`.
 local function git_worktree(cwd)
   local r =
     btv.await(btv.run({ cmd = "git", args = { "rev-parse", "--is-inside-work-tree" }, cwd = cwd }))
-  if r.code == -1 then
-    return "nogit"
+  return r.code == 0 and btv.str.trim(r.stdout or "") == "true"
+end
+
+-- Whether the host's `grep` takes the flags the grep leg relies on — `--null`, `-I`,
+-- `--exclude-dir` — as GNU and BSD grep do. busybox's (stock Alpine's) has none of
+-- them, and exits 1 on each, as for "no match". Probed once a session over a one-line
+-- stdin, by whether the file name came back NUL-terminated.
+local grep_full
+local function grep_is_full()
+  if grep_full == nil then
+    local r = btv.await(btv.run({
+      cmd = "grep",
+      args = { "-nIH", "--null", "--exclude-dir=.git", "-e", "x", "-" },
+      stdin = "x\n",
+    }))
+    grep_full = r.code == 0 and (r.stdout or ""):find("\0", 1, true) ~= nil
   end
-  return (r.code == 0 and btv.str.trim(r.stdout or "") == "true") and "yes" or "no"
+  return grep_full
+end
+
+-- git's version when it is too old for `git grep --column` (git 2.19+), else nil.
+-- Probed once a session: an older git rejects the flag, and the `.gitignore` grep leg
+-- would otherwise settle empty on every query, reading as "no matches".
+local git_old
+local function git_too_old()
+  if git_old == nil then
+    local r = btv.await(btv.run({ cmd = "git", args = { "--version" } }))
+    local v = (r.stdout or ""):match("(%d+%.%d+[%.%d]*)")
+    local major, minor = (v or ""):match("^(%d+)%.(%d+)")
+    major, minor = tonumber(major), tonumber(minor)
+    git_old = major and (major < 2 or (major == 2 and minor < 19)) and v or false
+  end
+  return git_old or nil
+end
+
+-- Whether a `.git` entry sits at or above `cwd` — rg's own test for "in a repository",
+-- the only place a `.gitignore` counts. When git has said no (`git_worktree`) the
+-- `.gitignore`-respecting pickers ask this to tell the two cases git reports alike
+-- (exit 128, in the user's locale): outside every repository there is nothing to
+-- honour, so plain `find` / `grep` list what rg would — and stay killable, where the
+-- `btv.fs` walk is not; under a `.git` git cannot or will not read (git missing, or
+-- another user's checkout: "dubious ownership"), only the walk keeps the ignore rules.
+local function under_dotgit(cwd)
+  local dir = btv.fname.modify(cwd, ":p")
+  while true do
+    if btv.await(btv.fs.exists(btv.utils.path_join(dir, ".git"))) then
+      return true
+    end
+    local root = btv.utils.path_root(dir)
+    if root == "" or dir == root then
+      return false
+    end
+    local up = btv.utils.dirname((dir:gsub("[/\\]+$", "")))
+    dir = (up == "" or #up < #root) and root or up
+  end
 end
 
 -- files: a static source — file paths streamed in, fuzzy-matched locally. An
@@ -1428,9 +1508,10 @@ end
 -- files_git is the same picker respecting `.gitignore` (and `.ignore` / `.rgignore`):
 -- `rg --files --hidden`, so dotfiles still list and only ignored paths drop out. Its
 -- fallback chain keeps that promise rather than quietly listing ignored files: with no
--- rg, `git ls-files --cached --others --exclude-standard` inside a work tree, plain
--- `find` outside one (there is no `.gitignore` to honour there, which is also what rg
--- does), and the `btv.fs` walk reading the ignore files itself where neither can run
+-- rg, `git ls-files --cached --others --exclude-standard` inside a work tree git
+-- answers for, plain `find` outside every repository (no `.gitignore` applies there,
+-- as for rg: `under_dotgit`), and otherwise — under a `.git` that git cannot or will
+-- not read — the `btv.fs` walk reading the ignore files itself as rg does
 -- (`btv.fs.walk{ gitignore = true }`). Both are built by `files_source`, so the pair
 -- cannot drift.
 local function files_source(name, title, gitignore)
@@ -1443,8 +1524,9 @@ local function files_source(name, title, gitignore)
     items = btv.async(function(ctx)
       local cancelled = false
       -- Stream a listing command's stdout as candidates. Returns whether the chain is
-      -- SETTLED here — the tool ran (whatever it listed), or the run was superseded.
-      -- `strip` removes `find`'s leading "./" so its paths match rg's relative style.
+      -- SETTLED here — the tool ran (whatever it listed), or the run was superseded —
+      -- and the child's exit. `strip = true` removes `find`'s leading "./" so its paths
+      -- match rg's relative style; a function maps each line to its path (nil drops it).
       local function run_files(cmd, args, strip)
         local stream = btv.run_stream({ cmd = cmd, args = args, cwd = ctx.cwd })
         -- Reap the job when the picker closes, so a confirmed/cancelled picker doesn't
@@ -1456,10 +1538,12 @@ local function files_source(name, title, gitignore)
         end)
         for batch in btv.await_each(stream) do
           for _, l in ipairs(batch) do
-            if strip then
+            if strip == true then
               l = l:gsub("^%./", "")
+            elseif strip then
+              l = strip(l) -- a function: the listing's own spelling -> the path, or nil
             end
-            if l ~= "" then
+            if l and l ~= "" then
               ctx.push({ text = l, path = l })
             end
           end
@@ -1468,7 +1552,7 @@ local function files_source(name, title, gitignore)
         -- `-1` is a spawn failure (no such binary) or our own `:kill()`. Anything
         -- else means it ran, so an empty listing is its ANSWER and the chain stops.
         local exit = stream:exit()
-        return cancelled or exit == nil or exit.code ~= -1
+        return cancelled or exit == nil or exit.code ~= -1, exit
       end
       -- The filter boxes ride along as `-g` arguments so rg prunes the tree rather than
       -- streaming paths the sink would drop — on a `node_modules`-sized directory that
@@ -1494,22 +1578,73 @@ local function files_source(name, title, gitignore)
       end
       -- The fallbacks stream in one pass; the widget still lists the low rows last.
       ctx.begin_pass(nil)
-      local repo = gitignore and git_worktree(ctx.cwd) or "no"
+      local repo = gitignore and git_worktree(ctx.cwd)
       if cancelled then
         return
       end
-      if repo == "yes" then
+      if repo then
         -- Tracked plus untracked-but-not-ignored, relative to `cwd` like rg's. Inside a
-        -- work tree git's answer is final, empty or not.
-        run_files(
+        -- work tree git's answer is final, empty or not. `core.fsmonitor` off: it is a
+        -- command the repository's own `.git/config` names, which `ls-files` would run —
+        -- a checkout unpacked from an archive must not run code because it was listed.
+        -- As rg would list the tree: a conflicted file once, not once per merge stage
+        -- (deduplicated here — `ls-files --deduplicate` is git 2.31+, and an older git
+        -- rejects it), and a tracked file deleted from disk is left out (git's
+        -- `--deleted` set, read first). A name git still C-quotes (`"`, `\`, a control
+        -- char) is unquoted. git failing (a corrupt index) rejects the run, naming it,
+        -- rather than settling on an empty list that reads as "no files".
+        local git = { "-c", "core.quotePath=false", "-c", "core.fsmonitor=false", "ls-files" }
+        local function git_args(...)
+          local a = { table.unpack(git) }
+          for _, x in ipairs({ ... }) do
+            a[#a + 1] = x
+          end
+          return a
+        end
+        local function git_failed(r)
+          error(
+            "files_git: git ls-files failed (exit "
+              .. tostring(r.code)
+              .. "): "
+              .. btv.str.trim(r.stderr or ""),
+            0
+          )
+        end
+        local del =
+          btv.await(btv.run({ cmd = "git", args = git_args("--deleted", "-z"), cwd = ctx.cwd }))
+        if cancelled then
+          return
+        elseif del.code ~= 0 then
+          git_failed(del)
+        end
+        -- Paths not to list: the deleted ones, then each one already listed.
+        local skip = {}
+        for f in (del.stdout or ""):gmatch("[^\0]+") do
+          skip[f] = true
+        end
+        local _, exit = run_files(
           "git",
-          { "-c", "core.quotePath=false", "ls-files", "--cached", "--others", "--exclude-standard" }
+          git_args("--cached", "--others", "--exclude-standard"),
+          function(l)
+            l = git_unquote(l)
+            if skip[l] then
+              return nil
+            end
+            skip[l] = true
+            return l
+          end
         )
+        if not cancelled and exit and exit.code ~= 0 then
+          git_failed(exit)
+        end
         return
       end
-      if
-        repo == "no" and run_files("find", { ".", "-type", "f", "-not", "-path", "*/.git/*" }, true)
-      then
+      -- Outside every repository (`under_dotgit`) `find` lists what rg would.
+      local plain = not gitignore or not under_dotgit(ctx.cwd)
+      if cancelled then
+        return
+      end
+      if plain and run_files("find", { ".", "-type", "f", "-not", "-path", "*/.git/*" }, true) then
         return
       end
       -- No shell / no rg / no find (the pure web client): walk the tree over btv.fs.
@@ -1571,8 +1706,8 @@ btv.picker.source(files_source("files_git", "Find Files", true))
 -- live_grep_git is the same search respecting `.gitignore` (and `.ignore` /
 -- `.rgignore`): `rg --hidden`, dotfiles still searched. With no rg it keeps the
 -- promise like `files_git` does — `git grep --untracked` (tracked plus untracked,
--- ignored excluded) inside a work tree, plain `grep` outside one, and the
--- `.gitignore`-aware `btv.fs` walk where neither can run. Both come from
+-- ignored excluded) inside a work tree git answers for, plain `grep` outside every
+-- repository, and otherwise the `.gitignore`-aware `btv.fs` walk. Both come from
 -- `grep_source`.
 local function grep_source(name, title, gitignore)
   return {
@@ -1726,11 +1861,18 @@ local function grep_source(name, title, gitignore)
         end
       end
 
-      -- Stream a grep-like command, parsing `file:lnum[:col]:text` per line; `has_col` for
-      -- rg's `--column`. `strip` drops grep's leading "./", and `on_line(file, lnum, col,
-      -- text)` turns a parsed line into rows. Returns whether the chain is SETTLED here —
-      -- the tool ran (matches or not), or the run was superseded.
-      local function run(cmd, args, has_col, strip, on_line)
+      -- Stream a grep-like command, parsing `file\0lnum[:col]:text` per line; `has_col`
+      -- for rg's `--column`. Every leg NUL-terminates the file name (`rg --null`, `git
+      -- grep -z`, `grep --null`), so a name holding `:12:3:` is not cut at its first
+      -- colon; `git grep -z` NUL-separates the numbers too. `colons` is for a basic grep
+      -- (busybox: no `--null`, `-I` or `--exclude-dir`): `file:lnum:text`, cut at the
+      -- first `:<digits>:`, so a name holding one is cut short there — and the two
+      -- other flags' work done here: a hit under `.git/` or on a line holding a NUL (a
+      -- binary file's) is dropped. `strip` drops grep's leading "./", and
+      -- `on_line(file, lnum, col, text)` turns a parsed line into rows. Returns
+      -- whether the chain is SETTLED here — the tool ran (matches or not), or the run
+      -- was superseded.
+      local function run(cmd, args, has_col, strip, on_line, colons)
         local stream = btv.run_stream({ cmd = cmd, args = args, cwd = ctx.cwd })
         ctx.on_cancel(function()
           cancelled = true
@@ -1742,10 +1884,19 @@ local function grep_source(name, title, gitignore)
               l = l:gsub("^%./", "")
             end
             local file, lnum, col, body
-            if has_col then
-              file, lnum, col, body = l:match("^(.-):(%d+):(%d+):(.*)$")
-            else
+            if colons then
               file, lnum, body = l:match("^(.-):(%d+):(.*)$")
+              col = 1
+              if
+                file
+                and (body:find("\0", 1, true) or file:find("^%.git/") or file:find("/%.git/"))
+              then
+                file = nil
+              end
+            elseif has_col then
+              file, lnum, col, body = l:match("^([^\0]*)\0(%d+)[:\0](%d+)[:\0](.*)$")
+            else
+              file, lnum, body = l:match("^([^\0]*)\0(%d+)[:\0](.*)$")
               col = 1
             end
             if file then
@@ -1770,6 +1921,7 @@ local function grep_source(name, title, gitignore)
           "--line-number",
           "--no-heading",
           "--with-filename",
+          "--null",
           "--color=never",
           scope,
           "-g",
@@ -1791,28 +1943,50 @@ local function grep_source(name, title, gitignore)
       -- rules on, negations only), keep this pass's own, and search exactly those, a
       -- chunk of paths per run so no command line grows unbounded. The common case —
       -- every low tree ignored — lists nothing and searches nothing.
-      local CHUNK = 200
+      local CHUNK, CHUNK_BYTES = 200, 16000
       local function grep_listed(pass)
         local list_args = { "--files", "--color=never", scope, "-g", "!.git" }
         for _, a in ipairs(pass.rg_excludes) do
           list_args[#list_args + 1] = a
         end
-        local r = btv.await(btv.run({ cmd = "rg", args = list_args, cwd = ctx.cwd }))
+        -- Streamed and reaped like every other leg: a keystroke or a close kills the
+        -- listing rather than leaving one full-tree `rg` per keystroke running on.
+        local stream = btv.run_stream({ cmd = "rg", args = list_args, cwd = ctx.cwd })
+        ctx.on_cancel(function()
+          cancelled = true
+          stream:kill()
+        end)
+        local files = {}
+        for batch in btv.await_each(stream) do
+          for _, l in ipairs(batch) do
+            if l ~= "" and pass.keeps(l) then
+              files[#files + 1] = l
+            end
+          end
+        end
         if cancelled then
           return true
         end
-        if r.code == -1 then
+        local exit = stream:exit()
+        if exit and exit.code == -1 then
           return false
         end
-        local files = {}
-        for l in (r.stdout or ""):gmatch("[^\r\n]+") do
-          if pass.keeps(l) then
-            files[#files + 1] = l
+        -- A chunk is capped in bytes as well as in paths — Windows refuses a command
+        -- line past 32767 chars — and a chunk whose `rg` cannot be spawned rejects the
+        -- run, rather than silently dropping every hit in its files.
+        local from = 1
+        while from <= #files do
+          local chunk, bytes = {}, 0
+          while from <= #files and #chunk < CHUNK do
+            local f = files[from]
+            if #chunk > 0 and bytes + #f + 3 > CHUNK_BYTES then
+              break
+            end
+            chunk[#chunk + 1], bytes, from = f, bytes + #f + 3, from + 1
           end
-        end
-        for from = 1, #files, CHUNK do
-          local chunk = { table.unpack(files, from, math.min(from + CHUNK - 1, #files)) }
-          run("rg", grep_args({}, chunk), true, false, emit_line)
+          if not run("rg", grep_args({}, chunk), true, false, emit_line) then
+            error("rg could not run over the deprioritized files", 0)
+          end
           if cancelled then
             return true
           end
@@ -1845,26 +2019,64 @@ local function grep_source(name, title, gitignore)
         emit(lit, file, lnum, col, line)
       end
       ctx.begin_pass(nil)
-      local repo = gitignore and git_worktree(ctx.cwd) or "no"
+      local repo = gitignore and git_worktree(ctx.cwd)
       if cancelled then
         return
       end
-      if repo == "yes" then
+      if repo then
         -- Inside a work tree git's answer is final: matches, none (exit 1), or an error
         -- (exit 128, a pattern it rejects) — never a fall through to plain `grep`,
-        -- which would search the ignored files.
-        run(
-          "git",
-          { "grep", "-n", "--column", "-I", "--untracked", "--no-color", "-e", q },
-          true,
-          false,
-          emit_lit
-        )
+        -- which would search the ignored files. `-z` prints each path raw (never
+        -- C-quoted or octal-escaped, which would make a row whose path names no file);
+        -- `core.quotePath` off says the same for a git that quotes anyway.
+        -- `core.fsmonitor` off, as for `ls-files`. A git older than `--column` is
+        -- reported, not run: its refusal would read as "no matches".
+        local old = git_too_old()
+        if cancelled then
+          return
+        end
+        if old then
+          error(
+            "git "
+              .. old
+              .. " is too old to search the repository: install git 2.19 or later, or rg",
+            0
+          )
+        end
+        run("git", {
+          "-c",
+          "core.quotePath=false",
+          "-c",
+          "core.fsmonitor=false",
+          "grep",
+          "-n",
+          "--column",
+          "-I",
+          "--untracked",
+          "--no-color",
+          "-z",
+          "-e",
+          q,
+        }, true, false, emit_lit)
+        return
+      end
+      -- Outside every repository (`under_dotgit`) `grep` searches what rg would.
+      local plain = not gitignore or not under_dotgit(ctx.cwd)
+      local full = plain and grep_is_full()
+      if cancelled then
         return
       end
       if
-        repo == "no"
-        and run("grep", { "-rnI", "--exclude-dir=.git", "--", q, "." }, false, true, emit_lit)
+        plain
+        and run(
+          "grep",
+          full and { "-rnI", "--null", "--exclude-dir=.git", "--", q, "." }
+            or { "-rnH", "-e", q, "." },
+          false,
+          true,
+          emit_lit,
+          not full
+        )
       then
         return
       end

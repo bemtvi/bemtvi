@@ -24,6 +24,9 @@ impl LuaGitignore {
     pub fn compile(text: &str) -> mlua::Result<(Self, Vec<String>)> {
         let mut builder = GitignoreBuilder::new("");
         let mut errors = Vec::new();
+        // A leading UTF-8 byte-order mark is not part of the first pattern, as git and
+        // rg read it (`GitignoreBuilder::add` strips it; `add_line` does not).
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         for line in text.lines() {
             if let Err(e) = builder.add_line(None, line) {
                 errors.push(e.to_string());

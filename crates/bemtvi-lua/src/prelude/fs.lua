@@ -102,37 +102,119 @@ end
 local IGNORE_KINDS = { ".rgignore", ".ignore", ".gitignore", "exclude" }
 local IGNORE_FILES = { [".rgignore"] = true, [".ignore"] = true, [".gitignore"] = true }
 
--- The parent of an absolute directory, or nil at the top (or for a relative one).
+-- `p` without trailing separators, its root (`"/"`, `"C:\\"`) kept whole.
+local function trim_seps(p)
+  local root = btv.utils.path_root(p)
+  local pat = btv.utils.path_style() == "windows" and "[/\\]+$" or "/+$"
+  return root .. p:sub(#root + 1):gsub(pat, "")
+end
+
+-- The parent of an absolute directory (spelled without trailing separators), or nil
+-- at the filesystem root (or for a relative one).
 local function parent_dir(p)
-  local d = btv.utils.dirname(p)
-  if d == "" and p:sub(1, 1) == "/" and p ~= "/" then
-    return "/"
-  end
-  if d == "" or d == p then
+  local root = btv.utils.path_root(p)
+  if root == "" or p == root then
     return nil
+  end
+  local d = btv.utils.dirname(p)
+  if d == "" or d == p then
+    return root
   end
   return d
 end
 
+-- Read one ignore file for the walk. A file that is not there (`ENOENT`, as for a
+-- repository without `info/exclude`, or one deleted mid-walk) has no rules. Any other
+-- failure skips the file with a warning naming it, once a session — as rg warns and
+-- walks on — rather than either silently listing everything it would have ignored or
+-- failing a whole picker over one unreadable file (a root-owned `.git`, an ancestor's
+-- `.ignore`). A file that is not a regular one once symlinks are followed is skipped
+-- the same way, unread: a checkout unpacked from an archive can carry a FIFO (a read
+-- no writer ever answers parks an fs worker for good, and over a daemon every `btv.fs`
+-- op queued behind it) or a link to `/dev/zero` (read until the editor runs out of
+-- memory).
+local function read_ignore(path)
+  local function fail(err)
+    local code = type(err) == "table" and err.code
+    if code == "ENOENT" or code == "ENOTDIR" then
+      return nil
+    end
+    local msg = type(err) == "table" and (err.message or err.code) or tostring(err)
+    btv.notify_once(
+      "btv.fs.walk: skipping ignore file " .. path .. ": " .. tostring(msg),
+      btv.log.levels.WARN
+    )
+    return nil
+  end
+  local sok, st = pcall(btv.await, btv.fs.stat(path))
+  if not sok then
+    return fail(st)
+  end
+  -- `S_IFMT` bits: `0` where the fs reports none (OPFS), `S_IFREG` for a regular file.
+  local fmt = (st.mode or 0) & 0xF000
+  if st.type ~= "file" or (fmt ~= 0 and fmt ~= 0x8000) then
+    return fail("not a regular file")
+  end
+  local ok, text = pcall(btv.await, btv.fs.read(path))
+  if ok then
+    return text
+  end
+  return fail(text)
+end
+
+-- The `info/exclude` of the repository whose `.git` entry `git` sits in `abs`. A `.git`
+-- directory holds it directly; a `.git` FILE (a linked worktree or a submodule) points
+-- at the real git dir with `gitdir: <path>`, and a worktree's git dir names the main
+-- repository's in `commondir` — the one whose `info/exclude` applies, as rg resolves it.
+local function exclude_path(abs, git)
+  local dotgit = btv.utils.path_join(abs, ".git")
+  if git.type == "directory" then
+    return btv.utils.path_join(dotgit, "info", "exclude")
+  elseif git.type ~= "file" then
+    return nil
+  end
+  local text = read_ignore(dotgit)
+  local gitdir = text and text:match("^gitdir: ([^\r\n]+)")
+  if not gitdir then
+    return nil
+  end
+  if btv.utils.path_root(gitdir) == "" then
+    gitdir = btv.utils.path_join(abs, gitdir)
+  end
+  local common = gitdir
+  local cd = read_ignore(btv.utils.path_join(gitdir, "commondir"))
+  cd = cd and cd:match("^([^\r\n]+)")
+  if cd then
+    common = btv.utils.path_root(cd) == "" and btv.utils.path_join(gitdir, cd) or cd
+  end
+  return btv.utils.path_join(common, "info", "exclude")
+end
+
 -- The ignore layers one directory contributes, from its `entries`: one per ignore file
 -- present (`.gitignore` only `in_repo`, as rg needs a repository to honour one), plus
--- `.git/info/exclude` when the directory is a repository root. `place` says where the
--- layer's directory sits relative to the walk root — `{ base = "a/b" }` below it
--- (`""` the root itself), `{ prefix = "sub/" }` above it.
-local function dir_layers(abs, entries, in_repo, place)
+-- the repository's `info/exclude` when the directory is a repository root and
+-- `exclude` asks for it. `place` says where the layer's directory sits relative to the
+-- walk root — `{ base = "a/b" }` below it (`""` the root itself), `{ prefix = "sub/" }`
+-- above it.
+local function dir_layers(abs, entries, in_repo, place, exclude)
   local layers = {}
   local function add(kind, path)
-    local ok, text = pcall(btv.await, btv.fs.read(path))
-    if ok and type(text) == "string" then
-      layers[#layers + 1] =
-        { kind = kind, m = btv.fs.gitignore(text), base = place.base, prefix = place.prefix }
+    local text = path and read_ignore(path)
+    if type(text) == "string" then
+      local m, errs = btv.fs.gitignore(text)
+      -- A line that does not compile is skipped, as rg and git skip it — and warned
+      -- about once a session per file and message, as rg warns, not dropped unseen.
+      for _, err in ipairs(errs) do
+        btv.notify_once("btv.fs.walk: " .. path .. ": " .. err, btv.log.levels.WARN)
+      end
+      layers[#layers + 1] = { kind = kind, m = m, base = place.base, prefix = place.prefix }
     end
   end
   for _, e in ipairs(entries) do
     if e.type == "file" and IGNORE_FILES[e.name] and (e.name ~= ".gitignore" or in_repo) then
       add(e.name, btv.utils.path_join(abs, e.name))
-    elseif e.name == ".git" and e.type == "directory" then
-      add("exclude", btv.utils.path_join(abs, ".git", "info", "exclude"))
+    elseif e.name == ".git" and exclude then
+      add("exclude", exclude_path(abs, e))
     end
   end
   return layers
@@ -145,6 +227,19 @@ local function has_git(entries)
     end
   end
   return false
+end
+
+-- `layers` without the git kinds (`.gitignore`, `info/exclude`): what still applies
+-- inside a nested repository, whose root is where an enclosing repository's git rules
+-- stop (as in git, and rg).
+local function drop_git_layers(layers)
+  local kept = {}
+  for _, l in ipairs(layers) do
+    if l.kind ~= ".gitignore" and l.kind ~= "exclude" then
+      kept[#kept + 1] = l
+    end
+  end
+  return kept
 end
 
 -- Whether `posix` (a `/`-separated path relative to the walk root) is ignored by the
@@ -188,15 +283,18 @@ end
 -- ```
 --
 -- With `gitignore = true` the walk reads each directory's `.gitignore`, `.ignore` and
--- `.rgignore` as it descends (and, for an absolute `dir`, those of the directories
--- above it), plus `.git/info/exclude` at a repository root, and prunes what they
+-- `.rgignore` as it descends (and those of the directories above `dir`), plus the
+-- repository's `info/exclude` at a repository root, and prunes what they
 -- ignore — negation, anchoring and precedence as in `rg`, through `btv.fs.gitignore`.
 -- As in `rg`, a `.gitignore` counts only inside a git repository (a directory with a
 -- `.git` at or above it) and not above that repository's root, while `.ignore` /
--- `.rgignore` count anywhere. The global git excludes file (`core.excludesFile`) is not
--- read. Directories with no ignore file cost nothing extra.
+-- `.rgignore` count anywhere. A nested repository (a submodule) starts afresh: the
+-- enclosing repository's git rules stop at its root. The global git excludes file
+-- (`core.excludesFile`) is not read. Directories with no ignore file cost nothing extra.
 --
--- An unreadable subdirectory is skipped (not fatal). MUST be awaited inside `btv.async`.
+-- An unreadable subdirectory is skipped (not fatal); an ignore file that exists but
+-- cannot be read, or is not a regular file, is skipped with a warning naming it (once
+-- a session), as `rg` warns and walks on. MUST be awaited inside `btv.async`.
 function btv.fs.walk(dir, opts)
   opts = opts or {}
   local max = opts.max or 50000
@@ -206,11 +304,12 @@ function btv.fs.walk(dir, opts)
   return btv.async(function()
     local out = {}
     -- The layers above `dir` and whether `dir` already sits in a repository: walk up,
-    -- nearest first, until the filesystem root.
+    -- nearest first, until the filesystem root. A relative `dir` is resolved against
+    -- the working directory first, as the fs ops resolve it.
     local root_layers, root_in_repo = {}, false
     if gitignore then
       local chain, prefix = {}, ""
-      local cur = dir
+      local cur = trim_seps(btv.fname.modify(dir, ":p"))
       local up = parent_dir(cur)
       while up do
         prefix = btv.utils.basename(cur) .. "/" .. prefix
@@ -229,7 +328,13 @@ function btv.fs.walk(dir, opts)
       for i, a in ipairs(chain) do
         for _, l in
           ipairs(
-            dir_layers(a.abs, a.entries, repo_at ~= nil and i <= repo_at, { prefix = a.prefix })
+            dir_layers(
+              a.abs,
+              a.entries,
+              repo_at ~= nil and i <= repo_at,
+              { prefix = a.prefix },
+              i == repo_at
+            )
           )
         do
           root_layers[#root_layers + 1] = l
@@ -250,8 +355,12 @@ function btv.fs.walk(dir, opts)
       if ok then
         local layers, in_repo = item.layers, item.in_repo
         if gitignore then
-          in_repo = in_repo or has_git(entries)
-          local own = dir_layers(abs, entries, in_repo, { base = item.posix })
+          local repo_root = has_git(entries)
+          in_repo = in_repo or repo_root
+          if repo_root then
+            layers = drop_git_layers(layers)
+          end
+          local own = dir_layers(abs, entries, in_repo, { base = item.posix }, repo_root)
           if #own > 0 then
             for _, l in ipairs(layers) do
               own[#own + 1] = l

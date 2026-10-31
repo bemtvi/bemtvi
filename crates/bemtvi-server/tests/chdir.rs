@@ -443,3 +443,46 @@ async fn a_server_ex_command_runs_before_the_next_one_in_the_same_batch() {
         "the `:lcd` belonged to the closed window, not the survivor"
     );
 }
+
+/// A RELATIVE `.gitignore` walk root (resolved against the working directory, as every
+/// `btv.fs` path is) still finds the repository above it, so the `.gitignore`s inside
+/// the walk count: `cd repo` then walking `src` prunes what `src/.gitignore` ignores, as
+/// walking the absolute path does. Lives here because it moves the process cwd.
+#[tokio::test]
+async fn gitignore_walk_from_a_relative_root_finds_the_repo_above() {
+    let _lock = serial_lock().lock().await;
+    let _guard = CwdGuard::capture();
+    let (rpc, _incoming) = start().await;
+    let root = temp_dir("chdir_walk_gitignore_relative");
+    for (rel, body) in [
+        (".git/HEAD", "ref: refs/heads/main\n"),
+        ("src/.gitignore", "*.tmp\n"),
+        ("src/z.tmp", "x\n"),
+        ("src/main.rs", "x\n"),
+    ] {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+    command(&rpc, &format!("cd {}", root.display())).await;
+    exec_lua(
+        &rpc,
+        "_G.out = nil\n\
+         btv.async(function()\n\
+           local ok, files = pcall(btv.await, btv.fs.walk('src', { hidden = true, gitignore = true }))\n\
+           if not ok then _G.out = 'ERR' return end\n\
+           table.sort(files)\n\
+           _G.out = table.concat(files, ',')\n\
+         end)()",
+    )
+    .await;
+    let mut got = String::new();
+    for _ in 0..200 {
+        if let Some(s) = exec_lua(&rpc, "return _G.out").await.as_str() {
+            got = s.to_string();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(got, ".gitignore,main.rs");
+}

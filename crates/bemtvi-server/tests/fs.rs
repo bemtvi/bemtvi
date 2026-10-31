@@ -813,13 +813,15 @@ fn ignore_fixture(tag: &str) -> std::path::PathBuf {
     root
 }
 
-async fn walk_sorted(rpc: &Rpc, dir: &std::path::Path) -> String {
+async fn walk_sorted(rpc: &Rpc, dir: impl AsRef<std::path::Path>) -> String {
+    let dir = dir.as_ref();
     exec_lua(
         rpc,
         &format!(
             "_G.out = nil\n\
              btv.async(function()\n\
-               local files = btv.await(btv.fs.walk(\"{d}\", {{ hidden = true, gitignore = true }}))\n\
+               local ok, files = pcall(btv.await, btv.fs.walk(\"{d}\", {{ hidden = true, gitignore = true }}))\n\
+               if not ok then _G.out = 'ERR: ' .. tostring(type(files) == 'table' and files.message or files) return end\n\
                for i, f in ipairs(files) do files[i] = f:gsub('\\\\', '/') end\n\
                table.sort(files)\n\
                _G.out = table.concat(files, \",\")\n\
@@ -891,4 +893,230 @@ async fn walk_with_gitignore_outside_a_repo_honours_only_dot_ignore() {
     fs::write(root.join("a.log"), "x").unwrap();
     fs::write(root.join("b.log"), "x").unwrap();
     assert_eq!(walk_sorted(&rpc, &root).await, ".gitignore,.ignore,a.log");
+}
+
+/// Write `body` at `root/rel`, creating the parents.
+fn put(root: &std::path::Path, rel: &str, body: &str) {
+    let p = root.join(rel);
+    fs::create_dir_all(p.parent().unwrap()).unwrap();
+    fs::write(p, body).unwrap();
+}
+
+/// A nested repository (a submodule, a vendored checkout) is its own world, as in rg
+/// and git: the outer `.gitignore` and `.git/info/exclude` stop at its root, so
+/// `vendor/lib/x.log` and `vendor/lib/y.tmp` are listed although the outer repo ignores
+/// `*.log` and excludes `*.tmp`.
+#[tokio::test]
+async fn walk_with_gitignore_stops_outer_rules_at_a_nested_repo() {
+    let (rpc, _incoming) = start().await;
+    let root = temp_dir("fs_walk_gitignore_nested");
+    put(&root, ".git/info/exclude", "*.tmp\n");
+    put(&root, ".gitignore", "*.log\n");
+    for f in [
+        "a.log",
+        "a.tmp",
+        "main.rs",
+        "vendor/lib/x.log",
+        "vendor/lib/y.tmp",
+    ] {
+        put(&root, f, "x\n");
+    }
+    put(&root, "vendor/lib/.git/HEAD", "ref: refs/heads/main\n");
+    let want = ".gitignore,main.rs,vendor/lib/x.log,vendor/lib/y.tmp";
+    assert_eq!(walk_sorted(&rpc, &root).await, want);
+    if let Ok(out) = std::process::Command::new("rg")
+        .args(["--files", "--hidden", "-g", "!.git"])
+        .current_dir(&root)
+        .output()
+    {
+        let mut rg: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.replace('\\', "/"))
+            .collect();
+        rg.sort();
+        assert_eq!(rg.join(","), want, "rg lists the same set");
+    }
+}
+
+/// A project that is its own repository inside another one (a home directory kept as
+/// a dotfiles repo, ignoring everything with `*`): neither the outer `.gitignore` nor
+/// the outer `.git/info/exclude` reaches into the project, whether the walk starts at
+/// the project root or below it.
+#[tokio::test]
+async fn walk_with_gitignore_ignores_an_enclosing_repos_rules() {
+    let (rpc, _incoming) = start().await;
+    let home = temp_dir("fs_walk_gitignore_dotfiles");
+    put(&home, ".git/info/exclude", "*\n");
+    put(&home, ".gitignore", "*\n");
+    put(&home, "proj/.git/HEAD", "ref: refs/heads/main\n");
+    put(&home, "proj/src/main.rs", "x\n");
+    assert_eq!(walk_sorted(&rpc, home.join("proj")).await, "src/main.rs");
+    assert_eq!(walk_sorted(&rpc, home.join("proj/src")).await, "main.rs");
+}
+
+/// A first line starting with a UTF-8 byte-order mark (as some Windows editors write
+/// it) is read as git and rg read it: the BOM is not part of the pattern.
+#[tokio::test]
+async fn gitignore_matcher_skips_a_leading_bom() {
+    let (rpc, _incoming) = start().await;
+    let got = exec_lua(
+        &rpc,
+        r#"return tostring(btv.fs.gitignore("\239\187\191a.log\n"):match("a.log"))"#,
+    )
+    .await;
+    assert_eq!(got.as_str(), Some("ignore"));
+}
+
+/// A walk root spelled with a trailing separator resolves the directories above it
+/// the same as without: the parent's anchored `/proj/gen/` still prunes `gen/`.
+#[tokio::test]
+async fn walk_with_gitignore_trailing_separator_on_the_root() {
+    let (rpc, _incoming) = start().await;
+    let w = temp_dir("fs_walk_gitignore_trailing");
+    put(&w, ".ignore", "/proj/gen/\n");
+    put(&w, "proj/gen/out.txt", "x\n");
+    put(&w, "proj/main.rs", "x\n");
+    let dir = format!("{}/", w.join("proj").display());
+    assert_eq!(walk_sorted(&rpc, &dir).await, "main.rs");
+}
+
+/// In a linked worktree (`git worktree add`) `.git` is a FILE pointing into the main
+/// repository, and the `info/exclude` that applies is the main repository's (the
+/// worktree's `commondir`), as rg resolves it.
+#[tokio::test]
+async fn walk_with_gitignore_reads_a_worktrees_common_exclude() {
+    let (rpc, _incoming) = start().await;
+    let base = temp_dir("fs_walk_gitignore_worktree");
+    put(&base, "main/.git/info/exclude", "secret.txt\n");
+    put(&base, "main/.git/worktrees/wt/commondir", "../..\n");
+    let gitdir = base.join("main/.git/worktrees/wt");
+    put(&base, "wt/.git", &format!("gitdir: {}\n", gitdir.display()));
+    put(&base, "wt/secret.txt", "x\n");
+    put(&base, "wt/main.rs", "x\n");
+    assert_eq!(walk_sorted(&rpc, base.join("wt")).await, ".git,main.rs");
+}
+
+/// An ignore file the walk cannot read is skipped with a warning naming it — as rg
+/// warns and walks on — not silently, and without failing the whole walk over it.
+#[cfg(unix)]
+#[tokio::test]
+async fn walk_with_gitignore_warns_and_goes_on_past_an_unreadable_ignore_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let (rpc, _incoming) = start().await;
+    let root = temp_dir("fs_walk_gitignore_unreadable");
+    put(&root, ".ignore", "a.log\n");
+    put(&root, "a.log", "x\n");
+    let ig = root.join(".ignore");
+    fs::set_permissions(&ig, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&ig).is_ok() {
+        eprintln!("skip: running with permission to read a mode-000 file");
+        return;
+    }
+    exec_lua(
+        &rpc,
+        "_G.notes = {}\nbtv.notify = function(m, l) table.insert(_G.notes, tostring(m) .. '@' .. tostring(l)) end",
+    )
+    .await;
+    let got = walk_sorted(&rpc, &root).await;
+    fs::set_permissions(&ig, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        got, ".ignore,a.log",
+        "the walk goes on without the file's rules"
+    );
+    let notes = exec_lua(&rpc, "return table.concat(_G.notes, '|')").await;
+    let notes = notes.as_str().unwrap_or_default().to_string();
+    assert!(
+        notes.contains(".ignore") && notes.contains("skipping"),
+        "a warning names the skipped file: {notes:?}"
+    );
+}
+
+/// An ignore-file line the `.gitignore` walk cannot compile is skipped (as rg and git
+/// skip it) but not silently: the walk warns once, naming the file, as rg warns on
+/// stderr — so a rule that never applies does not just look like a bug in the walk.
+#[tokio::test]
+async fn walk_with_gitignore_warns_once_about_a_line_it_cannot_compile() {
+    let (rpc, _incoming) = start().await;
+    let root = temp_dir("fs_walk_gitignore_badglob");
+    fs::write(root.join(".ignore"), "a{b\nskip.txt\n").unwrap();
+    fs::write(root.join("skip.txt"), "x").unwrap();
+    fs::write(root.join("keep.txt"), "x").unwrap();
+    exec_lua(
+        &rpc,
+        "_G.notes = {}\nbtv.notify = function(m, l) table.insert(_G.notes, tostring(m) .. '@' .. tostring(l)) end",
+    )
+    .await;
+    assert_eq!(walk_sorted(&rpc, &root).await, ".ignore,keep.txt");
+    assert_eq!(walk_sorted(&rpc, &root).await, ".ignore,keep.txt");
+    let notes = exec_lua(&rpc, "return table.concat(_G.notes, '|')").await;
+    let notes = notes.as_str().unwrap_or_default();
+    assert!(
+        notes.contains(".ignore") && notes.contains("a{b") && notes.matches('@').count() == 1,
+        "one warning naming the file and its bad line: {notes:?}"
+    );
+}
+
+/// An ignore file that is not a regular file — a FIFO (`.ignore` itself, or the
+/// repository's `info/exclude` symlinked to one) — is skipped unread with a warning
+/// naming it, instead of parking an fs worker forever on a read no writer will ever
+/// answer (or slurping `/dev/zero` until the editor runs out of memory). A checkout
+/// unpacked from an archive can carry either.
+#[cfg(unix)]
+#[tokio::test]
+async fn walk_with_gitignore_skips_an_ignore_file_that_is_not_a_regular_file() {
+    let (rpc, _incoming) = start().await;
+    let mkfifo = |p: &std::path::Path| {
+        assert!(std::process::Command::new("mkfifo")
+            .arg(p)
+            .status()
+            .expect("mkfifo")
+            .success());
+    };
+    // Unblock a reader parked on `fifo` (the pre-fix behavior), so the test can end.
+    let release = |p: std::path::PathBuf| {
+        std::thread::spawn(move || drop(fs::OpenOptions::new().write(true).open(p)));
+    };
+    exec_lua(
+        &rpc,
+        "_G.notes = {}\nbtv.notify = function(m, l) table.insert(_G.notes, tostring(m) .. '@' .. tostring(l)) end",
+    )
+    .await;
+    let notes = || async {
+        let n = exec_lua(&rpc, "return table.concat(_G.notes, '|')").await;
+        n.as_str().unwrap_or_default().to_string()
+    };
+
+    let root = temp_dir("fs_walk_gitignore_fifo");
+    fs::write(root.join("a.txt"), "x").unwrap();
+    mkfifo(&root.join(".ignore"));
+    let got = walk_sorted(&rpc, &root).await;
+    if got.starts_with("ERR") {
+        release(root.join(".ignore"));
+    }
+    assert_eq!(got, ".ignore,a.txt", "a FIFO .ignore is skipped unread");
+    let n = notes().await;
+    assert!(
+        n.contains(".ignore") && n.contains("regular"),
+        "a warning names the FIFO .ignore: {n:?}"
+    );
+
+    let repo = temp_dir("fs_walk_gitignore_fifo_exclude");
+    fs::create_dir_all(repo.join(".git/info")).unwrap();
+    fs::write(repo.join("a.txt"), "x").unwrap();
+    let pipe = temp_dir("fs_walk_gitignore_fifo_target").join("pipe");
+    mkfifo(&pipe);
+    std::os::unix::fs::symlink(&pipe, repo.join(".git/info/exclude")).unwrap();
+    let got = walk_sorted(&rpc, &repo).await;
+    if got.starts_with("ERR") {
+        release(pipe);
+    }
+    assert_eq!(
+        got, "a.txt",
+        "an info/exclude symlinked to a FIFO is skipped unread"
+    );
+    let n = notes().await;
+    assert!(
+        n.contains("exclude") && n.contains("regular"),
+        "a warning names the FIFO info/exclude: {n:?}"
+    );
 }

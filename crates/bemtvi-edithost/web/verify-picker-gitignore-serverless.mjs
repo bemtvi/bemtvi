@@ -113,6 +113,20 @@ try {
      end)()`);
   check("seeded a repository with a .gitignore under cwd via btv.fs (OPFS)", /ok/.test(String(seeded)), `seed=${JSON.stringify(seeded)}`);
 
+  // The error shape the walk branches on: `.git/info/exclude` is absent with its parent
+  // directory absent too, which OPFS signals as a raw `NotFoundError` DOMException. It must
+  // reach Lua as `ENOENT` (as native and the daemon report it) — any other code makes the
+  // walk reject instead of reading "no rules", and every serverless `_git` picker comes up empty.
+  const missing = await settle(page, "__missing", `btv.async(function()
+       local ok, e = pcall(btv.await, btv.fs.read(vim.fn.getcwd() .. "/.git/info/exclude"))
+       _G.__missing = ok and "resolved" or tostring(type(e) == "table" and e.code or e)
+     end)()`);
+  check(
+    "a read under a missing OPFS directory rejects ENOENT, as native and the daemon do",
+    /ENOENT/.test(String(missing)),
+    `code=${JSON.stringify(missing)}`,
+  );
+
   // The control: the unrestricted picker lists the ignored files.
   await luaResult(page, `btv.picker.open('files')`);
   const all = await pickerPaths(page, 5);
@@ -142,7 +156,34 @@ try {
     `paths=${hits}`,
   );
   await page.evaluate(() => window.__bemtvi.feed("<Esc>"));
-  await settle(page, "__rm", `btv.fs.remove(vim.fn.getcwd(), { recursive = true })
+
+  // A submodule's `.git` is a FILE naming its git dir RELATIVE to it
+  // (`gitdir: ../.git/modules/sub`), so the walk reads `sub/../.git/modules/sub/…`. OPFS
+  // has no `..` entry (a handle lookup by that name throws a TypeError), so the path must
+  // resolve `..` lexically — as it does natively and over a daemon — or the walk rejects
+  // with EIO and the `_git` pickers list nothing. The module's `info/exclude` applies.
+  const sub = await settle(page, "__sub", `btv.async(function()
+       local base = vim.fn.getcwd()
+       btv.await(btv.fs.mkdir(base .. "/.git/modules/sub/info", { recursive = true }))
+       btv.await(btv.fs.write(base .. "/.git/modules/sub/info/exclude", "secret.txt\\n"))
+       btv.await(btv.fs.mkdir(base .. "/sub", { recursive = true }))
+       btv.await(btv.fs.write(base .. "/sub/.git", "gitdir: ../.git/modules/sub\\n"))
+       btv.await(btv.fs.write(base .. "/sub/secret.txt", "x\\n"))
+       btv.await(btv.fs.write(base .. "/sub/kept.txt", "x\\n"))
+       local ok, files = pcall(btv.await, btv.fs.walk(base .. "/sub", { gitignore = true }))
+       if not ok then
+         _G.__sub = "ERR:" .. tostring(type(files) == "table" and (files.message or files.code) or files)
+         return
+       end
+       table.sort(files)
+       _G.__sub = table.concat(files, ",")
+     end)()`);
+  check(
+    "a submodule's relative gitdir: resolves over OPFS and its info/exclude applies",
+    /"kept\.txt"/.test(String(sub)),
+    `walk=${JSON.stringify(sub)}`,
+  );
+  await settle(page, "__rm",`btv.fs.remove(vim.fn.getcwd(), { recursive = true })
        :next(function() _G.__rm = "gone" end, function(e) _G.__rm = "err:" .. e.code end)`);
 } catch (e) {
   check("harness ran without throwing", false, String(e && e.stack || e));

@@ -56,11 +56,14 @@ btv.test.describe("examples/ts-install", function()
   btv.test.it(":TSInstallInfo reports the data-dir layout", function(t)
     open(t)
     t:cmd("TSInstallInfo")
-    local report = t:message()
-    if report == "" then
-      -- The listing may open as a panel instead of an echo; read it there.
-      report = table.concat(t:lines(), "\n")
-    end
+    -- The scan runs off the editor thread, so the listing opens a moment later, as
+    -- the `[TSInstall info]` panel (or an error message if the scan failed).
+    t:wait_for(function()
+      return btv.buf.name(0):find("TSInstall info", 1, true) ~= nil
+        or (t:message() or ""):find("TSInstallInfo", 1, true) ~= nil
+    end, { tries = 100, interval = 20, message = ":TSInstallInfo opened no listing" })
+    local report = table.concat(t:lines(), "\n")
+    btv.test.expect(btv.buf.name(0)).to_contain("TSInstall info")
     btv.test.expect(report).never.to_be("")
     -- Whatever the shape, it names where things live.
     btv.test.expect(report:lower()).to_match("parser")

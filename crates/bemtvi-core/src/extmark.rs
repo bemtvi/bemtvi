@@ -14,6 +14,7 @@
 //! mark's anchors for free, across every edit path.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 /// Reserved namespace for the editor's secondary (multi-)cursors. They are
@@ -120,6 +121,32 @@ pub const PAINT_NS: u32 = u32::MAX - 8;
 /// highlighter's baseline ([`TS_HL_PRIORITY`]), so a plugin / semantic-token
 /// mark wins over the base syntax color by default.
 pub const DEFAULT_PRIORITY: u32 = 4096;
+
+/// The lowest of the editor's own namespaces. They all sit in one block at the top
+/// of the `u32` range (a new one goes just below this, and moves it), where the Lua
+/// namespace allocator, counting up from 1, never reaches.
+const LOWEST_INTERNAL_NS: u32 = PAINT_NS;
+
+/// Whether `ns` is one of the editor's own namespaces (the multi-cursor heads, the
+/// snippet tabstops, the diagnostic anchors, the paint layer, …) rather than one a
+/// plugin allocated. The scripting bridges refuse these, so a plugin can't reach
+/// into editor state through a raw namespace number.
+pub fn is_internal_ns(ns: u32) -> bool {
+    ns >= LOWEST_INTERNAL_NS
+}
+
+/// The source of every structural stamp ([`ExtmarkStore::generation`] and each
+/// namespace's `gen`): one counter for the
+/// whole process, so two stamps are equal only when they record the same mutation.
+/// A per-slot counter would let two unrelated slots carry the same value (a store
+/// swapped in by undo, a namespace moved in from a snapshot) and a consumer comparing
+/// stamps would take different contents for unchanged.
+static STAMPS: AtomicU64 = AtomicU64::new(0);
+
+/// A stamp no earlier mutation carries. Never `0`, which reads as "never changed".
+fn next_stamp() -> u64 {
+    STAMPS.fetch_add(1, Ordering::Relaxed) + 1
+}
 
 /// Baseline priority the treesitter highlighter paints at (neovim's
 /// `vim.highlight.priorities.treesitter`). Extmarks default above this.
@@ -320,10 +347,31 @@ pub struct Extmark {
 #[derive(Debug, Default, Clone)]
 struct NsMarks {
     marks: BTreeMap<u64, Extmark>,
-    /// Structural-mutation counter: bumped by `set` / `del` / `clear` /
-    /// `clear_all` / `move_namespace_into`, never by [`ExtmarkStore::shift`].
+    /// Structural stamp (see [`STAMPS`]): restamped by `set` / `del` / `clear`,
+    /// never by [`ExtmarkStore::shift`]. A slot moved by `move_namespace_into` keeps
+    /// its stamp, which still describes the marks it holds.
     gen: u64,
     next_id: u64,
+    /// This namespace's marks sorted by position: the run the store's combined index
+    /// ([`ExtmarkStore::index`]) is rebuilt from. Each namespace keeps its own, so a
+    /// mark set, deleted or cleared here re-sorts this namespace's marks only, and
+    /// the rebuild merges already-sorted runs instead of sorting every mark in the
+    /// buffer. See [`PosIndex`].
+    index: PosIndex,
+}
+
+impl NsMarks {
+    /// Record a structural change to this namespace: a fresh stamp, and the index
+    /// dropped, since it no longer lists the marks there are.
+    fn touch(&mut self) {
+        self.gen = next_stamp();
+        self.index = PosIndex::default();
+    }
+
+    /// The namespace's sorted run, built now if a structural change dropped it.
+    fn index(&self, ns: u32) -> &Positions {
+        self.index.0.get_or_init(|| Positions::build(ns, self))
+    }
 }
 
 /// All extmarks of one buffer, partitioned by namespace id. A namespace id is an
@@ -336,16 +384,23 @@ struct NsMarks {
 #[derive(Debug, Default, Clone)]
 pub struct ExtmarkStore {
     by_ns: HashMap<u32, NsMarks>,
-    /// Bumped by every **structural** change — a mark set, deleted, or cleared, and a
-    /// namespace moved in or out — but deliberately NOT by [`shift`](Self::shift),
-    /// which moves byte anchors and touches nothing else.
+    /// Restamped by every **structural** change — a mark set, deleted, or cleared, a
+    /// namespace moved in or out, and undo adopting a snapshot's positions — but
+    /// deliberately NOT by [`shift`](Self::shift), which moves byte anchors and
+    /// touches nothing else.
     ///
     /// That asymmetry is what lets the Rust→Lua mirror stop re-serializing every
     /// mark's decorations on every keystroke: `hl_group`, `priority`, the sign /
     /// line-fill / line-hl payloads and the gravity flags are fixed for a mark's
-    /// lifetime, so they only need re-pushing when this counter moves. An edit
-    /// refreshes positions alone. See
-    /// `docs/plans/2026-08-07-incremental-buffer-mirror.md`.
+    /// lifetime, so they only need re-pushing when a structural change touched
+    /// them. An edit refreshes positions alone. While this stamp holds, the mirror
+    /// skips the buffer; when it moves, the per-namespace stamps
+    /// ([`ns_stamps`](Self::ns_stamps)) say which namespaces to re-send. See
+    /// `docs/plans/2026-08-07-incremental-buffer-mirror.md` and
+    /// `docs/plans/2026-10-31-incremental-extmark-mirror.md`.
+    ///
+    /// A stamp from [`STAMPS`], so a store swapped in for another can't carry the
+    /// value the consumer last saw. The undo snapshot cache compares it too.
     generation: u64,
     /// How many marks carry `virt_lines`. Maintained on every structural mutation so
     /// [`Buffer::virt_lines_by_line`](crate::Buffer::virt_lines_by_line) — called from
@@ -365,9 +420,11 @@ pub struct ExtmarkStore {
     next_serial: u64,
     /// Every mark's position, sorted, for the per-frame range queries
     /// ([`starting_in`](Self::starting_in), [`reaching`](Self::reaching)) — so a frame
-    /// visits the marks on screen rather than every mark in the buffer. Built on the
-    /// first query after a structural change, kept sorted by [`shift`](Self::shift),
-    /// and not carried by a clone. See [`PosIndex`].
+    /// visits the marks on screen rather than every mark in the buffer, with one
+    /// binary search however many namespaces there are. Dropped by a structural
+    /// change and rebuilt on the next query by merging the namespaces' own sorted
+    /// runs, kept sorted by [`shift`](Self::shift), and not carried by a clone. See
+    /// [`PosIndex`].
     index: PosIndex,
 }
 
@@ -399,10 +456,11 @@ fn count_gutter(widths: &mut BTreeMap<usize, usize>, width: usize, add: bool) {
 }
 
 impl ExtmarkStore {
-    /// Record a structural change: bump the [`generation`](Self::generation) and drop
-    /// the position index, which no longer lists the marks there are.
+    /// Record a structural change: restamp the [`generation`](Self::generation) and
+    /// drop the combined index, which no longer lists the marks there are. The
+    /// namespace a change lands in drops its own run too ([`NsMarks::touch`]).
     fn touch_structure(&mut self) {
-        self.generation += 1;
+        self.generation = next_stamp();
         self.index = PosIndex::default();
     }
 
@@ -438,9 +496,10 @@ impl ExtmarkStore {
             .collect()
     }
 
-    /// The position index, built now if a structural change dropped it.
+    /// The combined position index, rebuilt now from the namespaces' runs if a
+    /// structural change dropped it.
     fn index(&self) -> &Positions {
-        self.index.0.get_or_init(|| Positions::build(&self.by_ns))
+        self.index.0.get_or_init(|| Positions::merge(&self.by_ns))
     }
 
     /// The mark an index entry names. The index lists exactly the marks there are
@@ -529,7 +588,7 @@ impl ExtmarkStore {
         if let Some(old) = &replaced {
             count_gutter(&mut self.gutter_widths, gutter_width(old), false);
         }
-        slot.gen += 1;
+        slot.touch();
         self.virt_lines_marks = self.virt_lines_marks + usize::from(gained) - usize::from(lost);
         id
     }
@@ -545,7 +604,7 @@ impl ExtmarkStore {
         let removed = match self.by_ns.get_mut(&ns) {
             Some(slot) => match slot.marks.remove(&id) {
                 Some(m) => {
-                    slot.gen += 1;
+                    slot.touch();
                     Some(m)
                 }
                 None => None,
@@ -576,7 +635,7 @@ impl ExtmarkStore {
                     count_gutter(&mut self.gutter_widths, gutter_width(m), false);
                 }
                 slot.marks.clear();
-                slot.gen += 1;
+                slot.touch();
                 self.virt_lines_marks -= dropped;
             }
             Some(r) => {
@@ -595,7 +654,7 @@ impl ExtmarkStore {
                         true
                     }
                 });
-                slot.gen += 1;
+                slot.touch();
                 self.virt_lines_marks -= dropped;
             }
         }
@@ -671,6 +730,9 @@ impl ExtmarkStore {
                 continue;
             }
             let theirs = snap.by_ns.get(ns);
+            // The marks move without the namespace changing, so the stamp holds and
+            // only the index goes.
+            slot.index = PosIndex::default();
             for (id, m) in &mut slot.marks {
                 match theirs
                     .and_then(|s| s.marks.get(id))
@@ -687,8 +749,11 @@ impl ExtmarkStore {
                 }
             }
         }
-        // Positions moved wholesale: have the Lua mirror re-read the store, and the
-        // position index rebuild.
+        // Positions moved wholesale; each namespace above dropped its run, and
+        // `touch_structure` drops the combined index. The store generation moves, which is what the undo snapshot cache compares, but
+        // no namespace's stamp does, so the mirror re-sends no payload. It refreshes
+        // every position anyway: the one caller, undo's `restore_snapshot`, replaces
+        // the text with `mark_resync`, whose resync makes the mirror do that.
         self.touch_structure();
     }
 
@@ -706,13 +771,23 @@ impl ExtmarkStore {
         self.by_ns.get(&ns).map_or(0, |s| s.marks.len())
     }
 
-    /// The namespace's structural-mutation counter — what the marks' placement
-    /// recorded after its last `set`. The diagnostics anchor-trust guard compares
+    /// The namespace's structural stamp (see [`STAMPS`]) — what the marks' placement
+    /// recorded after its last `set`, `0` for a namespace with no slot. The diagnostics anchor-trust guard compares
     /// it to the recorded value to reject a store an undo resurrected from before
     /// the placement (its older `gen` fails the equality) while edits that only
     /// *shift* marks pass (a shift never bumps `gen`).
     pub fn ns_generation(&self, ns: u32) -> u64 {
         self.by_ns.get(&ns).map_or(0, |s| s.gen)
+    }
+
+    /// Every namespace slot with its structural stamp (see
+    /// [`ns_generation`](Self::ns_generation)), in no particular order, without
+    /// visiting a mark: O(namespaces). The mirror compares these against the stamps
+    /// it last pushed to re-send only the namespaces that changed. A slot emptied
+    /// by `del` / `clear` is still listed, with the stamp of the mutation that
+    /// emptied it.
+    pub fn ns_stamps(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
+        self.by_ns.iter().map(|(ns, s)| (*ns, s.gen))
     }
 
     /// Every mark of namespace `ns`, **in ascending id order** (the store keys each
@@ -755,7 +830,7 @@ impl ExtmarkStore {
     }
 
     /// The structural [`generation`](Self::generation) — see that field for why a
-    /// consumer gates a full re-serialize on it rather than on any change.
+    /// consumer gates its re-serialize on it rather than on any change.
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -809,17 +884,23 @@ impl ExtmarkStore {
                 }
             }
         }
-        // The same move for the position index, when one is built, so the next frame
-        // doesn't pay a rebuild for an edit.
+        // The same move for the combined index and each namespace's run, when built,
+        // so the next frame doesn't pay a rebuild for an edit.
         if let Some(ix) = self.index.0.get_mut() {
             ix.shift(start, old_end, new_end);
+        }
+        for slot in self.by_ns.values_mut() {
+            if let Some(ix) = slot.index.0.get_mut() {
+                ix.shift(start, old_end, new_end);
+            }
         }
     }
 }
 
-/// The lazily-built [`Positions`] of an [`ExtmarkStore`]. Its `Clone` gives an
-/// empty one: undo snapshots clone the store, and a snapshot is rarely queried, so
-/// it builds its own index only if it ever is rather than carrying a copy.
+/// A lazily-built [`Positions`]: a namespace's run or the combined index. Its `Clone`
+/// gives an empty one:
+/// undo snapshots clone the store, and a snapshot is rarely queried, so it builds
+/// its own index only if it ever is rather than carrying a copy.
 #[derive(Debug, Default)]
 struct PosIndex(OnceLock<Positions>);
 
@@ -849,12 +930,14 @@ impl PosEntry {
     }
 }
 
-/// Every mark's position, sorted by `(start, ns, id)`, with a max-end segment tree
-/// over the sorted entries for [`ExtmarkStore::reaching`].
+/// Mark positions sorted by `(start, ns, id)`, with a max-end segment tree over the
+/// sorted entries for [`ExtmarkStore::reaching`]: either one namespace's run or the
+/// store's combined index merged from them.
 ///
 /// The entries duplicate the positions the marks hold. Both move in the same
 /// [`ExtmarkStore::shift`], with the same gravity rules, and every structural change
-/// drops the index, so the two can't drift.
+/// to a namespace drops its run and the combined index (as does undo's position
+/// adoption), so the two can't drift.
 #[derive(Debug)]
 struct Positions {
     entries: Vec<PosEntry>,
@@ -864,22 +947,41 @@ struct Positions {
 }
 
 impl Positions {
-    fn build(by_ns: &HashMap<u32, NsMarks>) -> Self {
-        let mut entries: Vec<PosEntry> = by_ns
-            .iter()
-            .flat_map(|(ns, slot)| {
-                slot.marks.values().map(move |m| PosEntry {
-                    start: m.start,
-                    end: m.end.unwrap_or(m.start),
-                    has_end: m.end.is_some(),
-                    right_gravity: m.right_gravity,
-                    end_right_gravity: m.end_right_gravity,
-                    ns: *ns,
-                    id: m.id,
-                })
+    fn build(ns: u32, slot: &NsMarks) -> Self {
+        let mut entries: Vec<PosEntry> = slot
+            .marks
+            .values()
+            .map(|m| PosEntry {
+                start: m.start,
+                end: m.end.unwrap_or(m.start),
+                has_end: m.end.is_some(),
+                right_gravity: m.right_gravity,
+                end_right_gravity: m.end_right_gravity,
+                ns,
+                id: m.id,
             })
             .collect();
         entries.sort_unstable_by_key(PosEntry::key);
+        Self {
+            entries,
+            tree: OnceLock::new(),
+        }
+    }
+
+    /// The combined index: every namespace's sorted run, concatenated and merged. The
+    /// stable sort finds the runs already in the input and merges them, so this costs
+    /// about O(E log n) for n namespaces holding marks, and close to a copy when one
+    /// big namespace sits beside a few small ones: the shape of a plugin republishing
+    /// a handful of marks next to thousands of static ones. Only the namespaces whose
+    /// run a change dropped are sorted from scratch.
+    fn merge(by_ns: &HashMap<u32, NsMarks>) -> Self {
+        let mut entries = Vec::with_capacity(by_ns.values().map(|s| s.marks.len()).sum());
+        for (ns, slot) in by_ns {
+            if !slot.marks.is_empty() {
+                entries.extend_from_slice(&slot.index(*ns).entries);
+            }
+        }
+        entries.sort_by_key(PosEntry::key);
         Self {
             entries,
             tree: OnceLock::new(),

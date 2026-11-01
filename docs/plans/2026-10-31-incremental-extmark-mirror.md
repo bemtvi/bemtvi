@@ -103,6 +103,41 @@ wasm edit-host builds (the `native` gate covers transport only). Check
 `cargo check -p bemtvi-server --no-default-features` and the browser checks that read
 marks (`verify-decor.mjs`, `verify-gutter-text.mjs`).
 
+## As built
+
+- **No `positions_reset` stamp (step 2).** Phase 1 added it and Phase 2 removed it.
+  `adopt_positions_from` keeps moving the store generation, which the undo snapshot
+  cache compares, and no namespace stamp moves, so the walk re-sends no payload. Its
+  one caller, `restore_snapshot`, replaces the text through `mark_resync`, and that
+  resync already makes the mirror refresh every position (`PosScope::All`). A
+  mutation that ignored the stamp failed no test, because nothing could reach it.
+- **Read-after-write.** The one way a queued op failed was the native bridge
+  raising on a decoration it can't lower (an unknown `virt_text_pos` / `hl_mode`),
+  after the write-through. `btv.buf.set_extmark` now writes its row after queueing.
+  Otherwise the core can't fail an op: it clamps positions, and a deleted buffer
+  drops out of the push. No dirty-namespace tracking was needed.
+- **The remaining cost, and the index per namespace.** After Phase 2 the cost test
+  measured ~3.1x a run with no static marks (it was ~75x). Almost all of the rest
+  was the core's position index: one sorted vector for the whole store, which any
+  structural change dropped and the next frame rebuilt by sorting every mark. Each
+  namespace now also keeps its own sorted run, dropped only by a change to that
+  namespace (and by undo's position adoption). The combined index is still dropped
+  by any structural change, but it is rebuilt by concatenating the runs and merging
+  them with the run-adaptive stable sort: close to a copy when one big namespace sits
+  beside a few small ones. Edits shift both. The cost test measures ~1.3x and bounds
+  it at 2.0. A first version queried each namespace's run per call and merged the
+  hits (~1.0x here), but review measured it 2.3x slower than `main` typing beside
+  1000 small namespaces with marks on screen, since every frame looped and sorted
+  per query. One combined index keeps `main`'s query cost (~2.3x against `main`'s
+  ~2.2x on that shape, bounded at 2.8).
+- **The sweep (Phase 3, 2026-11-01).** `cargo test --workspace --no-fail-fast` green;
+  all 120 example specs pass under `--test-plugin`; the plugin repos dap, diff, help,
+  tree, line and markdown-preview pass. colored-pairs (3 provider-paint waits) and
+  snippets (`btv.reg.set('+')` now refused for the clipboard) fail identically on
+  `main`, so neither is this change. `cargo check -p bemtvi-server
+  --no-default-features` builds, and `verify-decor.mjs` / `verify-gutter-text.mjs`
+  pass against a fresh `build.sh`.
+
 ## Phases
 
 Each phase ends with the suite green and a commit, and pauses for review.

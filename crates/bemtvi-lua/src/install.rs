@@ -350,6 +350,18 @@ fn gutter_chunks_from_value(value: mlua::Value) -> mlua::Result<Vec<VirtChunkDat
     Ok(out)
 }
 
+/// Refuse one of the editor's own namespaces (see
+/// [`bemtvi_core::extmark::is_internal_ns`]) at an extmark bridge, loud, naming the
+/// API `f` the plugin called.
+fn plugin_ns(ns: u32, f: &str) -> mlua::Result<()> {
+    if bemtvi_core::extmark::is_internal_ns(ns) {
+        return Err(mlua::Error::RuntimeError(format!(
+            "{f}: namespace {ns} is reserved for the editor"
+        )));
+    }
+    Ok(())
+}
+
 /// Lower a `nvim_buf_set_extmark` `decoration` table (the virtual-text payload the
 /// prelude collected) into a [`VirtDecorData`]. Returns `None` when it carries
 /// neither `virt_text` nor `virt_lines` — a decoration of only not-yet-rendered
@@ -2469,6 +2481,7 @@ pub(crate) fn install_runtime_api(
                 right_gravity,
                 end_right_gravity,
             ): ExtmarkSetArgs| {
+                plugin_ns(ns, "nvim_buf_set_extmark")?;
                 let decor = match decoration {
                     Some(t) => virt_decor_from_table(&t)?.map(Box::new),
                     None => None,
@@ -2500,10 +2513,20 @@ pub(crate) fn install_runtime_api(
             crate::search::buf_search(lua, lines, pattern, opts)
         })?,
     )?;
+    // `btv._is_internal_ns(ns)` — whether `ns` is one of the editor's own namespaces,
+    // which the bridges refuse. The mirror lists some of them on the buffers the editor
+    // paints, so `clear_namespace(buf, -1, …)` asks this to pass over them.
+    btv.set(
+        "_is_internal_ns",
+        lua.create_function(|_, ns: i64| {
+            Ok(u32::try_from(ns).is_ok_and(bemtvi_core::extmark::is_internal_ns))
+        })?,
+    )?;
     let sh = shared.clone();
     btv.set(
         "_extmark_del",
         lua.create_function(move |_, (bufnr, ns, id): (u64, u32, u64)| {
+            plugin_ns(ns, "nvim_buf_del_extmark")?;
             sh.borrow_mut()
                 .extmark_ops
                 .push(ExtmarkOp::Del { bufnr, ns, id });
@@ -2515,6 +2538,7 @@ pub(crate) fn install_runtime_api(
         "_extmark_clear",
         lua.create_function(
             move |_, (bufnr, ns, line_start, line_end): (u64, u32, i64, i64)| {
+                plugin_ns(ns, "nvim_buf_clear_namespace")?;
                 sh.borrow_mut().extmark_ops.push(ExtmarkOp::Clear {
                     bufnr,
                     ns,
@@ -4265,6 +4289,7 @@ pub(crate) fn install_runtime_api(
     btv.set(
         "_decor_publish",
         lua.create_function(move |_, (ns, gen, win, buf, marks): DecorPublishArgs| {
+            plugin_ns(ns, "btv.decor publish")?;
             let marks = marks
                 .into_iter()
                 .map(|m| {

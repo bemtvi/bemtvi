@@ -1031,6 +1031,17 @@ pub(crate) struct ReadChain {
     pub(crate) deferred_win_enter: Vec<WindowId>,
 }
 
+/// What the `btv._extmarks` mirror holds for one buffer, as stamps: see
+/// [`EditHost::extmark_pushed`].
+#[derive(Default)]
+pub(crate) struct ExtmarkPushed {
+    /// The store's [`generation`](bemtvi_core::extmark::ExtmarkStore::generation):
+    /// while it holds, no namespace changed and the namespace walk is skipped.
+    pub(crate) generation: u64,
+    /// Each mirrored namespace's stamp. Reserved namespaces are never listed.
+    pub(crate) ns: HashMap<u32, u64>,
+}
+
 pub struct EditHost {
     editor: Editor,
     lua: LuaRuntime,
@@ -1525,15 +1536,18 @@ pub struct EditHost {
     /// (`nvim_buf_attach`). Tracked only to fire faithful buffer-change callbacks —
     /// a fuzzy-finder plugin drives its prompt filtering off `on_lines`.
     buf_mirror_lines: HashMap<BufferId, usize>,
-    /// Per-buffer extmark-store *structural* generation last serialized into the
-    /// `btv._extmarks` Lua mirror ([`EditHost::push_buf_mirror`]). A mark's
-    /// decorations (`hl_group`, priority, the sign / line-fill / line-hl payloads,
-    /// gravity) are fixed for its lifetime — an edit moves byte anchors and nothing
-    /// else — so the full re-serialize is gated on this counter and an edit refreshes
-    /// positions alone. Without it, a buffer carrying a few thousand marks (any
-    /// diagnostics / git-sign / rainbow plugin) re-serialized every mark on every
-    /// keystroke. See `docs/plans/2026-08-07-incremental-buffer-mirror.md`.
-    extmark_gens: HashMap<BufferId, u64>,
+    /// Per-buffer record of what the `btv._extmarks` Lua mirror holds
+    /// ([`EditHost::push_buf_mirror`]): the store stamps and each namespace's stamp
+    /// as last pushed. A mark's decorations (`hl_group`, priority, the sign /
+    /// line-fill / line-hl payloads, gravity) are fixed for its lifetime — an edit
+    /// moves byte anchors and nothing else — so an edit refreshes positions alone,
+    /// and a set / del / clear re-sends only the namespaces whose stamp moved.
+    /// Without it, a buffer carrying a few thousand marks re-serialized every mark
+    /// on every keystroke, and later on every mark any plugin set. See
+    /// `docs/plans/2026-08-07-incremental-buffer-mirror.md` and
+    /// `docs/plans/2026-10-31-incremental-extmark-mirror.md`. A buffer with no entry
+    /// is pushed whole.
+    extmark_pushed: HashMap<BufferId, ExtmarkPushed>,
     /// Per-buffer undo fingerprint last serialized into the `btv._undotree` Lua
     /// mirror ([`EditHost::push_undotree_mirror`]), so an unchanged tree isn't
     /// re-projected on every Lua entry — only edits/undo/redo rebuild it.
@@ -2219,7 +2233,7 @@ impl EditHost {
             bo_mirror_gen: u64::MAX,
             bo_mirror_known: HashSet::new(),
             win_jump_gens: HashMap::new(),
-            extmark_gens: HashMap::new(),
+            extmark_pushed: HashMap::new(),
             undo_mirror_versions: HashMap::new(),
             qf_mirror_version: None,
             reg_mirror_gen: None,

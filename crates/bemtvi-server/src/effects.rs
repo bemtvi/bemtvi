@@ -14,8 +14,8 @@ use bemtvi_core::{
 use bemtvi_lua::FsJob;
 use bemtvi_lua::{
     BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, DecorInvalidate, DecorPublish, DockOp,
-    ExtmarkMirror, ExtmarkOp, FloatMirror, GoMirror, HlDefMirror, HlSet, JumpMirror, LayerOp,
-    LinesDelta, LoopOp, NamedListOp, OptionValue, PanelOp, QfItem, QfMirror, Sequenced,
+    ExtmarkMirror, ExtmarkOp, ExtmarkPatch, FloatMirror, GoMirror, HlDefMirror, HlSet, JumpMirror,
+    LayerOp, LinesDelta, LoopOp, NamedListOp, OptionValue, PanelOp, QfItem, QfMirror, Sequenced,
     StatuslineKind, StatuslineTarget, TabMirror, TabOp, TsOp, ViewOp, VirtDecorData, WindowMirror,
     WindowOp,
 };
@@ -285,6 +285,70 @@ fn extmark_dirty_window(
         None
     };
     Some(PosScope::Window { lo, hi })
+}
+
+/// One mark's row in the `btv._extmarks` mirror: its 0-based position (two rope
+/// lookups) and every payload field a `get_extmarks(details = true)` reads back.
+fn extmark_mirror_row(
+    b: &bemtvi_core::Buffer,
+    ns: u32,
+    m: &bemtvi_core::extmark::Extmark,
+) -> ExtmarkMirror {
+    let (row, col) = byte_rowcol(b, m.start);
+    let (end_row, end_col) = match m.end {
+        Some(e) => {
+            let (r, c) = byte_rowcol(b, e);
+            (Some(r), Some(c))
+        }
+        None => (None, None),
+    };
+    let d = m.decor.as_deref();
+    let (sign_text, sign_hl_group) = match d {
+        Some(d) => (d.sign_text.clone(), d.sign_hl_group.clone()),
+        None => (None, None),
+    };
+    let (line_fill_text, line_fill_hl) = match d.and_then(|d| d.line_fill.as_ref()) {
+        Some(f) => (Some(f.text.clone()), f.hl_group.clone()),
+        None => (None, None),
+    };
+    let line_hl_group = d.and_then(|d| d.line_hl_group.clone());
+    let gutter_text = d.filter(|d| !d.gutter_text.is_empty()).map(|d| {
+        d.gutter_text
+            .iter()
+            .map(|c| {
+                std::iter::once(c.text.clone())
+                    .chain(c.hl_group.clone())
+                    .collect()
+            })
+            .collect()
+    });
+    ExtmarkMirror {
+        ns,
+        id: m.id,
+        row,
+        col,
+        end_row,
+        end_col,
+        hl_group: m.hl_group.clone(),
+        priority: m.priority,
+        sign_text,
+        sign_hl_group,
+        line_fill_text,
+        line_fill_hl,
+        line_hl_group,
+        gutter_text,
+        right_gravity: m.right_gravity,
+        end_right_gravity: m.end_right_gravity,
+    }
+}
+
+/// Namespace `ns`'s rows in the mirror, which replace whatever Lua holds for it. The
+/// cost is its own marks, never the rest of the buffer's.
+fn extmark_mirror_ns(b: &bemtvi_core::Buffer, ns: u32) -> Vec<ExtmarkMirror> {
+    b.extmarks
+        .iter_ns(ns)
+        .map(|m| extmark_mirror_row(b, ns, m))
+        .collect()
 }
 
 /// Every mirrored mark's *positions* in `buf`, flat:
@@ -2421,11 +2485,15 @@ impl EditHost {
         let mut bo: Vec<BoMirror> = Vec::new();
         // The extmark snapshot for `nvim_buf_get_extmarks`: only buffers that hold
         // marks contribute, so a session with no decoration plugin pays nothing.
-        // `None` for a buffer whose mark set did not change structurally — Lua keeps
+        // `None` for a buffer none of whose namespaces changed structurally — Lua keeps
         // the decorations it already holds and only its positions are refreshed
         // (below), which is the whole point: an edit moves anchors, never payloads.
-        let mut extmarks: Vec<(u64, Option<Vec<ExtmarkMirror>>)> = Vec::new();
+        // Otherwise the namespaces that changed, each replaced or dropped.
+        let mut extmarks: Vec<(u64, ExtmarkPatch)> = Vec::new();
         let mut extmark_positions_by_buf: Vec<(u64, Vec<i64>)> = Vec::new();
+        // Buffers pushed whole (no record of what Lua holds): Lua rebuilds their rows
+        // from this push alone rather than patching what it has.
+        let mut extmark_whole: Vec<u64> = Vec::new();
         // Buffers whose text changed since the last mirror, for the `nvim_buf_attach`
         // `on_lines` callbacks: `(bufnr, changedtick, old_line_count, new_line_count)`.
         // Only buffers already known last push contribute (a buffer's first
@@ -2530,85 +2598,54 @@ impl EditHost {
                     });
                     self.bo_mirror_known.insert(id);
                 }
-                // A buffer contributes a full re-serialize only when its store's
-                // structural generation moved (a mark set / deleted / cleared). An
-                // untouched buffer contributes nothing at all, and an edited one
-                // contributes positions only.
-                let ext_gen = b.extmarks.generation();
-                let structural = self.extmark_gens.get(&id) != Some(&ext_gen);
-                if structural {
-                    self.extmark_gens.insert(id, ext_gen);
-                }
+                // A buffer re-sends only the namespaces whose stamp moved since the
+                // last push (a mark set / deleted / cleared there), and drops the ones
+                // gone from the store. An untouched buffer contributes nothing at all,
+                // and an edited one contributes positions only. See
+                // `docs/plans/2026-10-31-incremental-extmark-mirror.md`.
                 if b.extmarks.is_empty() {
-                    // No marks: the buffer contributes nothing and Lua drops it.
-                } else if !structural {
-                    extmarks.push((id.0, None));
-                    if fresh {
+                    // No marks: the buffer contributes nothing and Lua drops it, so the
+                    // next mark pushes it whole.
+                    self.extmark_pushed.remove(&id);
+                } else {
+                    let generation = b.extmarks.generation();
+                    let pushed_before = self.extmark_pushed.contains_key(&id);
+                    let pushed = self.extmark_pushed.entry(id).or_default();
+                    if !pushed_before {
+                        extmark_whole.push(id.0);
+                    }
+                    let mut patch: Vec<(u32, Option<Vec<ExtmarkMirror>>)> = Vec::new();
+                    if !pushed_before || pushed.generation != generation {
+                        let mut seen = HashSet::new();
+                        for (ns, stamp) in b.extmarks.ns_stamps() {
+                            if is_reserved_ns(ns) {
+                                continue;
+                            }
+                            seen.insert(ns);
+                            if pushed.ns.insert(ns, stamp) != Some(stamp) {
+                                patch.push((ns, Some(extmark_mirror_ns(b, ns))));
+                            }
+                        }
+                        pushed.ns.retain(|ns, _| {
+                            let live = seen.contains(ns);
+                            if !live {
+                                patch.push((*ns, None));
+                            }
+                            live
+                        });
+                        pushed.generation = generation;
+                    }
+                    // Positions for the namespaces not re-sent, within the edit's window
+                    // (every mark after an undo, whose resync leaves `PosScope::All`). A
+                    // namespace re-sent above carries current positions already and
+                    // reading them again is harmless. A buffer pushed whole needs none.
+                    if pushed_before && fresh {
                         let flat = extmark_positions(b, pos_scope);
                         if !flat.is_empty() {
                             extmark_positions_by_buf.push((id.0, flat));
                         }
                     }
-                } else {
-                    let marks = b
-                        .extmarks
-                        .iter_with_ns()
-                        // The reserved multi-cursor namespaces (cursor heads and
-                        // their visual anchors) are internal editor state, not
-                        // user-visible extmarks — keep them out of the
-                        // `nvim_buf_get_extmarks` mirror.
-                        .filter(|(ns, _)| !is_reserved_ns(*ns))
-                        .map(|(ns, m)| {
-                            let (row, col) = byte_rowcol(b, m.start);
-                            let (end_row, end_col) = match m.end {
-                                Some(e) => {
-                                    let (r, c) = byte_rowcol(b, e);
-                                    (Some(r), Some(c))
-                                }
-                                None => (None, None),
-                            };
-                            let d = m.decor.as_deref();
-                            let (sign_text, sign_hl_group) = match d {
-                                Some(d) => (d.sign_text.clone(), d.sign_hl_group.clone()),
-                                None => (None, None),
-                            };
-                            let (line_fill_text, line_fill_hl) =
-                                match d.and_then(|d| d.line_fill.as_ref()) {
-                                    Some(f) => (Some(f.text.clone()), f.hl_group.clone()),
-                                    None => (None, None),
-                                };
-                            let line_hl_group = d.and_then(|d| d.line_hl_group.clone());
-                            let gutter_text = d.filter(|d| !d.gutter_text.is_empty()).map(|d| {
-                                d.gutter_text
-                                    .iter()
-                                    .map(|c| {
-                                        std::iter::once(c.text.clone())
-                                            .chain(c.hl_group.clone())
-                                            .collect()
-                                    })
-                                    .collect()
-                            });
-                            ExtmarkMirror {
-                                ns,
-                                id: m.id,
-                                row,
-                                col,
-                                end_row,
-                                end_col,
-                                hl_group: m.hl_group.clone(),
-                                priority: m.priority,
-                                sign_text,
-                                sign_hl_group,
-                                line_fill_text,
-                                line_fill_hl,
-                                line_hl_group,
-                                gutter_text,
-                                right_gravity: m.right_gravity,
-                                end_right_gravity: m.end_right_gravity,
-                            }
-                        })
-                        .collect();
-                    extmarks.push((id.0, Some(marks)));
+                    extmarks.push((id.0, (!patch.is_empty()).then_some(patch)));
                 }
             }
             bufs.push(BufMirror {
@@ -2627,7 +2664,7 @@ impl EditHost {
         let live: HashSet<BufferId> = self.editor.buffer_ids().into_iter().collect();
         self.buf_mirror_ticks.retain(|id, _| live.contains(id));
         self.buf_mirror_lines.retain(|id, _| live.contains(id));
-        self.extmark_gens.retain(|id, _| live.contains(id));
+        self.extmark_pushed.retain(|id, _| live.contains(id));
         // The `bo` mirror merges rows into the Lua table, so a buffer that vanished
         // since the last push is dropped from the table explicitly — `vim.bo` for a
         // dead bufnr reads `nil` exactly as it did when the table was replaced whole.
@@ -2875,9 +2912,17 @@ impl EditHost {
             padding: w.padding.to_string(),
             winhighlight: w.winhighlight.clone(),
         });
-        let _ = self
-            .lua
-            .set_extmark_mirror(&extmarks, &extmark_positions_by_buf);
+        // `extmark_pushed` already records these patches as delivered. If Lua didn't
+        // apply them, forget the record so the next push sends every buffer whole;
+        // otherwise a namespace missed here would stay missing until it next changed.
+        if let Err(e) =
+            self.lua
+                .set_extmark_mirror(&extmarks, &extmark_positions_by_buf, &extmark_whole)
+        {
+            self.extmark_pushed.clear();
+            self.editor
+                .echo(format!("E5108: Error refreshing the extmark mirror: {e}"));
+        }
         // The highlight registry, mirrored so `nvim_get_hl` reads live group
         // definitions from Lua. Gated on the registry's generation — a colorscheme
         // populates hundreds of groups once and rarely changes them, so re-pushing

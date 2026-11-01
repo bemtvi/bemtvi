@@ -248,6 +248,11 @@ pub struct QfMirror {
     pub valid: bool,
 }
 
+/// One buffer's entry in an extmark mirror push: `None` when no namespace changed
+/// (Lua keeps every row it holds), otherwise the namespaces that did, each with its
+/// new rows (`Some`) or dropped (`None`). Namespaces left out keep their rows.
+pub type ExtmarkPatch = Option<Vec<(u32, Option<Vec<ExtmarkMirror>>)>>;
+
 /// One extmark's row in the Rust→Lua extmark mirror, pushed before each chunk so
 /// `nvim_buf_get_extmarks` reads positions current with the buffer. `(row, col)`
 /// are 0-based, the server having converted the byte anchors against the rope.
@@ -4394,23 +4399,39 @@ impl LuaRuntime {
     /// [`ExtmarkStore`](bemtvi_core::ExtmarkStore) with positions already shifted
     /// for any edits, so a read this chunk reflects the live buffer.
     ///
-    /// A buffer's entry is its full mark list only when the store's **structural**
-    /// generation moved (a mark set / deleted / cleared); otherwise it is `true`,
-    /// meaning "keep the decorations you already hold". `positions` then carries that
-    /// buffer's flat `[ns, id, row, col, end_row, end_col]` refresh — the only thing
-    /// an edit can change about a mark. This is what stops a buffer carrying a few
-    /// thousand marks from re-serializing all of them on every keystroke; see
-    /// `docs/plans/2026-08-07-incremental-buffer-mirror.md`.
+    /// A buffer's entry is a [`ExtmarkPatch`]: `true` when no namespace changed
+    /// structurally, meaning "keep the decorations you already hold", otherwise a
+    /// map `ns -> list | false` naming only the namespaces a mark was set, deleted or
+    /// cleared in (a list replaces that namespace's rows, `false` drops it).
+    /// `positions` carries a buffer's flat `[ns, id, row, col, end_row, end_col]`
+    /// refresh — the only thing an edit or an undo can change about a mark. `whole`
+    /// names the buffers pushed in full (the server holds no record of what Lua has,
+    /// as after a failed push): Lua rebuilds those from the push alone. This is
+    /// what stops a buffer carrying a few thousand marks from re-serializing all of
+    /// them on every keystroke, or on every mark one plugin sets; see
+    /// `docs/plans/2026-08-07-incremental-buffer-mirror.md` and
+    /// `docs/plans/2026-10-31-incremental-extmark-mirror.md`.
     pub fn set_extmark_mirror(
         &self,
-        bufs: &[(u64, Option<Vec<ExtmarkMirror>>)],
+        bufs: &[(u64, ExtmarkPatch)],
         positions: &[(u64, Vec<i64>)],
+        whole: &[u64],
     ) -> mlua::Result<()> {
         let btv = self.btv()?;
         let entries = self.lua.create_table()?;
-        for (bufnr, marks) in bufs {
-            match marks {
-                Some(marks) => entries.set(*bufnr, self.to_lua(marks)?)?,
+        for (bufnr, patch) in bufs {
+            match patch {
+                Some(namespaces) => {
+                    let by_ns = self.lua.create_table()?;
+                    for (ns, marks) in namespaces {
+                        match marks {
+                            Some(marks) => by_ns.set(*ns, self.to_lua(marks)?)?,
+                            // `false` ⇒ the namespace is gone from the store.
+                            None => by_ns.set(*ns, false)?,
+                        }
+                    }
+                    entries.set(*bufnr, by_ns)?;
+                }
                 // `true` ⇒ structurally unchanged: Lua keeps the decorations it holds.
                 None => entries.set(*bufnr, true)?,
             }
@@ -4419,8 +4440,12 @@ impl LuaRuntime {
         for (bufnr, flat) in positions {
             pos.set(*bufnr, self.to_lua(flat)?)?;
         }
+        let whole_set = self.lua.create_table()?;
+        for bufnr in whole {
+            whole_set.set(*bufnr, true)?;
+        }
         let set: mlua::Function = btv.get("_set_extmark_mirror")?;
-        set.call((entries, pos))
+        set.call((entries, pos, whole_set))
     }
 
     /// Refresh the Rust→Lua highlight mirror (`btv._hl_defs[name]`) that

@@ -1018,20 +1018,6 @@ function btv.buf.set_extmark(buffer, ns, line, col, opts)
   -- Advance the allocator past this id so a later auto-id can't collide.
   btv._extmark_next[b][ns] = math.max(btv._extmark_next[b][ns] or 1, mark_id + 1)
 
-  -- Write-through the mirror (read-after-write within this chunk).
-  btv._extmarks[b] = btv._extmarks[b] or {}
-  btv._extmarks[b][ns] = btv._extmarks[b][ns] or {}
-  btv._extmarks[b][ns][mark_id] = {
-    row = line,
-    col = col,
-    end_row = end_row,
-    end_col = end_col,
-    hl_group = hl_group,
-    priority = priority,
-    decoration = decoration,
-    right_gravity = right_gravity,
-    end_right_gravity = end_right_gravity,
-  }
   btv._extmark_set(
     b,
     ns,
@@ -1046,6 +1032,22 @@ function btv.buf.set_extmark(buffer, ns, line, col, opts)
     right_gravity,
     end_right_gravity
   )
+  -- Write-through the mirror (read-after-write within this chunk), only once the op is
+  -- queued: `btv._extmark_set` raises on a decoration it can't lower, and a row written
+  -- before that would outlive the raise, a mark the core never held.
+  btv._extmarks[b] = btv._extmarks[b] or {}
+  btv._extmarks[b][ns] = btv._extmarks[b][ns] or {}
+  btv._extmarks[b][ns][mark_id] = {
+    row = line,
+    col = col,
+    end_row = end_row,
+    end_col = end_col,
+    hl_group = hl_group,
+    priority = priority,
+    decoration = decoration,
+    right_gravity = right_gravity,
+    end_right_gravity = end_right_gravity,
+  }
   return mark_id
 end
 
@@ -1053,27 +1055,36 @@ end
 -- mark `id` of namespace `ns` from `buffer`. Returns whether the mark existed.
 function btv.buf.del_extmark(buffer, ns, id)
   local b = btv._resolve_bufnr(buffer)
+  -- The bridge first: it raises on arguments it can't take, and a row dropped before
+  -- that would stay dropped while the core still holds the mark.
+  btv._extmark_del(b, ns, id)
   local marks = btv._extmarks[b] and btv._extmarks[b][ns]
   local existed = marks ~= nil and marks[id] ~= nil
   if existed then
     marks[id] = nil
   end
-  btv._extmark_del(b, ns, id)
   return existed
 end
 
 -- `btv.buf.clear_namespace(buffer, ns, line_start, line_end)` [alias
 -- `nvim_buf_clear_namespace`]: drop namespace `ns`'s extmarks in `buffer` whose line
 -- is in the 0-based range [line_start, line_end) — `line_end == -1` means to the end
--- of the buffer. `ns == -1` clears every namespace.
+-- of the buffer. `ns == -1` clears every namespace a plugin made; the editor's own
+-- highlights stay.
 function btv.buf.clear_namespace(buffer, ns, line_start, line_end)
   local b = btv._resolve_bufnr(buffer)
   if ns == -1 then
+    -- Every namespace a plugin can clear: the mirror also lists the editor's own
+    -- highlight namespaces on the buffers it paints, which the bridge refuses.
     for nsid in pairs(btv._extmarks[b] or {}) do
-      vim.api.nvim_buf_clear_namespace(b, nsid, line_start, line_end)
+      if not btv._is_internal_ns(nsid) then
+        vim.api.nvim_buf_clear_namespace(b, nsid, line_start, line_end)
+      end
     end
     return
   end
+  -- The bridge first, as in `del_extmark`.
+  btv._extmark_clear(b, ns, line_start, line_end)
   local marks = btv._extmarks[b] and btv._extmarks[b][ns]
   if marks then
     for id, m in pairs(marks) do
@@ -1082,7 +1093,6 @@ function btv.buf.clear_namespace(buffer, ns, line_start, line_end)
       end
     end
   end
-  btv._extmark_clear(b, ns, line_start, line_end)
 end
 
 -- Normalize a `get_extmarks` position argument to an inclusive (row, col) bound.

@@ -1794,58 +1794,74 @@ btv._namespace_next = btv._namespace_next or 1
 btv._extmarks = btv._extmarks or {}
 btv._extmark_next = btv._extmark_next or {}
 
--- Receive the extmark mirror: `entries[bufnr]` is the array of that buffer's
--- marks the server pushed from core (positions already shifted for any edits).
--- Rebuilds `btv._extmarks` from the authoritative state; the persistent
--- allocator (`btv._extmark_next`) is deliberately untouched.
-function btv._set_extmark_mirror(entries, positions)
+-- One mirror row from a mark the server pushed (`ExtmarkMirror`), in the shape the
+-- same-chunk write-through stores.
+local function extmark_row(m)
+  -- Reconstruct the `decoration` sub-table from the round-tripped sign fields so a
+  -- get_extmarks(details=true) AFTER this server refresh still returns the gutter sign
+  -- (the same shape the same-chunk write-through stored).
+  local decoration
+  if m.sign_text ~= nil or m.sign_hl_group ~= nil then
+    decoration = { sign_text = m.sign_text, sign_hl_group = m.sign_hl_group }
+  end
+  if m.line_fill_text ~= nil then
+    decoration = decoration or {}
+    decoration.line_fill = { text = m.line_fill_text, hl_group = m.line_fill_hl }
+  end
+  if m.line_hl_group ~= nil then
+    decoration = decoration or {}
+    decoration.line_hl_group = m.line_hl_group
+  end
+  if m.gutter_text ~= nil then
+    decoration = decoration or {}
+    decoration.gutter_text = m.gutter_text
+  end
+  return {
+    row = m.row,
+    col = m.col,
+    end_row = m.end_row,
+    end_col = m.end_col,
+    hl_group = m.hl_group,
+    priority = m.priority,
+    decoration = decoration,
+    -- Only the non-default gravity rides the wire; fill the default when absent
+    -- (start defaults right-gravity `true`, end defaults left-gravity → `false`).
+    right_gravity = m.right_gravity ~= false,
+    end_right_gravity = m.end_right_gravity == true,
+  }
+end
+
+-- Receive the extmark mirror. `entries[bufnr]` is `true` when none of that buffer's
+-- namespaces changed, or a map `ns -> list | false` of the ones that did: a list (the
+-- marks the server pushed from core, positions already shifted for any edits)
+-- replaces that namespace's rows, `false` drops the namespace, and every namespace
+-- the map leaves out keeps the rows it has. A buffer in `whole` is pushed in full, so
+-- its rows are rebuilt from this push alone, dropping any namespace it doesn't list. A
+-- buffer absent from `entries` holds no marks and is dropped. The persistent allocator
+-- (`btv._extmark_next`) is deliberately untouched.
+function btv._set_extmark_mirror(entries, positions, whole)
   local marks = {}
-  for bufnr, list in pairs(entries or {}) do
+  whole = whole or {}
+  for bufnr, patch in pairs(entries or {}) do
+    local by_ns = (not whole[bufnr] and btv._extmarks[bufnr]) or {}
     -- `true` ⇒ the buffer's mark SET did not change, only (possibly) where the marks
     -- sit. Keep the decorations we already hold and let the position pass below move
     -- them; rebuilding them would re-allocate every hl_group / sign / gravity field
     -- on every keystroke, which is exactly what this avoids.
-    if list == true then
-      marks[bufnr] = btv._extmarks[bufnr] or {}
-    else
-      local by_ns = {}
-      for _, m in ipairs(list) do
-        by_ns[m.ns] = by_ns[m.ns] or {}
-        -- Reconstruct the `decoration` sub-table from the round-tripped sign fields so
-        -- a get_extmarks(details=true) AFTER this server refresh still returns the
-        -- gutter sign (the same shape the same-chunk write-through stored).
-        local decoration
-        if m.sign_text ~= nil or m.sign_hl_group ~= nil then
-          decoration = { sign_text = m.sign_text, sign_hl_group = m.sign_hl_group }
+    if patch ~= true then
+      for ns, list in pairs(patch) do
+        if list == false then
+          by_ns[ns] = nil
+        else
+          local rows = {}
+          for _, m in ipairs(list) do
+            rows[m.id] = extmark_row(m)
+          end
+          by_ns[ns] = rows
         end
-        if m.line_fill_text ~= nil then
-          decoration = decoration or {}
-          decoration.line_fill = { text = m.line_fill_text, hl_group = m.line_fill_hl }
-        end
-        if m.line_hl_group ~= nil then
-          decoration = decoration or {}
-          decoration.line_hl_group = m.line_hl_group
-        end
-        if m.gutter_text ~= nil then
-          decoration = decoration or {}
-          decoration.gutter_text = m.gutter_text
-        end
-        by_ns[m.ns][m.id] = {
-          row = m.row,
-          col = m.col,
-          end_row = m.end_row,
-          end_col = m.end_col,
-          hl_group = m.hl_group,
-          priority = m.priority,
-          decoration = decoration,
-          -- Only the non-default gravity rides the wire; fill the default when absent
-          -- (start defaults right-gravity `true`, end defaults left-gravity → `false`).
-          right_gravity = m.right_gravity ~= false,
-          end_right_gravity = m.end_right_gravity == true,
-        }
       end
-      marks[bufnr] = by_ns
     end
+    marks[bufnr] = by_ns
   end
   btv._extmarks = marks
   -- Positions only: `[ns, id, row, col, end_row, end_col]` per mark, flat, with

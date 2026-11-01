@@ -388,6 +388,41 @@ async fn a_sign_below_the_viewport_appears_after_scrolling_to_it() {
     );
 }
 
+/// Undo moves marks back without an edit's `shift`, so each namespace's position
+/// index has to be dropped then, or the frame filters the visible lines on where the
+/// marks were before the undo. Thirty long inserted lines push the sign off screen (with
+/// a frame drawn there, so the index is built and carried across the insert), and
+/// the undo brings it back.
+#[tokio::test]
+async fn a_sign_brought_back_on_screen_by_an_undo_paints() {
+    let text: String = (0..100).map(|i| format!("line {i}\n")).collect();
+    let (rpc, mut inc) = start_with_file(&text).await;
+    put_sign(&rpc, 5).await;
+    assert_eq!(
+        signs_rows(&rpc, &mut inc)
+            .await
+            .get(5)
+            .cloned()
+            .flatten()
+            .as_deref(),
+        Some(">>")
+    );
+    // Long lines, so the byte the sign held below them lies past the viewport (and
+    // past the end) of the text the undo restores.
+    bemtvi_test_harness::feed(&rpc, &format!("gg30O{}<Esc>gg", "x".repeat(40)));
+    assert!(
+        signs_rows(&rpc, &mut inc).await.iter().all(Option::is_none),
+        "the sign is pushed below the viewport"
+    );
+    bemtvi_test_harness::feed(&rpc, "ugg");
+    let rows = signs_rows(&rpc, &mut inc).await;
+    assert_eq!(
+        rows.get(5).cloned().flatten().as_deref(),
+        Some(">>"),
+        "the undo brings the sign back to row 5: {rows:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_line_highlight_on_the_last_visible_row_renders() {
     let text: String = (0..40).map(|i| format!("line {i}\n")).collect();
@@ -683,9 +718,10 @@ async fn fuzz_snapshot(rpc: &Rpc) -> String {
     exec_lua(
         rpc,
         "local out = {}
-         for _, e in ipairs(btv.buf.extmarks(0, _G.fz.ns, 0, -1, { details = true })) do
+         for _, e in ipairs(btv.buf.extmarks(0, -1, 0, -1, { details = true })) do
            local d = e[4]
-           out[#out + 1] = { e[1], string.format('%d:%d,%d-%s,%s', e[1], e[2], e[3],
+           local key = string.format('%d/%d', d.ns_id, e[1])
+           out[#out + 1] = { key, string.format('%s:%d,%d-%s,%s', key, e[2], e[3],
              tostring(d.end_row), tostring(d.end_col)) }
          end
          table.sort(out, function(a, b) return a[1] < b[1] end)
@@ -740,11 +776,16 @@ async fn the_position_index_agrees_with_the_marks_across_random_edits() {
     // points and ranges, and pile up as edits collapse them, so ties and re-sorted
     // runs are exercised. Most edits keep the line count, which bounds the refresh
     // window on both sides.
+    //
+    // The marks are spread over three namespaces, each with its own index, and most
+    // steps also set or delete a mark in one of them after the frame: that namespace
+    // rebuilds its index while the other two carry theirs across the edit, and the
+    // queries merge all three.
     let text: String = (0..90).map(|i| format!("ab{i}cdefgh\n")).collect();
     let (rpc, mut inc) = start_with_file(&text).await;
     exec_lua(
         &rpc,
-        "_G.fz = { seed = 12345, ns = btv.ns.create('fz'), bump = btv.ns.create('bump') }
+        "_G.fz = { seed = 12345, ns = { btv.ns.create('fz1'), btv.ns.create('fz2'), btv.ns.create('fz3') } }
          function _G.fz.rand(n)
            _G.fz.seed = (_G.fz.seed * 1103515245 + 12345) % 2147483648
            return (_G.fz.seed // 65536) % n
@@ -759,7 +800,18 @@ async fn the_position_index_agrees_with_the_marks_across_random_edits() {
              opts.end_col = (opts.end_row == row) and math.min(8, col + r(4)) or r(8)
              opts.end_right_gravity = r(2) == 0
            end
-           btv.buf.set_extmark(0, _G.fz.ns, row, col, opts)
+           btv.buf.set_extmark(0, _G.fz.ns[r(3) + 1], row, col, opts)
+         end
+         -- A structural change in one namespace: a new mark, or one deleted.
+         function _G.fz.churn()
+           local ns = _G.fz.ns[r(3) + 1]
+           if r(2) == 0 then
+             local row = 30 + r(30)
+             btv.buf.set_extmark(0, ns, row, r(8), { sign_text = 'x', right_gravity = r(2) == 0 })
+           else
+             local marks = btv.buf.extmarks(0, ns, 0, -1)
+             if #marks > 0 then btv.buf.del_extmark(0, ns, marks[r(#marks) + 1][1]) end
+           end
          end
          btv.cmd('45')
          btv.cmd('normal! zz')",
@@ -768,6 +820,9 @@ async fn the_position_index_agrees_with_the_marks_across_random_edits() {
     for step in 0..150 {
         // Draw a frame so the index is built and must be carried across the edit.
         let _ = fuzz_sign_rows(&rpc, &mut inc).await;
+        if step % 4 != 0 {
+            exec_lua(&rpc, "_G.fz.churn()").await;
+        }
         let edit: String = exec_lua(
             &rpc,
             "local r = _G.fz.rand
@@ -795,7 +850,15 @@ async fn the_position_index_agrees_with_the_marks_across_random_edits() {
         .to_owned();
         let windowed = fuzz_snapshot(&rpc).await;
         let rows = fuzz_sign_rows(&rpc, &mut inc).await;
-        exec_lua(&rpc, "btv.buf.set_extmark(0, _G.fz.bump, 0, 0, { id = 1 })").await;
+        // Restamp every namespace, so the next push re-reads each from the store.
+        exec_lua(
+            &rpc,
+            "for _, ns in ipairs(_G.fz.ns) do
+               btv.buf.set_extmark(0, ns, 0, 0, { id = 999999 })
+               btv.buf.del_extmark(0, ns, 999999)
+             end",
+        )
+        .await;
         let full = fuzz_snapshot(&rpc).await;
         assert_eq!(
             windowed, full,
@@ -804,7 +867,7 @@ async fn the_position_index_agrees_with_the_marks_across_random_edits() {
         let marked: std::collections::BTreeSet<u64> = exec_lua(
             &rpc,
             "local s = {}
-             for _, e in ipairs(btv.buf.extmarks(0, _G.fz.ns, 0, -1)) do s[#s + 1] = e[2] + 1 end
+             for _, e in ipairs(btv.buf.extmarks(0, -1, 0, -1)) do s[#s + 1] = e[2] + 1 end
              return s",
         )
         .await
@@ -823,4 +886,53 @@ async fn the_position_index_agrees_with_the_marks_across_random_edits() {
             );
         }
     }
+}
+
+/// 300 keystrokes typed mid-buffer in a 5000-line buffer carrying `namespaces`
+/// namespaces of two marks each, all on the lines around the cursor: the shape of
+/// many plugins (or one plugin with a namespace per feature) decorating what's on
+/// screen.
+async fn many_namespaces_typing_cost(namespaces: usize) -> std::time::Duration {
+    let text: String = (0..5_000)
+        .map(|i| format!("line {i} with some text\n"))
+        .collect();
+    let (rpc, _inc) = start_with_file(&text).await;
+    exec_lua(&rpc, "btv.on('CursorMovedI', function() end)").await;
+    exec_lua(
+        &rpc,
+        &format!(
+            "for n = 1, {namespaces} do
+               local ns = btv.ns.create('many' .. n)
+               for k = 0, 1 do
+                 local row = 2480 + (n * 7 + k * 13) % 40
+                 btv.buf.set_extmark(0, ns, row, 0, {{ hl_group = 'Comment', end_row = row, end_col = 4 }})
+               end
+             end"
+        ),
+    )
+    .await;
+    bemtvi_test_harness::feed(&rpc, "2500GI");
+    let _ = exec_lua(&rpc, "return 1").await;
+    let started = std::time::Instant::now();
+    for _ in 0..300 {
+        bemtvi_test_harness::feed(&rpc, "z");
+    }
+    let _ = exec_lua(&rpc, "return 1").await;
+    started.elapsed()
+}
+
+#[tokio::test]
+async fn many_namespaces_do_not_dominate_the_cost_of_typing() {
+    // A ratio, so a loaded run doesn't flake it. Every namespace has marks on screen,
+    // the case where a per-namespace query does real work. Measured: `main` (one
+    // index) ~2.2x; querying each namespace's index and merging per call ~3.2x; one
+    // combined index merged from the namespaces' runs ~2.3x.
+    let bare = many_namespaces_typing_cost(0).await;
+    let heavy = many_namespaces_typing_cost(1_000).await;
+    let ratio = heavy.as_secs_f64() / bare.as_secs_f64();
+    assert!(
+        ratio < 2.8,
+        "typing beside 1000 namespaces of 2 marks cost {ratio:.1}x a mark-free buffer \
+         ({heavy:?} vs {bare:?}): the per-frame queries are paying per namespace again"
+    );
 }

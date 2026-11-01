@@ -837,10 +837,15 @@ pub(crate) fn collect_config_bundle(include_files: bool) -> std::io::Result<Conf
     }
     // The daemon's installed parser set: the client compiles the same languages
     // locally (parsers are native artifacts, never fetched — see `walk_config_dir`).
-    let ts_languages = bemtvi_ts::installed_parsers()
-        .into_iter()
-        .map(|p| p.lang)
-        .collect();
+    // They only feed that lazy install, so a dir that can't be listed costs the client
+    // that and no more: it must not refuse the session its config.
+    let ts_languages = match bemtvi_ts::installed_parsers() {
+        Ok(parsers) => parsers.into_iter().map(|p| p.lang).collect(),
+        Err(e) => {
+            eprintln!("bemtvi daemon: no tree-sitter parser list for the client: {e}");
+            Vec::new()
+        }
+    };
     Ok((config_dir, runtimepath, files, ts_languages, state_dir))
 }
 
@@ -1152,6 +1157,10 @@ pub struct EditHost {
     /// runs at most once per language rather than every frame.
     #[cfg(feature = "native")]
     resolved_ts_langs: HashSet<String>,
+    /// `(lang, name)` queries `btv.treesitter.set_query` holds. The bridge leaves them
+    /// alone: an explicit query is the last word over a file on the runtimepath.
+    #[cfg(feature = "native")]
+    explicit_ts_queries: HashSet<(String, String)>,
     /// Per-buffer LSP document-sync state, keyed by buffer id (the `syntax_states`
     /// analogue).
     lsp_states: HashMap<BufferId, LspDocState>,
@@ -2139,6 +2148,8 @@ impl EditHost {
             first_highlight_deferred: HashSet::new(),
             #[cfg(feature = "native")]
             resolved_ts_langs: HashSet::new(),
+            #[cfg(feature = "native")]
+            explicit_ts_queries: HashSet::new(),
             lsp_states: HashMap::new(),
             lsp_servers: HashMap::new(),
             lsp_progress: HashMap::new(),
@@ -2581,8 +2592,7 @@ impl EditHost {
         // Lazily install the daemon's tree-sitter parser set: register the `FileType`
         // autocmd (in Lua) that `:TSInstall`s a language the first time a buffer of that
         // type opens. Registered BEFORE sourcing so the startup buffer's own `FileType` is
-        // caught. (Unlike native, no local-installed filter — the wasm grammar set is
-        // JS-side and `:TSInstall` no-ops an already-present one; the Lua side dedups.)
+        // caught.
         if !ts_languages.is_empty() {
             let list = ts_languages
                 .iter()
@@ -5486,35 +5496,21 @@ where
 
 /// Set up the **lazy** tree-sitter auto-install for a daemon session: register the Lua
 /// `FileType` autocmd (`btv._remote_ts_autoinstall`) that `:TSInstall`s a remote language
-/// the first time a buffer of that filetype opens. `remote` is the daemon's installed
-/// parser set; we filter to languages not already installed locally (the daemon can't
-/// know the client's set) and hand only those to Lua, which dedups per session. A no-op
-/// for a local session (empty `remote`) or when every remote language is already here.
+/// the first time a buffer of that filetype opens, unless it's already here. `remote` is
+/// the daemon's installed parser set. A no-op for a local session (empty `remote`).
 /// Must run before the startup lifecycle seed so the first buffer's `FileType` is caught.
 #[cfg(feature = "native")]
 fn set_up_remote_ts_autoinstall(host: &mut EditHost, remote: &[String]) {
     if remote.is_empty() {
         return;
     }
-    let installed: HashSet<String> = bemtvi_ts::installed_parsers()
-        .into_iter()
-        .map(|p| p.lang)
-        .collect();
-    let missing: Vec<String> = remote
-        .iter()
-        .filter(|lang| !installed.contains(lang.as_str()))
-        .cloned()
-        .collect();
-    if missing.is_empty() {
-        return;
-    }
-    // Build a Lua array literal of the missing languages; `{:?}` quotes + escapes each
+    // Build a Lua array literal of the languages; `{:?}` quotes + escapes each
     // (parser stems are simple identifiers, so this is just `"rust", "lua"`). Registering
     // the autocmd is a synchronous `btv._autocmds` mutation and `FileType` dispatch reads
     // that table directly, so no effect-drain is needed — and we must NOT drain here, or
     // an early settle would fire the startup `FileType` seed before the user's own config
     // autocmds are registered.
-    let list = missing
+    let list = remote
         .iter()
         .map(|lang| format!("{lang:?}"))
         .collect::<Vec<_>>()

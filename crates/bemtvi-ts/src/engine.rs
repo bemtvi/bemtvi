@@ -688,7 +688,10 @@ impl Engine {
         text: Option<String>,
     ) -> Result<(), String> {
         if !is_engine_query(name) {
-            return Ok(());
+            return Err(format!(
+                "no such query (one of {:?})",
+                bemtvi_core::ENGINE_QUERY_NAMES
+            ));
         }
         let key = (lang.to_string(), name.to_string());
         match &text {
@@ -1991,6 +1994,7 @@ impl Engine {
         // Breadth-first: index `i` walks the growing list, appending the regions each
         // layer injects. The whole child pass shares one `INJECTION_DEADLINE` budget,
         // so a pathological (or cyclic) config can't stall the preview frame.
+        let mut waiting: Vec<String> = Vec::new();
         let mut i = 0;
         while i < owned.len() {
             let (this_lang, this_depth, injector) = {
@@ -2020,6 +2024,10 @@ impl Engine {
             for (child_lang, mut ranges) in regions {
                 let child_language = match self.grammar(&child_lang) {
                     Slot::Loaded(g) => g.language.clone(),
+                    Slot::Loading => {
+                        waiting.push(child_lang);
+                        continue;
+                    }
                     _ => continue, // missing/broken child grammar → region keeps host paint
                 };
                 let mut child_parser = Parser::new();
@@ -2062,12 +2070,14 @@ impl Engine {
 
         // Stash the injected languages for
         // [`text_injected_languages`](Self::text_injected_languages), which the server
-        // reads right after this call to resolve their runtimepath queries. The host
-        // (index 0) is excluded: its caller resolved it before calling.
+        // reads right after this call to resolve their runtimepath queries, and to tell
+        // an answer from one a grammar still on its way would change. So a language
+        // that's still loading counts, though it has no layer yet. The host (index 0) is
+        // excluded: its caller resolved it before calling.
         self.last_text_injections.clear();
-        for l in owned.iter().skip(1) {
-            if !self.last_text_injections.contains(&l.language) {
-                self.last_text_injections.push(l.language.clone());
+        for l in owned.iter().skip(1).map(|l| &l.language).chain(&waiting) {
+            if !self.last_text_injections.contains(l) {
+                self.last_text_injections.push(l.clone());
             }
         }
 
@@ -2629,6 +2639,14 @@ impl SyntaxEngine for Engine {
         text: Option<String>,
     ) -> Result<(), String> {
         Engine::set_query_overlay(self, lang, name, text)
+    }
+
+    fn overridden_langs(&self, name: &str) -> Vec<String> {
+        self.query_overrides
+            .keys()
+            .filter(|(_, n)| n == name)
+            .map(|(lang, _)| lang.clone())
+            .collect()
     }
 
     fn base_query(&self, lang: &str, name: &str) -> Result<Option<String>, String> {

@@ -56,20 +56,24 @@ pub struct InstalledParser {
 /// ([`data_dir`] first, then [`extra_roots`]), in the same precedence
 /// [`Engine`] loads them: a grammar present in several roots is reported once,
 /// from the first root that has it. Sorted by language. Used by `:TSInstallInfo`.
-pub fn installed_parsers() -> Vec<InstalledParser> {
+///
+/// A directory that doesn't exist has nothing in it. One that can't be listed is an
+/// error naming it, not an empty answer: "not installed" would send a caller to
+/// reinstall what's there.
+pub fn installed_parsers() -> std::io::Result<Vec<InstalledParser>> {
     let mut roots: Vec<PathBuf> = data_dir().into_iter().collect();
     roots.extend(extra_roots());
 
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for root in &roots {
-        let mut langs = parser_langs_in(root);
+        let mut langs = parser_langs_in(root)?;
         langs.sort();
         for lang in langs {
             if !seen.insert(lang.clone()) {
                 continue; // an earlier (higher-precedence) root already has it
             }
-            let queries = query_names_in(root, &lang);
+            let queries = query_names_in(root, &lang)?;
             out.push(InstalledParser {
                 lang,
                 root: root.clone(),
@@ -78,43 +82,82 @@ pub fn installed_parsers() -> Vec<InstalledParser> {
         }
     }
     out.sort_by(|a, b| a.lang.cmp(&b.lang));
-    out
+    Ok(out)
+}
+
+/// The languages with a parser and a `highlights` query to paint with, sorted: what
+/// `btv.treesitter.installed` lists. The query can sit beside the parser, in a `queries/`
+/// or `after/queries/` of `runtimepath`, or be held in memory (`overridden`, the languages
+/// `btv.treesitter.set_query` gave one): the places a highlight resolves from.
+///
+/// This touches the disk, so it runs off the editor thread.
+pub fn highlightable_langs(
+    runtimepath: &[PathBuf],
+    overridden: &HashSet<String>,
+) -> std::io::Result<Vec<String>> {
+    let on_runtimepath = |lang: &str| {
+        runtimepath.iter().any(|dir| {
+            ["queries", "after/queries"]
+                .iter()
+                .any(|sub| dir.join(sub).join(lang).join("highlights.scm").is_file())
+        })
+    };
+    Ok(installed_parsers()?
+        .into_iter()
+        .filter(|p| {
+            p.queries.iter().any(|q| q == "highlights")
+                || overridden.contains(&p.lang)
+                || on_runtimepath(&p.lang)
+        })
+        .map(|p| p.lang)
+        .collect())
+}
+
+/// The entries of `dir`, with none for a `dir` that doesn't exist. Other failures carry
+/// the path.
+fn dir_paths(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let named =
+        |e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", dir.display()));
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(named(e)),
+    };
+    entries
+        .map(|entry| entry.map(|e| e.path()).map_err(named))
+        .collect()
 }
 
 /// The grammar names installed under `<root>/parser/` — files named `<lang>.<ext>`
 /// for a loadable extension (`.so` on every OS, plus the platform-native one).
-fn parser_langs_in(root: &Path) -> Vec<String> {
+fn parser_langs_in(root: &Path) -> std::io::Result<Vec<String>> {
     let native = loader::native_lib_ext();
-    let Ok(entries) = std::fs::read_dir(root.join("parser")) else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(|e| {
-            let path = e.ok()?.path();
+    Ok(dir_paths(&root.join("parser"))?
+        .iter()
+        .filter_map(|path| {
             let ext = path.extension()?.to_str()?;
             if ext != "so" && ext != native {
                 return None;
             }
-            Some(path.file_stem()?.to_str()?.to_string())
+            let lang = path.file_stem()?.to_str()?;
+            // A name the engine refuses to load (`foo.old.so`) isn't an installed grammar.
+            loader::is_valid_language(lang).then(|| lang.to_string())
         })
-        .collect()
+        .collect())
 }
 
 /// Query file basenames under `<root>/queries/<lang>/` (without the `.scm`),
 /// sorted.
-fn query_names_in(root: &Path, lang: &str) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(root.join("queries").join(lang)) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .filter_map(|e| {
-            let path = e.ok()?.path();
+fn query_names_in(root: &Path, lang: &str) -> std::io::Result<Vec<String>> {
+    let mut names: Vec<String> = dir_paths(&root.join("queries").join(lang))?
+        .iter()
+        .filter_map(|path| {
             (path.extension()?.to_str()? == "scm")
                 .then(|| path.file_stem().and_then(|s| s.to_str()).map(String::from))?
         })
         .collect();
     names.sort();
-    names
+    Ok(names)
 }
 
 /// `$XDG_DATA_HOME` when set to an absolute path. Empty or relative values are

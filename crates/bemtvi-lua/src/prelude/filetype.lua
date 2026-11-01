@@ -1,5 +1,14 @@
--- Filetype surfaces (`btv.filetype.*`) — content-based detection.
+-- Filetype surfaces (`btv.filetype.*`) — by name, and content-based detection.
 btv.filetype = btv.filetype or {}
+
+-- `btv.filetype.match(path)` -> the filetype `path`'s name says, or `nil`: the same
+-- tables a buffer's name goes through (exact basename, globs, extension), for a name no
+-- buffer has, like a file a plugin shows in a view. Nothing is read, so a `#!` line and
+-- `btv.filetype.detect` have no say.
+function btv.filetype.match(path)
+  assert(type(path) == "string", "btv.filetype.match: path must be a string")
+  return btv._filetype_of_path(path)
+end
 
 -- `btv.filetype.detect(src)`: decide a buffer's filetype from its **content**,
 -- or clear the sniffer with `nil`.

@@ -126,6 +126,7 @@ async fn navigating_the_picker_never_pays_the_preview_parse() {
     let _guard = serial_lock().lock().await;
 
     if !bemtvi_ts::installed_parsers()
+        .expect("scan the grammar dirs")
         .iter()
         .any(|p| p.lang == "lua")
     {

@@ -1093,6 +1093,29 @@ impl EditHost {
                     let nlines = text.matches('\n').count();
                     self.settle_ts_highlight(lang, text, nlines, cb_id);
                 }
+                // The scan walks the grammar dirs, so it leaves the tick.
+                #[cfg(feature = "native")]
+                TsOp::Installed { cb_id } => {
+                    self.fx
+                        .loop_command(crate::evloop::LoopCommand::TsInstalled {
+                            id: cb_id,
+                            runtimepath: self.lua.runtimepath().to_vec(),
+                            overridden: self.editor.ts_overridden_langs("highlights"),
+                        });
+                }
+                // The browser's list is in memory: everything its highlighter has.
+                #[cfg(not(feature = "native"))]
+                TsOp::Installed { cb_id } => {
+                    let result = Ok(self.ts_installed_list());
+                    if let Err(e) = self.lua.run_callback(
+                        cb_id,
+                        false,
+                        bemtvi_lua::CallbackArgs::TsInstalled { result },
+                    ) {
+                        self.editor
+                            .echo(format!("E: btv.treesitter.installed callback: {e}"));
+                    }
+                }
                 #[cfg(feature = "native")]
                 TsOp::SetQuery { lang, name, text } => {
                     // `btv.treesitter.set_query`: install the override on the engine
@@ -1101,6 +1124,14 @@ impl EditHost {
                     // time) and lang-wide, so drop every buffer's highlight memo
                     // rather than track which are this language; they all re-query on
                     // the next redraw.
+                    let key = (lang.clone(), name.clone());
+                    if text.is_some() {
+                        self.explicit_ts_queries.insert(key);
+                    } else {
+                        // Back to the files, which includes the runtimepath's.
+                        self.explicit_ts_queries.remove(&key);
+                        self.resolved_ts_langs.remove(&lang);
+                    }
                     self.editor.set_ts_query(&lang, &name, text);
                     self.syntax_states.clear();
                 }
@@ -3980,6 +4011,18 @@ impl EditHost {
                 }
                 self.apply_lua_effects();
             }
+            LoopEvent::TsInstalled { id, result } => {
+                if let Err(e) =
+                    self.lua
+                        .run_callback(id, false, CallbackArgs::TsInstalled { result })
+                {
+                    self.editor.echo(format!(
+                        "E5108: Error in btv.treesitter.installed handler: {e}"
+                    ));
+                }
+                self.apply_lua_effects();
+            }
+            LoopEvent::TsInstallInfo { result } => self.show_ts_install_info(result),
             LoopEvent::GitResult { id, result } => {
                 // An off-tick `btv.git` op settled: resolve / reject its promise on this
                 // thread (marshalled to Lua in `run_callback`), then drain the reaction —

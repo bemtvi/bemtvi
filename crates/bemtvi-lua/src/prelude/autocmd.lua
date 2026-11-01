@@ -2093,12 +2093,11 @@ api.nvim_buf_get_commands = btv.user_command.buf_get
 
 -- `btv._remote_ts_autoinstall(langs)`: in an edit-host (daemon) session, lazily install the
 -- tree-sitter parsers the remote daemon had — the first time a buffer of one of those
--- filetypes opens. `langs` is the list the server hands over (already filtered to parsers
--- NOT installed on this client). It registers a `FileType` autocmd that `:TSInstall`s the
--- buffer's filetype on first sight (deduped per session). Parsers are native + compiled
--- locally, so this mirrors the remote's language set without fetching its wrong-arch
--- binaries. Dogfoods the public `FileType` + `:TSInstall` surface — the server only supplies
--- the language list.
+-- filetypes opens, unless this side can already highlight it (`btv.treesitter.installed`
+-- asks at that point, off the editor thread). Parsers are native + compiled locally, so
+-- this mirrors the remote's language set without fetching its wrong-arch binaries.
+-- Dogfoods the public `FileType` + `:TSInstall` surface — the server only supplies the
+-- language list.
 function btv._remote_ts_autoinstall(langs)
   local want = {}
   for _, lang in ipairs(langs or {}) do
@@ -2113,7 +2112,13 @@ function btv._remote_ts_autoinstall(langs)
       local ft = ev.match
       if ft and ft ~= "" and want[ft] and not requested[ft] then
         requested[ft] = true
-        vim.cmd("TSInstall " .. ft)
+        btv.treesitter.installed():next(function(here)
+          if not btv.tbl.contains(here, ft) then
+            vim.cmd("TSInstall " .. ft)
+          end
+        end, function(err)
+          btv.notify("remote tree-sitter setup: " .. tostring(err), btv.log.levels.ERROR)
+        end)
       end
     end,
   })

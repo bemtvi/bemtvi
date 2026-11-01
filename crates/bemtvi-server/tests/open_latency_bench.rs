@@ -112,6 +112,7 @@ async fn open_and_time(
 #[ignore = "benchmark: run explicitly with --ignored, needs the python grammar"]
 async fn open_latency() {
     if !bemtvi_ts::installed_parsers()
+        .expect("scan the grammar dirs")
         .iter()
         .any(|p| p.lang == "python")
     {

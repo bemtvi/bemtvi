@@ -393,6 +393,13 @@ pub trait SyntaxEngine {
         text: Option<String>,
     ) -> Result<(), String>;
 
+    /// The languages holding a `name` query in memory, from [`set_query`](Self::set_query)
+    /// or [`set_query_overlay`](Self::set_query_overlay). Empty for an engine with no
+    /// overrides (the wasm JS-side highlighter).
+    fn overridden_langs(&self, _name: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     /// The engine's **base** `(lang, name)` query — the on-disk text it would
     /// compile with no override, with any [`; inherits:`](parse_query_inherits)
     /// chain already folded in. The server reads this to compose an

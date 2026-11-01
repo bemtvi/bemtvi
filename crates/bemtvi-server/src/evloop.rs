@@ -114,6 +114,17 @@ pub enum LoopCommand {
     /// — the `btv.plugins` manager's clone / discover / source ops, which must see the local
     /// disk (plugins load into the local Lua VM). `false` for `btv.fs.*` (session routing).
     Fs { id: u64, job: FsJob, local: bool },
+    /// List the languages that can highlight for `btv.treesitter.installed` on the blocking
+    /// pool, and send them back as [`LoopEvent::TsInstalled`] for callback `id`. Always the
+    /// local disk, in a daemon session too: grammars load on this side of the wire.
+    TsInstalled {
+        id: u64,
+        runtimepath: Vec<PathBuf>,
+        overridden: Vec<String>,
+    },
+    /// Scan the parsers for `:TSInstallInfo` on the blocking pool, and send them back as
+    /// [`LoopEvent::TsInstallInfo`].
+    TsInstallInfo,
     /// Run an off-tick `btv.git.*` op (`btv._git_op`) through the actor's [`GitBackend`] —
     /// `bemtvi_git::run_git_job` on the blocking pool locally, or the daemon's `git_op` leg
     /// — and send the typed result back as [`LoopEvent::GitResult`] for callback `id`. Off
@@ -238,6 +249,15 @@ pub enum LoopEvent {
         id: u64,
         result: Result<FsValue, FsError>,
     },
+    /// A [`LoopCommand::TsInstalled`] scan finished.
+    TsInstalled {
+        id: u64,
+        result: Result<Vec<String>, String>,
+    },
+    /// A [`LoopCommand::TsInstallInfo`] scan finished.
+    TsInstallInfo {
+        result: Result<Vec<bemtvi_ts::InstalledParser>, String>,
+    },
     /// An off-tick `btv.git.*` op ([`LoopCommand::Git`]) settled: the typed result the
     /// promise registered under `id` resolves / rejects with. The server runs the matching
     /// `btv._run_cb` on its one thread (the marshalling to Lua happens there).
@@ -350,6 +370,16 @@ impl HttpBackend {
             }
             HttpBackend::Remote(remote) => remote.run(request).await,
         }
+    }
+}
+
+/// A grammar scan's outcome, whichever way it failed, as the message a user is shown.
+fn flatten_scan<T>(
+    result: Result<std::io::Result<T>, tokio::task::JoinError>,
+) -> Result<T, String> {
+    match result {
+        Ok(scan) => scan.map_err(|e| e.to_string()),
+        Err(e) => Err(format!("the scan failed: {e}")),
     }
 }
 
@@ -759,6 +789,33 @@ async fn run_evloop(
                         });
                     }
                 }
+            }
+            LoopCommand::TsInstalled {
+                id,
+                runtimepath,
+                overridden,
+            } => {
+                let event_tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let overridden = overridden.into_iter().collect();
+                        bemtvi_ts::highlightable_langs(&runtimepath, &overridden)
+                    })
+                    .await;
+                    let _ = event_tx.send(LoopEvent::TsInstalled {
+                        id,
+                        result: flatten_scan(result),
+                    });
+                });
+            }
+            LoopCommand::TsInstallInfo => {
+                let event_tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(bemtvi_ts::installed_parsers).await;
+                    let _ = event_tx.send(LoopEvent::TsInstallInfo {
+                        result: flatten_scan(result),
+                    });
+                });
             }
             LoopCommand::Git { id, job, local } => {
                 // The git sibling of the `Fs` arm — spawned so concurrent ops don't

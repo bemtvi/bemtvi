@@ -1688,6 +1688,8 @@ pub async fn serve_proc_daemon_on(
                 | LoopEvent::FsEvent { .. }
                 | LoopEvent::FsResult { .. }
                 | LoopEvent::GitResult { .. }
+                | LoopEvent::TsInstalled { .. }
+                | LoopEvent::TsInstallInfo { .. }
                 | LoopEvent::HttpResult { .. }
                 | LoopEvent::HttpMountResult { .. }
                 | LoopEvent::HttpServerRequest { .. }

@@ -259,6 +259,12 @@ impl Editor {
             self.echo(format!(
                 "treesitter: query '{lang}/{name}' failed to compile: {reason}"
             ));
+            return;
+        }
+        // A failed load is a cached verdict, and this query may be its cure (a parser with
+        // no `highlights.scm` of its own). The next ask loads the grammar again.
+        if self.syntax_failed.contains(lang) {
+            self.reload_ts_language(lang);
         }
     }
 
@@ -278,6 +284,13 @@ impl Editor {
                 "treesitter: query '{lang}/{name}' failed to compile: {reason}"
             ));
         }
+    }
+
+    /// The languages whose `name` query is held in memory rather than read from disk.
+    pub fn ts_overridden_langs(&self, name: &str) -> Vec<String> {
+        self.syntax
+            .as_ref()
+            .map_or_else(Vec::new, |engine| engine.overridden_langs(name))
     }
 
     /// The engine's **base** `(lang, name)` query text — what it compiles with no

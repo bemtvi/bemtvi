@@ -601,14 +601,30 @@ impl EditHost {
             .open_scratch_listing("[TSInstall info]", lines, 0);
     }
 
-    /// `:TSInstallInfo` — open a panel listing every parser installed across the
-    /// data-dir search path (bemtvi's own dir + a borrowed neovim `site/`), each
-    /// with the queries it ships and the root it resolves from. Installed parsers
-    /// only: the full installable catalog lives behind a network fetch we don't do
-    /// for a read-only info command.
+    /// `:TSInstallInfo`: the scan walks the grammar dirs, so it leaves the tick and lands in
+    /// [`show_ts_install_info`](Self::show_ts_install_info).
     #[cfg(feature = "native")]
     fn ts_install_info(&mut self) {
-        let parsers = bemtvi_ts::installed_parsers();
+        self.fx
+            .loop_command(crate::evloop::LoopCommand::TsInstallInfo);
+    }
+
+    /// Open a panel listing every parser installed across the data-dir search path
+    /// (bemtvi's own dir + a borrowed neovim `site/`), each with the queries it ships and
+    /// the root it resolves from. Installed parsers only: the full installable catalog
+    /// lives behind a network fetch we don't do for a read-only info command.
+    #[cfg(feature = "native")]
+    pub(crate) fn show_ts_install_info(
+        &mut self,
+        result: Result<Vec<bemtvi_ts::InstalledParser>, String>,
+    ) {
+        let parsers = match result {
+            Ok(parsers) => parsers,
+            Err(e) => {
+                self.editor.echo(format!("E: TSInstallInfo: {e}"));
+                return;
+            }
+        };
         let mut lines = Vec::new();
         if parsers.is_empty() {
             lines.push("No treesitter parsers installed.".to_string());

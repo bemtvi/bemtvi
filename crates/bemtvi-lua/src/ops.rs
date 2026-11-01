@@ -1659,6 +1659,9 @@ pub enum TsOp {
         text: String,
         cb_id: u64,
     },
+    /// `btv.treesitter.installed()`: settle `cb_id` with the languages that have a grammar
+    /// to highlight with.
+    Installed { cb_id: u64 },
     /// `btv.treesitter.fragment_context(lang, templates)`: install the framings the
     /// **fragment** highlighter (LSP hover / completion-docs code blocks) tries, in
     /// order, when a snippet doesn't parse on its own — each a template with one
@@ -1964,6 +1967,8 @@ pub enum CallbackArgs {
         /// coordinates — the engine's raw byte offsets, mapped to columns by the caller.
         spans: Vec<(usize, usize, usize, String)>,
     },
+    /// A `btv.treesitter.installed` settle: the languages, or why there's no answer.
+    TsInstalled { result: Result<Vec<String>, String> },
 }
 
 /// One diagnostic mirrored into the Lua `btv._diagnostics[bufnr]` table so the

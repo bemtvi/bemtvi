@@ -259,6 +259,25 @@ async fn config_bundle_lists_the_daemons_installed_treesitter_languages() {
     );
 }
 
+/// The parser set only feeds the client's lazy auto-install, so a grammar dir the daemon
+/// can't list costs that and no more: the session still connects, with its config.
+#[tokio::test]
+async fn an_unreadable_grammar_dir_doesnt_fail_the_config_fetch() {
+    let _g = serial_lock().lock().await;
+    let data = temp_dir("daemon_config_ts_unreadable");
+    std::fs::write(data.join("parser"), b"not a directory").unwrap();
+    let cfg = temp_dir("daemon_config_ts_unreadable_cfg");
+    populate_config(&cfg);
+    let _c = EnvGuard::set("BEMTVI_CONFIG", Some(&cfg));
+    let _r = EnvGuard::set("BEMTVI_RUNTIMEPATH", None);
+    let _d = EnvGuard::set("BEMTVI_DATA_DIR", Some(&data));
+
+    let bundle = fetch_over_wire(true).await;
+
+    assert!(bundle.ts_languages.is_empty());
+    assert!(!bundle.files.is_empty(), "the config still crosses");
+}
+
 /// The **lite** fetch (`include_files = false`, a `ConfigSource::Local` session) skips
 /// the file walk: the daemon still reports its config dir / cwd / parser set (the
 /// metadata a local-config session needs to seed `DirState` + parsers), but ships **no**

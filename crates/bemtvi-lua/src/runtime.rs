@@ -3354,6 +3354,13 @@ impl LuaRuntime {
                 }
                 run.call::<()>((id, keep, mlua::Value::Nil, mlua::Value::Table(arr)))
             }
+            CallbackArgs::TsInstalled { result } => match result {
+                Ok(langs) => {
+                    let arr = self.lua.create_sequence_from(langs)?;
+                    run.call::<()>((id, keep, mlua::Value::Nil, mlua::Value::Table(arr)))
+                }
+                Err(e) => run.call::<()>((id, keep, self.lua.create_string(&e)?)),
+            },
         }
     }
 

@@ -4691,6 +4691,29 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `btv._ts_installed(cb_id)`: the native lister behind the promise
+    // `btv.treesitter.installed`.
+    let sh = shared.clone();
+    btv.set(
+        "_ts_installed",
+        lua.create_function(move |_, cb_id: u64| {
+            sh.borrow_mut().ts_ops.push(TsOp::Installed { cb_id });
+            Ok(())
+        })?,
+    )?;
+
+    // `btv._filetype_of_path(path)`: the filetype `path`'s name says, behind
+    // `btv.filetype.match`. Pure: nothing is read.
+    btv.set(
+        "_filetype_of_path",
+        // A Lua string, not a `String`: a name on disk needn't be UTF-8. The rules only
+        // compare against ASCII, so the lossy spelling reaches the same verdict.
+        lua.create_function(move |_, path: mlua::LuaString| {
+            let path = path.to_string_lossy();
+            Ok(bemtvi_core::language_of_path(Some(std::path::Path::new(&path))).map(str::to_owned))
+        })?,
+    )?;
+
     // `btv._ts_fragment_context(lang, templates)`: the native setter behind
     // `btv.treesitter.fragment_context`. Queues a [`TsOp::SetFragmentContext`] the
     // server hands to the engine's fragment highlighter (the LSP doc-block path).

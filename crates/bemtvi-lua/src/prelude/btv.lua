@@ -386,6 +386,56 @@ function btv.treesitter.highlight(lang, text)
   end)
 end
 
+-- `btv.treesitter.installed()` -> promise of the list of languages with a grammar that
+-- can highlight: on native, a parser in bemtvi's data dir or a borrowed neovim `site/`
+-- with a `highlights` query (beside the parser, on the runtimepath, or from
+-- `btv.treesitter.set_query`); in the browser, what its highlighter has. `:TSInstall` adds to it.
+-- So a plugin can tell what's missing before asking for it:
+--
+-- ```lua
+-- btv.treesitter.installed():next(function(langs)
+--   if not btv.tbl.contains(langs, "rust") then
+--     btv.cmd("TSInstall rust")
+--   end
+-- end)
+-- ```
+function btv.treesitter.installed()
+  return btv.promise.new(function(resolve, reject)
+    local id = btv._next_cb_id()
+    btv._cb_fns[id] = function(err, langs)
+      if err then
+        reject(err)
+      else
+        resolve(langs)
+      end
+    end
+    btv._bridge(id, function()
+      btv._ts_installed(id)
+    end)
+  end)
+end
+
+-- `btv.treesitter.set_query(lang, name, text)`: use `text` as `lang`'s `name` query, in
+-- place of its query files, in every buffer. `name` is one of `highlights`, `indents`,
+-- `injections`, `folds` or `textobjects`. `nil` for `text` goes back to the files. A query
+-- that won't compile says so on the message line and changes nothing.
+--
+-- Not in the browser, whose highlighter is JS-side: it reports that on the message line.
+function btv.treesitter.set_query(lang, name, text)
+  assert(type(lang) == "string", "btv.treesitter.set_query: lang must be a string")
+  assert(type(name) == "string", "btv.treesitter.set_query: name must be a string")
+  assert(
+    text == nil or type(text) == "string",
+    "btv.treesitter.set_query: text must be a string or nil"
+  )
+  if
+    not btv.tbl.contains({ "highlights", "indents", "injections", "folds", "textobjects" }, name)
+  then
+    error("btv.treesitter.set_query: no query named " .. name, 2)
+  end
+  btv._btv_set_ts_query(lang, name, text)
+end
+
 -- The shipped framings, applied at the bottom of this section. Ordered per language
 -- by how a doc block usually arrives, most likely first — the first framing that
 -- parses cleanly wins, so ordering is the whole tuning knob. A framing that never

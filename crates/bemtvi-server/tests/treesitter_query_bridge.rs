@@ -226,7 +226,10 @@ async fn overlay_reaches_the_stateless_highlighter() {
          end)()",
     )
     .await;
-    poll_true(&rpc, "return _G.done").await;
+    assert!(
+        poll_true(&rpc, "return _G.done").await,
+        "the promise settled"
+    );
 
     let found = exec_lua(&rpc, "return _G.seen['bemtvi.stateless.test'] == true").await;
     assert_eq!(

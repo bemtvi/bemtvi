@@ -19,8 +19,8 @@ use std::time::Duration;
 use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
-    cursor, drain_to_latest_redraw, exec_lua, feed, lines, message, mode, serial_lock as test_lock,
-    start_attached, window0_field, write_temp,
+    cursor, drain_to_latest_redraw, exec_lua, feed, lines, message, mode, poll_true,
+    serial_lock as test_lock, start_attached, window0_field, write_temp,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -313,11 +313,15 @@ async fn ts_install_compiles_grammar_and_enables_indent() {
     // `:TSInstallInfo` lists the parser we just installed (in a read-only scratch
     // buffer, now the focused window), with its queries.
     feed(&rpc, ":TSInstallInfo<CR>");
-    let info = lines(&rpc).await;
-    let joined = info.join("\n");
     assert!(
-        joined.contains("rust") && joined.contains("indents"),
-        "TSInstallInfo listing missing rust/indents: {info:?}"
+        poll_true(
+            &rpc,
+            "local all = table.concat(btv.buf.lines(0, 0, -1), '\\n') \
+             return all:find('rust') ~= nil and all:find('indents') ~= nil"
+        )
+        .await,
+        "TSInstallInfo listing missing rust/indents: {:?}",
+        lines(&rpc).await
     );
 }
 

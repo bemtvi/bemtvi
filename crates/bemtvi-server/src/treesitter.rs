@@ -98,11 +98,11 @@ impl EditHost {
     /// re-querying the engine only on a memo miss (its content, the range, or its
     /// language changed since the last fetch).
     /// Answer one `btv.treesitter.highlight`: highlight `text` as `lang` and settle the
-    /// promise with the spans — unless that language's grammar is still loading, in
-    /// which case the ask is parked and re-run when it lands
-    /// ([`run_parked_ts_highlights`](Self::run_parked_ts_highlights)). Settling it now
-    /// would resolve the promise with an empty span list, which reads as "this text has
-    /// no highlights" rather than "not yet".
+    /// promise with the spans — unless the grammar of that language or of one it injects
+    /// is still loading, in which case the ask is parked and re-run when it lands
+    /// ([`run_parked_ts_highlights`](Self::run_parked_ts_highlights)). A promise settles
+    /// once, so settling now would leave out those spans for good, reading as "this text
+    /// has no such highlights" rather than "not yet".
     pub(crate) fn settle_ts_highlight(
         &mut self,
         lang: String,
@@ -111,8 +111,17 @@ impl EditHost {
         cb_id: u64,
     ) {
         let (spans, _bg) = self.resolved_preview_highlights(&lang, &text, 0, nlines);
-        if spans.is_empty() && self.editor.ts_language_pending(&lang) {
+        let waiting = self.editor.ts_language_pending(&lang)
+            || self
+                .editor
+                .ts_preview_injected_languages()
+                .iter()
+                .any(|injected| self.editor.ts_language_pending(injected));
+        if waiting {
             self.parked_ts_highlights.push((lang, text, nlines, cb_id));
+            // The highlight may have just asked for the grammar. Whatever runs this next
+            // needn't be a frame: a parked ask re-runs off a load that paints nothing.
+            self.dispatch_grammar_requests();
             return;
         }
         let spans = spans
@@ -254,7 +263,8 @@ impl EditHost {
         // newly installed overlay changes what its layer paints (and, for an
         // `injections` overlay, which deeper layers there are), so re-query rather
         // than leave this frame painted from the un-overlaid queries. Terminates: a
-        // round only repeats when it added to `resolved_ts_langs`, which never shrinks.
+        // round only repeats when it added to `resolved_ts_langs`, which only shrinks for a
+        // `set_query` clear, never within a frame.
         loop {
             let injected = self.editor.ts_injected_languages(buffer);
             if !self.resolve_injected_queries(injected) {
@@ -316,6 +326,12 @@ impl EditHost {
         let rtp = self.lua.runtimepath().to_vec();
         let mut applied = false;
         for name in bemtvi_core::ENGINE_QUERY_NAMES {
+            if self
+                .explicit_ts_queries
+                .contains(&(lang.to_string(), name.to_string()))
+            {
+                continue;
+            }
             let parts = self.collect_query_parts(lang, name, &rtp);
             if parts.is_empty() {
                 continue;
@@ -376,7 +392,8 @@ impl EditHost {
         let mut out = self.editor.preview_highlights_bg(lang, text, first, last);
         // Same shape as the buffer path: the injected languages are only knowable
         // once the parse has run, so resolve them and repaint. Terminates because a
-        // round only repeats when it added to `resolved_ts_langs`, which never shrinks.
+        // round only repeats when it added to `resolved_ts_langs`, which only shrinks for a
+        // `set_query` clear, never within a frame.
         loop {
             let injected = self.editor.ts_preview_injected_languages();
             if !self.resolve_injected_queries(injected) {

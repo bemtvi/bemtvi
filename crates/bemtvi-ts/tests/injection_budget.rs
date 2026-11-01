@@ -24,12 +24,18 @@ mod fixture;
 
 use bemtvi_core::BufferId;
 use bemtvi_ts::Engine;
-use fixture::{install_markdown_grammar, install_rust_grammar, install_rust_grammar_as, TempDir};
+use fixture::{
+    install_markdown_grammar, install_markdown_inline_grammar, install_rust_grammar,
+    install_rust_grammar_as, TempDir,
+};
 
 const RUST_IN_FENCES: &str = "((fenced_code_block (code_fence_content) @injection.content) \
      (#set! injection.language \"rust\"))";
 
 const BUF: BufferId = BufferId(1);
+
+/// The capture `markdown_inline` puts on a code span.
+const CODE_SPAN: &str = "text.literal";
 
 /// Stand-in languages for the multi-language fence test, each backed by its own copy
 /// of the rust grammar (see [`install_rust_grammar_as`]) so each costs a real load.
@@ -230,5 +236,270 @@ fn an_over_budget_injection_colours_in_across_frames_with_no_edit() {
         paints_rust(&mut engine, 80),
         "the injected rust never painted: an over-budget child parse was dropped, \
          not resumed, and nothing re-attempted it without an edit"
+    );
+}
+
+/// A markdown document of `count` long paragraphs, the shape of a real one: every
+/// paragraph is its own `markdown_inline` region, no one of them is over budget, and
+/// together they are. Long enough for each parse to outlast tree-sitter's cancellation
+/// check (every 100 parser operations, counted afresh per `parse` call), or a resume
+/// of it finishes whatever the budget says and hides a restarting pass.
+fn paragraphs(count: usize) -> String {
+    let mut s = String::from("# hi\n\n");
+    for p in 0..count {
+        for i in 0..40 {
+            s.push_str(&format!(
+                "`code{p}_{i}` and *some* [link](target) words here. "
+            ));
+        }
+        s.push_str("\n\n");
+    }
+    s
+}
+
+/// An engine reading the real bundled queries, over a document of [`paragraphs`].
+fn prose_engine(tag: &str, text: &str) -> (TempDir, Engine) {
+    let data = TempDir::new(tag);
+    install_markdown_grammar(&data.0);
+    install_markdown_inline_grammar(&data.0);
+    std::env::set_var("BEMTVI_DATA_DIR", &data.0);
+    let mut engine = Engine::new(data.0.clone());
+    engine.open(BUF, "markdown", text);
+    (data, engine)
+}
+
+/// The lines a code span paints on, for `[first, last)`. The host grammar never
+/// emits this capture, so it is proof the paragraph's inline layer built.
+fn code_span_lines(engine: &mut Engine, first: usize, last: usize) -> Vec<usize> {
+    let mut lines: Vec<usize> = engine
+        .highlights(BUF, first, last)
+        .into_iter()
+        .filter(|s| s.group == CODE_SPAN)
+        .map(|s| s.line)
+        .collect();
+    lines.dedup();
+    lines
+}
+
+/// Many regions that together outrun one budget must still converge. A resume used
+/// to walk every region from the top again, re-parsing the ones that had already
+/// landed: once that re-parse alone filled the budget the tail of the document was
+/// never reached, the buffer stayed pending for good, and the server spun at 100% CPU
+/// repainting it.
+#[test]
+fn many_regions_past_one_budget_converge() {
+    let text = paragraphs(300);
+    let (_data, mut engine) = prose_engine("inj_budget_many", &text);
+    let mut frames = 0;
+    while engine.parse_pending(BUF) {
+        frames += 1;
+        assert!(
+            frames < 300,
+            "still parsing after {frames} frames with no edit: the resume never reached \
+             the end of the document"
+        );
+        let _ = engine.highlights(BUF, 0, 80);
+    }
+    assert!(
+        frames > 1,
+        "fixture is wrong: this should not fit in one budget"
+    );
+    let lines = text.lines().count();
+    assert!(
+        !code_span_lines(&mut engine, lines - 4, lines).is_empty(),
+        "the tail of the document never painted"
+    );
+}
+
+/// What has painted stays painted while the rest of the document catches up. A resume
+/// used to hand each landed layer's tree back as a parse hint, in the wrong order, and
+/// when the budget cut that parse short it painted some *other* region's tree clipped
+/// to this one's ranges: the colours came and went on every frame.
+#[test]
+fn a_painted_line_does_not_flicker_while_the_rest_converges() {
+    let text = paragraphs(300);
+    let (_data, mut engine) = prose_engine("inj_budget_flicker", &text);
+    let lines = text.lines().count();
+    let mut painted = code_span_lines(&mut engine, 0, lines);
+    let mut frames = 0;
+    while engine.parse_pending(BUF) && frames < 40 {
+        frames += 1;
+        let now = code_span_lines(&mut engine, 0, lines);
+        let lost: Vec<_> = painted.iter().filter(|l| !now.contains(l)).collect();
+        assert!(lost.is_empty(), "frame {frames}: lines went dark: {lost:?}");
+        painted = now;
+    }
+    assert!(!painted.is_empty(), "the document never painted");
+}
+
+/// An edit that leaves most of the regions alone must not make them parse again: a
+/// keystroke's cost follows what it touched, not how much document there is.
+#[test]
+fn an_edit_leaves_the_regions_it_did_not_touch_alone() {
+    let text = paragraphs(300);
+    let (_data, mut engine) = prose_engine("inj_budget_edit", &text);
+    let open_frames = frames_to_converge(&mut engine, 80).expect("the parse never converged");
+
+    // One character at the start of the last paragraph.
+    let at = text.trim_end().rfind("\n\n").unwrap() + 2;
+    let line = text[..at].matches('\n').count();
+    engine.edit(
+        BUF,
+        &[bemtvi_core::BufferEdit {
+            start_byte: at,
+            old_end_byte: at,
+            new_end_byte: at + 1,
+            start_point: (line, 0),
+            old_end_point: (line, 0),
+            new_end_point: (line, 1),
+            text: "x".to_string(),
+        }],
+    );
+    // Every paragraph keeps its colour on every frame, the root parse finishing over
+    // several of them included: nothing it left alone goes dark or starts over.
+    let lines = text.lines().count();
+    let mut frames = 0;
+    loop {
+        let painted = code_span_lines(&mut engine, 0, lines);
+        assert_eq!(
+            painted.len(),
+            300,
+            "frame {frames}: {} painted",
+            painted.len()
+        );
+        if !engine.parse_pending(BUF) {
+            break;
+        }
+        frames += 1;
+        assert!(
+            frames < open_frames.max(2),
+            "one edit took {frames} frames, as much as the whole document's first parse"
+        );
+    }
+}
+
+/// An edit reaching more regions than one budget parses leaves them painting their
+/// old trees while they catch up, and what they end on must be the new parse alone: the
+/// old tree is swapped out when the new one lands, not painted along with it.
+#[test]
+fn a_region_catching_up_after_an_edit_ends_on_its_new_parse_alone() {
+    let text = paragraphs(300);
+    let (_data, mut engine) = prose_engine("inj_budget_swap", &text);
+    frames_to_converge(&mut engine, 80).expect("the parse never converged");
+
+    // The opening backtick of each paragraph's first code span, one same-size edit
+    // each: every region is touched, and nothing moves.
+    let mut edited = text.clone().into_bytes();
+    let mut edits = Vec::new();
+    let mut at = 0;
+    for (line, l) in text.lines().enumerate() {
+        if l.starts_with('`') {
+            edited[at] = b'x';
+            edits.push(bemtvi_core::BufferEdit {
+                start_byte: at,
+                old_end_byte: at + 1,
+                new_end_byte: at + 1,
+                start_point: (line, 0),
+                old_end_point: (line, 1),
+                new_end_point: (line, 1),
+                text: "x".to_string(),
+            });
+        }
+        at += l.len() + 1;
+    }
+    assert_eq!(edits.len(), 300);
+    engine.edit(BUF, &edits);
+    frames_to_converge(&mut engine, 80).expect("the parse never converged");
+
+    let spans = |engine: &mut Engine| {
+        let mut all: Vec<_> = engine
+            .highlights(BUF, 0, 700)
+            .into_iter()
+            .map(|s| (s.line, s.start_byte, s.end_byte, s.group))
+            .collect();
+        all.sort();
+        all
+    };
+    let edited = String::from_utf8(edited).unwrap();
+    let (_fresh_data, mut fresh) = prose_engine("inj_budget_swap_fresh", &edited);
+    frames_to_converge(&mut fresh, 80).expect("the parse never converged");
+    assert!(
+        spans(&mut engine) == spans(&mut fresh),
+        "the edited document paints differently from the same text opened fresh"
+    );
+}
+
+/// Regions after an edit moved, and their reused trees must have moved with them.
+#[test]
+fn a_reused_region_paints_where_the_edit_moved_it() {
+    let text = paragraphs(3);
+    let (_data, mut engine) = prose_engine("inj_budget_shift", &text);
+    frames_to_converge(&mut engine, 80).expect("the parse never converged");
+    let before = code_span_lines(&mut engine, 0, 20);
+    assert_eq!(before, vec![2, 4, 6]);
+
+    // A blank line above every paragraph: all three regions move, none is touched.
+    engine.edit(
+        BUF,
+        &[bemtvi_core::BufferEdit {
+            start_byte: 0,
+            old_end_byte: 0,
+            new_end_byte: 1,
+            start_point: (0, 0),
+            old_end_point: (0, 0),
+            new_end_point: (1, 0),
+            text: "\n".to_string(),
+        }],
+    );
+    frames_to_converge(&mut engine, 80).expect("the parse never converged");
+    assert_eq!(code_span_lines(&mut engine, 0, 20), vec![3, 5, 7]);
+}
+
+/// The lines of a `keyword` span, for `[first, last)`.
+fn keyword_lines(engine: &mut Engine, first: usize, last: usize) -> Vec<usize> {
+    let mut lines: Vec<usize> = engine
+        .highlights(BUF, first, last)
+        .into_iter()
+        .filter(|s| s.group == "keyword")
+        .map(|s| s.line)
+        .collect();
+    lines.dedup();
+    lines
+}
+
+/// The other half of leaving regions alone: an edit *inside* a region must reparse
+/// it, even one that leaves its byte range exactly as it was. `let` -> `lex` is the
+/// same size, so nothing but the edit itself says the region changed.
+#[test]
+fn a_same_size_edit_inside_a_region_still_reparses_it() {
+    let data = TempDir::new("inj_budget_same_size");
+    install_rust_grammar(&data.0);
+    install_markdown_grammar(&data.0);
+    std::env::set_var("BEMTVI_DATA_DIR", &data.0);
+
+    let mut engine = engine(&data.0);
+    let text = "```rust\nlet x = 1;\n```\n\n```rust\nlet y = 2;\n```\n";
+    engine.open(BUF, "markdown", text);
+    frames_to_converge(&mut engine, 10).expect("the parse never converged");
+    assert_eq!(keyword_lines(&mut engine, 0, 10), vec![1, 5]);
+
+    let at = text.rfind("let").unwrap() + 2; // the `t` of the second `let`
+    engine.edit(
+        BUF,
+        &[bemtvi_core::BufferEdit {
+            start_byte: at,
+            old_end_byte: at + 1,
+            new_end_byte: at + 1,
+            start_point: (5, 2),
+            old_end_point: (5, 3),
+            new_end_point: (5, 3),
+            text: "x".to_string(),
+        }],
+    );
+    frames_to_converge(&mut engine, 10).expect("the parse never converged");
+    assert_eq!(
+        keyword_lines(&mut engine, 0, 10),
+        vec![1],
+        "the edited region kept painting its old parse"
     );
 }

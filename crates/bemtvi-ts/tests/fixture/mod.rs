@@ -159,3 +159,13 @@ pub fn install_markdown_grammar(root: &Path) {
         write_query(root, "markdown", name, &scm);
     }
 }
+
+/// Install the Markdown inline grammar + its highlights query under `root`: the one
+/// the block grammar's bundled injection query hands every paragraph to.
+pub fn install_markdown_inline_grammar(root: &Path) {
+    let md = registry_crate_dir("tree-sitter-md-0.5.3").join("tree-sitter-markdown-inline");
+    compile_grammar(root, "markdown_inline", &md.join("src"));
+    let scm = std::fs::read_to_string(md.join("queries").join("highlights.scm"))
+        .expect("read markdown_inline query");
+    write_query(root, "markdown_inline", "highlights", &scm);
+}

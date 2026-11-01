@@ -8,7 +8,7 @@
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -38,13 +38,11 @@ const PARSE_DEADLINE: Duration = Duration::from_millis(50);
 /// refresh — grammar loads included — the injection analogue of [`PARSE_DEADLINE`].
 /// Injected regions reparse per edit, so an adversarial config (many regions, or a
 /// pathological child grammar) could otherwise stall the edit path. On expiry the
-/// remaining child parses are cancelled and their last-good (edit-shifted) trees are
-/// kept, so the cost is one frame of stale injected highlights rather than a hang.
-///
-/// A region with no last-good tree — a `<script lang="ts">` on the frame the file
-/// opened — is not lost by expiry: it is kept pending and resumed a budget at a time
-/// on later frames ([`PendingInjection`]), so it colours in shortly *after* the file
-/// paints instead of holding the paint up.
+/// remaining regions are kept pending and resumed a budget at a time on later frames
+/// ([`PendingInjection`]), painting their last-good (edit-shifted) trees if they have
+/// them: a few frames of stale injected highlights rather than a hang. A region with no
+/// last-good tree — a `<script lang="ts">` on the frame the file opened — colours in
+/// shortly *after* the file paints instead of holding the paint up.
 const INJECTION_DEADLINE: Duration = Duration::from_millis(50);
 
 /// How deep injected layers may nest (host → injected → injected-within-injected →
@@ -99,34 +97,31 @@ struct BufferState {
     line_bg_lines: Vec<usize>,
 }
 
-/// A child parse still in flight: cancelled by [`INJECTION_DEADLINE`] before it
-/// produced a tree, and kept whole so the next refresh can resume it.
+/// A child region not parsed yet: cancelled by [`INJECTION_DEADLINE`] before it
+/// produced a tree, or never started because the budget had already run out. It is
+/// the unit of work of [`Engine::run_injection_queue`], and what is left of that queue
+/// is kept whole so the next refresh carries on from it.
 ///
 /// The `parser` is the point of this type. tree-sitter retains a cancelled parse on
 /// the parser that ran it, so calling `parse` again continues from where the budget
-/// ran out — dropping the parser instead (what the engine used to do) would restart
-/// the region from scratch every frame and, for a region genuinely larger than one
-/// budget, never finish. The rest of the fields are what
-/// [`Engine::build_injection_layers`] matches it back to its region by.
-///
-/// A *nested* pending region needs no depth or injector stored alongside it: the
-/// pass that resumes it re-derives its parent layer first (from the parent's own
-/// tree, so no reparse), and the parent's injection query re-enqueues the child at
-/// the right depth and under the right injector, where `(language, ranges)` finds
-/// this parser again.
+/// ran out — dropping the parser instead would restart the region from scratch every
+/// frame and, for a region genuinely larger than one budget, never finish.
 struct PendingInjection {
-    /// The injected language (normalized), half of the key matching it to a region.
+    /// The injected language (normalized).
     language: String,
-    /// The buffer byte ranges the parse covers, already merged and ascending — the
-    /// other half of the key, so a region the text moved gets a fresh parse rather
-    /// than one resumed against bytes it never started on.
+    /// The buffer byte ranges the parse covers.
     ranges: Vec<Range<usize>>,
+    /// Nesting depth, 1 for a region the host injects.
+    depth: usize,
+    /// The language that injected this region: `injection.parent` when it is queried
+    /// in turn.
+    injector: String,
     /// Holds the outstanding parse; `parse` on it resumes rather than restarts.
-    /// `None` for a region the pass deferred *before* starting it — a first region
-    /// of a language whose grammar was still uncached when the frame's budget ran
-    /// out (see [`Engine::build_injection_layers`]). It gets a fresh parser when the
-    /// next frame reaches it.
+    /// `None` for a region that has not started.
     parser: Option<Parser>,
+    /// The incremental hint for a region that has not started. A started parse fixed
+    /// its old tree when it began and takes no other.
+    hint: Option<Tree>,
 }
 
 /// One injected sub-language layer: a child grammar's parse of the host buffer
@@ -143,12 +138,92 @@ struct InjectionLayer {
     /// The injected language (already normalized, e.g. `rust`); looked up in the
     /// grammar cache to find the child highlights query.
     language: String,
+    /// Nesting depth, 1 for a region the host injects. Layers stay sorted on it: the
+    /// painter's precedence is vector order, so a deeper layer must come later.
+    depth: usize,
     /// The child parse tree, in buffer coordinates.
     tree: Tree,
     /// The buffer byte ranges this layer covers. A combined layer owns several; a
     /// node spanning the gap between two ranges must paint only *within* them, so
     /// the painter clips this layer's captures to these ranges.
     ranges: Vec<Range<usize>>,
+}
+
+/// A layer waiting for its region: its ranges on the new text, and its tree.
+type OldLayer = (Vec<Range<usize>>, Tree);
+
+/// The layers an edit found, shifted onto the new text and waiting for the region
+/// each one belongs to. See [`Engine::update_injection_layers`].
+#[derive(Default)]
+struct OldLayers {
+    /// By language, then by where the layer's first range starts.
+    by_lang: HashMap<String, BTreeMap<usize, OldLayer>>,
+    /// The bytes the edit wrote, ascending and merged: a layer whose ranges miss all
+    /// of them read nothing that changed, so its tree needs no parse.
+    written: Vec<Range<usize>>,
+}
+
+impl OldLayers {
+    /// Add a layer, under where its text is now.
+    fn insert(&mut self, layer: InjectionLayer) {
+        if let Some(start) = layer.ranges.first().map(|r| r.start) {
+            self.by_lang
+                .entry(layer.language)
+                .or_default()
+                .insert(start, (layer.ranges, layer.tree));
+        }
+    }
+
+    /// Take the old layer whose text overlaps this region. Matched on position, never
+    /// on order: a tree handed to tree-sitter for another region's text saves it no
+    /// work, and painted as the stale fallback it shows that other region's colours.
+    fn take(&mut self, language: &str, ranges: &[Range<usize>]) -> Option<OldLayer> {
+        let (first, last) = (ranges.first()?, ranges.last()?);
+        let of_lang = self.by_lang.get_mut(language)?;
+        let (&start, (old, _)) = of_lang.range(..=last.end).next_back()?;
+        if old.last()?.end < first.start {
+            return None;
+        }
+        of_lang.remove(&start)
+    }
+
+    /// Whether the edit wrote into, or right up against, any of `ranges`.
+    fn touches(&self, ranges: &[Range<usize>]) -> bool {
+        ranges.iter().any(|r| {
+            let i = self.written.partition_point(|w| w.end < r.start);
+            self.written.get(i).is_some_and(|w| w.start <= r.end)
+        })
+    }
+}
+
+/// The bytes each edit wrote, in the coordinates after the last of them. Past a few
+/// hundred edits in one batch, the whole document counts: that is a paste or a macro,
+/// and working out which of its edits reached which region would cost more than it
+/// saves.
+fn written_ranges(edits: &[InputEdit]) -> Vec<Range<usize>> {
+    if edits.len() > 256 {
+        return std::iter::once(0..usize::MAX).collect();
+    }
+    let mut out: Vec<Range<usize>> = edits
+        .iter()
+        .enumerate()
+        .map(|(i, e)| shift_range(&(e.start_byte..e.new_end_byte), &edits[i + 1..]))
+        .collect();
+    merge_ranges(&mut out);
+    out
+}
+
+/// Sort `ranges` and merge the ones that overlap or touch.
+fn merge_ranges(ranges: &mut Vec<Range<usize>>) {
+    ranges.sort_by_key(|r| r.start);
+    ranges.dedup_by(|next, prev| {
+        if next.start <= prev.end {
+            prev.end = prev.end.max(next.end);
+            true
+        } else {
+            false
+        }
+    });
 }
 
 impl BufferState {
@@ -866,63 +941,122 @@ impl Engine {
     /// query (or buffer) is new so there is nothing to reparse incrementally from.
     fn rebuild_injection_layers(&mut self, buffer: BufferId) {
         let regions = self.top_level_injection_regions(buffer);
-        self.build_injection_layers(buffer, regions, HashMap::new());
+        self.build_injection_layers(buffer, regions, OldLayers::default());
     }
 
-    /// Advance the child parses [`INJECTION_DEADLINE`] cut short, one budget further.
+    /// Re-derive the regions after the root parse finished over several frames, keeping
+    /// the layers that are still right: an edit that outran the root's budget reaches
+    /// here with every layer current and only the *regions* out of date, and dropping
+    /// the layers would take the whole document's colour with them for as long as they
+    /// took to parse again. The pending regions count as written, since their trees are
+    /// the ones still waiting on a parse.
+    fn refresh_injection_layers(&mut self, buffer: BufferId) {
+        let Some(state) = self.buffers.get_mut(&buffer) else {
+            return;
+        };
+        let mut written: Vec<_> = state
+            .pending_injections
+            .iter()
+            .flat_map(|p| p.ranges.iter().cloned())
+            .collect();
+        merge_ranges(&mut written);
+        let mut old = OldLayers {
+            by_lang: HashMap::new(),
+            written,
+        };
+        for layer in std::mem::take(&mut state.injections) {
+            old.insert(layer);
+        }
+        let regions = self.top_level_injection_regions(buffer);
+        self.build_injection_layers(buffer, regions, old);
+    }
+
+    /// Advance the regions [`INJECTION_DEADLINE`] left unparsed, one budget further.
     ///
     /// Called from [`highlights`](Self::highlights) — so the server's "repaint while
     /// [`parse_pending`](Self::parse_pending)" loop drives it, exactly as it already
-    /// drives the root parse's resumption. The regions come from the cache rather
-    /// than a fresh query: this path runs only when the text has not changed, so
-    /// re-running the host's injection query would rediscover the same set at the
-    /// cost of a whole-tree walk.
+    /// drives the root parse's resumption. This path runs only when the text has not
+    /// changed, so it works from the pending regions alone: the layers that landed are
+    /// still right. Going back over them would spend the budget before the frame
+    /// reached the regions it came for, and past some document size no frame would
+    /// ever get there.
     fn resume_pending_injections(&mut self, buffer: BufferId) {
         let Some(state) = self.buffers.get_mut(&buffer) else {
             return;
         };
-        let regions = state.injection_regions.clone();
-        // The layers that already landed, handed back as their own parse hints so
-        // this pass re-derives them from their trees instead of reparsing them.
-        let mut old_by_lang: HashMap<String, Vec<Tree>> = HashMap::new();
-        for layer in std::mem::take(&mut state.injections) {
-            old_by_lang
-                .entry(layer.language)
-                .or_default()
-                .push(layer.tree);
+        let queue = std::mem::take(&mut state.pending_injections).into();
+        let (landed, still_pending) = self.run_injection_queue(buffer, queue, OldLayers::default());
+        let Some(state) = self.buffers.get_mut(&buffer) else {
+            return;
+        };
+        state.pending_injections = still_pending;
+        if landed.is_empty() {
+            return;
         }
-        self.build_injection_layers(buffer, regions, old_by_lang);
+        // A region painting a stale tree until its parse finished has finished now.
+        let fresh: HashSet<(&str, &[Range<usize>])> = landed
+            .iter()
+            .map(|l| (l.language.as_str(), l.ranges.as_slice()))
+            .collect();
+        state
+            .injections
+            .retain(|l| !fresh.contains(&(l.language.as_str(), l.ranges.as_slice())));
+        drop(fresh);
+        state.injections.extend(landed);
+        state
+            .injections
+            .sort_by_key(|l| (l.depth, l.ranges.first().map_or(usize::MAX, |r| r.start)));
     }
 
     /// Re-derive a buffer's injected child layers **incrementally** after an edit.
-    /// Each surviving child tree is `edit`ed with this frame's deltas and reused as
-    /// the parse hint for the region of its language, so unchanged subtrees are not
-    /// reparsed (and it doubles as the last-good fallback under the parse budget).
+    /// Each surviving child tree is `edit`ed with this frame's deltas: if the edit wrote
+    /// nothing into its region that is all it needs, and otherwise it is the parse hint
+    /// for the region it overlaps, and the last-good fallback under the parse budget.
     fn update_injection_layers(
         &mut self,
         buffer: BufferId,
         edits: &[InputEdit],
         before: Option<&Tree>,
     ) {
-        // Lift the old layers out, shifting each tree by this frame's deltas so it
-        // can serve as an incremental reparse hint for its language's new region(s).
-        let old_by_lang = {
+        // Lift the old layers out, shifted onto the new text.
+        let old = {
             let Some(state) = self.buffers.get_mut(&buffer) else {
                 return;
             };
-            let mut map: HashMap<String, Vec<Tree>> = HashMap::new();
+            let mut old = OldLayers {
+                by_lang: HashMap::new(),
+                written: written_ranges(edits),
+            };
             for mut layer in std::mem::take(&mut state.injections) {
                 for e in edits {
                     layer.tree.edit(e);
                 }
-                map.entry(layer.language).or_default().push(layer.tree);
+                for r in &mut layer.ranges {
+                    *r = shift_range(r, edits);
+                }
+                old.insert(layer);
             }
-            map
+            old
         };
-        let regions = self
-            .incremental_injection_regions(buffer, edits, before)
-            .unwrap_or_else(|| self.top_level_injection_regions(buffer));
-        self.build_injection_layers(buffer, regions, old_by_lang);
+        // A root parse this edit's budget cut short leaves a tree that is not the text
+        // yet, and a query over it can miss the very region being typed in. Keep the
+        // regions there were, moved with the text, until the parse lands and
+        // [`refresh_injection_layers`](Self::refresh_injection_layers) re-derives them.
+        let regions = match self.buffers.get(&buffer) {
+            Some(state) if state.incomplete => state
+                .injection_regions
+                .iter()
+                .map(|r| InjectionRegion {
+                    language: r.language.clone(),
+                    ranges: r.ranges.iter().map(|x| shift_range(x, edits)).collect(),
+                    extent: shift_range(&r.extent, edits),
+                })
+                .collect(),
+            _ => self
+                .incremental_injection_regions(buffer, edits, before)
+                .unwrap_or_else(|| self.top_level_injection_regions(buffer)),
+        };
+        self.build_injection_layers(buffer, regions, old);
     }
 
     /// Update the cached top-level injection regions for `buffer` from what the edit
@@ -1082,102 +1216,121 @@ impl Engine {
     }
 
     /// Build the child layers for `regions` (each a `(language, ranges)` region-set),
-    /// reusing the edit-shifted trees in `old_by_lang` (FIFO per language) as
-    /// incremental parse hints — empty for a full rebuild. Each set is parsed by its
-    /// child grammar restricted to its ranges via `included_ranges` (so one combined
-    /// injection's many ranges form one tree, and the tree is in buffer coordinates).
-    ///
-    /// Nesting is a breadth-first walk: after a layer parses, its own grammar's
-    /// injection query runs over it to enqueue the regions *it* injects, down to
-    /// [`MAX_INJECTION_DEPTH`]. Shallower layers are pushed first, so the painter's
-    /// layer rank (vector order) already makes a deeper layer win over a shallower.
-    ///
-    /// A missing or broken child grammar is silently skipped (best-effort) and the
-    /// region keeps the host's flat paint. The whole pass is bounded by
-    /// [`INJECTION_DEADLINE`]: once over budget a cancelled parse falls back to its
-    /// (edit-shifted) old tree — one frame stale, never a hang. Runs entirely in Rust
-    /// (no Lua), so it is safe off the synchronous redraw path.
+    /// from `old`'s edit-shifted trees where it has them, and replace the buffer's
+    /// layers with the result. A region this pass did not get to is left pending.
     fn build_injection_layers(
         &mut self,
         buffer: BufferId,
         regions: Vec<InjectionRegion>,
-        mut old_by_lang: HashMap<String, Vec<Tree>>,
+        old: OldLayers,
     ) {
         // The host language injected the top-level regions; it is their parent for
         // the `injection.parent` directive when those layers are queried in turn.
-        let Some(host_lang) = self.buffers.get(&buffer).map(|s| s.language.clone()) else {
+        let Some(state) = self.buffers.get_mut(&buffer) else {
             return;
         };
-        // Whatever the last refresh left mid-parse. A region that still exists takes
-        // its parser back below and resumes; one that doesn't drops with this vec.
-        let mut resumable: Vec<PendingInjection> = Vec::new();
+        let host_lang = state.language.clone();
+        state.injection_regions = regions.clone();
+        // Whatever the last refresh left mid-parse was reading text or a query that
+        // has since changed. Its regions are re-derived below.
+        state.pending_injections.clear();
+        let queue = regions
+            .into_iter()
+            .map(|r| PendingInjection {
+                language: r.language,
+                ranges: r.ranges,
+                depth: 1,
+                injector: host_lang.clone(),
+                parser: None,
+                hint: None,
+            })
+            .collect();
+        let (layers, still_pending) = self.run_injection_queue(buffer, queue, old);
         if let Some(state) = self.buffers.get_mut(&buffer) {
-            state.injection_regions = regions.clone();
-            resumable = std::mem::take(&mut state.pending_injections);
+            state.injections = layers;
+            state.pending_injections = still_pending;
         }
+    }
+
+    /// Work through `queue` for one budget: what landed, and what is left.
+    ///
+    /// Each region is parsed by its child grammar restricted to its ranges via
+    /// `included_ranges` (so one combined injection's many ranges form one tree, and
+    /// the tree is in buffer coordinates). Nesting is a breadth-first walk: after a
+    /// layer lands, its own grammar's injection query enqueues the regions *it*
+    /// injects, down to [`MAX_INJECTION_DEPTH`].
+    ///
+    /// A missing or broken child grammar is silently skipped (best-effort) and the
+    /// region keeps the host's flat paint. Once [`INJECTION_DEADLINE`] is spent no
+    /// parse or grammar load starts, and each frame gets through at least the region
+    /// at the head of the queue, so the queue always drains. A region with an old tree
+    /// paints that meanwhile: it comes back in the layers *and* stays pending, and the
+    /// caller swaps the tree when the parse lands. Runs entirely in Rust (no Lua), so
+    /// it is safe off the synchronous redraw path.
+    fn run_injection_queue(
+        &mut self,
+        buffer: BufferId,
+        mut queue: VecDeque<PendingInjection>,
+        mut old: OldLayers,
+    ) -> (Vec<InjectionLayer>, Vec<PendingInjection>) {
         let started = Instant::now();
         // One wall-clock budget for the whole pass, load time included: what this
         // bounds is the *frame*, and a cold `dlopen` plus a compile of every `.scm` a
         // language ships is as real a stall as a pathological parse (hundreds of ms
-        // for typescript). A language's first region therefore usually spends the
-        // whole budget arriving and parses nothing — that is fine and is not the same
-        // as being dropped: it is kept as a [`PendingInjection`], `parse_pending`
-        // reports it, and the next frame resumes it with a full budget against a
-        // grammar that is now cached. The region colours in a frame or two after the
-        // file paints rather than stalling the paint it belongs to.
-        let mut layers = Vec::with_capacity(regions.len());
+        // for typescript).
+        let mut layers = Vec::with_capacity(queue.len());
         let mut still_pending: Vec<PendingInjection> = Vec::new();
-        // (language, ranges, depth, injector) — `injector` is the language that
-        // injected this region, used as `injection.parent` when recursing into it.
-        let mut queue: VecDeque<(String, Vec<Range<usize>>, usize, String)> = regions
-            .into_iter()
-            .map(|r| (r.language, r.ranges, 1, host_lang.clone()))
-            .collect();
 
-        while let Some((language, mut ranges, depth, injector)) = queue.pop_front() {
+        while let Some(mut work) = queue.pop_front() {
             // `included_ranges` must be ascending and non-overlapping. A combined
             // pattern can match *nested* nodes (a section inside a section), whose
             // ranges overlap — passed through raw, `set_included_ranges` would
             // reject them and the whole layer would silently drop. Merge each
             // overlap into its union (identical coverage for both the child parse
-            // and the painter's clipping). Merged before the load below so a region
-            // deferred there keys the same way as one that got this far.
-            ranges.sort_by_key(|r| r.start);
-            ranges.dedup_by(|next, prev| {
-                if next.start <= prev.end {
-                    prev.end = prev.end.max(next.end);
-                    true
-                } else {
-                    false
-                }
-            });
+            // and the painter's clipping).
+            merge_ranges(&mut work.ranges);
 
-            // A grammar not yet cached costs a `dlopen` plus a compile of every
-            // `.scm` it ships — hundreds of ms for typescript, none of it
-            // interruptible. So no load *starts* on a frame that has already spent
-            // its budget: the region it belongs to can't be parsed on that frame
-            // anyway, and a document with fenced code in eight languages would
-            // otherwise pay all eight loads at once. Deferring costs nothing — the
-            // region stays pending, so the next frame comes right back and spends
-            // its budget here — and the file keeps painting while its injections
-            // arrive over the frames after it.
-            //
-            // Keyed on *unattempted*, not on "not loaded": a language whose load
-            // already failed (or that isn't installed) is a cached lookup below,
-            // costs nothing, and drops the region — deferring that one instead would
-            // leave it pending forever and the server repainting to resolve it.
-            let cold = !self.grammars.contains_key(&language);
-            if cold && started.elapsed() >= INJECTION_DEADLINE {
-                still_pending.push(PendingInjection {
-                    language,
-                    ranges,
-                    parser: None,
-                });
+            // A tree this region can use. If the edit wrote nothing into it, the tree
+            // already is the parse, so the region costs nothing and is not subject to
+            // the budget below.
+            let mut stale = None;
+            if work.parser.is_none() && work.hint.is_none() {
+                if let Some((old_ranges, tree)) = old.take(&work.language, &work.ranges) {
+                    if old_ranges == work.ranges && !old.touches(&work.ranges) {
+                        self.land_injection(buffer, work, tree, &mut layers, &mut queue);
+                        continue;
+                    }
+                    work.hint = Some(tree.clone());
+                    stale = Some(tree);
+                }
+            }
+            // Painting a stale tree while the region waits, however it comes to wait.
+            let mut wait = |work: PendingInjection, stale: Option<Tree>| {
+                if let Some(tree) = stale {
+                    layers.push(InjectionLayer {
+                        language: work.language.clone(),
+                        depth: work.depth,
+                        tree,
+                        ranges: work.ranges.clone(),
+                    });
+                }
+                still_pending.push(work);
+            };
+
+            // A grammar not yet cached costs a `dlopen` plus a compile of every `.scm`
+            // it ships, none of it interruptible, and even a warm parse has its set-up
+            // to pay. A frame past its budget starts neither: a document with hundreds
+            // of regions would overrun by the set-up alone. Deferring costs nothing —
+            // the region stays pending, so the next frame comes right back and spends
+            // its budget here — and a region whose grammar turns out to be missing
+            // drops when that frame reaches it.
+            if started.elapsed() >= INJECTION_DEADLINE {
+                wait(work, stale);
                 continue;
             }
             // Lazily load (cache) the child grammar; skip silently if it is missing
             // or broken — the region just keeps the host's flat paint.
-            let child_language = match self.grammar(&language) {
+            let child_language = match self.grammar(&work.language) {
                 Slot::Loaded(g) => g.language.clone(),
                 // Being loaded off the editor thread: the region is not lost, it is
                 // waiting. Keeping it pending is what makes the host repaint (the
@@ -1186,98 +1339,91 @@ impl Engine {
                 // `Loading` always resolves to a verdict, and a `NotInstalled` one
                 // drops the region here.
                 Slot::Loading => {
-                    still_pending.push(PendingInjection {
-                        language,
-                        ranges,
-                        parser: None,
-                    });
+                    wait(work, stale);
                     continue;
                 }
                 _ => continue,
             };
             // The parser that already holds this region's cancelled parse, if the
-            // last refresh left one — resuming it continues from where the budget
-            // ran out, where a fresh parser would restart the region from scratch.
-            // Keyed by the merged ranges, so a region the edit moved gets a fresh
-            // parse rather than one resumed against the wrong text.
-            let resumed = resumable
-                .iter()
-                .position(|p| p.language == language && p.ranges == ranges)
-                .and_then(|i| resumable.remove(i).parser);
-            let resuming = resumed.is_some();
-            let mut parser = resumed.unwrap_or_else(Parser::new);
-            if !resuming && parser.set_language(&child_language).is_err() {
-                continue;
-            }
-            // An edit-shifted tree of this language, reused as the incremental parse
-            // hint and the stale fallback if this frame's parse is cancelled. Never
-            // handed to a *resumed* parse: that parse already fixed its old tree when
-            // it started, and swapping one in mid-flight would parse against a hint
-            // it never began from.
-            let old = match resuming {
-                true => None,
-                false => old_by_lang.get_mut(&language).and_then(Vec::pop),
+            // last refresh left one — resuming it continues from where the budget ran
+            // out, where a fresh parser would restart the region from scratch.
+            let mut parser = match work.parser.take() {
+                Some(parser) => parser,
+                None => {
+                    let mut parser = Parser::new();
+                    let Some(state) = self.buffers.get(&buffer) else {
+                        return (layers, still_pending);
+                    };
+                    let included: Vec<tree_sitter::Range> = work
+                        .ranges
+                        .iter()
+                        .map(|r| ts_range(&state.shadow, r))
+                        .collect();
+                    if parser.set_language(&child_language).is_err()
+                        || included.is_empty()
+                        || parser.set_included_ranges(&included).is_err()
+                    {
+                        continue;
+                    }
+                    parser
+                }
             };
-
+            let hint = work.hint.take();
             let Some(state) = self.buffers.get(&buffer) else {
-                return;
+                return (layers, still_pending);
             };
             let shadow = &state.shadow;
-            let included: Vec<tree_sitter::Range> =
-                ranges.iter().map(|r| ts_range(shadow, r)).collect();
-            if included.is_empty() || parser.set_included_ranges(&included).is_err() {
-                continue;
-            }
             let tree = {
                 let mut budget = deadline_budget(started, INJECTION_DEADLINE);
                 let options = ParseOptions::new().progress_callback(&mut budget);
                 let mut callback = |byte: usize, _: Point| -> &[u8] { read_chunk(shadow, byte) };
-                parser.parse_with_options(&mut callback, old.as_ref(), Some(options))
+                parser.parse_with_options(&mut callback, hint.as_ref(), Some(options))
             };
-            let tree = match tree {
-                Some(tree) => tree,
-                // Budget exhausted (or parse cancelled): keep the last-good child
-                // tree if there is one, painting one frame stale. A brand-new region
-                // has nothing to paint, so its parse is kept alive instead — the next
-                // refresh resumes it a budget further (see [`PendingInjection`]),
-                // which is what makes a region larger than one budget colour in over
-                // a few frames rather than wait for an edit that rebuilds it.
+            match tree {
+                Some(tree) => self.land_injection(buffer, work, tree, &mut layers, &mut queue),
+                // Budget exhausted: the parser keeps the parse, and the next refresh
+                // resumes it a budget further (see [`PendingInjection`]), which is what
+                // makes a region larger than one budget colour in over a few frames
+                // rather than wait for an edit that rebuilds it.
                 None => {
-                    match old {
-                        Some(tree) => layers.push(InjectionLayer {
-                            language,
-                            tree,
-                            ranges,
-                        }),
-                        None => still_pending.push(PendingInjection {
-                            language,
-                            ranges,
-                            parser: Some(parser),
-                        }),
-                    }
-                    continue;
-                }
-            };
-
-            // Nesting: enqueue the regions this layer itself injects, one level down.
-            if depth < MAX_INJECTION_DEPTH {
-                for (lang, sub) in
-                    self.nested_injection_regions(&language, &tree, buffer, &injector)
-                {
-                    queue.push_back((lang, sub, depth + 1, language.clone()));
+                    work.parser = Some(parser);
+                    wait(work, stale);
                 }
             }
-            layers.push(InjectionLayer {
-                language,
-                tree,
-                ranges,
-            });
         }
+        (layers, still_pending)
+    }
 
-        if let Some(state) = self.buffers.get_mut(&buffer) {
-            state.injections = layers;
-            state.pending_injections = still_pending;
+    /// A region has its tree: keep the layer, and enqueue the regions it injects in
+    /// turn, one level down.
+    fn land_injection(
+        &self,
+        buffer: BufferId,
+        work: PendingInjection,
+        tree: Tree,
+        layers: &mut Vec<InjectionLayer>,
+        queue: &mut VecDeque<PendingInjection>,
+    ) {
+        if work.depth < MAX_INJECTION_DEPTH {
+            for (language, ranges) in
+                self.nested_injection_regions(&work.language, &tree, buffer, &work.injector)
+            {
+                queue.push_back(PendingInjection {
+                    language,
+                    ranges,
+                    depth: work.depth + 1,
+                    injector: work.language.clone(),
+                    parser: None,
+                    hint: None,
+                });
+            }
         }
+        layers.push(InjectionLayer {
+            language: work.language,
+            depth: work.depth,
+            tree,
+            ranges: work.ranges,
+        });
     }
 
     /// (Re)initialize a buffer from full text and do the initial parse. The
@@ -1538,7 +1684,7 @@ impl Engine {
         if resumed_to_completion {
             // The freshly-completed root tree needs its injection layers built, just
             // as the open/edit paths do after their reparse.
-            self.rebuild_injection_layers(buffer);
+            self.refresh_injection_layers(buffer);
         } else if self
             .buffers
             .get(&buffer)

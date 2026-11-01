@@ -2307,7 +2307,7 @@ M._default_recommended = {
   },
   {
     "bemtvi/bemtvi-tree",
-    tag = "v1.0.1",
+    tag = "v1.1.1",
     desc = "File explorer sidebar (<leader>e)",
     keys = { "<leader>e" },
     config = [[ require("bemtvi-tree").setup() ]],
@@ -2337,7 +2337,7 @@ M._default_recommended = {
   },
   {
     "bemtvi/bemtvi-snippets",
-    tag = "v1.0.0",
+    tag = "v1.0.1",
     desc = "Snippet engine + the friendly-snippets collection",
     dependencies = { "rafamadriz/friendly-snippets" },
   },
@@ -2355,7 +2355,7 @@ M._default_recommended = {
   },
   {
     "bemtvi/bemtvi-markdown-preview",
-    tag = "v1.0.0",
+    tag = "v1.0.1",
     desc = "Live markdown preview in your browser (:MarkdownPreview)",
   },
   {

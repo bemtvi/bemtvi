@@ -29,11 +29,11 @@ BUNDLE="$OUT/plugins-bundle.lua"
 # when its tag moves there.
 PLUGINS=(
   "bemtvi/bemtvi-keys-helper	2f9e1060cea16ad0a4c15bcfebc5d15e25cb17ab"
-  "bemtvi/bemtvi-tree	20338af5add9cf7e48a80358b80319b59ea5842e"
+  "bemtvi/bemtvi-tree	18f533977e06143334fa285cecd285124345a611"
   "bemtvi/bemtvi-line	ef85139ce85619e249ddfb54337aa218fd335c17"
   "bemtvi/bemtvi-lspconfig	deafc538b71140646acc9b4bf0eaa302f669267c"
   "bemtvi/bemtvi-diff	05bb889a91e21a317efa7dcd089833215284b24d"
-  "bemtvi/bemtvi-snippets	ad5eff3ed906efd6057fe9cedab1bd838424b9fd"
+  "bemtvi/bemtvi-snippets	b7f4fef2828668459f424d10c5d2a928232aa39e"
   "bemtvi/bemtvi-markdown-preview	8472323d9bf06d0a15ba46a01a2a7a33752313b5"
 )
 

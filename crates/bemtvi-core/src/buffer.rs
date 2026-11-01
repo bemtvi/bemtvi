@@ -205,6 +205,10 @@ pub struct Buffer {
     /// shifted on every edit through [`Buffer::record`] and dropped wholesale on
     /// [`Buffer::mark_resync`]. See [`crate::extmark`].
     pub extmarks: crate::extmark::ExtmarkStore,
+    /// The server's LSP inlay hints as `line -> [(byte column, width)]`: all the core
+    /// needs of them, for [`inline_splices`](Self::inline_splices). Replaced whole by
+    /// [`set_inlay_splices`](Self::set_inlay_splices) when the hints change.
+    inlay_splices: std::collections::BTreeMap<usize, Vec<(usize, usize)>>,
     /// Buffer-local marks `a`–`z` (`m{a-z}` set, `` `{x} `` / `'{x}` jump), each a
     /// `(line, byte-column)` position. They live on the buffer — not the window —
     /// so they follow it across switches, matching vim. Like [`extmarks`], they are
@@ -364,6 +368,7 @@ impl Buffer {
             changelistidx: 0,
             change_span: None,
             extmarks: crate::extmark::ExtmarkStore::default(),
+            inlay_splices: std::collections::BTreeMap::new(),
             marks: HashMap::new(),
             last_visual: None,
             kind: BufferKind::Ordinary,
@@ -640,6 +645,101 @@ impl Buffer {
     /// Editable line containing byte offset `byte_idx`.
     pub fn byte_to_line(&self, byte_idx: usize) -> usize {
         self.text.byte_to_line_idx(byte_idx, LINE_TYPE)
+    }
+
+    /// Replace the LSP inlay hints [`inline_splices`](Self::inline_splices) counts.
+    /// `hints` maps a 0-based line to its `(byte column, cell width)` hints. The hints
+    /// live in the server, which calls this whenever they change.
+    pub fn set_inlay_splices(
+        &mut self,
+        hints: std::collections::BTreeMap<usize, Vec<(usize, usize)>>,
+    ) {
+        self.inlay_splices = hints;
+    }
+
+    /// The window soft-wrap rows of `line` (0-based, its text passed as `text`), counting
+    /// the line's [`inline_splices`](Self::inline_splices). Everything that lays out or
+    /// counts a line's rows goes through this, so they all see the same rows.
+    pub fn wrap_rows(
+        &self,
+        line: usize,
+        text: &str,
+        tabstop: usize,
+        width: usize,
+        indent: usize,
+        wo: crate::unicode::WrapOpts,
+    ) -> Vec<crate::unicode::WrapSeg> {
+        let splices = self.inline_splices(line, tabstop);
+        crate::unicode::window_wrap_segments(text, tabstop, width, indent, wo, &splices)
+    }
+
+    /// The cells spliced into `line` (0-based) beyond its own text: its inline
+    /// `virt_text` marks and LSP inlay hints, as `(anchor text column, width)` ascending
+    /// by anchor. The anchor is the column the text at it has without any splice; the
+    /// splice's cells come right before that text. Every piece of column arithmetic
+    /// about inline cells starts from this list. O(log marks + marks on the line), plus
+    /// the text up to its last anchor.
+    pub fn inline_splices(&self, line: usize, tabstop: usize) -> Vec<(usize, usize)> {
+        self.inline_splices_upto(line, tabstop, usize::MAX)
+    }
+
+    /// [`inline_splices`](Self::inline_splices) anchored at or before byte column `byte`:
+    /// all that bears on where that byte paints. A per-frame question about the cursor
+    /// asks this, so a splice far along a huge line doesn't cost the frame that line.
+    pub fn inline_splices_upto(
+        &self,
+        line: usize,
+        tabstop: usize,
+        byte: usize,
+    ) -> Vec<(usize, usize)> {
+        let mut bytes = self.inline_bytes(line);
+        bytes.retain(|s| s.0 <= byte);
+        let Some(&(last, _)) = bytes.last() else {
+            return bytes;
+        };
+        // A little past the last anchor, so the head can't cut the grapheme it's on.
+        let text = self.line_head(line, last.saturating_add(256));
+        let mut vc = crate::unicode::LineVirtcol::new(&text, tabstop);
+        bytes
+            .into_iter()
+            .map(|(byte, width)| (vc.at(byte.min(text.len())), width))
+            .collect()
+    }
+
+    /// The total cells spliced into `line`, which needs none of its text.
+    pub fn inline_width(&self, line: usize) -> usize {
+        self.inline_bytes(line).iter().map(|s| s.1).sum()
+    }
+
+    /// `line`'s splices as `(byte column, width)`, ascending by byte.
+    fn inline_bytes(&self, line: usize) -> Vec<(usize, usize)> {
+        use crate::extmark::VirtTextPos;
+        let line_start = self.line_start(line);
+        let mut bytes: Vec<(usize, usize)> =
+            self.inlay_splices.get(&line).cloned().unwrap_or_default();
+        let line_end = line_start + self.line_len(line);
+        let mut marks: Vec<_> = self
+            .extmarks
+            .starting_in(line_start, line_end + 1)
+            .map(|(_, m)| m)
+            .filter(|m| {
+                m.decor.as_deref().is_some_and(|d| {
+                    d.virt_text_pos == VirtTextPos::Inline && !d.virt_text.is_empty()
+                })
+            })
+            .collect();
+        marks.sort_by_key(|m| (m.start, m.priority, m.id));
+        bytes.extend(marks.into_iter().map(|m| {
+            let decor = m.decor.as_deref().expect("filtered to inline marks");
+            let width = decor
+                .virt_text
+                .iter()
+                .map(|c| crate::unicode::grapheme_cells(&c.text))
+                .sum();
+            (m.start - line_start, width)
+        }));
+        bytes.sort_by_key(|&(byte, _)| byte);
+        bytes
     }
 
     /// Collect every extmark's `virt_lines` (whole extra screen rows) keyed by the

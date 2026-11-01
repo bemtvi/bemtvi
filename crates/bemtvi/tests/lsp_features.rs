@@ -170,6 +170,102 @@ async fn await_lua_contains(rpc: &Rpc, expr: &str, want: &str) -> String {
     last
 }
 
+/// A click on a row with an inlay hint maps through the hint's cells like inline
+/// `virt_text`: hints are spliced in by the same renderers but live on the server,
+/// out of the core's sight, so this guards the frame carrying them back to the click.
+#[tokio::test]
+async fn click_past_an_inlay_hint_lands_on_the_painted_char() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features");
+    arm_mock(
+        &dir,
+        r#"{
+            "inlay_hints": [
+                { "position": { "line": 0, "character": 5 }, "label": ": i32", "kind": 1 }
+            ]
+        }"#,
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "let x = 1\n").await;
+    exec_lua(&rpc, "vim.lsp.inlay_hint.enable(true)").await;
+    assert!(
+        await_lua_eq(&rpc, "#btv.lsp.inlay_hint.get({ bufnr = 0 })", "1").await,
+        "the hint should arrive"
+    );
+    exec_lua(&rpc, "vim.o.number = false vim.o.signcolumn = 'no'").await;
+    let gutter = exec_lua(&rpc, "return btv.win.textoff(0)")
+        .await
+        .as_u64()
+        .expect("textoff") as usize;
+    // `let x[: i32] = 1`: cell 5 starts the hint, which is 5 cells wide.
+    for (cell, want) in [(4, 4), (5, 5), (9, 5), (10, 5), (12, 7)] {
+        bemtvi_test_harness::feed_mouse(&rpc, "left", "press", 0, gutter + cell);
+        assert_eq!(cursor(&rpc).await, (1, want), "cell {cell}");
+    }
+    // Disabling takes the hint's cells off the columns too.
+    exec_lua(&rpc, "vim.lsp.inlay_hint.enable(false)").await;
+    bemtvi_test_harness::feed_mouse(&rpc, "left", "press", 0, gutter + 6);
+    assert_eq!(cursor(&rpc).await, (1, 6), "no hint any more");
+}
+
+/// A sideways scroll treats an inlay hint like inline text: `leftcol` counts its cells,
+/// a click maps through them, and `$` brings the line's end in with them counted.
+#[tokio::test]
+async fn an_inlay_hint_takes_columns_under_a_sideways_scroll() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features");
+    arm_mock(
+        &dir,
+        r#"{
+            "inlay_hints": [
+                { "position": { "line": 0, "character": 2 }, "label": "HINTS", "kind": 1 }
+            ]
+        }"#,
+    );
+    let body = format!("{}\n", "abcdefghij".repeat(30));
+    let (rpc, _incoming) = open_with_server(&dir, &body).await;
+    exec_lua(&rpc, "vim.lsp.inlay_hint.enable(true)").await;
+    assert!(
+        await_lua_eq(&rpc, "#btv.lsp.inlay_hint.get({ bufnr = 0 })", "1").await,
+        "the hint should arrive"
+    );
+    exec_lua(
+        &rpc,
+        "vim.o.number = false vim.o.signcolumn = 'no' vim.o.wrap = false",
+    )
+    .await;
+    let gutter = exec_lua(&rpc, "return btv.win.textoff(0)")
+        .await
+        .as_u64()
+        .expect("textoff") as usize;
+    feed(&rpc, "21|");
+    let _ = cursor(&rpc).await;
+    // ab[HINTS]cdef…, scrolled by 3: `INTS` then `c`.
+    exec_lua(&rpc, "btv.win.set_leftcol(0, 3)").await;
+    bemtvi_test_harness::feed_mouse(&rpc, "left", "press", 0, gutter + 5);
+    assert_eq!(cursor(&rpc).await, (1, 3), "the `d`");
+    bemtvi_test_harness::feed_mouse(&rpc, "left", "press", 0, gutter + 4);
+    assert_eq!(cursor(&rpc).await, (1, 2), "the `c`, past the hint's rest");
+    let shown = "return vim.fn.winsaveview().leftcol";
+    assert_eq!(
+        exec_lua(&rpc, shown).await.as_u64(),
+        Some(2),
+        "its hint comes in"
+    );
+    let left = "return vim.fn.winsaveview().leftcol";
+    feed(&rpc, "$");
+    let _ = cursor(&rpc).await;
+    let width = exec_lua(&rpc, "return btv.win.width(0)")
+        .await
+        .as_u64()
+        .unwrap();
+    let want = 300 + 5 - width + gutter as u64;
+    assert_eq!(
+        exec_lua(&rpc, left).await.as_u64(),
+        Some(want),
+        "`$` counts it"
+    );
+}
+
 /// Enabling inlay hints requests them, the mock replies, and the decoded hint
 /// reaches the `btv.lsp.inlay_hint.get` read mirror — exercising the full
 /// enable→request→reply→`btv._set_inlay_hints`→getter chain (the mirror receiver

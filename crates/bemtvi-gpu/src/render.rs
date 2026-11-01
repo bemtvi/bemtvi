@@ -1533,7 +1533,15 @@ impl Renderer {
                         self.push_text(items, &segs, (x, y), fg, text_clip);
                         continue;
                     }
+                    // This frame's column applied to the row's inline cells: the band
+                    // carries them whole, since the column moves every frame.
                     let inlay = s.inlay_hints.get(k).map(Vec::as_slice).unwrap_or(&[]);
+                    let vtext = s.virt_text.get(k).map(Vec::as_slice).unwrap_or(&[]);
+                    let clipped = bemtvi_view::clip_band_row(lc, inlay, vtext);
+                    let (lc, inlay, vtext) = match &clipped {
+                        Some(row) => (row.left, row.inlay.as_slice(), row.vtext.as_slice()),
+                        None => (lc, inlay, vtext),
+                    };
                     // Visual selection rides the slide. Its moving edge grows with the
                     // scroll: rows the interpolated cursor hasn't reached yet are not
                     // highlighted (the band carries the destination extent), so the
@@ -1556,7 +1564,7 @@ impl Renderer {
                                 *span,
                                 lc,
                                 inlay,
-                                &[],
+                                vtext,
                                 sel_bg,
                                 clip.top as f32,
                                 clip.bottom as f32,
@@ -1574,7 +1582,7 @@ impl Renderer {
                                 *span,
                                 lc,
                                 inlay,
-                                &[],
+                                vtext,
                                 sel_bg,
                                 clip.top as f32,
                                 clip.bottom as f32,
@@ -1594,7 +1602,7 @@ impl Renderer {
                                 *span,
                                 lc,
                                 inlay,
-                                &[],
+                                vtext,
                                 search_bg,
                                 clip.top as f32,
                                 clip.bottom as f32,
@@ -1609,7 +1617,7 @@ impl Renderer {
                             *span,
                             lc,
                             inlay,
-                            &[],
+                            vtext,
                             inc_bg,
                             clip.top as f32,
                             clip.bottom as f32,
@@ -1639,7 +1647,6 @@ impl Renderer {
                         }
                     }
                     let hl = s.highlights.get(k).map(Vec::as_slice).unwrap_or(&[]);
-                    let vtext = s.virt_text.get(k).map(Vec::as_slice).unwrap_or(&[]);
                     // A `~` end-of-buffer filler row (`numbers[k] == None`) in the band
                     // paints with the theme's `EndOfBuffer` foreground, like the settled
                     // path — otherwise the fillers flash to the plain text `fg` for the
@@ -1703,7 +1710,7 @@ impl Renderer {
                                 (*ds, *de),
                                 lc,
                                 inlay,
-                                &[],
+                                vtext,
                                 color,
                             );
                         }
@@ -1792,6 +1799,7 @@ impl Renderer {
                     quads, win, view, ox, oy, text_x0, wcols, text_rows, normal_bg,
                 );
                 for (i, raw) in win.lines.iter().enumerate() {
+                    let row_left = win.row_leftcol(i);
                     let row = oy as usize + i;
 
                     // `'cursorline'`: tint the cursor's screen row across the whole
@@ -1830,7 +1838,7 @@ impl Renderer {
                     let display = expand_tabs(
                         raw,
                         win.tabstop.max(1) as usize,
-                        win.leftcol as usize + wcols as usize + 1,
+                        row_left as usize + wcols as usize + 1,
                     );
 
                     // Inline LSP inlay hints on this row, spliced into the text below
@@ -1850,14 +1858,7 @@ impl Renderer {
                     // Selection band(s) for this row.
                     if let Some(Some(span)) = win.selection.get(i) {
                         self.push_span_quad(
-                            quads,
-                            text_x0,
-                            row,
-                            *span,
-                            win.leftcol,
-                            inlay,
-                            vtext,
-                            sel_bg,
+                            quads, text_x0, row, *span, row_left, inlay, vtext, sel_bg,
                         );
                     }
                     // Secondary multi-cursor selections, painted with the same
@@ -1866,14 +1867,7 @@ impl Renderer {
                     if let Some(spans) = win.secondary_selection.get(i) {
                         for span in spans {
                             self.push_span_quad(
-                                quads,
-                                text_x0,
-                                row,
-                                *span,
-                                win.leftcol,
-                                inlay,
-                                vtext,
-                                sel_bg,
+                                quads, text_x0, row, *span, row_left, inlay, vtext, sel_bg,
                             );
                         }
                     }
@@ -1881,14 +1875,7 @@ impl Renderer {
                     if let Some(spans) = win.search.get(i) {
                         for span in spans {
                             self.push_span_quad(
-                                quads,
-                                text_x0,
-                                row,
-                                *span,
-                                win.leftcol,
-                                inlay,
-                                vtext,
-                                search_bg,
+                                quads, text_x0, row, *span, row_left, inlay, vtext, search_bg,
                             );
                         }
                     }
@@ -1897,14 +1884,7 @@ impl Renderer {
                         let inc_bg =
                             style_bg(&view.incsearch_style).unwrap_or(DEFAULT_INCSEARCH_BG);
                         self.push_span_quad(
-                            quads,
-                            text_x0,
-                            row,
-                            *span,
-                            win.leftcol,
-                            inlay,
-                            vtext,
-                            inc_bg,
+                            quads, text_x0, row, *span, row_left, inlay, vtext, inc_bg,
                         );
                     }
 
@@ -1998,7 +1978,7 @@ impl Renderer {
                         fg
                     };
                     let mut segments =
-                        row_segments(&display, hl, &view.styles, row_fg, normal_bg, win.leftcol);
+                        row_segments(&display, hl, &view.styles, row_fg, normal_bg, row_left);
                     // Recolor the glyphs under a search match to the `Search` /
                     // `IncSearch` foreground (the TUI does this) — done on the base
                     // segments, in the same column space the search spans use, so the
@@ -2008,7 +1988,7 @@ impl Renderer {
                         segments,
                         win.search.get(i).map(Vec::as_slice).unwrap_or(&[]),
                         win.incsearch.get(i).copied().flatten(),
-                        win.leftcol,
+                        row_left,
                         style_fg(&view.search_style),
                         style_fg(&view.incsearch_style),
                     );
@@ -2031,14 +2011,14 @@ impl Renderer {
                         .chain(win.search.get(i).into_iter().flatten().copied())
                         .chain(win.incsearch.get(i).copied().flatten())
                         .collect();
-                    segments = clear_bg_under(segments, &overlay, win.leftcol);
+                    segments = clear_bg_under(segments, &overlay, row_left);
                     // The glyph under the block cursor, inverted so it reads against
                     // the opaque quad. Last of the base-space recolors, so it wins over
                     // a search match on the same cell — the cursor is on top of it.
                     if let Some(cfg) = block_cursor_fg.filter(|_| i as u16 == win.cursor_row) {
                         segments = apply_cursor_fg(
                             segments,
-                            win.leftcol,
+                            row_left,
                             win.cursor_screen_col,
                             win.cursor_width,
                             cfg,
@@ -2048,16 +2028,16 @@ impl Renderer {
                     // (shift / overwrite); inlay hints splice in too. The common no-virt
                     // row keeps the cheaper inlay-only splice (tested path, untouched).
                     segments = if vtext.is_empty() {
-                        splice_inlay(segments, inlay, win.leftcol, &view.styles)
+                        splice_inlay(segments, inlay, row_left, &view.styles)
                     } else {
-                        apply_row_virt(segments, inlay, vtext, win.leftcol, &view.styles, fg)
+                        apply_row_virt(segments, inlay, vtext, row_left, &view.styles, fg)
                     };
                     // The run begins at the first *visible* column (`row_segments`
                     // already dropped the off-screen-left ones), so it starts at the
                     // text origin — not `leftcol` cells back over the gutter. Clip it
                     // to this window's text area so a line wider than the window cuts
                     // off at the edge instead of bleeding into the next split.
-                    let pos = self.cell_px(text_run_origin(text_x0, win.leftcol), row as u16);
+                    let pos = self.cell_px(text_run_origin(text_x0, row_left), row as u16);
                     self.push_text(items, &segments, pos, row_fg, text_clip);
                     // Background quads for any segment whose group set a `bg` — a
                     // buffer-text span (a diff line tint, a colorscheme group with a
@@ -2067,7 +2047,7 @@ impl Renderer {
                     self.push_seg_backgrounds(
                         quads,
                         &segments,
-                        text_run_origin(text_x0, win.leftcol),
+                        text_run_origin(text_x0, row_left),
                         row,
                         (ox + wcols) as f32 * self.cell_w,
                     );
@@ -2083,7 +2063,7 @@ impl Renderer {
                                 text_x0,
                                 row,
                                 (*s, *e),
-                                win.leftcol,
+                                row_left,
                                 inlay,
                                 vtext,
                                 color,
@@ -2100,8 +2080,8 @@ impl Renderer {
                         if let Some(Some((text, severity, id))) = win.diagnostics_virt.get(i) {
                             // The line's painted width includes the spliced inlay
                             // cells, so the virtual text sits past them too.
-                            let inserted = inlay_shift(inlay, win.leftcol, u16::MAX, true);
-                            let painted = cells(&display).saturating_sub(win.leftcol as usize)
+                            let inserted = inlay_shift(inlay, row_left, u16::MAX, true);
+                            let painted = cells(&display).saturating_sub(row_left as usize)
                                 + inserted as usize;
                             let start = text_x0 + painted as u16 + 1;
                             let limit = (ox + wcols).saturating_sub(start);
@@ -2126,9 +2106,8 @@ impl Renderer {
                         // never overlap the painted text.
                         if !vtext.is_empty() {
                             let right_px = (ox + wcols) as f32 * self.cell_w;
-                            let inlay_inserted = inlay_shift(inlay, win.leftcol, u16::MAX, true);
-                            let virt_inserted =
-                                virt_inline_shift(vtext, win.leftcol, u16::MAX, true);
+                            let inlay_inserted = inlay_shift(inlay, row_left, u16::MAX, true);
+                            let virt_inserted = virt_inline_shift(vtext, row_left, u16::MAX, true);
                             let painted = (cells(&display).saturating_sub(win.leftcol as usize)
                                 + inlay_inserted as usize
                                 + virt_inserted as usize)
@@ -2237,12 +2216,12 @@ impl Renderer {
             // band row; settled it's the window's hints on the cursor row.
             // Mid-pan the cursor rides the band's interpolated column (see the band
             // paint): whole columns as the scroll, the fraction a sub-pixel shift.
-            let (leftcol, dx) = match scroll {
+            let (mut leftcol, dx) = match scroll {
                 Some(s) => {
                     let lc = s.leftcol.max(0.0).floor();
                     (lc as u16, (s.leftcol - lc) * self.cell_w)
                 }
-                None => (win.leftcol, 0.0),
+                None => (win.row_leftcol(win.cursor_row as usize), 0.0),
             };
             // A cursor the pan has yet to bring into view stays hidden until it does.
             let text_w = (ox + wcols).saturating_sub(text_x0);
@@ -2271,7 +2250,23 @@ impl Renderer {
                 Some(s) => {
                     let idx = s.cursor_row.round() as usize; // cursor's band-row index
                     let row_inlay = s.inlay_hints.get(idx).map(Vec::as_slice).unwrap_or(&[]);
-                    inlay_shift(row_inlay, leftcol, win.cursor_screen_col, true)
+                    let row_vtext = s.virt_text.get(idx).map(Vec::as_slice).unwrap_or(&[]);
+                    match bemtvi_view::clip_band_row(leftcol, row_inlay, row_vtext) {
+                        Some(row) => {
+                            leftcol = row.left;
+                            inlay_shift(&row.inlay, leftcol, win.cursor_screen_col, true)
+                                + virt_inline_shift(
+                                    &row.vtext,
+                                    leftcol,
+                                    win.cursor_screen_col,
+                                    true,
+                                )
+                        }
+                        None => {
+                            inlay_shift(row_inlay, leftcol, win.cursor_screen_col, true)
+                                + virt_inline_shift(row_vtext, leftcol, win.cursor_screen_col, true)
+                        }
+                    }
                 }
             };
             // Clamp to the window's text area so a tiny window (a dock dragged to its
@@ -2387,7 +2382,8 @@ impl Renderer {
         let accent = color_to_rgba(srgb_to_color(MULTICURSOR_ACCENT));
         let fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
         for &(crow, ccol) in &win.secondary_cursors {
-            let Some(rel) = ccol.checked_sub(win.leftcol) else {
+            let row_left = win.row_leftcol(crow as usize);
+            let Some(rel) = ccol.checked_sub(row_left) else {
                 continue; // scrolled off to the left
             };
             // Shift past the inlay hints spliced in at or before this cursor's
@@ -2397,7 +2393,7 @@ impl Renderer {
                 .get(crow as usize)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let x = text_x0 + rel + inlay_shift(row_inlay, win.leftcol, ccol, true);
+            let x = text_x0 + rel + inlay_shift(row_inlay, row_left, ccol, true);
             // Drop anything past the text area's right edge or below its last row.
             if crow >= text_rows || x >= text_x0.saturating_add(wcols) {
                 continue;

@@ -469,8 +469,13 @@ impl EditHost {
                         // Every mark in `marks` has `decor` (the bucket only kept
                         // marks whose decor carries virt_text).
                         let decor = m.decor.as_deref().expect("virt_text mark has decor");
-                        // Hide this mark on a selected row when it opted in.
-                        if decor.virt_text_hide && row_selected {
+                        // Hide this mark on a selected row when it opted in. Never an
+                        // inline mark: its cells are part of the line's columns, and a
+                        // selection must not reflow the row (neovim's rule too).
+                        if decor.virt_text_hide
+                            && row_selected
+                            && decor.virt_text_pos != VirtTextPos::Inline
+                        {
                             return None;
                         }
                         // Place each position on the right soft-wrap segment, rebased

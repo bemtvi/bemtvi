@@ -270,6 +270,7 @@ impl EditHost {
                     // Clear the read mirror too, so `vim.lsp.inlay_hint.get` returns
                     // nothing for a disabled buffer.
                     let _ = self.lua.set_inlay_hints(buffer.0, &[]);
+                    self.sync_inlay_splices(buffer);
                 }
                 self.lsp_dirty = true;
                 return;

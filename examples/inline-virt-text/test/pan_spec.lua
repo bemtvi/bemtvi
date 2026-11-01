@@ -1,0 +1,32 @@
+local dir = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub(2)))
+dofile(dir .. "/init.lua")
+local function step(t, key, want)
+  t:feed(key)
+  t:wait_for(function()
+    return vim.fn.winsaveview().leftcol == want
+  end)
+end
+btv.test.describe("pan demo", function()
+  btv.test.it("keys place the mark and move the view", function(t)
+    btv.buf.set_lines(0, 0, -1, false, { string.rep("abcdefghijklmnopqrstuvwxyz", 12) })
+    step(t, "<F5>", 0)
+    local ns = btv.ns.create("pan-demo")
+    btv.test.expect(#vim.api.nvim_buf_get_extmarks(0, ns, 0, -1, {})).to_equal(1)
+    step(t, "<F6>", 8)
+    step(t, "<F7>", 20)
+    step(t, "<F8>", 50)
+    -- From the line's start and end too: the keys bring the cursor along.
+    t:feed("0")
+    step(t, "<F7>", 20)
+    t:feed("$")
+    step(t, "<F8>", 50)
+    t:feed("$")
+    t:wait_for(function()
+      return vim.fn.winsaveview().leftcol > 100
+    end)
+    t:feed("0")
+    t:wait_for(function()
+      return vim.fn.winsaveview().leftcol == 0
+    end)
+  end)
+end)

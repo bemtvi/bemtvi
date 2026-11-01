@@ -198,6 +198,21 @@ impl Editor {
         unicode::virtcol(&s, self.cursor.col, self.tabstop())
     }
 
+    /// Where the cursor's character sits under `nowrap`, in the space `leftcol` counts:
+    /// the column its cells start at, its own inline text included, and the column the
+    /// character itself paints at.
+    pub(crate) fn cursor_painted_span(&self) -> (usize, usize) {
+        let tab = self.tabstop();
+        let splices = self
+            .buffer()
+            .inline_splices_upto(self.cursor.line, tab, self.cursor.col);
+        let vc = self.cursor_virtcol();
+        (
+            unicode::painted_start(vc, &splices),
+            unicode::painted_col(vc, &splices),
+        )
+    }
+
     /// Advance `count` grapheme clusters forward from byte offset `from`, never
     /// passing `limit`. Returns the new offset and how many clusters were crossed.
     pub(crate) fn advance_graphemes(
@@ -645,22 +660,26 @@ impl Editor {
             opts.sidescrolloff.min(tw.saturating_sub(1) / 2)
         };
         let recenter = opts.sidescroll == 0;
-        let vc = self.cursor_virtcol();
+        let (start, vc) = self.cursor_painted_span();
         let left = self.leftcol;
+        // The right edge wins a conflict: a placement wider than the window can't all
+        // show, and the character it's drawn before is the one that must.
+        let furthest_left = (vc + so + 1).saturating_sub(tw);
 
-        if vc < left + so {
-            // Cursor at/past the left margin: scroll left.
+        if start < left + so {
+            // Cursor's cells at/past the left margin: scroll left.
             self.leftcol = if recenter {
-                vc.saturating_sub(tw / 2)
+                start.saturating_sub(tw / 2)
             } else {
-                vc.saturating_sub(so)
-            };
+                start.saturating_sub(so)
+            }
+            .max(furthest_left);
         } else if vc + so + 1 > left + tw {
             // Cursor at/past the right margin: scroll right.
             self.leftcol = if recenter {
                 vc.saturating_sub(tw / 2)
             } else {
-                (vc + so + 1).saturating_sub(tw)
+                furthest_left
             };
         }
     }

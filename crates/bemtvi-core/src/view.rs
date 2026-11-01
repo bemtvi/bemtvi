@@ -1226,7 +1226,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         // the per-frame projection must not copy a huge wrapped line per window.
         let line = buf.line_cow(cur_line);
         let indent = unicode::cont_indent(&line, tabstop, width, wo);
-        let segs = unicode::window_wrap_segments(&line, tabstop, width, indent, wo);
+        let segs = buf.wrap_rows(cur_line, &line, tabstop, width, indent, wo);
         let idx = segs
             .iter()
             .rposition(|s| cur_col >= s.start_byte)
@@ -1256,7 +1256,13 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
             .find(|f| f.contains(cur_line))
             .map_or(cur_line, |f| f.start);
         screen_row_of(&rows, shown).is_none()
-            || (!wrap && (cursor_screen_col < w.leftcol || cursor_screen_col >= w.leftcol + width))
+            || (!wrap && {
+                let painted = unicode::painted_col(
+                    cursor_screen_col,
+                    &buf.inline_splices_upto(cur_line, buf.options.effective_tabstop(), cur_col),
+                );
+                painted < w.leftcol || painted >= w.leftcol + width
+            })
     };
 
     // The scroll markers. Down the side, a page of the window's rows over the range
@@ -1526,7 +1532,7 @@ fn line_text_rows_of(
     }
     let text = buf.line_cow(line);
     let indent = unicode::cont_indent(&text, tabstop, width, wo);
-    unicode::window_wrap_segments(&text, tabstop, width, indent, wo).len()
+    buf.wrap_rows(line, &text, tabstop, width, indent, wo).len()
 }
 
 /// The number of **screen rows** the buffer lines `[base, target)` occupy: each
@@ -1759,7 +1765,7 @@ fn row_skeleton(
             // the client paints it as leading text — `render_rows` shifts this line's
             // overlays right by the prefix width to keep them aligned.
             let (prefix, indent) = unicode::break_prefix(&text, tabstop, width, wo);
-            let segs = unicode::window_wrap_segments(&text, tabstop, width, indent, wo);
+            let segs = buf.wrap_rows(buf_line, &text, tabstop, width, indent, wo);
             // `'list'` glyphs, worked out once for the whole line: a tab's width and
             // whether a blank is leading / trailing depend on the line, not the row.
             let subs = lcs

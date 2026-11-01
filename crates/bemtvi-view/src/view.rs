@@ -207,6 +207,10 @@ pub struct WindowView {
     /// renderer drops this many leading screen cells from each text row and shifts
     /// the cursor and every span left by it; the number gutter is not offset.
     pub leftcol: u16,
+    /// The text column each row paints from, where it isn't `leftcol`: `leftcol` counts
+    /// inline cells too, so a row whose inline text scrolled off starts further left.
+    /// Empty when no row differs. Read through [`row_leftcol`](Self::row_leftcol).
+    pub row_leftcol: Vec<u16>,
     /// This window's status line as rendered segments (`text` + resolved
     /// `style`), projected by the server's `%`-format engine. The client paints
     /// them left-to-right; an empty vec (an older server) falls back to a bare
@@ -1376,6 +1380,13 @@ fn parse_scrollbars(v: Option<&Value>) -> Option<Scrollbars> {
     })
 }
 
+impl WindowView {
+    /// The text column screen row `row` of this window paints from.
+    pub fn row_leftcol(&self, row: usize) -> u16 {
+        self.row_leftcol.get(row).copied().unwrap_or(self.leftcol)
+    }
+}
+
 fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
     let rect = match map_get(m, "rect") {
         Some(Value::Map(r)) => Some(WinRect {
@@ -1446,6 +1457,14 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         cursor_hidden: map_get(m, "cursor_hidden").and_then(Value::as_bool) == Some(true),
         scrollbars: parse_scrollbars(map_get(m, "scrollbars")),
         leftcol: map_u16(m, "leftcol"),
+        row_leftcol: map_get(m, "row_leftcol")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .map(|v| v.as_u64().unwrap_or(0) as u16)
+                    .collect()
+            })
+            .unwrap_or_default(),
         status: parse_status(map_get(m, "status"), styles),
         // Default true so an older server (no flag) keeps the per-window status.
         status_visible: map_get(m, "status_visible")

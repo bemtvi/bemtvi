@@ -3036,3 +3036,339 @@ async fn drag_into_wrapped_continuation_stays_aligned() {
     feed(&rpc, "d");
     assert_eq!(lines(&rpc).await, vec!["01z", "secondline"]);
 }
+
+/// Lay an inline `virt_text` mark on `line` (0-based) at byte `col`. `exec_lua`
+/// awaits, so the frame that paints the mark precedes the next click.
+async fn inline_mark(rpc: &Rpc, line: usize, col: usize, text: &str) {
+    exec_lua(
+        rpc,
+        &format!(
+            r#"local ns = btv.ns.create("click")
+               vim.api.nvim_buf_set_extmark(0, ns, {line}, {col}, {{
+                   virt_text = {{ {{ "{text}", "LineNr" }} }},
+                   virt_text_pos = "inline",
+               }})"#
+        ),
+    )
+    .await;
+}
+
+/// Press the left button at `(row, col)` and read the 0-based cursor column,
+/// asserting the click stayed on the 1-based buffer `line`.
+async fn click_col(rpc: &Rpc, line: usize, row: usize, col: usize) -> usize {
+    feed_mouse(rpc, "left", "press", row, col);
+    let (l, c) = cursor(rpc).await;
+    assert_eq!(l, line, "the click at ({row}, {col}) changed line");
+    c
+}
+
+/// The bug report: `1234567abc…` drawn, a click on the `c` lands on `c`, not 7
+/// cells to its right. And a click on the virtual text itself has no text under
+/// it, so it lands on the character the text is anchored before.
+#[tokio::test]
+async fn click_past_inline_virt_text_lands_on_the_painted_char() {
+    let (rpc, _incoming) = start("abcdefghijklmnopqrstuvwxyz").await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    inline_mark(&rpc, 0, 0, "1234567").await;
+    assert_eq!(click_col(&rpc, 1, 0, 9).await, 2, "the `c` at cell 9");
+    assert_eq!(click_col(&rpc, 1, 0, 7).await, 0, "the `a` right after it");
+    for cell in [0, 3, 6] {
+        assert_eq!(
+            click_col(&rpc, 1, 0, cell).await,
+            0,
+            "cell {cell} is on the virtual text"
+        );
+    }
+}
+
+/// A mark mid-line moves only what's after it, and marks accumulate — including
+/// two on one anchor, and a second mark further right.
+#[tokio::test]
+async fn click_around_inline_virt_text_mid_line() {
+    let (rpc, _incoming) = start("abcdefghijklmnopqrstuvwxyz").await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    // abcde[XYZ]fghij[P][QQ]klm…
+    inline_mark(&rpc, 0, 5, "XYZ").await;
+    inline_mark(&rpc, 0, 10, "P").await;
+    inline_mark(&rpc, 0, 10, "QQ").await;
+    for (cell, want) in [
+        (2, 2),   // before every mark
+        (4, 4),   // the `e`, last before the first mark
+        (5, 5),   // on `XYZ`: its anchor, the `f`
+        (7, 5),   // still on `XYZ`
+        (8, 5),   // the `f` itself
+        (9, 6),   // the `g`
+        (12, 9),  // the `j`, last before the second anchor
+        (13, 10), // on `P`
+        (15, 10), // on `QQ`
+        (16, 10), // the `k`
+        (17, 11), // the `l`
+    ] {
+        assert_eq!(click_col(&rpc, 1, 0, cell).await, want, "cell {cell}");
+    }
+}
+
+/// Anchors are screen columns, so a tab and wide characters before the mark count
+/// by their cells, and a wide character *in* the virtual text counts as two.
+#[tokio::test]
+async fn click_past_inline_virt_text_with_tab_and_wide_chars() {
+    // `\t` = cells 0-7, `日本` = cells 8-11 (bytes 1-6), `abc` from cell 12 (byte 7).
+    let (rpc, _incoming) = start("\t日本abc").await;
+    command(&rpc, "set nonumber norelativenumber nowrap tabstop=8").await;
+    inline_mark(&rpc, 0, 7, "語x").await; // 3 cells, at the `a`
+    assert_eq!(
+        click_col(&rpc, 1, 0, 10).await,
+        4,
+        "the `本` before the mark"
+    );
+    for cell in [12, 14] {
+        assert_eq!(click_col(&rpc, 1, 0, cell).await, 7, "on the virtual text");
+    }
+    assert_eq!(click_col(&rpc, 1, 0, 15).await, 7, "the `a`");
+    assert_eq!(click_col(&rpc, 1, 0, 16).await, 8, "the `b`");
+}
+
+/// `leftcol` counts text and inline cells together, so a mark scrolled past still
+/// holds the text after it where its cells put it, and a click on a cell inside the
+/// partly-scrolled mark lands on its anchor.
+#[tokio::test]
+async fn click_with_inline_virt_text_under_horizontal_scroll() {
+    let body = "abcdefghijklmnopqrstuvwxyz".repeat(8);
+    let (rpc, _incoming) = start(&body).await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    inline_mark(&rpc, 0, 3, "1234").await; // painted 3..7, then `d` at 7
+    inline_mark(&rpc, 0, 15, "XY").await; // painted 19..21, then `p` at 21
+    let win = exec_lua(&rpc, "return btv.win.current()")
+        .await
+        .as_u64()
+        .expect("win");
+    feed(&rpc, "11|");
+    cursor(&rpc).await;
+    exec_lua(&rpc, &format!("btv.win.set_leftcol({win}, 5)")).await;
+    assert_eq!(win_leftcol(&rpc, win).await, 5);
+    // abc[12]34defg…: cell 2 is the `d`'s mark's last cell, cell 3 the `e`.
+    for (cell, want) in [(3, 4), (13, 14), (14, 15), (15, 15), (16, 15), (17, 16)] {
+        assert_eq!(click_col(&rpc, 1, 0, cell).await, want, "cell {cell}");
+    }
+    assert_eq!(win_leftcol(&rpc, win).await, 5, "no click moved the view");
+    // A click on what's left of the first mark lands on its `d`, whose text comes in.
+    assert_eq!(click_col(&rpc, 1, 0, 0).await, 3, "the anchor");
+    assert_eq!(win_leftcol(&rpc, win).await, 3, "the whole mark shows");
+}
+
+/// Under `'nowrap'`, `$` brings the line's end into view with its inline cells
+/// counted, so the cursor isn't drawn past the right edge.
+#[tokio::test]
+async fn dollar_counts_inline_cells_in_the_scroll() {
+    let body = "x".repeat(300);
+    let (plain, _i1) = start(&body).await;
+    command(&plain, "set nonumber norelativenumber nowrap").await;
+    feed(&plain, "$");
+    cursor(&plain).await;
+    let win = current_win(&plain).await;
+    let without = win_leftcol(&plain, win).await;
+
+    let (rpc, _i2) = start(&body).await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    inline_mark(&rpc, 0, 0, "12345678").await;
+    feed(&rpc, "$");
+    cursor(&rpc).await;
+    let win = current_win(&rpc).await;
+    assert_eq!(win_leftcol(&rpc, win).await, without + 8);
+}
+
+/// A character's inline text counts as part of it: coming back to it brings its
+/// placement into view too, so `$` then `0` shows a mark at the line's start again.
+#[tokio::test]
+async fn coming_back_to_a_char_reveals_its_inline_text() {
+    let (rpc, _incoming) = start(&"x".repeat(300)).await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    inline_mark(&rpc, 0, 0, "12345678").await;
+    let win = current_win(&rpc).await;
+    feed(&rpc, "$");
+    cursor(&rpc).await;
+    assert!(win_leftcol(&rpc, win).await > 100);
+    feed(&rpc, "0");
+    cursor(&rpc).await;
+    assert_eq!(win_leftcol(&rpc, win).await, 0, "the whole mark shows");
+}
+
+/// Under `sidescrolloff`, the margin is kept before the placement, not just the char.
+#[tokio::test]
+async fn revealing_inline_text_keeps_the_side_margin() {
+    let (rpc, _incoming) = start(&"x".repeat(300)).await;
+    command(&rpc, "set nonumber norelativenumber nowrap sidescrolloff=3").await;
+    inline_mark(&rpc, 0, 100, "12345678").await;
+    let win = current_win(&rpc).await;
+    feed(&rpc, "$");
+    cursor(&rpc).await;
+    feed(&rpc, "101|");
+    cursor(&rpc).await;
+    assert_eq!(
+        win_leftcol(&rpc, win).await,
+        97,
+        "3 cells before the mark's start"
+    );
+}
+
+/// A placement wider than the window can't all show, so the character it's drawn before
+/// stays in view rather than the view chasing the placement's start.
+#[tokio::test]
+async fn a_placement_wider_than_the_window_keeps_its_char_in_view() {
+    let (rpc, _incoming) = start_narrow(&"x".repeat(300), 20).await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    inline_mark(&rpc, 0, 100, &"M".repeat(50)).await;
+    let win = current_win(&rpc).await;
+    feed(&rpc, "$");
+    cursor(&rpc).await;
+    feed(&rpc, "101|");
+    cursor(&rpc).await;
+    assert_eq!(
+        win_leftcol(&rpc, win).await,
+        131,
+        "the char paints at the last cell, 150"
+    );
+}
+
+/// A line that overflows only because of its inline cells can be wheeled over: the
+/// furthest `leftcol` counts them.
+#[tokio::test]
+async fn the_wheel_reaches_past_inline_cells() {
+    let (rpc, _incoming) = start(&"x".repeat(78)).await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    inline_mark(&rpc, 0, 0, "12345678").await;
+    let win = current_win(&rpc).await;
+    for _ in 0..5 {
+        wheel_mod(&rpc, "right", "", 5, 3);
+    }
+    assert_eq!(win_leftcol(&rpc, win).await, 6, "78 + 8 - 80");
+}
+
+/// The wheel parks the cursor by painted cells: with the first text cell under a
+/// mark's cells, the cursor is still in view and the scroll sticks.
+#[tokio::test]
+async fn the_wheel_parks_the_cursor_past_inline_cells() {
+    let (rpc, _incoming) = start(&"x".repeat(300)).await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    inline_mark(&rpc, 0, 0, "12345678").await;
+    let win = current_win(&rpc).await;
+    wheel_mod(&rpc, "right", "", 5, 10); // 6 columns: inside the mark
+    assert_eq!(win_leftcol(&rpc, win).await, 6);
+    assert_eq!(
+        cursor(&rpc).await.1,
+        1,
+        "the first char whose inline text doesn't hold the view back"
+    );
+    wheel_mod(&rpc, "right", "", 5, 10); // 12: 4 text cells past the mark
+    assert_eq!(win_leftcol(&rpc, win).await, 12);
+    assert_eq!(cursor(&rpc).await.1, 4);
+}
+
+/// Wrapped rows are laid out from the buffer text alone (the virtual text does not
+/// reflow them), so a mark shifts only the clicks on its own display row.
+#[tokio::test]
+async fn click_with_inline_virt_text_on_a_wrapped_line() {
+    let (rpc, _incoming) = start_narrow("0123456789ABCDEFGHIJabcdefghij\nsecond", 20).await;
+    command(&rpc, "set nonumber norelativenumber wrap").await;
+    inline_mark(&rpc, 0, 25, "XYZ").await; // the `f`, row 1 cell 5
+    assert_eq!(click_col(&rpc, 1, 0, 9).await, 9, "the row before the mark");
+    assert_eq!(click_col(&rpc, 1, 1, 2).await, 22, "before it on its row");
+    assert_eq!(click_col(&rpc, 1, 1, 6).await, 25, "on `XYZ`");
+    assert_eq!(click_col(&rpc, 1, 1, 9).await, 26, "past `XYZ`");
+    assert_eq!(click_col(&rpc, 2, 2, 1).await, 1, "the next buffer line");
+}
+
+/// A continuation row's `'showbreak'` prefix sits before the row-local anchor; both
+/// are undone, each once.
+#[tokio::test]
+async fn click_with_inline_virt_text_after_a_showbreak_prefix() {
+    let (rpc, _incoming) = start_narrow("0123456789ABCDEFGHIJabcdefghij", 20).await;
+    command(&rpc, "set nonumber norelativenumber wrap showbreak=>>").await;
+    inline_mark(&rpc, 0, 25, "XYZ").await; // row 1: `>>` + 5 cells, then the mark
+    assert_eq!(click_col(&rpc, 1, 1, 0).await, 20, "on the prefix");
+    assert_eq!(click_col(&rpc, 1, 1, 3).await, 21, "before the mark");
+    assert_eq!(click_col(&rpc, 1, 1, 8).await, 25, "on `XYZ`");
+    assert_eq!(click_col(&rpc, 1, 1, 11).await, 26, "past `XYZ`");
+}
+
+/// The gutter comes off first: a number column doesn't count toward the mark.
+#[tokio::test]
+async fn click_past_inline_virt_text_with_a_number_gutter() {
+    let (rpc, _incoming) = start("abcdefghij").await;
+    command(&rpc, "set number nowrap").await;
+    let gutter = exec_lua(&rpc, "return btv.win.textoff(0)")
+        .await
+        .as_u64()
+        .expect("textoff") as usize;
+    assert!(gutter > 0, "the number column is shown");
+    inline_mark(&rpc, 0, 0, "1234").await;
+    assert_eq!(click_col(&rpc, 1, 0, gutter + 6).await, 2, "the `c`");
+}
+
+/// A scroll moves the row a mark painted on; the shift follows the mark's line,
+/// not the screen row.
+#[tokio::test]
+async fn click_after_scrolling_a_marked_line_away() {
+    let (rpc, _incoming) = start("abcdefghij\nklmnopqrst\nuvwxyz").await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    inline_mark(&rpc, 0, 0, "1234").await;
+    feed(&rpc, "<C-e>");
+    cursor(&rpc).await;
+    assert_eq!(click_col(&rpc, 2, 0, 2).await, 2, "line 2 carries no mark");
+}
+
+/// `virt_text_hide` doesn't apply to inline text, as in neovim: its cells are part
+/// of the line's columns, so selecting a row neither reflows it nor shifts clicks.
+#[tokio::test]
+async fn an_inline_mark_keeps_its_cells_on_a_selected_row() {
+    let (rpc, mut incoming) = start("abcdefghij\nklmnopqrst").await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    exec_lua(
+        &rpc,
+        r#"local ns = btv.ns.create("click")
+           vim.api.nvim_buf_set_extmark(0, ns, 0, 0, {
+               virt_text = { { "1234", "LineNr" } },
+               virt_text_pos = "inline",
+               virt_text_hide = true,
+           })"#,
+    )
+    .await;
+    feed(&rpc, "V");
+    assert_eq!(mode(&rpc).await, "V");
+    let frame = wait_redraw(&mut incoming, |_| true).await;
+    let rows = field(&frame, "virt_text")
+        .and_then(Value::as_array)
+        .expect("virt_text");
+    assert_eq!(rows[0].as_array().map(Vec::len), Some(1), "still drawn");
+    assert_eq!(click_col(&rpc, 1, 0, 6).await, 2, "the `c`, past the mark");
+}
+
+/// A drag maps through the same columns as a press.
+#[tokio::test]
+async fn drag_past_inline_virt_text_tracks_the_pointer() {
+    let (rpc, _incoming) = start("abcdefghijklmnop").await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    inline_mark(&rpc, 0, 0, "1234").await;
+    feed_mouse(&rpc, "left", "press", 0, 5); // the `b`
+    feed_mouse(&rpc, "left", "drag", 0, 8); // the `e`
+    assert_eq!(mode(&rpc).await, "v");
+    assert_eq!(cursor(&rpc).await, (1, 4));
+    feed(&rpc, "d");
+    assert_eq!(lines(&rpc).await, vec!["afghijklmnop"]);
+}
+
+/// A double click selects the word under the *painted* cell.
+#[tokio::test]
+async fn double_click_past_inline_virt_text_selects_the_painted_word() {
+    let (rpc, clock, _incoming) = start_clocked("foo bar baz").await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    inline_mark(&rpc, 0, 0, "1234").await;
+    feed_mouse_at(&rpc, &clock, 1000, "left", "press", 0, 9); // the `a` of `bar`
+    feed_mouse_at(&rpc, &clock, 1000, "left", "release", 0, 9);
+    cursor(&rpc).await;
+    feed_mouse_at(&rpc, &clock, 1100, "left", "press", 0, 9);
+    feed_mouse_at(&rpc, &clock, 1100, "left", "release", 0, 9);
+    assert_eq!(mode(&rpc).await, "v");
+    feed(&rpc, "d");
+    assert_eq!(lines(&rpc).await, vec!["foo  baz"]);
+}

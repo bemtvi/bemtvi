@@ -2548,7 +2548,7 @@ impl Editor {
         let ts = buf.options.effective_tabstop();
         let cap = reach.saturating_add(text_w);
         let widest = (top..top.saturating_add(text_h).min(line_count))
-            .map(|l| line_width_capped(buf, l, ts, cap))
+            .map(|l| line_width_capped(buf, l, ts, cap) + buf.inline_width(l))
             .max()
             .unwrap_or(0);
         widest.min(cap).saturating_sub(text_w)
@@ -2686,8 +2686,8 @@ impl Editor {
             .leftcol
             .saturating_add(tw)
             .saturating_sub(so.saturating_add(1));
-        let vc = self.cursor_virtcol();
-        let target = if vc < lo {
+        let (start, vc) = self.cursor_painted_span();
+        let target = if start < lo {
             lo
         } else if vc > hi {
             hi
@@ -2696,7 +2696,22 @@ impl Editor {
         };
         let line = self.buffer().line(self.cursor.line);
         let ts = self.buffer().options.effective_tabstop();
-        self.cursor.col = crate::unicode::byte_at_virtcol(&line, target, ts);
+        let splices = self.buffer().inline_splices(self.cursor.line, ts);
+        let mut col = unsplice_inline(target, &splices);
+        // `target` on a splice maps to the character after it. At the right edge that
+        // character paints past `hi`, so the one before it is the last in view.
+        if vc > hi && crate::unicode::painted_col(col, &splices) > hi {
+            col = col.saturating_sub(1);
+        }
+        self.cursor.col = crate::unicode::byte_at_virtcol(&line, col, ts);
+        // At the left edge that character's inline text is what the view would come back
+        // for, so the cursor parks on the next one and the scroll sticks.
+        if start < lo {
+            let at = crate::unicode::virtcol(&line, self.cursor.col, ts);
+            if crate::unicode::painted_start(at, &splices) < lo {
+                self.cursor.col = crate::unicode::next_grapheme(&line, self.cursor.col);
+            }
+        }
         self.snap_cursor();
         self.desired_col = self.cursor_virtcol();
         self.preserve_desired = true;
@@ -2814,6 +2829,9 @@ impl Editor {
     /// the view projects ([`row_skeleton`](crate::view)) backwards from the first
     /// visible line `top`, so a click on a wrapped line's continuation row resolves
     /// to that line (at the wrapped column) rather than the next buffer line.
+    ///
+    /// `rel_x` is a **painted** column too: the cells spliced into the row
+    /// ([`Buffer::inline_splices`]) come off before it maps to a byte.
     fn text_cell_to_buf(
         &self,
         win: WindowId,
@@ -2850,14 +2868,16 @@ impl Editor {
         let mut line = top;
         let mut remaining = rel_y;
         let seg;
+        let seg_end; // the column the next display row starts at
         let indent; // continuation-prefix cells baked onto the resolved row
         loop {
             if line >= line_count {
                 // A cell below the last line lands on the last line's last segment
                 // (vim's "click past the buffer end" behavior).
                 line = line_count.saturating_sub(1);
-                let (segs, ci) = wrap_segs(&buf.line(line), ts, width, wrap, wo);
+                let (segs, ci) = wrap_segs(buf, line, &buf.line(line), ts, width, wrap, wo);
                 seg = *segs.last().expect("wrap_segs is never empty");
+                seg_end = usize::MAX;
                 indent = if seg.start_col > 0 { ci } else { 0 };
                 break;
             }
@@ -2869,9 +2889,10 @@ impl Editor {
                 return Some((line, 0));
             }
             remaining -= above;
-            let (segs, ci) = wrap_segs(&buf.line(line), ts, width, wrap, wo);
+            let (segs, ci) = wrap_segs(buf, line, &buf.line(line), ts, width, wrap, wo);
             if remaining < segs.len() {
                 seg = segs[remaining];
+                seg_end = segs.get(remaining + 1).map_or(usize::MAX, |s| s.start_col);
                 indent = if seg.start_col > 0 { ci } else { 0 };
                 break;
             }
@@ -2884,6 +2905,17 @@ impl Editor {
             line += 1;
         }
 
+        // This display row's splices, in the row-local columns it paints them at.
+        let inline: Vec<(usize, usize)> = if rel_x < gutter {
+            Vec::new()
+        } else {
+            buf.inline_splices(line, ts)
+                .into_iter()
+                .filter(|&(anchor, _)| anchor >= seg.start_col && anchor < seg_end)
+                .map(|(anchor, w)| (anchor - seg.start_col + indent, w))
+                .collect()
+        };
+
         let col = if rel_x < gutter {
             // The number column: place the cursor at the line's start.
             0
@@ -2893,7 +2925,7 @@ impl Editor {
             // byte; past it, the row-local cell is rebased onto the segment's start
             // column before mapping back to a byte (clamped to the segment so it
             // can't spill onto the next display row).
-            let cell = rel_x - gutter;
+            let cell = unsplice_inline(rel_x - gutter, &inline);
             if cell < indent {
                 seg.start_byte
             } else {
@@ -2905,7 +2937,7 @@ impl Editor {
             // mapped back to a byte offset (rounding a between-cells click to the
             // nearest grapheme). `set_window_cursor`'s clamp pulls a past-EOL
             // result onto the last char in Normal mode.
-            let screen_col = (rel_x - gutter).saturating_add(leftcol);
+            let screen_col = unsplice_inline((rel_x - gutter).saturating_add(leftcol), &inline);
             crate::unicode::byte_at_virtcol(&buf.line(line), screen_col, ts)
         };
         Some((line, col))
@@ -3030,6 +3062,8 @@ fn probe_window(w: &Window, x: usize, y: usize) -> Option<(usize, usize)> {
 /// the view's `row_skeleton` wrap split. Under `nowrap` (or `width == 0`) the whole
 /// line is one segment spanning byte `0..len` at column 0 with no prefix.
 fn wrap_segs(
+    buf: &Buffer,
+    line: usize,
     text: &str,
     tabstop: usize,
     width: usize,
@@ -3039,7 +3073,7 @@ fn wrap_segs(
     if wrap && width > 0 {
         let indent = crate::unicode::cont_indent(text, tabstop, width, wo);
         (
-            crate::unicode::window_wrap_segments(text, tabstop, width, indent, wo),
+            buf.wrap_rows(line, text, tabstop, width, indent, wo),
             indent,
         )
     } else {
@@ -3052,6 +3086,26 @@ fn wrap_segs(
             0,
         )
     }
+}
+
+/// Undo the inline splice on a display row: map painted column `col` to the text
+/// column it shows, given the row's `(anchor, width)` cells ascending by anchor. A
+/// painted column on an inline run has no text under it, so it lands on the run's
+/// anchor, the character the run is drawn before (neovim counts inline text as part
+/// of that character's size). The inverse of [`painted_col`](crate::unicode::painted_col).
+fn unsplice_inline(col: usize, inline: &[(usize, usize)]) -> usize {
+    let mut shift = 0;
+    for &(anchor, width) in inline {
+        let start = anchor + shift;
+        if col < start {
+            break;
+        }
+        if col < start + width {
+            return anchor;
+        }
+        shift += width;
+    }
+    col - shift
 }
 
 /// One open region's absolute on-screen placement this frame (see

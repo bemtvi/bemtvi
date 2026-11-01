@@ -17,6 +17,7 @@
 //!   animating client drives from its own clock.
 
 mod anim;
+mod band;
 mod fit;
 mod hit_test;
 pub mod images;
@@ -27,6 +28,7 @@ mod style;
 mod view;
 
 pub use anim::{arm_scroll, lerp, ScrollAnim};
+pub use band::{clip_band_row, BandRow};
 pub use fit::{
     doc_box, elide_keep_tail, elide_middle, fit_gutter_text, fit_row, gutter_cell, pmenu_row,
     pmenu_start, row_head_col, row_hl_extent, wrap_chars, CellRect,

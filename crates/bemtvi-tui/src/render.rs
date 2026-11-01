@@ -951,8 +951,11 @@ fn render_window(
     let anim_hl: Vec<Vec<HlSpan>>;
     let anim_numbers: Vec<Option<usize>>;
     let anim_continuation: Vec<bool>;
-    let anim_inlay: Vec<Vec<InlayHint>>;
-    let anim_virt_text: Vec<Vec<VirtPlacement>>;
+    let mut anim_inlay: Vec<Vec<InlayHint>>;
+    let mut anim_virt_text: Vec<Vec<VirtPlacement>>;
+    // This frame's column applied to the band rows' inline cells: the text column each
+    // row paints from, like the settled window's `row_leftcol`.
+    let mut anim_row_leftcol: Vec<u16> = Vec::new();
     let anim_virt_lines: Vec<Option<Vec<VirtChunk>>>;
     let anim_diag_virt: Vec<Option<DiagVirt>>;
     // Diagnostic underlines and signs ride the screen-row band now, sliced like the
@@ -1072,6 +1075,21 @@ fn render_window(
                 .cloned()
                 .collect();
             anim_virt_text = a.virt_text.iter().skip(off).take(height).cloned().collect();
+            for row in 0..anim_lines.len() {
+                let inlay = anim_inlay.get(row).map_or(&[][..], Vec::as_slice);
+                let vtext = anim_virt_text.get(row).map_or(&[][..], Vec::as_slice);
+                let Some(clipped) = bemtvi_view::clip_band_row(leftcol, inlay, vtext) else {
+                    anim_row_leftcol.push(leftcol);
+                    continue;
+                };
+                anim_row_leftcol.push(clipped.left);
+                if let Some(slot) = anim_inlay.get_mut(row) {
+                    *slot = clipped.inlay;
+                }
+                if let Some(slot) = anim_virt_text.get_mut(row) {
+                    *slot = clipped.vtext;
+                }
+            }
             anim_virt_lines = a
                 .virt_lines
                 .iter()
@@ -1380,6 +1398,11 @@ fn render_window(
         frame_numbers,
         win.tabstop.max(1) as usize,
         leftcol as usize,
+        if anim.is_none() {
+            &win.row_leftcol
+        } else {
+            &anim_row_leftcol
+        },
         &theme,
     );
     // Paint the secondary multi-cursors over the settled text. They're a
@@ -1395,7 +1418,7 @@ fn render_window(
                 text_inner,
                 win.cursor_screen_col,
                 win.cursor_row,
-                win.leftcol,
+                win.row_leftcol(win.cursor_row as usize),
                 Style::default()
                     .bg(MULTICURSOR_ACCENT)
                     .fg(Color::Black)
@@ -1410,6 +1433,14 @@ fn render_window(
     // computed from `frame_inlay`, so it's the band's hints mid-slide and the
     // window's once settled (both indexed by the cursor's screen row). Returned so
     // the caller places the focused window's cursor past the splice in either case.
+    let leftcol = if anim.is_none() {
+        win.row_leftcol(cursor_row as usize)
+    } else {
+        anim_row_leftcol
+            .get(cursor_row as usize)
+            .copied()
+            .unwrap_or(leftcol)
+    };
     let cursor_shift =
         inlay_cursor_shift(frame_inlay, cursor_row, win.cursor_screen_col, leftcol).saturating_add(
             virt_cursor_shift(frame_virt_text, cursor_row, win.cursor_screen_col, leftcol),
@@ -1440,7 +1471,14 @@ fn render_secondary_cursors(frame: &mut Frame, text_inner: Rect, win: &WindowVie
         Style::default().add_modifier(Modifier::REVERSED)
     };
     for &(row, col) in &win.secondary_cursors {
-        paint_cursor_cell(frame, text_inner, col, row, win.leftcol, patch);
+        paint_cursor_cell(
+            frame,
+            text_inner,
+            col,
+            row,
+            win.row_leftcol(row as usize),
+            patch,
+        );
     }
 }
 
@@ -1694,6 +1732,7 @@ fn render_text(
     numbers: &[Option<usize>],
     tabstop: usize,
     leftcol: usize,
+    row_leftcol: &[u16],
     theme: &LineTheme,
 ) {
     let width = area.width as usize;
@@ -1727,8 +1766,21 @@ fn render_text(
                 // end-of-buffer filler.
                 let is_filler = matches!(numbers.get(row), Some(None));
                 highlight_line(
-                    l, sel, sec_sel, matches, cur, hl, diag, virt, vtext, inlay, width, is_filler,
-                    tabstop, leftcol, theme,
+                    l,
+                    sel,
+                    sec_sel,
+                    matches,
+                    cur,
+                    hl,
+                    diag,
+                    virt,
+                    vtext,
+                    inlay,
+                    width,
+                    is_filler,
+                    tabstop,
+                    row_leftcol.get(row).map_or(leftcol, |&left| left as usize),
+                    theme,
                 )
             })
             .collect::<Vec<_>>(),

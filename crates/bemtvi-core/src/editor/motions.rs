@@ -727,16 +727,16 @@ impl Editor {
         let buf = self.buffer();
         // Segment a line with the window's `'breakindent'`/`'showbreak'` continuation
         // indent, so gj/gk step the same display rows the window renders.
-        let segs_of = |text: &str| {
+        let segs_of = |line: usize, text: &str| {
             let indent = unicode::cont_indent(text, tab, width, wo);
-            unicode::window_wrap_segments(text, tab, width, indent, wo)
+            buf.wrap_rows(line, text, tab, width, indent, wo)
         };
-        let seg_count = |line: usize| segs_of(&buf.line_cow(line)).len();
+        let seg_count = |line: usize| segs_of(line, &buf.line_cow(line)).len();
 
         // The cursor's current display column: its screen column minus the start
         // column of the wrap segment it sits in.
         let text0 = buf.line_cow(self.cursor.line);
-        let segs0 = segs_of(&text0);
+        let segs0 = segs_of(self.cursor.line, &text0);
         let cur_full = unicode::virtcol(&text0, self.cursor.col, tab);
         let cur_seg = segs0
             .iter()
@@ -774,7 +774,7 @@ impl Editor {
         // Land at the target row's start column + the wanted display column, clamped
         // to the row's own extent so it doesn't spill into the next row's content.
         let text = buf.line_cow(line);
-        let segs = segs_of(&text);
+        let segs = segs_of(line, &text);
         let start_col = segs.get(seg).map_or(0, |s| s.start_col);
         let next_start = segs.get(seg + 1).map_or(usize::MAX, |s| s.start_col);
         let screen_col = (start_col + want).min(next_start.saturating_sub(1).max(start_col));
@@ -803,7 +803,7 @@ impl Editor {
             let opts = &self.windows.cur().options;
             let wo = opts.wrap_opts();
             let indent = unicode::cont_indent(&text, tab, width, wo);
-            let segs = unicode::window_wrap_segments(&text, tab, width, indent, wo);
+            let segs = buf.wrap_rows(line, &text, tab, width, indent, wo);
             let seg = segs
                 .iter()
                 .rposition(|s| self.cursor.col >= s.start_byte)

@@ -2575,3 +2575,91 @@ fn a_gutter_text_chunk_with_only_a_background_keeps_the_number_colour() {
     assert_eq!(bg(&buf, 1, 1), Some(Color::Rgb(0x40, 0, 0)));
     assert_eq!(fg(&buf, 1, 1), Some(Color::Rgb(0, 0xaa, 0)));
 }
+
+/// One 8-cell inline placement at column 0 of `abcdefghij…`, as the server sends the
+/// frame once `leftcol` has clipped it: the row paints from `row_leftcol`.
+fn scrolled_inline(leftcol: u64, row_left: u64, placement: Option<&str>) -> String {
+    let places = placement.map_or(Vec::new(), |text| {
+        vec![Value::Array(vec![
+            Value::from(1u64), // inline
+            Value::from(row_left),
+            Value::from(0u64),
+            Value::Array(vec![Value::Array(vec![Value::from(text), Value::Nil])]),
+        ])]
+    });
+    let v = view(vec![
+        ("lines", lines(&["abcdefghijklmnopqrstuvwxyz"])),
+        ("leftcol", Value::from(leftcol)),
+        ("row_leftcol", Value::Array(vec![Value::from(row_left)])),
+        ("virt_text", Value::Array(vec![Value::Array(places)])),
+    ]);
+    let buf = paint(&v, 12, 3);
+    (0..12).map(|x| buf[(x, 0)].symbol().to_string()).collect()
+}
+
+#[test]
+fn a_row_paints_from_its_own_column_with_the_clipped_placement() {
+    assert_eq!(
+        scrolled_inline(3, 0, Some("45678")),
+        "45678abcdefg",
+        "`leftcol` 3 inside the placement shows its last 5 cells"
+    );
+    assert_eq!(
+        scrolled_inline(10, 2, None),
+        "cdefghijklmn",
+        "`leftcol` 10 past it starts at text column 2"
+    );
+}
+
+/// A slide frame over a band row carrying an unclipped 8-cell placement at column 0,
+/// holding `leftcol` steady so the frame is the same whatever the clock says.
+fn pan_frame(leftcol: u64) -> String {
+    let inline = Value::Array(vec![
+        Value::from(1u64),
+        Value::from(0u64),
+        Value::from(0u64),
+        Value::Array(vec![Value::Array(vec![
+            Value::from("12345678"),
+            Value::Nil,
+        ])]),
+    ]);
+    let band_row = "abcdefghijklmnopqrstuvwxyz";
+    let params = redraw(vec![
+        ("lines", lines(&[band_row])),
+        ("leftcol", Value::from(leftcol)),
+        (
+            "scroll",
+            Value::Map(vec![
+                (Value::from("lines"), lines(&[band_row, band_row, band_row])),
+                (Value::from("from_row"), Value::from(0u64)),
+                (Value::from("to_row"), Value::from(1u64)),
+                (Value::from("from_leftcol"), Value::from(leftcol)),
+                (Value::from("to_leftcol"), Value::from(leftcol)),
+                (Value::from("duration_ms"), Value::from(10_000u64)),
+                (
+                    "virt_text".into(),
+                    Value::Array(vec![
+                        Value::Array(vec![inline.clone()]),
+                        Value::Array(vec![inline.clone()]),
+                        Value::Array(vec![inline]),
+                    ]),
+                ),
+            ]),
+        ),
+    ]);
+    let mut client = ScrollHarness::new();
+    client.on_redraw(&params);
+    assert!(client.animating(), "the slide armed");
+    let buf = client.paint(12, 5);
+    row_text(&buf, 0)
+}
+
+/// Mid-slide a row paints as it will once settled: the rest of a placement the column
+/// falls inside, and past one the text stays where its cells put it, so a pan doesn't
+/// drop the placement and snap the text back when it ends.
+#[test]
+fn a_slide_clips_a_placement_at_its_interpolated_column() {
+    assert_eq!(pan_frame(3), "45678abcdefg");
+    assert_eq!(pan_frame(10), "cdefghijklmn");
+    assert_eq!(pan_frame(0), "12345678abcd");
+}

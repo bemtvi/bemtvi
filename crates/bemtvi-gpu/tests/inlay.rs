@@ -249,3 +249,30 @@ fn splice_keeps_a_cluster_whole_when_a_hint_lands_mid_glyph() {
     let out = splice_inlay(base, &[hint(1, "«h»")], 0, &[]);
     assert_eq!(text(&out), "日«h»ab");
 }
+
+/// A row paints from its own column (`row_leftcol`) with the server's clipped
+/// placement: both the splice's shift and the cursor key off that column, so what
+/// `leftcol` hid doesn't push anything. The view falls back to `leftcol` per row.
+#[test]
+fn a_clipped_placement_shifts_from_the_rows_own_column() {
+    let trimmed = [ivirt(0, "45678")];
+    assert_eq!(
+        virt_inline_shift(&trimmed, 0, 0, true),
+        5,
+        "its anchor char"
+    );
+    assert_eq!(
+        virt_inline_shift(&[], 2, 2, true),
+        0,
+        "a hidden one left none"
+    );
+    let mut win = bemtvi_view::WindowView {
+        leftcol: 10,
+        ..Default::default()
+    };
+    assert_eq!(win.row_leftcol(0), 10);
+    win.row_leftcol = vec![2, 10];
+    assert_eq!(win.row_leftcol(0), 2);
+    assert_eq!(win.row_leftcol(1), 10);
+    assert_eq!(win.row_leftcol(5), 10, "past the list");
+}

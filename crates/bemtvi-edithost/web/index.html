@@ -1555,10 +1555,69 @@
       scrollRAF = 0;
       scrollAnim = null;
     }
+    // A slide's column moves every frame, so the band carries its inline cells whole
+    // and the frame applies the column here, the model the server applies to a settled
+    // window (`leftcol` counts text and inline cells together): hidden splices go, the
+    // one it falls inside keeps its visible cells, and each row gets the text column it
+    // paints from. `bemtvi_view::clip_band_row` is the native clients' copy.
+    function clipBandRows(band) {
+      band.band_virt_text ??= band.virt_text;
+      band.band_inlay_hints ??= band.inlay_hints;
+      const cellsOf = (t) => [...t].reduce((n, ch) => n + cellWidthCells(ch), 0);
+      const skipCells = (t, n) => {
+        let out = "";
+        for (const ch of t) {
+          const w = cellWidthCells(ch);
+          if (n <= 0) out += ch;
+          else if (n >= w) n -= w;
+          else { out += " ".repeat(w - n); n = 0; }
+        }
+        return out;
+      };
+      const skipChunks = (chunks, n) => chunks.flatMap(([t, id]) => {
+        const w = cellsOf(t);
+        if (n >= w) { n -= w; return []; }
+        const kept = [skipCells(t, n), id];
+        n = 0;
+        return [kept];
+      });
+      const lefts = [], hintRows = [], placeRows = [];
+      for (let row = 0; row < band.lines.length; row++) {
+        const hints = band.band_inlay_hints?.[row] || [];
+        const places = band.band_virt_text?.[row] || [];
+        // Paint order: by anchor, a hint before inline text at a shared anchor.
+        const items = [
+          ...hints.map((h, i) => ({ col: h[0], width: cellsOf(h[1]), hint: i })),
+          ...places.flatMap((p, i) => p[0] === 1
+            ? [{ col: p[1], width: p[3].reduce((n, c) => n + cellsOf(c[0]), 0), place: i }]
+            : []),
+        ].sort((x, y) => x.col - y.col);
+        let shift = 0, hidden = items.length, skip = 0;
+        for (let i = 0; i < items.length; i++) {
+          const start = items[i].col + shift;
+          if (band.leftcol <= start) { hidden = i; break; }
+          if (band.leftcol < start + items[i].width) { hidden = i; skip = band.leftcol - start; break; }
+          shift += items[i].width;
+        }
+        const gone = items.slice(0, hidden);
+        const cut = skip > 0 ? items[hidden] : null;
+        hintRows.push(hints
+          .map((h, i) => (cut?.hint === i ? [h[0], skipCells(h[1], skip), ...h.slice(2)] : h))
+          .filter((_, i) => !gone.some((g) => g.hint === i)));
+        placeRows.push(places
+          .map((p, i) => (cut?.place === i ? [p[0], p[1], p[2], skipChunks(p[3], skip)] : p))
+          .filter((_, i) => !gone.some((g) => g.place === i)));
+        lefts.push(band.leftcol - shift - skip);
+      }
+      band.row_leftcol = lefts;
+      band.inlay_hints = hintRows;
+      band.virt_text = placeRows;
+    }
     function renderScrollBand(box, w, rect, winSpans) {
       const a = scrollAnim;
       const band = a.band;
       band.leftcol = a.leftcol;
+      clipBandRows(band);
       const gutterW = w.number_width || 0;
       const strip = document.createElement("div");
       strip.className = "scroll-band";
@@ -2112,7 +2171,7 @@
         }
       }
 
-      const leftcol = w.leftcol || 0;
+      const leftcol = w.row_leftcol?.[row] ?? (w.leftcol || 0);
       // A picker (a menu carrying a prompt `query`) moves the cursor into its input box,
       // so the buffer cursor must hide while it's open — matching the native TUI/GUI
       // (`picker_open = menu.query.is_some()`). A queryless select / completion popup
@@ -2473,7 +2532,7 @@
         return html + `<span class="eob"${css ? ` style="${css}"` : ""}>${escapeHtml(line)}</span>`;
       }
       const tabstop = w.tabstop || 8;
-      const leftcol = w.leftcol || 0;
+      const leftcol = w.row_leftcol?.[row] ?? (w.leftcol || 0);
       const hints = w.inlay_hints?.[row] || [];
       const hlSpans = w.highlights?.[row] || [];
       const diagSpans = w.diagnostics?.[row] || [];

@@ -2260,3 +2260,257 @@ async fn grapheme_steps_on_a_long_line_keep_clusters_whole() {
         assert_eq!(cursor(&rpc).await.1, want, "h steps one cluster");
     }
 }
+
+/// Open `lines` wrapped at the 80-column default with no gutter, lay an inline mark
+/// of `width` cells on line 0 at byte `col`, and return the frame's `numbers` (the
+/// buffer line per screen row, up to the first filler row) and the rows holding it.
+async fn wrapped_with_inline(
+    rpc: &bemtvi_rpc::Rpc,
+    incoming: &mut tokio::sync::mpsc::UnboundedReceiver<bemtvi_rpc::Incoming>,
+    text: &str,
+    col: usize,
+    width: usize,
+) -> (Vec<u64>, Vec<(usize, u64)>) {
+    feed(
+        rpc,
+        ":set nonumber<CR>:set norelativenumber<CR>:set wrap<CR>",
+    );
+    feed(rpc, "i");
+    feed(rpc, text);
+    feed(rpc, "<Esc>");
+    exec_lua(
+        rpc,
+        &format!(
+            r#"local ns = vim.api.nvim_create_namespace("vt")
+               vim.api.nvim_buf_set_extmark(0, ns, 0, {col}, {{
+                   virt_text = {{ {{ string.rep("V", {width}), "Comment" }} }},
+                   virt_text_pos = "inline",
+               }})"#
+        ),
+    )
+    .await;
+    let map = redraw_after(rpc, incoming, "<Esc>").await;
+    wrap_rows(&map)
+}
+
+/// The frame's `numbers` up to the first filler row, and each `(row, column)` an
+/// inline placement sits at.
+fn wrap_rows(map: &[(Value, Value)]) -> (Vec<u64>, Vec<(usize, u64)>) {
+    let numbers = view_get(map, "numbers")
+        .and_then(Value::as_array)
+        .expect("numbers")
+        .iter()
+        .map_while(Value::as_u64)
+        .collect();
+    let mut placed = Vec::new();
+    let rows = view_get(map, "virt_text").and_then(Value::as_array);
+    for (row, places) in rows.into_iter().flatten().enumerate() {
+        for p in places.as_array().into_iter().flatten() {
+            let p = p.as_array().expect("placement");
+            if p[0].as_u64() == Some(1) {
+                placed.push((row, p[1].as_u64().expect("col")));
+            }
+        }
+    }
+    (numbers, placed)
+}
+
+/// A line that fits by its own cells but not with its inline text takes two rows.
+#[tokio::test]
+async fn wrap_counts_inline_cells_at_the_line_start() {
+    let (rpc, mut incoming) = start(None).await;
+    let (numbers, placed) = wrapped_with_inline(&rpc, &mut incoming, &"a".repeat(76), 0, 8).await;
+    assert_eq!(numbers, vec![1, 1], "72 text cells + 8, then 4");
+    assert_eq!(placed, vec![(0, 0)]);
+}
+
+/// A placement that doesn't fit what's left of its row moves down whole, with its
+/// anchor character, and the row before ends short.
+#[tokio::test]
+async fn wrap_moves_a_placement_down_with_its_anchor() {
+    let (rpc, mut incoming) = start(None).await;
+    let (numbers, placed) = wrapped_with_inline(&rpc, &mut incoming, &"a".repeat(78), 75, 8).await;
+    assert_eq!(numbers, vec![1, 1]);
+    assert_eq!(placed, vec![(1, 0)], "it starts the second row");
+    // The cursor on the anchor char rides down with it; the one before stays.
+    feed(&rpc, "0");
+    let on_row = |c: usize| format!("{c}|");
+    let map = redraw_after(&rpc, &mut incoming, &on_row(76)).await;
+    assert_eq!(field(&map, "cursor_row").and_then(Value::as_u64), Some(1));
+    let map = redraw_after(&rpc, &mut incoming, &on_row(75)).await;
+    assert_eq!(field(&map, "cursor_row").and_then(Value::as_u64), Some(0));
+}
+
+/// A placement at the end of a full row opens a row of its own past the text.
+#[tokio::test]
+async fn wrap_gives_a_line_end_placement_its_own_row() {
+    let (rpc, mut incoming) = start(None).await;
+    let (numbers, placed) = wrapped_with_inline(&rpc, &mut incoming, &"a".repeat(78), 78, 8).await;
+    assert_eq!(numbers, vec![1, 1]);
+    assert_eq!(placed, vec![(1, 0)]);
+}
+
+/// A placement wider than a whole row starts one and is clipped there. Its anchor
+/// character shares that row, and the text after it wraps below, where it shows.
+#[tokio::test]
+async fn wrap_keeps_the_text_after_an_over_wide_placement() {
+    let (rpc, mut incoming) = start(None).await;
+    let (numbers, placed) = wrapped_with_inline(&rpc, &mut incoming, "abc", 0, 100).await;
+    assert_eq!(numbers, vec![1, 1], "no empty row above it");
+    assert_eq!(placed, vec![(0, 0)]);
+    let map = redraw_after(&rpc, &mut incoming, "0l").await;
+    assert_eq!(
+        field(&map, "cursor_row").and_then(Value::as_u64),
+        Some(1),
+        "`b`"
+    );
+}
+
+/// Under `'linebreak'`, a word moved down takes the placements anchored in it.
+#[tokio::test]
+async fn wrap_with_linebreak_moves_a_placement_with_its_word() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, ":set linebreak<CR>");
+    let text = format!("{} {}", "a".repeat(70), "b".repeat(8));
+    // The mark is inside the `b` word; that word no longer fits the first row.
+    let (numbers, placed) = wrapped_with_inline(&rpc, &mut incoming, &text, 73, 8).await;
+    assert_eq!(numbers, vec![1, 1]);
+    assert_eq!(placed, vec![(1, 2)], "two `b`s into the moved word");
+}
+
+/// A click, `gj` and the next buffer line's row all follow the reflowed layout.
+#[tokio::test]
+async fn click_and_gj_follow_a_row_inline_cells_wrapped() {
+    let (rpc, mut incoming) = start(None).await;
+    let (numbers, _) = wrapped_with_inline(&rpc, &mut incoming, &"a".repeat(76), 0, 8).await;
+    assert_eq!(numbers, vec![1, 1]);
+    feed(&rpc, "o");
+    feed(&rpc, "second");
+    feed(&rpc, "<Esc>gg0");
+    let (line, col) = cursor(&rpc).await;
+    assert_eq!((line, col), (1, 0));
+    bemtvi_test_harness::feed_mouse(&rpc, "left", "press", 1, 2);
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 74),
+        "row 1 starts at text column 72"
+    );
+    bemtvi_test_harness::feed_mouse(&rpc, "left", "press", 2, 3);
+    assert_eq!(cursor(&rpc).await, (2, 3), "the second line, on row 2");
+    feed(&rpc, "gg0gj");
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 72),
+        "gj reaches the row the text wrapped to"
+    );
+    feed(&rpc, "gj");
+    assert_eq!(cursor(&rpc).await.0, 2);
+}
+
+/// A placement that already fit its row, then moved down when a later character broke
+/// the word, still takes room on the new row: this 79-cell word fits a row by itself,
+/// but not with the 2 cells it carries. A mark before the word stays behind and doesn't
+/// count there.
+#[tokio::test]
+async fn wrap_with_linebreak_counts_a_moved_placement_on_its_new_row() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, ":set linebreak<CR>");
+    let text = format!("{} {}", "a".repeat(60), "b".repeat(79));
+    let (numbers, placed) = wrapped_with_inline(&rpc, &mut incoming, &text, 63, 2).await;
+    assert_eq!(numbers, vec![1, 1, 1], "61, then 2 + 78 `b`s, then 1");
+    assert_eq!(placed, vec![(1, 2)]);
+    exec_lua(
+        &rpc,
+        r#"local ns = vim.api.nvim_create_namespace("vt")
+           vim.api.nvim_buf_set_extmark(0, ns, 0, 5, {
+               virt_text = { { "XY", "Comment" } },
+               virt_text_pos = "inline",
+           })"#,
+    )
+    .await;
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    let (numbers, placed) = wrap_rows(&map);
+    assert_eq!(numbers, vec![1, 1, 1], "the earlier mark stays on row 0");
+    assert_eq!(placed, vec![(0, 5), (1, 2)]);
+}
+
+/// One nowrap line with an inline mark, its view set to `leftcol`: the frame's
+/// first-row `(start column, [(placement col, text)])`.
+async fn scrolled_inline_row(virt: &str, leftcol: u64) -> (u64, Vec<(u64, String)>) {
+    let (rpc, mut incoming) = start(None).await;
+    feed(
+        &rpc,
+        ":set nonumber<CR>:set norelativenumber<CR>:set nowrap<CR>",
+    );
+    feed(&rpc, "i");
+    feed(&rpc, &"a".repeat(300));
+    feed(&rpc, "<Esc>");
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"local ns = vim.api.nvim_create_namespace("vt")
+               vim.api.nvim_buf_set_extmark(0, ns, 0, 0, {{
+                   virt_text = {{ {{ "{virt}", "Comment" }} }},
+                   virt_text_pos = "inline",
+               }})
+               "#
+        ),
+    )
+    .await;
+    feed(&rpc, "41|");
+    let _ = lines(&rpc).await;
+    exec_lua(&rpc, &format!("btv.win.set_leftcol(0, {leftcol})")).await;
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert_eq!(view_u64(&map, "leftcol"), leftcol);
+    let row_left = view_get(&map, "row_leftcol")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.first())
+        .and_then(Value::as_u64)
+        .unwrap_or(leftcol);
+    let placed = view_get(&map, "virt_text")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.first())
+        .and_then(Value::as_array)
+        .map(|places| {
+            places
+                .iter()
+                .filter_map(|p| {
+                    let p = p.as_array()?;
+                    (p[0].as_u64()? == 1).then_some(())?;
+                    let text: String = p[3]
+                        .as_array()?
+                        .iter()
+                        .filter_map(|c| c.as_array()?.first()?.as_str())
+                        .collect();
+                    Some((p[1].as_u64()?, text))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (row_left, placed)
+}
+
+/// `leftcol` inside a placement shows the rest of it, and the text keeps its place.
+#[tokio::test]
+async fn nowrap_clips_a_placement_the_scroll_falls_inside() {
+    assert_eq!(
+        scrolled_inline_row("12345678", 3).await,
+        (0, vec![(0, "45678".to_string())])
+    );
+}
+
+/// `leftcol` past a whole placement drops it, and the text stays where its cells put
+/// it: text column 2 is the first shown, not column 10.
+#[tokio::test]
+async fn nowrap_keeps_the_text_where_a_scrolled_off_placement_put_it() {
+    assert_eq!(scrolled_inline_row("12345678", 10).await, (2, vec![]));
+}
+
+/// A wide character the scroll cuts in half shows as a blank, keeping the columns.
+#[tokio::test]
+async fn nowrap_blanks_a_wide_char_the_scroll_cuts() {
+    assert_eq!(
+        scrolled_inline_row("語x", 1).await,
+        (0, vec![(0, " x".to_string())])
+    );
+}

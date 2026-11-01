@@ -195,6 +195,30 @@ impl EditHost {
             .collect();
         mirror.sort_by_key(|h| (h.line, h.col, h.client_id));
         let _ = self.lua.set_inlay_hints(buffer.0, &mirror);
+        self.sync_inlay_splices(buffer);
+    }
+
+    /// Hand the core the columns `buffer`'s painted hints take, so its column arithmetic
+    /// counts them ([`Buffer::inline_splices`](bemtvi_core::Buffer::inline_splices)).
+    /// The same hints [`inlay_hints_for`](Self::inlay_hints_for) projects: from every
+    /// server, none while disabled, never an unresolved empty one.
+    pub(crate) fn sync_inlay_splices(&mut self, buffer: BufferId) {
+        let mut hints: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
+        if let Some(state) = self.lsp_states.get(&buffer).filter(|s| s.inlay_enabled) {
+            for (_, doc) in state.servers() {
+                for (&line, spans) in &doc.inlay.hints {
+                    hints.entry(line).or_default().extend(
+                        spans
+                            .iter()
+                            .filter(|s| !s.text.is_empty())
+                            .map(|s| (s.byte_col, unicode::grapheme_cells(&s.text))),
+                    );
+                }
+            }
+        }
+        if let Some(buf) = self.editor.buffer_of_mut(buffer) {
+            buf.set_inlay_splices(hints);
+        }
     }
 
     /// Issue an `inlayHint/resolve` for every lazy placeholder cached for `buffer`,

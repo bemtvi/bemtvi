@@ -47,7 +47,8 @@ impl<'a> RowGeom<'a> {
         let wo = self.opts.wrap_opts();
         let indent = unicode::cont_indent(&text, tab, self.width, wo);
         Some(
-            unicode::window_wrap_segments(&text, tab, self.width, indent, wo)
+            self.buf
+                .wrap_rows(line, &text, tab, self.width, indent, wo)
                 .iter()
                 .map(|s| s.start_byte)
                 .collect(),

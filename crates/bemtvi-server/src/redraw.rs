@@ -689,7 +689,9 @@ impl EditHost {
             self.diagnostics_virt_text_for(win.buffer, &win.winhl, &segments, styles);
         // Inlay hints ride a live LSP, which the browser build has too (the daemon's
         // LSP leg), and its renderer paints them — so they project on both builds.
-        let inlay_hints = self.inlay_hints_for(win.buffer, &win.winhl, &segments, styles);
+        let mut inlay_hints = self.inlay_hints_for(win.buffer, &win.winhl, &segments, styles);
+        let mut virt_text = virt_text;
+        let row_leftcol = scroll_inline_rows(win.leftcol, &mut virt_text, &mut inlay_hints);
         let scroll = match &win.scroll {
             Some(s) => self.project_band(
                 win,
@@ -733,6 +735,7 @@ impl EditHost {
                 ),
             ),
             (Value::from("leftcol"), Value::from(win.leftcol as u64)),
+            (Value::from("row_leftcol"), row_leftcol),
             (Value::from("text_pointer"), Value::from(win.text_pointer)),
             (Value::from("cursor_hidden"), Value::from(win.cursor_hidden)),
             (Value::from("scrollbars"), scrollbars_value(win.scrollbars)),
@@ -2098,6 +2101,140 @@ impl RowSeg {
     /// (like the number) shows here and not on continuation rows.
     pub(crate) fn is_first(&self) -> bool {
         self.start == 0
+    }
+}
+
+/// Apply a window's `leftcol` to its rows' inline cells, which the clients splice from:
+/// `inlay_hints` entries `[col, text, style]` and `virt_text` inline placements
+/// `[pos, col, hl_mode, [[text, style], …]]`. `leftcol` counts text and inline cells
+/// together, so a row's text starts further left by what the scroll hid. A hidden splice
+/// leaves the payload, one the scroll falls inside keeps only its visible cells. So a
+/// client needs no splice arithmetic: it paints each row from the column returned here.
+/// The result has one column per row, or is empty when every row starts at `leftcol`.
+fn scroll_inline_rows(leftcol: usize, virt_text: &mut Value, inlay_hints: &mut Value) -> Value {
+    const POS_INLINE: u64 = 1;
+    /// Which payload a splice came from, and its index in that row.
+    #[derive(Clone, Copy)]
+    enum Item {
+        Hint(usize),
+        Virt(usize),
+    }
+    fn chunks_width(chunks: &Value) -> usize {
+        chunks.as_array().map_or(0, |chunks| {
+            chunks
+                .iter()
+                .filter_map(|c| c.as_array()?.first()?.as_str())
+                .map(unicode::grapheme_cells)
+                .sum()
+        })
+    }
+    // Hide the first `skip` cells of a `[[text, style], …]` chunk run.
+    fn skip_chunks(chunks: &mut Value, mut skip: usize) {
+        let Value::Array(list) = chunks else { return };
+        list.retain_mut(|chunk| {
+            let Value::Array(pair) = chunk else {
+                return true;
+            };
+            let Some(text) = pair.first().and_then(Value::as_str) else {
+                return true;
+            };
+            let width = unicode::grapheme_cells(text);
+            if skip >= width {
+                skip -= width;
+                return false;
+            }
+            pair[0] = Value::from(unicode::skip_cells(text, skip));
+            skip = 0;
+            true
+        });
+    }
+    if leftcol == 0 {
+        return Value::Array(Vec::new());
+    }
+    let (Value::Array(virt_rows), Value::Array(hint_rows)) = (virt_text, inlay_hints) else {
+        return Value::Array(Vec::new());
+    };
+    let empty: &[Value] = &[];
+    let mut lefts: Vec<u64> = Vec::with_capacity(virt_rows.len());
+    let mut shifted = false;
+    for (row, row_places) in virt_rows.iter_mut().enumerate() {
+        let hints = hint_rows
+            .get(row)
+            .and_then(Value::as_array)
+            .map_or(empty, Vec::as_slice);
+        let places = row_places.as_array().map_or(empty, Vec::as_slice);
+        // Paint order: by anchor, an inlay hint before inline text at a shared anchor.
+        let mut items: Vec<(usize, usize, Item)> = hints
+            .iter()
+            .enumerate()
+            .filter_map(|(i, h)| {
+                let [col, text, ..] = h.as_array()?.as_slice() else {
+                    return None;
+                };
+                let width = unicode::grapheme_cells(text.as_str()?);
+                Some((col.as_u64()? as usize, width, Item::Hint(i)))
+            })
+            .chain(places.iter().enumerate().filter_map(|(i, p)| {
+                let [pos, col, _, chunks, ..] = p.as_array()?.as_slice() else {
+                    return None;
+                };
+                (pos.as_u64()? == POS_INLINE).then_some(())?;
+                Some((col.as_u64()? as usize, chunks_width(chunks), Item::Virt(i)))
+            }))
+            .collect();
+        items.sort_by_key(|item| item.0);
+        let splices: Vec<(usize, usize)> = items.iter().map(|&(c, w, _)| (c, w)).collect();
+        let at = unicode::row_scroll(leftcol, &splices);
+        lefts.push(at.left as u64);
+        shifted |= at.left != leftcol;
+        if at.hidden == 0 && at.skip == 0 {
+            continue;
+        }
+        if at.skip > 0 {
+            match items[at.hidden].2 {
+                Item::Hint(i) => {
+                    if let Some(Value::Array(row_hints)) = hint_rows.get_mut(row) {
+                        if let Value::Array(hint) = &mut row_hints[i] {
+                            let text = hint[1].as_str().unwrap_or_default();
+                            hint[1] = Value::from(unicode::skip_cells(text, at.skip));
+                        }
+                    }
+                }
+                Item::Virt(i) => {
+                    if let Value::Array(places) = row_places {
+                        if let Value::Array(place) = &mut places[i] {
+                            skip_chunks(&mut place[3], at.skip);
+                        }
+                    }
+                }
+            }
+        }
+        // Drop the hidden, last index first so the earlier ones stay valid.
+        let mut hint_gone: Vec<usize> = Vec::new();
+        let mut virt_gone: Vec<usize> = Vec::new();
+        for item in &items[..at.hidden] {
+            match item.2 {
+                Item::Hint(i) => hint_gone.push(i),
+                Item::Virt(i) => virt_gone.push(i),
+            }
+        }
+        hint_gone.sort_unstable_by(|a, b| b.cmp(a));
+        virt_gone.sort_unstable_by(|a, b| b.cmp(a));
+        if let Some(Value::Array(row_hints)) = hint_rows.get_mut(row) {
+            for i in hint_gone {
+                row_hints.remove(i);
+            }
+        }
+        if let Value::Array(places) = row_places {
+            for i in virt_gone {
+                places.remove(i);
+            }
+        }
+    }
+    if shifted {
+        Value::Array(lefts.into_iter().map(Value::from).collect())
+    } else {
+        Value::Array(Vec::new())
     }
 }
 

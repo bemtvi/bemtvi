@@ -86,6 +86,97 @@ pub fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
+/// Cells `s` takes on the clients' grapheme grid: each cluster measured on its own,
+/// which is how they lay out spliced text such as inline `virt_text`.
+pub fn grapheme_cells(s: &str) -> usize {
+    s.graphemes(true).map(UnicodeWidthStr::width).sum()
+}
+
+/// The column text column `col` paints at once a line's inline cells are counted:
+/// `splices` are `(anchor, width)` ascending by anchor, and a splice comes right before
+/// the text at its anchor. The line's one screen-column space, which `leftcol` counts in.
+pub fn painted_col(col: usize, splices: &[(usize, usize)]) -> usize {
+    col + splices
+        .iter()
+        .take_while(|s| s.0 <= col)
+        .map(|s| s.1)
+        .sum::<usize>()
+}
+
+/// The column the cells of text column `col` start at, its own inline text included:
+/// [`painted_col`] less the splices anchored on it. Neovim sizes a character with its
+/// inline text, so this is the left edge a scroll must reach to show it whole.
+pub fn painted_start(col: usize, splices: &[(usize, usize)]) -> usize {
+    col + splices
+        .iter()
+        .take_while(|s| s.0 < col)
+        .map(|s| s.1)
+        .sum::<usize>()
+}
+
+/// Where a horizontal scroll leaves one row. See [`row_scroll`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowScroll {
+    /// The text column the row's visible part starts from: `leftcol` less every inline
+    /// cell the scroll hides. A row with nothing spliced left of it has `leftcol`.
+    pub left: usize,
+    /// How many leading splices are entirely hidden.
+    pub hidden: usize,
+    /// Cells hidden of the splice after those, the one the scroll falls inside.
+    pub skip: usize,
+}
+
+/// Apply `leftcol`, a column of the line's text and inline cells together, to a row's
+/// `splices` (`(anchor, width)` in paint order). Neovim's `w_leftcol` model: a splice
+/// the scroll falls inside shows the rest of its cells, and past a whole one the text
+/// after it stays where its cells put it.
+pub fn row_scroll(leftcol: usize, splices: &[(usize, usize)]) -> RowScroll {
+    let mut shift = 0;
+    for (i, &(anchor, width)) in splices.iter().enumerate() {
+        let start = anchor + shift;
+        if leftcol <= start {
+            return RowScroll {
+                left: leftcol - shift,
+                hidden: i,
+                skip: 0,
+            };
+        }
+        if leftcol < start + width {
+            let skip = leftcol - start;
+            return RowScroll {
+                left: leftcol - shift - skip,
+                hidden: i,
+                skip,
+            };
+        }
+        shift += width;
+    }
+    RowScroll {
+        left: leftcol - shift,
+        hidden: splices.len(),
+        skip: 0,
+    }
+}
+
+/// `s` without its first `cells` cells. A wide character the cut falls inside leaves a
+/// blank for its remaining cell, so what follows keeps its column.
+pub fn skip_cells(s: &str, cells: usize) -> String {
+    let mut left = cells;
+    let mut out = String::new();
+    for g in s.graphemes(true) {
+        let w = UnicodeWidthStr::width(g);
+        if left == 0 {
+            out.push_str(g);
+        } else if left >= w {
+            left -= w;
+        } else {
+            out.extend(std::iter::repeat_n(' ', w - left));
+            left = 0;
+        }
+    }
+    out
+}
+
 /// The number of display **rows** `lines` occupy when soft-wrapped to `width` columns
 /// — the height a `wrap`ped float needs to show the content without clipping, since a
 /// single long line (a reflowed markdown paragraph) spans several rows. Each line is
@@ -107,7 +198,7 @@ pub fn wrapped_row_count(
     }
     lines
         .iter()
-        .map(|l| wrap_segments_indented(l, tabstop, width, 0, linebreak).len())
+        .map(|l| wrap_segments_indented(l, tabstop, width, 0, linebreak, &[]).len())
         .sum()
 }
 
@@ -168,7 +259,7 @@ pub struct WrapSeg {
 /// documented v1 limitation. Leading indentation, the common case, sits on the
 /// first segment and is unaffected.)
 pub fn wrap_segments(line: &str, tabstop: usize, width: usize) -> Vec<WrapSeg> {
-    wrap_segments_indented(line, tabstop, width, 0, false)
+    wrap_segments_indented(line, tabstop, width, 0, false, &[])
 }
 
 /// A window's soft-wrap config — where a row may break (`'linebreak'`) and the
@@ -280,12 +371,22 @@ pub fn cont_indent(line: &str, tabstop: usize, width: usize, wo: WrapOpts) -> us
 /// blank before it in the row still hard-breaks at the edge, so an over-long word
 /// (a URL, a path) — or one that an indent alone precedes — fills its rows rather
 /// than leaving them empty.
+///
+/// `splices` are the line's inline cells ([`Buffer::inline_splices`]): `(anchor text
+/// column, width)` ascending by anchor. Each takes room on the row holding its anchor,
+/// so that row covers fewer text columns; `start_col` stays a text column. A splice
+/// that doesn't fit what's left of its row moves down whole with its anchor character,
+/// so a label is never split. One wider than a whole row starts a row and is clipped
+/// there. One anchored past the text, without room, gets a final row of its own.
+///
+/// [`Buffer::inline_splices`]: crate::buffer::Buffer::inline_splices
 pub fn wrap_segments_indented(
     line: &str,
     tabstop: usize,
     width: usize,
     cont_indent: usize,
     linebreak: bool,
+    splices: &[(usize, usize)],
 ) -> Vec<WrapSeg> {
     if width == 0 {
         return vec![WrapSeg {
@@ -312,8 +413,16 @@ pub fn wrap_segments_indented(
     let mut word_start: Option<(usize, usize)> = None;
     let mut after_blank = false;
     let mut seen_word = false;
+    // The next splice not yet placed, and the inline cells on the current row.
+    let mut next_splice = 0;
+    let mut row_inline = 0;
     for g in line.graphemes(true) {
         let w = grapheme_width(g, col, tabstop);
+        let reached = next_splice;
+        while next_splice < splices.len() && splices[next_splice].0 <= col {
+            next_splice += 1;
+        }
+        let pending: usize = splices[reached..next_splice].iter().map(|s| s.1).sum();
         // The current row's usable width: full for the first segment, reduced by the
         // continuation indent for every later one.
         let avail = if seg_start_byte == 0 {
@@ -323,7 +432,7 @@ pub fn wrap_segments_indented(
         };
         // Break *before* a grapheme that would overflow the current row, but never
         // emit an empty row (so an over-wide grapheme still occupies its own row).
-        if col + w > seg_start_col + avail && byte > seg_start_byte {
+        if col + row_inline + pending + w > seg_start_col + avail && byte > seg_start_byte {
             // Under `'linebreak'`, back the break up to the start of the word being
             // split — but only when that word actually started inside this row, else
             // there is nothing to move down and the row breaks at the edge.
@@ -338,6 +447,12 @@ pub fn wrap_segments_indented(
             });
             seg_start_byte = brk_byte;
             seg_start_col = brk_col;
+            // Only the splices anchored in a word that moved down come along.
+            row_inline = splices[..reached]
+                .iter()
+                .filter(|s| s.0 >= brk_col)
+                .map(|s| s.1)
+                .sum();
             // The word that moved down starts the new row, so it is no longer a break
             // candidate; the next blank run opens the next one.
             word_start = None;
@@ -352,8 +467,25 @@ pub fn wrap_segments_indented(
             after_blank = false;
             seen_word = true;
         }
+        row_inline += pending;
         col += w;
         byte += g.len();
+    }
+    // Splices anchored past the text sit after it, on a row of their own if need be.
+    let pending: usize = splices[next_splice..].iter().map(|s| s.1).sum();
+    let avail = if seg_start_byte == 0 {
+        width
+    } else {
+        width - cont_indent
+    };
+    if pending > 0 && col + row_inline + pending > seg_start_col + avail && byte > seg_start_byte {
+        segs.push(WrapSeg {
+            start_byte: seg_start_byte,
+            end_byte: byte,
+            start_col: seg_start_col,
+        });
+        seg_start_byte = byte;
+        seg_start_col = col;
     }
     segs.push(WrapSeg {
         start_byte: seg_start_byte,
@@ -375,8 +507,9 @@ pub fn window_wrap_segments(
     width: usize,
     cont_indent: usize,
     wo: WrapOpts,
+    splices: &[(usize, usize)],
 ) -> Vec<WrapSeg> {
-    let mut segs = wrap_segments_indented(line, tabstop, width, cont_indent, wo.linebreak);
+    let mut segs = wrap_segments_indented(line, tabstop, width, cont_indent, wo.linebreak, splices);
     if !wo.eol || width == 0 {
         return segs;
     }
@@ -387,7 +520,12 @@ pub fn window_wrap_segments(
         width - cont_indent.min(width.saturating_sub(1))
     };
     let cols = virtcol(line, line.len(), tabstop);
-    if cols - last.start_col >= avail {
+    let inline: usize = splices
+        .iter()
+        .filter(|s| s.0 >= last.start_col)
+        .map(|s| s.1)
+        .sum();
+    if cols - last.start_col + inline >= avail {
         segs.push(WrapSeg {
             start_byte: line.len(),
             end_byte: line.len(),

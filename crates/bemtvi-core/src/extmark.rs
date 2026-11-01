@@ -198,7 +198,8 @@ pub struct VirtDecor {
     pub virt_text: Vec<VirtChunk>,
     pub virt_text_pos: VirtTextPos,
     /// Hide the `virt_text` when the line is covered (e.g. by a visual block);
-    /// stored for parity, honored by the renderer.
+    /// honored by the renderer. Not for an `Inline` mark, whose cells are part of the
+    /// line's columns.
     pub virt_text_hide: bool,
     /// Paint the `virt_text` with only the **foreground** of its highlight group —
     /// the background (and `reverse`) are dropped, so the surface underneath shows

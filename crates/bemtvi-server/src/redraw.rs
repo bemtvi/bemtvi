@@ -346,6 +346,8 @@ impl EditHost {
             let diagnostics_virt_layer = layer("diagnostics_virt");
             let number_width_v = layer("number_width");
             let sign_width_v = layer("sign_width");
+            let gutter_text_v = layer("gutter_text");
+            let gutter_text_width_v = layer("gutter_text_width");
             let leftcol_v = layer("leftcol");
             let numbers_v = layer("numbers");
             let number_shown = matches!(layer("number"), Value::Boolean(true))
@@ -393,6 +395,8 @@ impl EditHost {
                 diagnostics_virt: &diagnostics_virt_layer,
                 number_width: &number_width_v,
                 sign_width: &sign_width_v,
+                gutter_text: &gutter_text_v,
+                gutter_text_width: &gutter_text_width_v,
                 number_shown,
                 leftcol: &leftcol_v,
                 numbers: &numbers_v,
@@ -667,6 +671,13 @@ impl EditHost {
         let sign_cells = self.merged_sign_cells(win.buffer, &win.winhl, &segments, styles);
         let diagnostics_signs = crate::extmarks::signs_value(&sign_cells);
         let sign_width = crate::extmarks::sign_width_from_cells(&sign_cells, win.signcolumn);
+        // The gutter text column (`gutter_text` marks), between the numbers and the
+        // text. A core extmark, so both builds project it; its width is core's.
+        // Its shipped width is capped to what the other gutters leave of the window
+        // (see `gutter_text_cap`), and the band below ships rows to the same cap.
+        let gutter_text_width = gutter_text_cap(win, sign_width);
+        let gutter_text =
+            self.extmark_gutter_cells(win.buffer, &win.winhl, &segments, gutter_text_width, styles);
         // Diagnostic underline spans + inline virtual text. Like the gutter signs
         // above, both read the core-/tick-shared `diagnostics_merged` store (the LSP
         // set plus the client-set `btv.diagnostic.set` set, the latter having no server
@@ -684,6 +695,7 @@ impl EditHost {
                 win,
                 s,
                 s.from_leftcol.max(s.to_leftcol) + win.rect.width,
+                gutter_text_width,
                 styles,
             ),
             None => Value::Nil,
@@ -894,6 +906,16 @@ impl EditHost {
             (Value::from("line_bg"), line_bg),
             (Value::from("diagnostics_signs"), diagnostics_signs),
             (Value::from("sign_width"), Value::from(sign_width as u64)),
+            // The gutter text column: its width (the buffer's widest `gutter_text`,
+            // `0` when none, capped at the window's content box so a huge mark can't
+            // make a client pad thousands of cells) and per row `Nil` or a
+            // `[[text, style_id], …]` run. The client paints it between the number
+            // gutter and the text.
+            (
+                Value::from("gutter_text_width"),
+                Value::from(gutter_text_width as u64),
+            ),
+            (Value::from("gutter_text"), gutter_text),
             (Value::from("inlay_hints"), inlay_hints),
             (Value::from("status"), status),
             // Whether this window paints its own status row (per `'laststatus'`).
@@ -1238,6 +1260,7 @@ impl EditHost {
         win: &bemtvi_core::WindowView,
         s: &ScrollAnim,
         reach: usize,
+        gutter_text_width: usize,
         styles: &mut StyleTable,
     ) -> Value {
         let (buffer, winhl, tabstop) = (win.buffer, &win.winhl, win.tabstop);
@@ -1285,6 +1308,10 @@ impl EditHost {
         // The line-background layer rides the band too, so a code block's tint slides
         // with the text (mirrors `window_value`).
         let line_bg = self.line_bg_for(buffer, winhl, &segments, styles);
+        // …and so does the gutter text column, so a diff's numbers slide with their
+        // lines.
+        let gutter_text =
+            self.extmark_gutter_cells(buffer, winhl, &segments, gutter_text_width, styles);
         Value::Map(vec![
             (Value::from("from_row"), Value::from(s.from_row as u64)),
             (Value::from("to_row"), Value::from(s.to_row as u64)),
@@ -1326,6 +1353,7 @@ impl EditHost {
             (Value::from("diagnostics_virt"), diagnostics_virt),
             (Value::from("diagnostics"), diagnostics),
             (Value::from("diagnostics_signs"), diagnostics_signs),
+            (Value::from("gutter_text"), gutter_text),
         ])
     }
 
@@ -1929,6 +1957,21 @@ fn rect_value(rect: &ViewRect) -> Value {
         (Value::from("width"), Value::from(rect.width as u64)),
         (Value::from("height"), Value::from(rect.height as u64)),
     ])
+}
+
+/// The gutter text column's width as shipped for `win`: the buffer's widest mark, but
+/// never more than the window's content box (`left_gutters + text_width`) leaves
+/// beside the fold, sign (`sign_width`, the width this frame ships) and number
+/// gutters. The clients lay the four out side by side and start the text after them,
+/// so a wider column would push the text origin, and the column's own backgrounds,
+/// past the window's right edge into its neighbour.
+fn gutter_text_cap(win: &bemtvi_core::WindowView, sign_width: u16) -> usize {
+    let others = win.foldcolumn_width + usize::from(sign_width) + win.number_width;
+    win.gutter_text_width.min(
+        win.left_gutters
+            .saturating_add(win.text_width)
+            .saturating_sub(others),
+    )
 }
 
 /// One visible row's soft-wrap **segment**, for the per-row server overlay

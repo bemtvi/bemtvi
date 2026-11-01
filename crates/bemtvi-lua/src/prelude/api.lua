@@ -828,7 +828,8 @@ local EXTMARK_OPT_OK = {
 -- `sign_hl_group`: the sign is merged with the LSP diagnostic signs into the row's single
 -- sign cell (`extmarks.rs::merged_sign_cells`, highest `priority` wins) and its
 -- highlight is resolved through the window's `winhighlight` into the cell's style, so a
--- plugin's signs paint AND take their colour. The remainder — conceal and the other
+-- plugin's signs paint AND take their colour. `gutter_text` RENDERS too, in its own
+-- column between the line numbers and the text. The remainder — conceal and the other
 -- line-highlight groups — are accepted and stored but unpainted. (The gravity flags
 -- `right_gravity` / `end_right_gravity` are NOT in this bucket — they are honored end to
 -- end; see `EXTMARK_OPT_OK` and `btv.buf.set_extmark`.) For the unpainted rest, a
@@ -858,6 +859,9 @@ local EXTMARK_OPT_DECORATION = {
   -- repeated across the line's width), e.g. a rule on a blank alignment row. Both
   -- `sign_text` and `line_fill` RENDER (the rest below are stored-but-unpainted).
   line_fill = true,
+  -- `gutter_text = { { text, group? }, … }` — btv-native: the line's text in the gutter
+  -- text column, between the line numbers and the text. RENDERS end to end.
+  gutter_text = true,
   number_hl_group = true,
   line_hl_group = true,
   cursorline_hl_group = true,
@@ -869,6 +873,48 @@ local EXTMARK_OPT_DECORATION = {
   undo_restore = true,
   invalidate = true,
 }
+
+-- Refuse a `gutter_text` that isn't a list of `{ text, group? }` chunks, naming the key
+-- and the chunk. A newline, a tab or any other control character is refused too: a
+-- column cell can show none of them. So is anything that would paint less than it
+-- says: an empty list, a chunk past a hole or beside a named key (never visited), and
+-- a chunk slot past the group (ignored).
+local function check_gutter_text(value, prefix, level)
+  local not_a_list = prefix .. ": gutter_text must be a list of { text, group? } chunks"
+  if type(value) ~= "table" or next(value) == nil then
+    error(not_a_list, level + 1)
+  end
+  local keys = 0
+  for _ in pairs(value) do
+    keys = keys + 1
+  end
+  if keys ~= #value or value[keys] == nil then
+    error(not_a_list, level + 1)
+  end
+  for i, chunk in ipairs(value) do
+    local where = prefix .. ": gutter_text[" .. i .. "]"
+    if type(chunk) ~= "table" or type(chunk[1]) ~= "string" then
+      error(where .. " must be { text, group? } with a string text", level + 1)
+    end
+    for k in pairs(chunk) do
+      if k ~= 1 and k ~= 2 then
+        error(where .. " must be { text, group? }: unexpected slot " .. tostring(k), level + 1)
+      end
+    end
+    if chunk[2] ~= nil and type(chunk[2]) ~= "string" then
+      error(where .. ": the group must be a string", level + 1)
+    end
+    if chunk[1]:find("[\n\t]") then
+      error(where .. " may not contain a newline or a tab", level + 1)
+    end
+    -- Any other C0 control, DEL, or a C1 control (U+0080..U+009F, UTF-8 `\194\128`..
+    -- `\194\159`): none has a cell, and the frame would ship it scrubbed to a wider
+    -- `^X` / `<xx>` spelling than the column was measured at.
+    if chunk[1]:find("[%z\1-\31\127]") or chunk[1]:find("\194[\128-\159]") then
+      error(where .. " may not contain a control character", level + 1)
+    end
+  end
+end
 
 -- Split a `set_extmark`-shaped option table into the positional payload the
 -- `btv._extmark_set` bridge takes, validating as it goes: an unknown key fails loud,
@@ -901,6 +947,10 @@ function btv._extmark_split_opts(opts, prefix, level)
   local hl_group = opts.hl_group
   if hl_group ~= nil and type(hl_group) ~= "string" then
     error(prefix .. ": hl_group must be a string (group lists not supported yet)", level)
+  end
+  if opts.gutter_text ~= nil then
+    -- `level` counts from this function; the checker is one frame further down.
+    check_gutter_text(opts.gutter_text, prefix, level == 0 and -1 or level)
   end
   -- `end_line` is the deprecated alias for `end_row`; honor either.
   local end_row = opts.end_row
@@ -942,6 +992,20 @@ end
 -- does NOT grow when you type at its edges (a highlight span); `right_gravity = false`
 -- with `end_right_gravity = true` makes an (even empty) range GROW to swallow text
 -- typed at either edge — the anchor shape a live snippet tabstop needs.
+--
+-- `gutter_text` (btv-native) fills the gutter text column, between the line numbers and
+-- the text, on the mark's line: a non-empty list of `{ text, group? }` chunks, such as a
+-- diff's old and new line numbers. The column is as wide as the widest `gutter_text` in
+-- the buffer, in screen cells, but never wider than the window has left beside its other
+-- gutters, and a shorter one is padded on the right. A chunk with no group paints as
+-- `LineNr` (`CursorLineNr` on the cursor line). The highest `priority` mark on a line
+-- wins, then the higher mark id; they don't concatenate. A malformed list raises,
+-- naming the chunk, and so does a newline, a tab or any other control character in the
+-- text.
+--
+-- ```lua
+-- btv.buf.set_extmark(0, ns, 4, 0, { gutter_text = { { "  12 ", "DiffDelete" }, { "     " } } })
+-- ```
 function btv.buf.set_extmark(buffer, ns, line, col, opts)
   local b = btv._resolve_bufnr(buffer)
   opts = opts or {}

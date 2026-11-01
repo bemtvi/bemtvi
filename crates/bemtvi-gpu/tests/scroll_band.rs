@@ -26,6 +26,7 @@ fn gesture() -> ScrollData {
         diagnostics_virt: vec![None, Some(("■ E123: oops".into(), 1, None)), None],
         diagnostics: vec![vec![], vec![(0, 4, 1, None)], vec![]],
         diagnostics_signs: vec![None, Some(("E".into(), 1, None)), None],
+        gutter_text: vec![Some(vec![(" 12".into(), None)]), None, None],
         ..ScrollData::default()
     }
 }
@@ -43,4 +44,6 @@ fn band_frame_carries_inline_diagnostics() {
     // The sibling diagnostic layers were carried all along — keep them locked.
     assert_eq!(frame.diagnostics, &data.diagnostics[..]);
     assert_eq!(frame.diagnostics_signs, &data.diagnostics_signs[..]);
+    // …and so does the gutter text column, so a diff's numbers slide with their lines.
+    assert_eq!(frame.gutter_text, &data.gutter_text[..]);
 }

@@ -287,7 +287,7 @@ end
 -- `:set_decor(ns, marks)` — replace namespace `ns`'s decoration on the view buffer
 -- with `marks`. Each mark is `{ line, col, <extmark opts> }` (0-based `line`/`col`,
 -- then any `nvim_buf_set_extmark` opt: `hl_group`, `end_col`, `virt_text`,
--- `sign_text`, `priority`, …). A no-op (warned) before the buffer exists.
+-- `sign_text`, `gutter_text`, `priority`, …). A no-op (warned) before the buffer exists.
 function View:set_decor(ns, marks)
   local buf = self:bufnr()
   if not buf then

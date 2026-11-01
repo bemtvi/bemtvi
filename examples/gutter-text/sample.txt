@@ -1,0 +1,9 @@
+@@ -10,5 +10,6 @@ fn main() {
+     let args = parse_args();
+-    let cfg = load(&args);
++    let cfg = load(&args)?;
++    cfg.validate()?;
+     let out = run(&cfg); // the result of the run, printed below once it has been formatted for the terminal
+-    print(out);
++    println!("{out}");
+ }

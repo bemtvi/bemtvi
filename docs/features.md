@@ -33,6 +33,7 @@ the one-liner is the elevator pitch.
 | [Permanent docks](features/docks.md) | VSCode-style editable edge panels (file tree, terminals, problem lists) that are global across tabs, toggle independently of windows, and carry their own tabs and options. |
 | [Fuzzy picker](features/picker.md) | `btv.picker`: a server-owned fuzzy finder with streaming Lua sources, live (`dynamic`) sources, a file/location preview pane, and fully rebindable keys. |
 | [Quickfix & named-list dock tabs](features/quickfix-dock-lists.md) | The quickfix list and named lists open as bottom-dock tabs by default (`'qfdock'`) — several searches side by side, entries jumping into the main area — with the `btv.qf.*` sinks and the picker's `<C-q>` / `<Tab>` multi-select. Location lists keep vim's split behavior. |
+| [Gutter text](features/gutter-text.md) | A column of a plugin's own text between the line numbers and the text (the `gutter_text` extmark key): a diff's old and new line numbers, a blame hash and author. It isn't part of the line, so a sideways scroll, a click, `$` and wrapping all keep working. |
 
 ## Platform
 

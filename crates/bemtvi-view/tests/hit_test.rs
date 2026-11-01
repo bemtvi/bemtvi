@@ -228,6 +228,39 @@ fn the_i_beam_is_over_the_text_only() {
 }
 
 #[test]
+fn the_gutter_text_column_keeps_the_arrow() {
+    // A 4-cell number gutter, then a 6-cell gutter text column: text starts at 10.
+    let mut win = text_win(
+        WinRect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 23,
+        },
+        true,
+    );
+    win.number = true;
+    win.number_width = 4;
+    win.gutter_text_width = 6;
+    let view = View {
+        windows: vec![win],
+        ..Default::default()
+    };
+    assert!(
+        !text_pointer_at(&view, geo(), 3, 4),
+        "the column's first cell"
+    );
+    assert!(
+        !text_pointer_at(&view, geo(), 3, 9),
+        "the column's last cell"
+    );
+    assert!(
+        text_pointer_at(&view, geo(), 3, 10),
+        "the first text column"
+    );
+}
+
+#[test]
 fn a_read_only_window_or_a_float_over_the_text_keeps_the_arrow() {
     let rect = |x, width| WinRect {
         x,

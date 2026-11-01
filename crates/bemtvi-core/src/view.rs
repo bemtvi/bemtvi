@@ -583,7 +583,8 @@ pub struct WindowView {
     /// fold or sign column is shown.
     pub text_width: usize,
     /// Width in cells of every left gutter the client carves off before the text
-    /// body — the fold column, the sign column, then the number gutter (exactly
+    /// body — the fold column, the sign column, the number gutter, then the gutter
+    /// text column (exactly
     /// the terms [`text_width`](WindowView::text_width) subtracts from the content
     /// box). The client's text-body origin is the content origin plus this many
     /// cells, so a consumer anchoring to the painted text inner (the menu box's
@@ -599,6 +600,10 @@ pub struct WindowView {
     /// for open folds, `+` for a closed one, spaces elsewhere). Empty when
     /// `foldcolumn` is `0`.
     pub foldcolumn: Vec<String>,
+    /// Width in cells of the gutter text column, between the number gutter and the
+    /// text: the widest `gutter_text` extmark in the buffer, `0` when there is none.
+    /// The per-row text is projected by the server, which resolves its highlights.
+    pub gutter_text_width: usize,
     /// This window's `'signcolumn'` policy. Carried so the server (which owns the
     /// diagnostics that fill the column) can resolve it to a rendered sign width;
     /// core itself only consults its [`floor`](crate::SignColumn::floor_cells) for
@@ -912,6 +917,9 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         .expect("a live window's buffer is always open");
     let line_count = buf.line_count();
     let number_width = ed.number_width_for(&w.options, line_count);
+    // The gutter text column's width: the buffer's widest `gutter_text` mark, kept by
+    // the extmark store as marks change (never a walk of the marks here).
+    let gutter_text_width = buf.extmarks.gutter_text_width();
     // A bordered float spends one cell on each side on its border, so its content
     // (gutter + text + status) lives in the rect inset by one cell. Tiled windows
     // and borderless floats use the whole rect. The client draws the border on the
@@ -946,17 +954,18 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         .saturating_sub(usize::from(status_visible))
         .max(1);
     // The text area is the content box minus *every* gutter the client carves off its
-    // left: the fold column, then the sign column, then the number gutter (the order
-    // the clients split them in). Counting only the number gutter here would wrap
+    // left: the fold column, then the sign column, then the number gutter, then the
+    // gutter text column (the order the clients split them in). Counting only the number gutter here would wrap
     // segments too wide by the other two, and the client would clip each row's tail
     // off the right edge — text silently lost on `wrap`, and a `nowrap` line that
     // looks like it fits.
     let width = content_width
         .saturating_sub(w.options.foldcolumn)
         .saturating_sub(signcol_cells(w.sign_width, &w.options))
-        .saturating_sub(number_width);
+        .saturating_sub(number_width)
+        .saturating_sub(gutter_text_width);
     // The left-gutter total the client carves off before the text body (fold +
-    // sign + number, the same terms `width` subtracts). A consumer matching the
+    // sign + number + gutter text, the same terms `width` subtracts). A consumer matching the
     // painted text inner — the menu box's x-anchor — must offset the content
     // origin by all three, not just the number gutter.
     let left_gutters = content_width.saturating_sub(width);
@@ -1418,6 +1427,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         left_gutters,
         foldcolumn_width,
         foldcolumn,
+        gutter_text_width,
         signcolumn: w.options.signcolumn,
         padding: pad,
         tabstop: buf.options.effective_tabstop(),

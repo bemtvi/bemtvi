@@ -651,6 +651,8 @@ dependencies = [
  "image",
  "libc",
  "rmpv",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

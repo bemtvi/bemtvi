@@ -1826,6 +1826,10 @@ function btv._set_extmark_mirror(entries, positions)
           decoration = decoration or {}
           decoration.line_hl_group = m.line_hl_group
         end
+        if m.gutter_text ~= nil then
+          decoration = decoration or {}
+          decoration.gutter_text = m.gutter_text
+        end
         by_ns[m.ns][m.id] = {
           row = m.row,
           col = m.col,

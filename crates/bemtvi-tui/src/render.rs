@@ -16,8 +16,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::images::ImageStore;
 use bemtvi_view::{
-    arm_scroll, doc_box, elide_middle, fit_row, gutter_cell, lerp, pmenu_row, pmenu_start,
-    row_head_col, row_hl_extent, CellRect, ScrollAnim,
+    arm_scroll, doc_box, elide_middle, fit_gutter_text, fit_row, gutter_cell, lerp, pmenu_row,
+    pmenu_start, row_head_col, row_hl_extent, CellRect, ScrollAnim,
 };
 use bemtvi_view::{
     DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, MenuData, MenuField,
@@ -960,6 +960,7 @@ fn render_window(
     // blanking out for the ~150ms slide.
     let anim_diag: Vec<Vec<DiagSpan>>;
     let anim_signs: Vec<Option<DiagSign>>;
+    let anim_gutter_text: Vec<Option<Vec<VirtChunk>>>;
     let anim_search: SearchSpans;
     let anim_incsearch: IncSearchSpans;
     // The line-background layer rides the band too (sliced to the visible window like
@@ -982,6 +983,8 @@ fn render_window(
     // assigned in the same match as the other frame fields.
     let frame_diag: &[Vec<DiagSpan>];
     let frame_signs: &[Option<DiagSign>];
+    // The gutter text column rides the band like the signs.
+    let frame_gutter_text: &[Option<Vec<VirtChunk>>];
     let frame_numbers: &[Option<usize>];
     // Soft-wrap continuation flags, sliced like `numbers`, so the gutter blanks the
     // wrapped rows whether the viewport is settled or mid-slide.
@@ -1097,6 +1100,13 @@ fn render_window(
                 .take(height)
                 .cloned()
                 .collect();
+            anim_gutter_text = a
+                .gutter_text
+                .iter()
+                .skip(off)
+                .take(height)
+                .cloned()
+                .collect();
             // Search matches ride the slide too, sliced to the visible window like
             // the highlights, so `hlsearch` stays lit on the moving text.
             anim_search = a.search.iter().skip(off).take(height).cloned().collect();
@@ -1123,6 +1133,7 @@ fn render_window(
             frame_diag_virt = &anim_diag_virt;
             frame_diag = &anim_diag;
             frame_signs = &anim_signs;
+            frame_gutter_text = &anim_gutter_text;
             frame_search = &anim_search;
             frame_incsearch = &anim_incsearch;
             frame_line_bg = &anim_line_bg;
@@ -1145,6 +1156,7 @@ fn render_window(
             frame_diag_virt = &win.diagnostics_virt;
             frame_diag = &win.diagnostics;
             frame_signs = &win.diagnostics_signs;
+            frame_gutter_text = &win.gutter_text;
             frame_search = &win.search;
             frame_incsearch = &win.incsearch;
             frame_line_bg = &win.line_bg;
@@ -1243,6 +1255,19 @@ fn render_window(
         gutter_area
     };
 
+    // The gutter text column (`gutter_text` marks), between the numbers and the
+    // text. Painted below, once the palette resolves its chunks' styles.
+    let (gutter_text_area, text_inner) = if win.gutter_text_width > 0 {
+        let cols = Layout::horizontal([
+            Constraint::Length(win.gutter_text_width),
+            Constraint::Min(0),
+        ])
+        .split(text_inner);
+        (Some(cols[0]), cols[1])
+    } else {
+        (None, text_inner)
+    };
+
     // `'colorcolumn'`: paint a vertical ruler down the text body at each configured
     // column. Screen cell = text origin + (col - 1) - leftcol; a column scrolled off
     // the left under `nowrap`, or past the right edge, is skipped. Painted after the
@@ -1326,6 +1351,17 @@ fn render_window(
     // resolves style ids.
     if let Some(sign_area) = sign_area {
         render_sign_column(frame, sign_area, frame_signs, &palette);
+    }
+    if let Some(area) = gutter_text_area {
+        render_gutter_text(
+            frame,
+            area,
+            (frame_gutter_text, frame_numbers),
+            current_line,
+            win,
+            view,
+            &palette,
+        );
     }
     render_text(
         frame,
@@ -1505,6 +1541,53 @@ fn render_gutter(
                         .unwrap_or_else(|| Style::default().add_modifier(Modifier::DIM))
                 };
                 Line::from(Span::styled(cell, style))
+            })
+            .collect::<Vec<_>>(),
+    );
+    frame.render_widget(Paragraph::new(text), area);
+}
+
+/// Paint the gutter text column reserved by [`render_window`]: each row's chunks
+/// fitted to the column ([`fit_gutter_text`]), each in its own palette style over
+/// the number column's (`CursorLineNr` on the cursor line, else `LineNr`), which a
+/// chunk with no style paints in alone. A row with no gutter text stays blank.
+fn render_gutter_text(
+    frame: &mut Frame,
+    area: Rect,
+    (rows, numbers): (&[Option<Vec<VirtChunk>>], &[Option<usize>]),
+    current_line: usize,
+    win: &WindowView,
+    view: &View,
+    palette: &[Style],
+) {
+    let width = area.width as usize;
+    let text = Text::from(
+        (0..area.height as usize)
+            .map(|row| {
+                let current = numbers.get(row).copied().flatten() == Some(current_line);
+                let plain = if current {
+                    win.cursor_line_nr(view).map(rt).unwrap_or_default()
+                } else {
+                    win.line_nr(view)
+                        .map(rt)
+                        .unwrap_or_else(|| Style::default().add_modifier(Modifier::DIM))
+                };
+                let chunks = rows.get(row).and_then(Option::as_deref);
+                Line::from(
+                    fit_gutter_text(chunks, width)
+                        .into_iter()
+                        .map(|(t, id)| {
+                            // A chunk's group composes over the number column's
+                            // colours, so one that sets only a background (a diff's
+                            // `DiffDelete`) keeps the `LineNr` foreground, as the GUI
+                            // and the browser paint it.
+                            let style = id
+                                .and_then(|i| palette.get(i).copied())
+                                .map_or(plain, |s| plain.patch(s));
+                            Span::styled(t, style)
+                        })
+                        .collect::<Vec<_>>(),
+                )
             })
             .collect::<Vec<_>>(),
     );

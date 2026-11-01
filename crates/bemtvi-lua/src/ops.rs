@@ -1351,6 +1351,10 @@ pub struct VirtDecorData {
     /// background (full width, `hl_eol` semantics), projected as the per-window
     /// `line_bg` layer painted under the text. `None` ⇒ no line background.
     pub line_hl_group: Option<String>,
+    /// `btv`-native text for the gutter text column (between the line numbers and
+    /// the text) as `{text, hl_group}` chunks; empty ⇒ none. See
+    /// [`bemtvi_core::VirtDecor::gutter_text`].
+    pub gutter_text: Vec<VirtChunkData>,
 }
 
 #[derive(Clone, Debug)]

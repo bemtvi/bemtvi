@@ -93,6 +93,38 @@ fn viewport_byte_range(
     Some((lo, hi))
 }
 
+/// `chunks` cut to the first `max_cells` display cells, per grapheme as the column's
+/// width is measured, or `None` when they already fit (the common case: no copy). A
+/// wide grapheme the cut would split becomes spaces in its chunk's style, as the
+/// clients' own fit (`fit_gutter_text`) spells it, so a background band still reaches
+/// the edge. The walk stops at the cut, so a huge string costs `max_cells`, not its
+/// length.
+fn clip_gutter_chunks(chunks: &[VirtChunk], max_cells: usize) -> Option<Vec<VirtChunk>> {
+    let mut used = 0usize;
+    for (i, c) in chunks.iter().enumerate() {
+        let mut at = 0usize;
+        while at < c.text.len() {
+            let next = unicode::next_grapheme(&c.text, at);
+            let w = unicode::display_width(&c.text[at..next]);
+            if used + w > max_cells {
+                let mut out: Vec<VirtChunk> = chunks[..i].to_vec();
+                let mut text = c.text[..at].to_owned();
+                text.push_str(&" ".repeat(max_cells - used));
+                if !text.is_empty() {
+                    out.push(VirtChunk {
+                        text,
+                        hl_group: c.hl_group.clone(),
+                    });
+                }
+                return Some(out);
+            }
+            used += w;
+            at = next;
+        }
+    }
+    None
+}
+
 /// The buffer's highlight-bearing extmarks, prepared **once per frame** so the
 /// per-row projection can find the marks touching its line without re-scanning the
 /// whole store.
@@ -104,9 +136,9 @@ fn viewport_byte_range(
 /// `docs/plans/2026-08-07-incremental-buffer-mirror.md`.
 ///
 /// Only marks that can actually paint are kept — a `hl_group` *and* a range `end`,
-/// which is exactly what the old per-mark clip required — each paired with its
-/// `iter_all` enumerate index so the deterministic source-layering order the scan
-/// produced is preserved byte-for-byte.
+/// which is exactly what the old per-mark clip required — each paired with its rank
+/// in `(namespace, id)` order, the layering order: within a namespace a later mark
+/// paints over an earlier one at the same priority.
 pub(crate) struct HlMarkIndex<'a> {
     /// `(enumerate order, start, end, mark)`, sorted by `start`.
     marks: Vec<(u32, usize, usize, &'a bemtvi_core::Extmark)>,
@@ -124,19 +156,32 @@ impl<'a> HlMarkIndex<'a> {
         // `viewport_byte_range`): pruning them with an integer compare first keeps the
         // sort to the handful on screen rather than every mark in the buffer, and keeps
         // one long mark from making each row's look-back walk the whole buffer's marks.
-        let (lo, hi) = viewport_byte_range(buf, segs).unwrap_or((0, 0));
-        let mut marks: Vec<(u32, usize, usize, &'a bemtvi_core::Extmark)> = buf
+        // The store's position index answers "which marks reach the viewport" without
+        // visiting the rest (`ExtmarkStore::reaching`).
+        let Some((lo, hi)) = viewport_byte_range(buf, segs) else {
+            return Self {
+                marks: Vec::new(),
+                max_end: Vec::new(),
+            };
+        };
+        let mut found: Vec<(u32, &'a bemtvi_core::Extmark)> = buf
             .extmarks
-            .iter_all()
-            .enumerate()
-            .filter_map(|(i, m)| {
+            .reaching(lo, hi)
+            .into_iter()
+            .filter(|(_, m)| {
                 // Mirrors the clip's own guards: no group or no range ⇒ paints nothing.
-                let end = m.end?;
-                m.hl_group.as_deref()?;
                 // `overlapping` keeps `start < hi && end > lo` for a row inside the
                 // viewport, so nothing outside these bounds can ever be returned.
-                (m.start < hi && end > lo).then_some((i as u32, m.start, end, m))
+                m.hl_group.is_some() && m.end.is_some_and(|end| end > lo)
             })
+            .collect();
+        // The layering order: `(namespace, id)`, so within a namespace the later mark
+        // wins a tie in priority, deterministically across namespaces too.
+        found.sort_by_key(|(ns, m)| (*ns, m.id));
+        let mut marks: Vec<(u32, usize, usize, &'a bemtvi_core::Extmark)> = found
+            .into_iter()
+            .enumerate()
+            .map(|(i, (_, m))| (i as u32, m.start, m.end.unwrap_or(m.start), m))
             .collect();
         marks.sort_by_key(|(order, start, _, _)| (*start, *order));
         let mut max_end = Vec::with_capacity(marks.len());
@@ -359,10 +404,7 @@ impl EditHost {
         };
         use std::collections::HashMap;
         let mut by_line: HashMap<usize, Vec<&bemtvi_core::Extmark>> = HashMap::new();
-        for m in buf.extmarks.iter_all() {
-            if m.start < lo || m.start >= hi {
-                continue;
-            }
+        for (_, m) in buf.extmarks.starting_in(lo, hi) {
             let Some(decor) = m.decor.as_deref() else {
                 continue;
             };
@@ -505,10 +547,7 @@ impl EditHost {
         };
         use std::collections::HashMap;
         let mut by_line: HashMap<usize, (&str, u32)> = HashMap::new();
-        for m in buf.extmarks.iter_all() {
-            if m.start < lo || m.start >= hi {
-                continue;
-            }
+        for (_, m) in buf.extmarks.starting_in(lo, hi) {
             let Some(group) = m.decor.as_deref().and_then(|d| d.line_hl_group.as_deref()) else {
                 continue;
             };
@@ -685,10 +724,7 @@ impl EditHost {
         };
         use std::collections::HashMap;
         let mut by_line: HashMap<usize, Vec<&bemtvi_core::Extmark>> = HashMap::new();
-        for m in buf.extmarks.iter_all() {
-            if m.start < lo || m.start >= hi {
-                continue;
-            }
+        for (_, m) in buf.extmarks.starting_in(lo, hi) {
             if m.decor.as_deref().is_some_and(|d| d.sign_text.is_some()) {
                 by_line
                     .entry(buf.byte_to_line(m.start))
@@ -722,6 +758,80 @@ impl EditHost {
                 Some((cell, best.priority))
             })
             .collect()
+    }
+
+    /// Per visible row, the gutter text column's chunk run `[[text, style_id], …]`
+    /// (`Nil` on a row with none). Like the number, it shows on a line's first display
+    /// row only, so a wrapped line's continuation rows, a virtual line and a filler
+    /// row stay blank; a closed fold shows its first line's. Several marks on a line
+    /// don't concatenate: the highest `priority` wins, then the highest id, as for
+    /// signs. A chunk's group resolves through `winhl`; a chunk with none rides as
+    /// `Nil`, which the client paints in the number column's colours (`LineNr`, or
+    /// `CursorLineNr` on the cursor line). Fitting the run to the column's width is
+    /// the client's (`bemtvi_view::fit_gutter_text`).
+    ///
+    /// Skipped outright when no mark in the buffer carries gutter text (the store's
+    /// O(1) width), so a buffer without the column pays nothing.
+    ///
+    /// A row ships at most `max_cells` of its text — the window's width, past which
+    /// nothing of the column can show — so a plugin's unbounded string costs a frame
+    /// no more than a window's width per row.
+    pub(crate) fn extmark_gutter_cells(
+        &self,
+        buffer: BufferId,
+        winhl: &WinHl,
+        segs: &[crate::redraw::RowSeg],
+        max_cells: usize,
+        styles: &mut StyleTable,
+    ) -> Value {
+        let empty = || Value::Array(Vec::new());
+        let Some(buf) = self.editor.buffer_of(buffer) else {
+            return empty();
+        };
+        if buf.extmarks.gutter_text_width() == 0 {
+            return empty();
+        }
+        let Some((lo, hi)) = viewport_byte_range(buf, segs) else {
+            return empty();
+        };
+        use std::collections::HashMap;
+        let mut by_line: HashMap<usize, &bemtvi_core::Extmark> = HashMap::new();
+        for (_, m) in buf.extmarks.starting_in(lo, hi) {
+            if m.decor
+                .as_deref()
+                .is_some_and(|d| !d.gutter_text.is_empty())
+            {
+                by_line
+                    .entry(buf.byte_to_line(m.start))
+                    .and_modify(|best| {
+                        if (m.priority, m.id) > (best.priority, best.id) {
+                            *best = m;
+                        }
+                    })
+                    .or_insert(m);
+            }
+        }
+        if by_line.is_empty() {
+            return empty();
+        }
+        Value::Array(
+            segs.iter()
+                .map(|seg| {
+                    let chunks = seg
+                        .line
+                        .filter(|_| seg.is_first())
+                        .and_then(|n| by_line.get(&(n - 1)))
+                        .and_then(|m| m.decor.as_deref());
+                    match chunks {
+                        Some(d) => match clip_gutter_chunks(&d.gutter_text, max_cells) {
+                            Some(clipped) => self.virt_chunks_value(&clipped, winhl, styles),
+                            None => self.virt_chunks_value(&d.gutter_text, winhl, styles),
+                        },
+                        None => Value::Nil,
+                    }
+                })
+                .collect(),
+        )
     }
 
     /// The merged gutter sign per visible row — extmark `sign_text` marks combined
@@ -796,10 +906,14 @@ impl EditHost {
         let Some(buf) = self.editor.buffer_of(buffer) else {
             return virt_text;
         };
-        // The highest-priority line_fill mark per anchor line (ties → highest id).
+        // The highest-priority line_fill mark per anchor line (ties → highest id),
+        // among the marks anchored on the visible lines.
+        let Some((lo, hi)) = viewport_byte_range(buf, segs) else {
+            return virt_text;
+        };
         use std::collections::HashMap;
         let mut by_line: HashMap<usize, &bemtvi_core::Extmark> = HashMap::new();
-        for m in buf.extmarks.iter_all() {
+        for (_, m) in buf.extmarks.starting_in(lo, hi) {
             if m.decor.as_deref().is_some_and(|d| d.line_fill.is_some()) {
                 by_line
                     .entry(buf.byte_to_line(m.start))

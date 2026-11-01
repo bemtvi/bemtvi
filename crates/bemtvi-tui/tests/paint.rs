@@ -775,6 +775,73 @@ fn cursor_lands_on_its_character_with_the_number_gutter_on() {
     );
 }
 
+/// A row of the `gutter_text` wire key: `[[text, style_id], …]`, `None` ⇒ `Nil`.
+fn gutter_row(chunks: &[(&str, Option<u64>)]) -> Value {
+    Value::Array(
+        chunks
+            .iter()
+            .map(|(t, id)| Value::Array(vec![Value::from(*t), id.map_or(Value::Nil, Value::from)]))
+            .collect(),
+    )
+}
+
+#[test]
+fn the_gutter_text_column_sits_between_the_numbers_and_the_text() {
+    // A 4-cell number gutter, then a 6-cell gutter text column. Row 1 fills it, row 2
+    // has none (blank), row 3 is shorter and padded on the right.
+    let v = view(vec![
+        ("lines", lines(&["one", "two", "three"])),
+        ("numbers", numbers(&[Some(1), Some(2), Some(3)])),
+        ("number", Value::from(true)),
+        ("number_width", Value::from(4u64)),
+        ("cursor_line", Value::from(1u64)),
+        ("cursor_row", Value::from(0u64)),
+        ("cursor_screen_col", Value::from(1u64)),
+        (
+            "styles",
+            Value::Array(vec![style(vec![("fg", rgb(0xff, 0, 0))])]),
+        ),
+        ("gutter_text_width", Value::from(6u64)),
+        (
+            "gutter_text",
+            Value::Array(vec![
+                gutter_row(&[(" 12", Some(0)), (" 13", None)]),
+                Value::Nil,
+                gutter_row(&[(" 9", None)]),
+            ]),
+        ),
+    ]);
+    let (buf, cursor) = paint_with_cursor(&v, 30, 6);
+    assert_eq!(row_text(&buf, 0).trim_end(), "  1  12 13one");
+    assert_eq!(row_text(&buf, 1).trim_end(), "  2       two");
+    assert_eq!(row_text(&buf, 2).trim_end(), "  3  9    three");
+    // The styled chunk takes its own colour; the plain one keeps the gutter's.
+    assert_eq!(fg(&buf, 5, 0), Some(Color::Rgb(255, 0, 0)));
+    assert_ne!(fg(&buf, 8, 0), Some(Color::Rgb(255, 0, 0)));
+    // The cursor sits on its character past both columns: 4 + 6 + 1.
+    assert_eq!(cursor, Some((11, 0)));
+}
+
+#[test]
+fn a_wide_character_cut_by_the_gutter_text_edge_becomes_a_space() {
+    // Two-cell `日` and `本` in a 3-cell column: `本` would straddle the edge.
+    let v = view(vec![
+        ("lines", lines(&["x"])),
+        ("numbers", numbers(&[Some(1)])),
+        ("gutter_text_width", Value::from(3u64)),
+        (
+            "gutter_text",
+            Value::Array(vec![gutter_row(&[("日本", None)])]),
+        ),
+    ]);
+    let buf = paint(&v, 20, 5);
+    // `日` takes cells 0-1, the cut `本` leaves a space in cell 2, and the text
+    // starts at cell 3.
+    assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "日");
+    assert_eq!(buf.cell((2, 0)).unwrap().symbol(), " ");
+    assert_eq!(buf.cell((3, 0)).unwrap().symbol(), "x");
+}
+
 #[test]
 fn gutter_disabled_paints_text_at_column_zero() {
     // No number options (the Tier-1 default): text is flush left, no gutter.
@@ -2452,4 +2519,59 @@ fn u16_extreme_colorcolumn_and_cursors_paint_without_overflow() {
         ),
     ]);
     let _ = paint(&v, 80, 24);
+}
+
+#[test]
+fn gutter_text_control_characters_never_reach_the_terminal() {
+    // A plugin's gutter text is untrusted: an escape sequence in it must not be
+    // written raw (terminal injection). No painted cell may hold a control
+    // character, and the text still starts past the column.
+    let v = view(vec![
+        ("lines", lines(&["x"])),
+        ("numbers", numbers(&[Some(1)])),
+        ("gutter_text_width", Value::from(6u64)),
+        (
+            "gutter_text",
+            Value::Array(vec![gutter_row(&[("\x1b[2J\x07\r", None)])]),
+        ),
+    ]);
+    let buf = paint(&v, 20, 5);
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            let sym = buf.cell((x, y)).unwrap().symbol();
+            assert!(
+                !sym.contains(char::is_control),
+                "cell ({x}, {y}) holds a control character: {sym:?}"
+            );
+        }
+    }
+    assert_eq!(buf.cell((6, 0)).unwrap().symbol(), "x");
+}
+
+#[test]
+fn a_gutter_text_chunk_with_only_a_background_keeps_the_number_colour() {
+    // A diff gutter's `DiffDelete`-style group that sets only a background: the
+    // chunk takes that background but keeps the number column's foreground
+    // (`LineNr`), as the GUI paints it, rather than dropping to the text colour.
+    let v = view(vec![
+        ("lines", lines(&["one", "two"])),
+        ("numbers", numbers(&[Some(1), Some(2)])),
+        ("cursor_line", Value::from(1u64)),
+        (
+            "styles",
+            Value::Array(vec![
+                style(vec![("bg", rgb(0x40, 0, 0))]),
+                style(vec![("fg", rgb(0, 0xaa, 0))]),
+            ]),
+        ),
+        ("chrome", chrome(vec![("line_nr", 1)])),
+        ("gutter_text_width", Value::from(3u64)),
+        (
+            "gutter_text",
+            Value::Array(vec![Value::Nil, gutter_row(&[(" 12", Some(0))])]),
+        ),
+    ]);
+    let buf = paint(&v, 20, 5);
+    assert_eq!(bg(&buf, 1, 1), Some(Color::Rgb(0x40, 0, 0)));
+    assert_eq!(fg(&buf, 1, 1), Some(Color::Rgb(0, 0xaa, 0)));
 }

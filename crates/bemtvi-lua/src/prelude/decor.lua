@@ -50,9 +50,9 @@ btv._decor = btv._decor or { providers = {} }
 -- }
 -- ```
 -- `hl` is the decor-native shorthand for `hl_group`. A mark that would draw nothing —
--- carrying no `hl_group`, `virt_text`, `virt_lines`, `sign_text`, `line_hl_group` or
--- `line_fill` — fails loud rather than silently painting nothing, and so does a mark
--- with an unknown key.
+-- carrying no `hl_group`, `virt_text`, `virt_lines`, `sign_text`, `line_hl_group`,
+-- `line_fill` or `gutter_text` — fails loud rather than silently painting nothing, and
+-- so does a mark with an unknown key.
 function btv.decor.provider(spec)
   if type(spec) ~= "table" or type(spec.name) ~= "string" then
     error("btv.decor.provider: requires a { name = <string>, on_range = <fn> } table", 2)
@@ -266,6 +266,7 @@ local MARK_RENDERS = {
   sign_text = true,
   line_hl_group = true,
   line_fill = true,
+  gutter_text = true,
 }
 
 -- Normalize one published mark into `{ row, col, opts }`, where `opts` is exactly the
@@ -323,7 +324,7 @@ local function normalize_mark(m, name)
       "btv.decor provider '"
         .. name
         .. "': this mark would draw nothing — give it one of "
-        .. "hl_group (or hl), virt_text, virt_lines, sign_text, line_hl_group, line_fill",
+        .. "hl_group (or hl), virt_text, virt_lines, sign_text, line_hl_group, line_fill, gutter_text",
       0
     )
   end

@@ -94,7 +94,7 @@ pub use render::{cmdline_caret_col, popup_covers, query_caret_col};
 pub use render::{apply_cursor_fg, block_cursor_colors};
 // Where a floating menu box anchors — window-relative for a completion popup, but
 // screen-relative for the command-line wildmenu. Exported for the Tier-1 `menu` test.
-pub use render::menu_box_origin;
+pub use render::{menu_box_origin, text_anchor};
 // The point-size → device-pixel font size the cell grid is measured at, exported so
 // the Tier-1 `grid` test can shape a row at a fractional display scale and check it
 // still lands on the grid.

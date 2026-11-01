@@ -14,6 +14,7 @@
 //! mark's anchors for free, across every edit path.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::OnceLock;
 
 /// Reserved namespace for the editor's secondary (multi-)cursors. They are
 /// stored as point extmarks so the buffer's single edit choke point
@@ -241,6 +242,27 @@ pub struct VirtDecor {
     /// composes on top and the fill spans the full width. Used by the rendered
     /// markdown doc floats to back fenced code blocks. `None` ⇒ no line background.
     pub line_hl_group: Option<String>,
+    /// `btv`-native: the anchored line's text in the **gutter text** column, the
+    /// column between the line numbers and the text (a diff's old and new line
+    /// numbers, a blame hash). Shown on the line's first display row only. The column
+    /// is as wide as the widest `gutter_text` in the buffer
+    /// ([`ExtmarkStore::gutter_text_width`]), so a shorter one is padded on the right.
+    /// A chunk with no group paints as `LineNr` (`CursorLineNr` on the cursor line).
+    /// Empty ⇒ the mark puts nothing there.
+    pub gutter_text: Vec<VirtChunk>,
+}
+
+impl VirtDecor {
+    /// The display width of [`gutter_text`](Self::gutter_text), in cells, summed per
+    /// grapheme as the clients measure what they paint.
+    pub fn gutter_text_width(&self) -> usize {
+        use unicode_segmentation::UnicodeSegmentation;
+        self.gutter_text
+            .iter()
+            .flat_map(|c| c.text.graphemes(true))
+            .map(crate::unicode::display_width)
+            .sum()
+    }
 }
 
 /// A single extmark, identified within its buffer by `(namespace, id)`.
@@ -330,9 +352,22 @@ pub struct ExtmarkStore {
     /// in O(1) instead of filtering every mark. [`shift`](Self::shift) never changes
     /// it: it moves anchors, not payloads.
     virt_lines_marks: usize,
+    /// How many marks carry a `gutter_text` of each display width (only widths
+    /// above zero are keyed). The gutter text column is as wide as the widest of
+    /// them, which the view, cursor and mouse arithmetic all read every frame, so it
+    /// is kept here on every structural mutation rather than found by scanning the
+    /// marks: the largest key is the width. [`shift`](Self::shift) never changes
+    /// it, for the same reason as [`virt_lines_marks`](Self::virt_lines_marks).
+    gutter_widths: BTreeMap<usize, usize>,
     /// The next [`Extmark::serial`] to hand out. Store-wide and monotonic, carried by
     /// every clone, so a snapshot's serials never collide with later placements.
     next_serial: u64,
+    /// Every mark's position, sorted, for the per-frame range queries
+    /// ([`starting_in`](Self::starting_in), [`reaching`](Self::reaching)) — so a frame
+    /// visits the marks on screen rather than every mark in the buffer. Built on the
+    /// first query after a structural change, kept sorted by [`shift`](Self::shift),
+    /// and not carried by a clone. See [`PosIndex`].
+    index: PosIndex,
 }
 
 /// Whether `m` carries `virt_lines` rows, the one payload
@@ -341,7 +376,79 @@ fn has_virt_lines(m: &Extmark) -> bool {
     m.decor.as_deref().is_some_and(|d| !d.virt_lines.is_empty())
 }
 
+/// The display width of `m`'s `gutter_text`, `0` for a mark with none — the key
+/// [`ExtmarkStore::gutter_widths`] counts it under.
+fn gutter_width(m: &Extmark) -> usize {
+    m.decor.as_deref().map_or(0, VirtDecor::gutter_text_width)
+}
+
+/// Count `width` in or out of a [`gutter_widths`](ExtmarkStore::gutter_widths) map.
+fn count_gutter(widths: &mut BTreeMap<usize, usize>, width: usize, add: bool) {
+    if width == 0 {
+        return;
+    }
+    if add {
+        *widths.entry(width).or_default() += 1;
+    } else if let Some(n) = widths.get_mut(&width) {
+        *n -= 1;
+        if *n == 0 {
+            widths.remove(&width);
+        }
+    }
+}
+
 impl ExtmarkStore {
+    /// Record a structural change: bump the [`generation`](Self::generation) and drop
+    /// the position index, which no longer lists the marks there are.
+    fn touch_structure(&mut self) {
+        self.generation += 1;
+        self.index = PosIndex::default();
+    }
+
+    /// Every mark whose `start` lies in `[lo, hi)`, with its namespace, in
+    /// `(start, namespace, id)` order. O(log E + k) for k results, from the position
+    /// index — what a per-frame layer anchored on the visible lines asks for.
+    pub fn starting_in(&self, lo: usize, hi: usize) -> impl Iterator<Item = (u32, &Extmark)> + '_ {
+        let ix = self.index();
+        let from = ix.entries.partition_point(|e| e.start < lo);
+        let to = ix.entries.partition_point(|e| e.start < hi).max(from);
+        ix.entries[from..to].iter().map(|e| (e.ns, self.mark_of(e)))
+    }
+
+    /// Every mark that reaches into `[lo, hi)`: `start < hi` and its `end` (its
+    /// `start`, for a point mark) at or past `lo`, with its namespace, in
+    /// `(start, namespace, id)` order. This is the query for ranges that start above
+    /// the viewport and end inside it, which [`starting_in`](Self::starting_in) misses.
+    /// A max-end tree over the index makes it O((k + 1) log E) for k results: one long
+    /// mark doesn't make every query walk the marks before it.
+    ///
+    /// Inclusive at `lo` so a zero-width range sitting exactly on it is found; a
+    /// caller that wants `end > lo` filters the one extra case.
+    pub fn reaching(&self, lo: usize, hi: usize) -> Vec<(u32, &Extmark)> {
+        let ix = self.index();
+        let upto = ix.entries.partition_point(|e| e.start < hi);
+        let mut hits = Vec::new();
+        ix.reaching(upto, lo, &mut hits);
+        hits.into_iter()
+            .map(|i| {
+                let e = &ix.entries[i];
+                (e.ns, self.mark_of(e))
+            })
+            .collect()
+    }
+
+    /// The position index, built now if a structural change dropped it.
+    fn index(&self) -> &Positions {
+        self.index.0.get_or_init(|| Positions::build(&self.by_ns))
+    }
+
+    /// The mark an index entry names. The index lists exactly the marks there are
+    /// (every structural change drops it), so the lookup can't miss.
+    fn mark_of(&self, e: &PosEntry) -> &Extmark {
+        self.get(e.ns, e.id)
+            .expect("the position index lists only marks the store holds")
+    }
+
     /// Set (create or replace) an extmark. With `id == None` a fresh id is
     /// allocated from the namespace's counter; with `Some(id)` the caller's id is
     /// used (replacing any existing mark) and the counter is advanced past it so
@@ -379,7 +486,7 @@ impl ExtmarkStore {
         right_gravity: bool,
         end_right_gravity: bool,
     ) -> u64 {
-        self.generation += 1;
+        self.touch_structure();
         let slot = self.by_ns.entry(ns).or_default();
         let id = match id {
             Some(id) => {
@@ -413,10 +520,14 @@ impl ExtmarkStore {
             serial: self.next_serial,
         };
         let gained = has_virt_lines(&mark);
+        count_gutter(&mut self.gutter_widths, gutter_width(&mark), true);
         let replaced = slot.marks.insert(id, mark);
         // `insert` hands back whatever occupied this id, which is the only way to
         // know whether the count should also drop for a mark just overwritten.
         let lost = replaced.as_ref().is_some_and(has_virt_lines);
+        if let Some(old) = &replaced {
+            count_gutter(&mut self.gutter_widths, gutter_width(old), false);
+        }
         slot.gen += 1;
         self.virt_lines_marks = self.virt_lines_marks + usize::from(gained) - usize::from(lost);
         id
@@ -429,7 +540,7 @@ impl ExtmarkStore {
 
     /// Delete one mark; returns whether it existed.
     pub fn del(&mut self, ns: u32, id: u64) -> bool {
-        self.generation += 1;
+        self.touch_structure();
         let removed = match self.by_ns.get_mut(&ns) {
             Some(slot) => match slot.marks.remove(&id) {
                 Some(m) => {
@@ -443,6 +554,9 @@ impl ExtmarkStore {
         if removed.as_ref().is_some_and(has_virt_lines) {
             self.virt_lines_marks -= 1;
         }
+        if let Some(m) = &removed {
+            count_gutter(&mut self.gutter_widths, gutter_width(m), false);
+        }
         removed.is_some()
     }
 
@@ -450,13 +564,16 @@ impl ExtmarkStore {
     /// `range` (`None` ⇒ the whole buffer). Mirrors
     /// `nvim_buf_clear_namespace`, whose line range the caller converts to bytes.
     pub fn clear(&mut self, ns: u32, range: Option<std::ops::Range<usize>>) {
-        self.generation += 1;
+        self.touch_structure();
         let Some(slot) = self.by_ns.get_mut(&ns) else {
             return;
         };
         match range {
             None => {
                 let dropped = slot.marks.values().filter(|m| has_virt_lines(m)).count();
+                for m in slot.marks.values() {
+                    count_gutter(&mut self.gutter_widths, gutter_width(m), false);
+                }
                 slot.marks.clear();
                 slot.gen += 1;
                 self.virt_lines_marks -= dropped;
@@ -465,11 +582,13 @@ impl ExtmarkStore {
                 // Counted inside the retain rather than by scanning twice around it:
                 // `retain` already visits every mark, so the bookkeeping is free.
                 let mut dropped = 0usize;
+                let widths = &mut self.gutter_widths;
                 slot.marks.retain(|_, m| {
                     if r.contains(&m.start) {
                         if has_virt_lines(m) {
                             dropped += 1;
                         }
+                        count_gutter(widths, gutter_width(m), false);
                         false
                     } else {
                         true
@@ -485,9 +604,10 @@ impl ExtmarkStore {
     /// (undo/redo, file reload), where byte anchors are meaningless against the
     /// new text and there is nothing to rebuild them from.
     pub fn clear_all(&mut self) {
-        self.generation += 1;
+        self.touch_structure();
         self.by_ns.clear();
         self.virt_lines_marks = 0;
+        self.gutter_widths.clear();
     }
 
     /// Move namespace `ns`'s marks out of `self` and into `dst`, replacing whatever
@@ -497,19 +617,29 @@ impl ExtmarkStore {
     /// store about to be installed, so undo never wipes them. See
     /// [`crate::editor::Editor::restore_snapshot`].
     pub fn move_namespace_into(&mut self, ns: u32, dst: &mut ExtmarkStore) {
-        self.generation += 1;
-        dst.generation += 1;
+        self.touch_structure();
+        dst.touch_structure();
         // Whatever `dst` held for `ns` is discarded either way, so its count sheds
         // that slot before taking on ours.
         let displaced = dst.by_ns.get(&ns).map_or(0, |s| {
             s.marks.values().filter(|m| has_virt_lines(m)).count()
         });
         dst.virt_lines_marks -= displaced;
+        if let Some(s) = dst.by_ns.get(&ns) {
+            for m in s.marks.values() {
+                count_gutter(&mut dst.gutter_widths, gutter_width(m), false);
+            }
+        }
         match self.by_ns.remove(&ns) {
             Some(slot) => {
                 let moved = slot.marks.values().filter(|m| has_virt_lines(m)).count();
                 self.virt_lines_marks -= moved;
                 dst.virt_lines_marks += moved;
+                for m in slot.marks.values() {
+                    let w = gutter_width(m);
+                    count_gutter(&mut self.gutter_widths, w, false);
+                    count_gutter(&mut dst.gutter_widths, w, true);
+                }
                 dst.by_ns.insert(ns, slot);
             }
             None => {
@@ -556,8 +686,9 @@ impl ExtmarkStore {
                 }
             }
         }
-        // Positions moved wholesale: have the Lua mirror re-read the store.
-        self.generation += 1;
+        // Positions moved wholesale: have the Lua mirror re-read the store, and the
+        // position index rebuild.
+        self.touch_structure();
     }
 
     /// Every mark across all namespaces (order across namespaces is unspecified;
@@ -615,6 +746,13 @@ impl ExtmarkStore {
         self.virt_lines_marks > 0
     }
 
+    /// The width in cells of the gutter text column: the widest `gutter_text` any
+    /// mark carries, `0` when none does. Read from the per-width counts, never by
+    /// walking the marks (see [`gutter_widths`](Self::gutter_widths)).
+    pub fn gutter_text_width(&self) -> usize {
+        self.gutter_widths.keys().next_back().copied().unwrap_or(0)
+    }
+
     /// The structural [`generation`](Self::generation) — see that field for why a
     /// consumer gates a full re-serialize on it rather than on any change.
     pub fn generation(&self) -> u64 {
@@ -648,7 +786,8 @@ impl ExtmarkStore {
         // round-3 benchmark confirmed is the fastest shape: a position index
         // cannot skip the walk (an anchor strictly below the edit is unchanged,
         // but discovering that costs a visit), and per-mark index maintenance
-        // measured 59x slower. `gen` is deliberately NOT bumped: a shift is not a
+        // measured 59x slower. (The read-side [`PosIndex`] is kept current below
+        // with one more flat pass and a local re-sort, not per-mark re-keying.) `gen` is deliberately NOT bumped: a shift is not a
         // structural mutation, and the diagnostics anchor-trust guard relies on
         // `gen` surviving edits.
         for slot in self.by_ns.values_mut() {
@@ -668,6 +807,162 @@ impl ExtmarkStore {
                     m.end = Some(e.max(m.start));
                 }
             }
+        }
+        // The same move for the position index, when one is built, so the next frame
+        // doesn't pay a rebuild for an edit.
+        if let Some(ix) = self.index.0.get_mut() {
+            ix.shift(start, old_end, new_end);
+        }
+    }
+}
+
+/// The lazily-built [`Positions`] of an [`ExtmarkStore`]. Its `Clone` gives an
+/// empty one: undo snapshots clone the store, and a snapshot is rarely queried, so
+/// it builds its own index only if it ever is rather than carrying a copy.
+#[derive(Debug, Default)]
+struct PosIndex(OnceLock<Positions>);
+
+impl Clone for PosIndex {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+/// One mark in the position index: its anchors (an `end` equal to `start` for a
+/// point mark) and gravity, copied so [`Positions::shift`] can move them without a
+/// lookup, and its `(ns, id)` key.
+#[derive(Debug, Clone, Copy)]
+struct PosEntry {
+    start: usize,
+    end: usize,
+    has_end: bool,
+    right_gravity: bool,
+    end_right_gravity: bool,
+    ns: u32,
+    id: u64,
+}
+
+impl PosEntry {
+    fn key(&self) -> (usize, u32, u64) {
+        (self.start, self.ns, self.id)
+    }
+}
+
+/// Every mark's position, sorted by `(start, ns, id)`, with a max-end segment tree
+/// over the sorted entries for [`ExtmarkStore::reaching`].
+///
+/// The entries duplicate the positions the marks hold. Both move in the same
+/// [`ExtmarkStore::shift`], with the same gravity rules, and every structural change
+/// drops the index, so the two can't drift.
+#[derive(Debug)]
+struct Positions {
+    entries: Vec<PosEntry>,
+    /// `tree[node]` is the largest `end` under `node`, the root at 1 and the leaves
+    /// from `leaves`, built on the first `reaching` query after an edit.
+    tree: OnceLock<(usize, Vec<usize>)>,
+}
+
+impl Positions {
+    fn build(by_ns: &HashMap<u32, NsMarks>) -> Self {
+        let mut entries: Vec<PosEntry> = by_ns
+            .iter()
+            .flat_map(|(ns, slot)| {
+                slot.marks.values().map(move |m| PosEntry {
+                    start: m.start,
+                    end: m.end.unwrap_or(m.start),
+                    has_end: m.end.is_some(),
+                    right_gravity: m.right_gravity,
+                    end_right_gravity: m.end_right_gravity,
+                    ns: *ns,
+                    id: m.id,
+                })
+            })
+            .collect();
+        entries.sort_unstable_by_key(PosEntry::key);
+        Self {
+            entries,
+            tree: OnceLock::new(),
+        }
+    }
+
+    /// Move every entry for an edit replacing `[start, old_end)` with text ending at
+    /// `new_end`, exactly as [`ExtmarkStore::shift`] moves the marks, and keep the
+    /// entries sorted.
+    ///
+    /// Entries before `start` keep their place, and those at or past `old_end` all move
+    /// by the same delta, so their order holds. Only an entry inside the replaced
+    /// region (or at `start` itself, for an insertion) can change places, and each of
+    /// those lands on `start` or `new_end` — a contiguous run of the vector, with no
+    /// entry before it above `start` and none after it below `new_end`. Re-sorting that
+    /// run restores the order: typing on a line re-sorts the marks on the line, not the
+    /// buffer.
+    fn shift(&mut self, start: usize, old_end: usize, new_end: usize) {
+        for e in &mut self.entries {
+            e.start = if e.right_gravity {
+                shift_right_gravity(e.start, start, old_end, new_end)
+            } else {
+                shift_left_gravity(e.start, start, old_end, new_end)
+            };
+            e.end = if e.has_end {
+                let end = if e.end_right_gravity {
+                    shift_right_gravity(e.end, start, old_end, new_end)
+                } else {
+                    shift_left_gravity(e.end, start, old_end, new_end)
+                };
+                end.max(e.start)
+            } else {
+                e.start
+            };
+        }
+        let from = self.entries.partition_point(|e| e.start < start);
+        let to = self.entries.partition_point(|e| e.start <= new_end);
+        if to > from {
+            self.entries[from..to].sort_unstable_by_key(PosEntry::key);
+        }
+        debug_assert!(
+            self.entries.windows(2).all(|w| w[0].key() <= w[1].key()),
+            "the position index stays sorted across an edit"
+        );
+        self.tree = OnceLock::new();
+    }
+
+    /// The max-end tree, built now if an edit dropped it: `(leaves, tree)`.
+    fn tree(&self) -> &(usize, Vec<usize>) {
+        self.tree.get_or_init(|| {
+            let leaves = self.entries.len().next_power_of_two().max(1);
+            let mut tree = vec![0usize; 2 * leaves];
+            for (i, e) in self.entries.iter().enumerate() {
+                tree[leaves + i] = e.end;
+            }
+            for node in (1..leaves).rev() {
+                tree[node] = tree[2 * node].max(tree[2 * node + 1]);
+            }
+            (leaves, tree)
+        })
+    }
+
+    /// Push, in ascending order, the index of every entry among the first `upto`
+    /// whose `end` is at or past `lo`. Descends only into subtrees whose largest
+    /// `end` reaches `lo`, so it costs O((k + 1) log E).
+    fn reaching(&self, upto: usize, lo: usize, out: &mut Vec<usize>) {
+        if upto == 0 {
+            return;
+        }
+        let (leaves, tree) = self.tree();
+        // An explicit stack of `(node, first leaf, leaf count)`, right child pushed
+        // first so the left one pops first and the results come out ascending.
+        let mut stack = vec![(1usize, 0usize, *leaves)];
+        while let Some((node, first, count)) = stack.pop() {
+            if first >= upto || tree[node] < lo {
+                continue;
+            }
+            if count == 1 {
+                out.push(first);
+                continue;
+            }
+            let half = count / 2;
+            stack.push((2 * node + 1, first + half, half));
+            stack.push((2 * node, first, half));
         }
     }
 }

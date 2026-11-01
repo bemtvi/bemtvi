@@ -1541,6 +1541,8 @@
         // too (the strip renders them like the settled path). Diagnostic virtual text
         // slides as well.
         virt_lines: s.virt_lines || [],
+        // The gutter text column slides with its lines.
+        gutter_text: s.gutter_text || [],
         // Diagnostic underlines, signs, and virtual text all ride the screen-row band
         // now, so squiggles and signs slide with the text instead of blanking for the
         // slide (over a daemon these arrive populated; the client build leaves empty).
@@ -1571,7 +1573,7 @@
         // the settled path so the virtual rows slide with the text.
         const vlines = band.virt_lines && band.virt_lines[i];
         if (Array.isArray(vlines)) {
-          const g = (gutterW > 0 || band.sign_width > 0) ? renderGutterCell(band, i, gutterW) : "";
+          const g = hasGutter(band, gutterW) ? renderGutterCell(band, i, gutterW) : "";
           rowEl.innerHTML = g + virtChunksHtml(vlines);
           strip.appendChild(rowEl);
           continue;
@@ -1893,7 +1895,7 @@
       // text starts past the fold, sign and number gutters, and only a row showing a
       // buffer line has any (a virtual line or a `~` filler has no number).
       if (w.text_pointer) {
-        box.dataset.tp = String((w.foldcolumn_width || 0) + (w.sign_width || 0) + (w.number_width || 0));
+        box.dataset.tp = String((w.foldcolumn_width || 0) + (w.sign_width || 0) + (w.number_width || 0) + (w.gutter_text_width || 0));
         box._numbers = w.numbers || [];
       }
       // This window's `'winhighlight'` chrome override (a dock's `Normal:NormalSB`
@@ -1955,7 +1957,7 @@
           // gutter) is a later refinement — today virtual rows begin at the text body.
           const vlines = w.virt_lines && w.virt_lines[r];
           if (Array.isArray(vlines)) {
-            const g = (gutterW > 0 || w.sign_width > 0) ? renderGutterCell(w, r, gutterW) : "";
+            const g = hasGutter(w, gutterW) ? renderGutterCell(w, r, gutterW) : "";
             rowEl.innerHTML = g + virtChunksHtml(vlines);
             box.appendChild(rowEl);
             continue;
@@ -2005,7 +2007,7 @@
       if (!sb) return;
       const thick = Math.max(cw * 0.3, 2);
       const right = rect.width * cw, bottom = textRows * ch;
-      const textLeft = ((w.foldcolumn_width || 0) + (w.sign_width || 0) + (w.number_width || 0)) * cw;
+      const textLeft = ((w.foldcolumn_width || 0) + (w.sign_width || 0) + (w.number_width || 0) + (w.gutter_text_width || 0)) * cw;
       const opacity = w.focused ? "0.35" : "0.2";
       const thumb = (left, top, width, height) => {
         const el = document.createElement("div");
@@ -2030,7 +2032,7 @@
       const cols = w.colorcolumn;
       if (!cols || !cols.length) return;
       const leftcol = w.leftcol || 0;
-      const textOrigin = (w.foldcolumn_width || 0) + (w.sign_width || 0) + gutterW;
+      const textOrigin = (w.foldcolumn_width || 0) + (w.sign_width || 0) + gutterW + (w.gutter_text_width || 0);
       const h = textRows * ch;
       for (const col of cols) {
         const textCol = col - 1;
@@ -2056,7 +2058,7 @@
       // (the number width) drops the signs. Matches the other render paths
       // (`renderLineServer`, the virt-line / scroll-band rows) and `renderGutterCell`,
       // which renders the foldcolumn + sign cell and returns early when `width <= 0`.
-      if (gutterW > 0 || w.sign_width > 0) html += renderGutterCell(w, row, gutterW);
+      if (hasGutter(w, gutterW)) html += renderGutterCell(w, row, gutterW);
       if (isFiller) return html + `<span class="eob">${escapeHtml(line)}</span>`;
 
       const tabstop = w.tabstop || 8;
@@ -2234,7 +2236,7 @@
       // inline-virt shift (not painted on this path yet) — an approximation.
       const ra = vtext.filter((p) => p[0] === 3).flatMap((p) => p[3]);
       if (ra.length && rect) {
-        const textW = Math.max(0, rect.width - gutterW - (w.foldcolumn_width || 0) - (w.sign_width || 0));
+        const textW = Math.max(0, rect.width - gutterW - (w.foldcolumn_width || 0) - (w.sign_width || 0) - (w.gutter_text_width || 0));
         const total = ra.reduce((s, [t]) => s + [...t].length, 0);
         const paintedVisible = Math.max(0, cells.length - leftcol);
         const start = Math.max(paintedVisible + 1, textW - total);
@@ -2465,7 +2467,7 @@
     function renderLineServer(w, row, gutterW, rect) {
       const line = w.lines[row] ?? "";
       const isFiller = w.numbers[row] === null;
-      let html = (gutterW > 0 || w.sign_width > 0) ? renderGutterCell(w, row, gutterW) : "";
+      let html = hasGutter(w, gutterW) ? renderGutterCell(w, row, gutterW) : "";
       if (isFiller) {
         const css = chromeCss(view.chrome?.end_of_buffer);
         return html + `<span class="eob"${css ? ` style="${css}"` : ""}>${escapeHtml(line)}</span>`;
@@ -2595,23 +2597,65 @@
           html += `<span class="gutter">${" ".repeat(sw)}</span>`;
         }
       }
-      if (width <= 0) return html;
-      // Blank the number on a soft-wrap continuation row (vim shows it on the line's
-      // first row only); `numbers` still carries the line there.
-      const n = w.continuation?.[row] ? null : w.numbers[row];
-      const cur = w.cursor_line;
-      let cell, cls = "gutter";
-      if (n === null || n === undefined) cell = " ".repeat(width);
-      else if (w.number && w.relativenumber && n === cur) { cell = String(n).padEnd(width); cls = "gutter-cur"; }
-      else {
-        let v;
-        if (!w.relativenumber) v = n;
-        else if (n === cur) v = 0;
-        else v = Math.abs(n - cur);
-        cell = String(v).padStart(width - 1) + " ";
-        if (n === cur) cls = "gutter-cur";
+      if (width > 0) {
+        // Blank the number on a soft-wrap continuation row (vim shows it on the line's
+        // first row only); `numbers` still carries the line there.
+        const n = w.continuation?.[row] ? null : w.numbers[row];
+        const cur = w.cursor_line;
+        let cell, cls = "gutter";
+        if (n === null || n === undefined) cell = " ".repeat(width);
+        else if (w.number && w.relativenumber && n === cur) { cell = String(n).padEnd(width); cls = "gutter-cur"; }
+        else {
+          let v;
+          if (!w.relativenumber) v = n;
+          else if (n === cur) v = 0;
+          else v = Math.abs(n - cur);
+          cell = String(v).padStart(width - 1) + " ";
+          if (n === cur) cls = "gutter-cur";
+        }
+        html += `<span class="${cls}">${escapeHtml(cell)}</span>`;
       }
-      return html + `<span class="${cls}">${escapeHtml(cell)}</span>`;
+      // The gutter text column (`gutter_text` marks), between the numbers and the
+      // text: each chunk in its own style over the number column's colours
+      // (`CursorLineNr` on the cursor line), so a group that sets only a background
+      // keeps the number foreground, as the GUI and the terminal paint it.
+      const gtw = w.gutter_text_width || 0;
+      if (gtw > 0) {
+        const plain = w.numbers[row] === w.cursor_line ? "gutter-cur" : "gutter";
+        for (const [text, id] of fitGutterText(w.gutter_text?.[row], gtw)) {
+          const css = id != null ? styleToCss(paletteStyle(id)) : "";
+          html += `<span class="${plain}"${css ? ` style="${css}"` : ""}>${escapeHtml(text)}</span>`;
+        }
+      }
+      return html;
+    }
+    // Whether a row paints the gutter cell: the fold, sign, number or gutter text
+    // column. Any of them can exist without line numbers (an `btv.view` diff pane, a
+    // `'foldcolumn'` with `nonumber`), so the number width alone is not the test.
+    function hasGutter(w, gutterW) {
+      return gutterW > 0 || (w.foldcolumn_width || 0) > 0 || (w.sign_width || 0) > 0
+        || (w.gutter_text_width || 0) > 0;
+    }
+    // Fit one row of the gutter text column to exactly `width` cells: the chunks
+    // clipped at the column's edge (a wide cluster cut by it becomes spaces) and
+    // padded with a style-less run of spaces. The twin of `bemtvi_view::fit_gutter_text`,
+    // measured with the same width tables (`clusterWidth`).
+    function fitGutterText(chunks, width) {
+      const out = [];
+      let used = 0;
+      for (const [text, id] of (Array.isArray(chunks) ? chunks : [])) {
+        if (used >= width) break;
+        let kept = "";
+        for (const g of clusters(text)) {
+          const gw = clusterWidth(g);
+          if (used + gw > width) { kept += " ".repeat(width - used); used = width; break; }
+          kept += g;
+          used += gw;
+        }
+        if (kept) out.push([kept, id]);
+      }
+      if (used < width) out.push([" ".repeat(width - used), null]);
+      return out;
     }
 
     // Render a single-style run of text into the same boxed-cell model the content
@@ -2866,7 +2910,7 @@
       // the word it lines up under.
       const o = regionOrigin(fw ? fw.region : "main", tablineRows);
       const gutterW = fw
-        ? (fw.foldcolumn_width || 0) + (fw.sign_width || 0) + (fw.number_width || 0)
+        ? (fw.foldcolumn_width || 0) + (fw.sign_width || 0) + (fw.number_width || 0) + (fw.gutter_text_width || 0)
         : 0;
       const baseX = menu.editor_relative ? 0 : menu.cmdline ? rect.x : o.x + rect.x + gutterW;
       const baseY = menu.editor_relative ? 0 : menu.cmdline ? tablineRows + rect.y : o.y + rect.y;

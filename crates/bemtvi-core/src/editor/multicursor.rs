@@ -231,15 +231,14 @@ impl Editor {
         v
     }
 
-    /// Every secondary cursor's [`CURSOR_NS`] extmark in the current buffer, in
-    /// store order. The shared read prelude behind the multi-cursor queries (heads,
-    /// byte positions, selection pairs) — each chains its own `map`/`filter`.
+    /// Every secondary cursor's [`CURSOR_NS`] extmark in the current buffer, in id
+    /// order. The shared read prelude behind the multi-cursor queries (heads, byte
+    /// positions, selection pairs) — each chains its own `map`/`filter`. Reads that
+    /// one namespace: [`has_secondary_cursors`](Self::has_secondary_cursors) runs on
+    /// every key, and filtering every mark in the buffer for it cost each keystroke
+    /// O(marks) when there were no cursors at all.
     fn cursor_marks(&self) -> impl Iterator<Item = &crate::extmark::Extmark> {
-        self.buffer()
-            .extmarks
-            .iter_with_ns()
-            .filter(|(ns, _)| *ns == CURSOR_NS)
-            .map(|(_, m)| m)
+        self.buffer().extmarks.iter_ns(CURSOR_NS)
     }
 
     /// Whether any secondary cursor is active on the current buffer.

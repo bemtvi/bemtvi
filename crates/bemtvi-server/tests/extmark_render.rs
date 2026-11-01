@@ -467,3 +467,360 @@ async fn gutter_signs_do_not_dominate_the_cost_of_typing() {
          ({heavy:?} vs {bare:?}) — the per-frame sign scan is unpruned again"
     );
 }
+
+// ===== the position index ====================================================
+//
+// Every per-frame layer finds its marks through the store's position index
+// (`ExtmarkStore::starting_in` / `reaching`) rather than by walking every mark, so a
+// frame's cost follows the marks on screen. See
+// `docs/plans/2026-10-31-extmark-position-index.md`.
+
+/// How long 300 cursor moves take near the top of a 20 000-line buffer whose last
+/// `marks` lines each carry a mark made by `place` (a Lua statement using the line
+/// index `i` and namespace `ns`): every mark is far below the viewport.
+async fn moving_cost(marks: usize, place: &str) -> std::time::Duration {
+    let lines = 20_000;
+    let text: String = (0..lines)
+        .map(|i| format!("line {i} with some text\n"))
+        .collect();
+    let (rpc, _inc) = start_with_file(&text).await;
+    if marks > 0 {
+        exec_lua(
+            &rpc,
+            &format!(
+                "vim.api.nvim_set_hl(0, 'IxBg', {{ bg = 0x332211 }})
+                 local ns = btv.ns.create('ix')
+                 local diags = {{}}
+                 for i = {}, {} do {place} end
+                 if #diags > 0 then btv.diagnostic.set(ns, 0, diags) end",
+                lines - marks,
+                lines - 1
+            ),
+        )
+        .await;
+    }
+    let _ = exec_lua(&rpc, "return 1").await;
+    let started = std::time::Instant::now();
+    for k in 0..300 {
+        bemtvi_test_harness::feed(&rpc, if k % 20 < 10 { "j" } else { "k" });
+    }
+    let _ = exec_lua(&rpc, "return 1").await;
+    started.elapsed()
+}
+
+#[tokio::test]
+async fn marks_off_screen_cost_a_frame_nothing_in_any_layer() {
+    // Ratios against a mark-free buffer, so a loaded `cargo test --workspace` doesn't
+    // flake it. Every layer runs every frame whatever the marks carry, so one layer
+    // walking every mark again raises every kind's ratio together: the mean is the
+    // sharp signal. Measured: before the index ~3.5x per kind; with it, ~1.15x mean
+    // (worst kind 1.3x); with one layer (signs) put back on the full walk, ~1.6x mean.
+    let bare = moving_cost(0, "").await;
+    let mut ratios = Vec::new();
+    for (layer, place) in [
+        (
+            "highlight",
+            "btv.buf.set_extmark(0, ns, i, 0, { hl_group = 'Comment', end_row = i, end_col = 2 })",
+        ),
+        (
+            "virt_text",
+            "btv.buf.set_extmark(0, ns, i, 0, { virt_text = { { ' x', 'Comment' } } })",
+        ),
+        (
+            "line_hl_group",
+            "btv.buf.set_extmark(0, ns, i, 0, { line_hl_group = 'IxBg' })",
+        ),
+        (
+            "sign_text",
+            "btv.buf.set_extmark(0, ns, i, 0, { sign_text = '>>' })",
+        ),
+        (
+            "gutter_text",
+            "btv.buf.set_extmark(0, ns, i, 0, { gutter_text = { { tostring(i) } } })",
+        ),
+        (
+            "line_fill",
+            "btv.buf.set_extmark(0, ns, i, 0, { line_fill = { text = '-' } })",
+        ),
+        (
+            "diagnostic",
+            "diags[#diags + 1] = { lnum = i, col = 0, end_col = 2, severity = 1, message = 'x' }",
+        ),
+    ] {
+        let heavy = moving_cost(20_000, place).await;
+        ratios.push((layer, heavy.as_secs_f64() / bare.as_secs_f64()));
+    }
+    let report: Vec<String> = ratios.iter().map(|(l, r)| format!("{l} {r:.2}x")).collect();
+    let mean = ratios.iter().map(|(_, r)| r).sum::<f64>() / ratios.len() as f64;
+    assert!(
+        mean < 1.35 && ratios.iter().all(|(_, r)| *r < 1.8),
+        "20 000 off-screen marks still cost a frame (mean {mean:.2}x; {}; bare {bare:?})",
+        report.join(", ")
+    );
+}
+
+#[tokio::test]
+async fn a_range_from_far_above_the_viewport_still_paints() {
+    // `reaching` must find a range that starts long before the viewport and ends in
+    // it, past thousands of short marks that end before it.
+    let text: String = (0..3_000).map(|i| format!("line {i}\n")).collect();
+    let (rpc, mut inc) = start_with_file(&text).await;
+    exec_lua(
+        &rpc,
+        "local ns = btv.ns.create('far')
+         for i = 0, 2500 do btv.buf.set_extmark(0, ns, i, 0, { hl_group = 'Comment', end_row = i, end_col = 2 }) end
+         btv.buf.set_extmark(0, ns, 1, 0, { hl_group = 'Comment', end_row = 2950, end_col = 0 })
+         btv.cmd('2800')",
+    )
+    .await;
+    let _ = exec_lua(&rpc, "return 1").await;
+    let map = wait_redraw(&mut inc, |m| window0_field(m, "highlights").is_some()).await;
+    let rows = window0_field(&map, "highlights")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let painted = rows
+        .iter()
+        .filter(|r| r.as_array().is_some_and(|a| !a.is_empty()))
+        .count();
+    assert!(
+        painted >= rows.len().saturating_sub(2) && painted > 0,
+        "the long range paints every row it covers: {painted} of {} rows",
+        rows.len()
+    );
+}
+
+#[tokio::test]
+async fn marks_collapsed_by_a_deletion_still_render_on_their_rows() {
+    // Marks of both gravities inside a deleted region collapse onto its start; the
+    // index re-sorts that run. Signs on the lines around it must stay on their rows,
+    // and editing on afterwards must keep finding them (a stale order would hide one).
+    let (rpc, mut inc) = start_with_file(&sample()).await;
+    exec_lua(
+        &rpc,
+        "local ns = btv.ns.create('grav')
+         -- line 1 is `line 1 …`: a left-gravity mark at col 3 and a right-gravity one at col 1
+         btv.buf.set_extmark(0, ns, 1, 3, { sign_text = 'L', right_gravity = false })
+         btv.buf.set_extmark(0, ns, 1, 1, { sign_text = 'R', priority = 1 })
+         btv.buf.set_extmark(0, ns, 0, 0, { sign_text = 'A' })
+         btv.buf.set_extmark(0, ns, 2, 0, { sign_text = 'B' })",
+    )
+    .await;
+    // Delete columns 0..5 of line 2 (1-based), collapsing both marks onto column 0.
+    bemtvi_test_harness::feed(&rpc, "2G05x");
+    let rows = signs_rows(&rpc, &mut inc).await;
+    assert_eq!(rows[0].as_deref(), Some("A"));
+    assert_eq!(
+        rows[1].as_deref(),
+        Some("L"),
+        "the higher-priority collapsed mark wins: {rows:?}"
+    );
+    assert_eq!(rows[2].as_deref(), Some("B"));
+    // Join line 2 onto line 1, then open a line above: every mark moves again.
+    bemtvi_test_harness::feed(&rpc, "kJggOnew<Esc>");
+    let rows = signs_rows(&rpc, &mut inc).await;
+    assert_eq!(rows[0], None, "the opened line has no sign: {rows:?}");
+    assert!(
+        rows[1].is_some(),
+        "line 1 (now joined) keeps a sign: {rows:?}"
+    );
+    assert_eq!(rows[2].as_deref(), Some("B"));
+}
+
+#[tokio::test]
+async fn a_replacement_that_reorders_marks_keeps_them_findable() {
+    // One edit replacing text that holds a right-gravity mark and a left-gravity one
+    // sends the first past the replacement's end and leaves the second at its start,
+    // so the earlier entry in the index now sits after the later one. Here the
+    // replacement runs past the viewport: unless the index re-sorts that run, the
+    // left-gravity sign on the last visible row is lost to the binary search.
+    let text: String = (0..60).map(|i| format!("line {i}\n")).collect();
+    let (rpc, mut inc) = start_with_file(&text).await;
+    let rows = signs_rows(&rpc, &mut inc).await;
+    let last = rows.len() - 1;
+    exec_lua(
+        &rpc,
+        &format!(
+            "local ns = btv.ns.create('reorder')
+             for i = 0, {last} - 1 do btv.buf.set_extmark(0, ns, i, 0, {{ sign_text = 'a' }}) end
+             btv.buf.set_extmark(0, ns, {last}, 0, {{ sign_text = 'R' }})
+             btv.buf.set_extmark(0, ns, {last}, 2, {{ sign_text = 'L', right_gravity = false }})
+             for i = {last} + 1, 59 do btv.buf.set_extmark(0, ns, i, 0, {{ sign_text = 'z' }}) end"
+        ),
+    )
+    .await;
+    // Draw a frame first, so the index is built before the edit and has to be kept
+    // sorted across it rather than rebuilt after.
+    let _ = signs_rows(&rpc, &mut inc).await;
+    // A separate chunk: the marks must exist before the edit moves them.
+    exec_lua(
+        &rpc,
+        &format!("btv.buf.set_text(0, {last}, 0, {last}, 4, {{ 'one', 'two', 'three', 'four', 'five', 'six' }})"),
+    )
+    .await;
+    let rows = signs_rows(&rpc, &mut inc).await;
+    assert_eq!(
+        rows[last].as_deref(),
+        Some("L"),
+        "the left-gravity sign stays on the last visible row: {rows:?}"
+    );
+    // The right-gravity one went to the replacement's end, five lines down, and the
+    // marks after the replacement moved down with their lines.
+    exec_lua(&rpc, &format!("btv.cmd('{}')", last + 10)).await;
+    let rows = signs_rows(&rpc, &mut inc).await;
+    let at = rows
+        .iter()
+        .position(|r| r.as_deref() == Some("L"))
+        .expect("L still shown");
+    assert_eq!(rows[at + 1..at + 5], [None, None, None, None], "{rows:?}");
+    assert_eq!(rows[at + 5].as_deref(), Some("R"), "{rows:?}");
+    assert_eq!(rows[at + 6].as_deref(), Some("z"), "{rows:?}");
+}
+
+/// One snapshot of namespace `fz`'s marks as the Lua mirror holds them, serialized
+/// `id:row,col-end_row,end_col` in id order.
+async fn fuzz_snapshot(rpc: &Rpc) -> String {
+    exec_lua(
+        rpc,
+        "local out = {}
+         for _, e in ipairs(btv.buf.extmarks(0, _G.fz.ns, 0, -1, { details = true })) do
+           local d = e[4]
+           out[#out + 1] = { e[1], string.format('%d:%d,%d-%s,%s', e[1], e[2], e[3],
+             tostring(d.end_row), tostring(d.end_col)) }
+         end
+         table.sort(out, function(a, b) return a[1] < b[1] end)
+         local s = {}
+         for _, x in ipairs(out) do s[#s + 1] = x[2] end
+         return table.concat(s, ' ')",
+    )
+    .await
+    .as_str()
+    .unwrap_or_default()
+    .to_owned()
+}
+
+/// The next frame's `(buffer line, has a sign)` for every row showing a buffer line.
+async fn fuzz_sign_rows(rpc: &Rpc, inc: &mut UnboundedReceiver<Incoming>) -> Vec<(u64, bool)> {
+    let _ = exec_lua(rpc, "return 1").await;
+    let map = wait_redraw(inc, |m| {
+        window0_field(m, "diagnostics_signs").is_some() && window0_field(m, "numbers").is_some()
+    })
+    .await;
+    let arr = |k: &str| {
+        window0_field(&map, k)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let signs = arr("diagnostics_signs");
+    arr("numbers")
+        .iter()
+        .zip(signs.iter())
+        .filter_map(|(n, s)| {
+            let line = n.as_u64()?;
+            let has = s
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(Value::as_str)
+                .is_some();
+            Some((line, has))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_position_index_agrees_with_the_marks_across_random_edits() {
+    // A differential check of the index against the store it duplicates. The buffer
+    // is taller than the window, which is scrolled into its middle, so every query is
+    // a real sub-range. After each random edit the mirror's positions arrive through
+    // the windowed refresh (which asks the index, `reaching`), and the signs through
+    // `starting_in`; a structural change then forces a full re-read of every mark
+    // straight from the store. The two reads must agree, and every visible line the
+    // store puts a mark on (and only those) shows a sign. Marks mix both gravities,
+    // points and ranges, and pile up as edits collapse them, so ties and re-sorted
+    // runs are exercised. Most edits keep the line count, which bounds the refresh
+    // window on both sides.
+    let text: String = (0..90).map(|i| format!("ab{i}cdefgh\n")).collect();
+    let (rpc, mut inc) = start_with_file(&text).await;
+    exec_lua(
+        &rpc,
+        "_G.fz = { seed = 12345, ns = btv.ns.create('fz'), bump = btv.ns.create('bump') }
+         function _G.fz.rand(n)
+           _G.fz.seed = (_G.fz.seed * 1103515245 + 12345) % 2147483648
+           return (_G.fz.seed // 65536) % n
+         end
+         local r = _G.fz.rand
+         for _ = 1, 400 do
+           local row = r(90)
+           local col = r(8)
+           local opts = { sign_text = 'x', right_gravity = r(2) == 0 }
+           if r(2) == 0 then
+             opts.end_row = math.min(89, row + r(3))
+             opts.end_col = (opts.end_row == row) and math.min(8, col + r(4)) or r(8)
+             opts.end_right_gravity = r(2) == 0
+           end
+           btv.buf.set_extmark(0, _G.fz.ns, row, col, opts)
+         end
+         btv.cmd('45')
+         btv.cmd('normal! zz')",
+    )
+    .await;
+    for step in 0..150 {
+        // Draw a frame so the index is built and must be carried across the edit.
+        let _ = fuzz_sign_rows(&rpc, &mut inc).await;
+        let edit: String = exec_lua(
+            &rpc,
+            "local r = _G.fz.rand
+             local lines = btv.buf.lines(0, 0, -1)
+             local n = #lines
+             local sr = 30 + r(30)
+             local sc = r(#lines[sr + 1] + 1)
+             local er, ec = sr, sc
+             if r(4) ~= 0 then
+               er = sr + r(2)
+               ec = (er == sr) and math.min(#lines[er + 1], sc + r(5)) or r(#lines[er + 1] + 1)
+             end
+             local rep = ({ { '' }, { 'zz' }, { 'q', 'w' }, { 'yyy' }, { 'k' } })[r(5) + 1]
+             -- Keep the line count near 90: a line-count change only every so often.
+             local delta = (#rep - 1) - (er - sr)
+             if (n > 92 and delta > 0) or (n < 88 and delta < 0) or r(3) ~= 0 then
+               if delta ~= 0 then er = sr; ec = math.min(#lines[sr + 1], sc + r(3)); rep = { 'mm' } end
+             end
+             btv.buf.set_text(0, sr, sc, er, ec, rep)
+             return string.format('%d,%d-%d,%d %s', sr, sc, er, ec, table.concat(rep, '|'))",
+        )
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+        let windowed = fuzz_snapshot(&rpc).await;
+        let rows = fuzz_sign_rows(&rpc, &mut inc).await;
+        exec_lua(&rpc, "btv.buf.set_extmark(0, _G.fz.bump, 0, 0, { id = 1 })").await;
+        let full = fuzz_snapshot(&rpc).await;
+        assert_eq!(
+            windowed, full,
+            "step {step} ({edit}): the index-scoped refresh disagrees with the store"
+        );
+        let marked: std::collections::BTreeSet<u64> = exec_lua(
+            &rpc,
+            "local s = {}
+             for _, e in ipairs(btv.buf.extmarks(0, _G.fz.ns, 0, -1)) do s[#s + 1] = e[2] + 1 end
+             return s",
+        )
+        .await
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Value::as_u64)
+        .collect();
+        assert!(rows.len() > 5, "the window shows lines: {rows:?}");
+        for (line, has) in &rows {
+            assert_eq!(
+                *has,
+                marked.contains(line),
+                "step {step} ({edit}): line {line} sign {has}, rows {rows:?}"
+            );
+        }
+    }
+}

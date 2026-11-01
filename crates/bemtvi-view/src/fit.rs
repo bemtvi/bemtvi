@@ -312,6 +312,47 @@ pub fn gutter_cell(
     }
 }
 
+/// Fit one row of the gutter text column to exactly `width` display cells: the
+/// chunks clipped at the column's right edge and padded on the right with a
+/// style-less chunk of spaces, so a shorter line's text lines up with the widest.
+/// `None` (a row with no gutter text) is all padding. A wide character that would
+/// straddle the edge becomes a space rather than spilling into the text.
+///
+/// Unlike the rest of this module it counts display cells, per grapheme, as the
+/// server measures the column's width, so a wide name in a blame column still
+/// lines up. The GUI, the terminal and the browser all pad through here (the
+/// browser's twin is `fitGutterText` in `web/index.html`).
+pub fn fit_gutter_text(chunks: Option<&[crate::VirtChunk]>, width: usize) -> Vec<crate::VirtChunk> {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let mut out: Vec<crate::VirtChunk> = Vec::new();
+    let mut used = 0usize;
+    for (text, style) in chunks.unwrap_or_default() {
+        if used >= width {
+            break;
+        }
+        let mut kept = String::new();
+        for g in text.graphemes(true) {
+            let w = g.width();
+            if used + w > width {
+                // A wide grapheme cut by the edge: fill what's left with spaces.
+                kept.push_str(&" ".repeat(width - used));
+                used = width;
+                break;
+            }
+            kept.push_str(g);
+            used += w;
+        }
+        if !kept.is_empty() {
+            out.push((kept, *style));
+        }
+    }
+    if used < width {
+        out.push((" ".repeat(width - used), None));
+    }
+    out
+}
+
 /// A rectangle in screen **cells** — the toolkit-neutral spelling of the TUI's
 /// ratatui `Rect` and the GUI's loose `(x, y, w, h)` quadruple, so popup geometry
 /// the two clients must agree on can be expressed once here.

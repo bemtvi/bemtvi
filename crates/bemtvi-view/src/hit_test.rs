@@ -57,7 +57,7 @@ pub fn resize_handle_at(view: &View, geo: Geometry, row: u16, col: u16) -> Optio
 
 /// Whether the screen cell `(row, col)` is over the text of a window that takes the
 /// text I-beam pointer ([`WindowView::text_pointer`]) — its text columns, past the
-/// fold, sign and number gutters and above its status row, on a row that shows a
+/// fold, sign, number and gutter text columns and above its status row, on a row that shows a
 /// buffer line (not a virtual line or a `~` filler). A float over the cell
 /// decides it (topmost first), so a read-only float over editable text shows the
 /// arrow. Mirrors the renderer's window placement, padding and float border.
@@ -99,7 +99,8 @@ pub fn text_pointer_at(view: &View, geo: Geometry, row: u16, col: u16) -> bool {
         let gutter = win
             .foldcolumn_width
             .saturating_add(win.sign_width)
-            .saturating_add(number);
+            .saturating_add(number)
+            .saturating_add(win.gutter_text_width);
         let text_h = h.saturating_sub(u16::from(win.status_visible));
         // Only a row that shows a buffer line has text to select: a virtual line,
         // a `~` filler and a row the view never filled keep the arrow.

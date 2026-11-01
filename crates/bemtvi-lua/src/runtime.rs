@@ -284,6 +284,11 @@ pub struct ExtmarkMirror {
     /// state a details read must keep returning.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line_hl_group: Option<String>,
+    /// The gutter text column's chunks, each `[text]` or `[text, hl_group]` —
+    /// round-tripped like the signs. A chunk is a list rather than a pair with an
+    /// optional group so an absent group reads back `nil`, not a `null` sentinel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gutter_text: Option<Vec<Vec<String>>>,
     /// Anchor gravity — round-tripped so a `get_extmarks(details=true)` after the tick
     /// surfaces the same flags the write-through stored. Only the *non-default* value
     /// rides the wire (start defaults right-gravity `true`, end defaults left-gravity,
@@ -1694,6 +1699,10 @@ pub struct UiMirror<'a> {
     /// is drawn at all (`t:gutter()`).
     pub number_width: &'a rmpv::Value,
     pub sign_width: &'a rmpv::Value,
+    /// The gutter text column: its per-row chunk runs (`t:decor()`) and its width
+    /// (`t:gutter()`).
+    pub gutter_text: &'a rmpv::Value,
+    pub gutter_text_width: &'a rmpv::Value,
     pub number_shown: bool,
     /// The focused window's scroll position: its horizontal offset, and the buffer
     /// line number of each painted row (`t:view()`).
@@ -3797,6 +3806,8 @@ impl LuaRuntime {
             diagnostics_virt,
             number_width,
             sign_width,
+            gutter_text,
+            gutter_text_width,
             number_shown,
             leftcol,
             numbers,
@@ -3902,6 +3913,14 @@ impl LuaRuntime {
         ui.set(
             "sign_width",
             crate::convert::rmpv_to_lua(&self.lua, sign_width)?,
+        )?;
+        ui.set(
+            "gutter_text",
+            crate::convert::rmpv_to_lua(&self.lua, gutter_text)?,
+        )?;
+        ui.set(
+            "gutter_text_width",
+            crate::convert::rmpv_to_lua(&self.lua, gutter_text_width)?,
         )?;
         // `number_width` is the width the column takes WHEN it is drawn; whether it
         // is drawn is `'number'`/`'relativenumber'`, which the client checks

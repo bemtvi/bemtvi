@@ -292,6 +292,64 @@ fn virt_chunks_from_table(list: &Table) -> mlua::Result<Vec<VirtChunkData>> {
     Ok(out)
 }
 
+/// Parse a `gutter_text` value into its chunks, refusing what the prelude's
+/// `check_gutter_text` refuses, by name: anything but a non-empty list of
+/// `{ text, group? }` (no hole, no named key, no third slot), a text that isn't a Lua
+/// string (a number is not coerced), a group that isn't one, and a newline, tab or
+/// other control character (a column cell has nowhere to put one; the frame would
+/// ship it scrubbed to a wider `^X` / `<xx>` spelling than the column's width).
+/// `Nil` ⇒ no gutter text.
+fn gutter_chunks_from_value(value: mlua::Value) -> mlua::Result<Vec<VirtChunkData>> {
+    let err = |msg: String| {
+        Err(mlua::Error::RuntimeError(format!(
+            "nvim_buf_set_extmark: {msg}"
+        )))
+    };
+    const NOT_A_LIST: &str = "gutter_text must be a list of { text, group? } chunks";
+    let list = match value {
+        mlua::Value::Nil => return Ok(Vec::new()),
+        mlua::Value::Table(list) => list,
+        _ => return err(NOT_A_LIST.into()),
+    };
+    let len = list.raw_len();
+    if len == 0 || list.clone().pairs::<mlua::Value, mlua::Value>().count() != len {
+        return err(NOT_A_LIST.into());
+    }
+    let mut out = Vec::with_capacity(len);
+    for i in 1..=len {
+        let where_ = format!("gutter_text[{i}]");
+        let shape = || {
+            err(format!(
+                "{where_} must be {{ text, group? }} with a string text"
+            ))
+        };
+        let mlua::Value::Table(chunk) = list.raw_get::<mlua::Value>(i)? else {
+            return shape();
+        };
+        let mlua::Value::String(text) = chunk.raw_get::<mlua::Value>(1)? else {
+            return shape();
+        };
+        let slots = chunk.raw_len();
+        if slots > 2 || chunk.clone().pairs::<mlua::Value, mlua::Value>().count() != slots {
+            return shape();
+        }
+        let hl_group = match chunk.raw_get::<mlua::Value>(2)? {
+            mlua::Value::Nil => None,
+            mlua::Value::String(s) => Some(s.to_str()?.to_owned()),
+            _ => return err(format!("{where_}: the group must be a string")),
+        };
+        let text = text.to_str()?.to_owned();
+        if text.contains(['\n', '\t']) {
+            return err(format!("{where_} may not contain a newline or a tab"));
+        }
+        if text.chars().any(char::is_control) {
+            return err(format!("{where_} may not contain a control character"));
+        }
+        out.push(VirtChunkData { text, hl_group });
+    }
+    Ok(out)
+}
+
 /// Lower a `nvim_buf_set_extmark` `decoration` table (the virtual-text payload the
 /// prelude collected) into a [`VirtDecorData`]. Returns `None` when it carries
 /// neither `virt_text` nor `virt_lines` — a decoration of only not-yet-rendered
@@ -328,11 +386,17 @@ fn virt_decor_from_table(t: &Table) -> mlua::Result<Option<VirtDecorData>> {
     // `line_hl_group = "<group>"` — the full-width line background (neovim's
     // `line_hl_group`), a renderable decoration on its own (the `line_bg` layer).
     let line_hl_group = t.get::<Option<String>>("line_hl_group")?;
+    // `gutter_text = { {text, hl_group?}, … }` — the gutter text column's chunks. The
+    // prelude's opt-splitter has already refused a malformed one by name, but the
+    // bridge is reached past it too (a direct `btv._extmark_set`, `btv._decor_publish`),
+    // so it holds the same line itself (`gutter_chunks_from_value`).
+    let gutter_text = gutter_chunks_from_value(t.get::<mlua::Value>("gutter_text")?)?;
     if virt_text.is_empty()
         && virt_lines.is_empty()
         && sign_text.is_none()
         && line_fill.is_none()
         && line_hl_group.is_none()
+        && gutter_text.is_empty()
     {
         return Ok(None);
     }
@@ -371,6 +435,7 @@ fn virt_decor_from_table(t: &Table) -> mlua::Result<Option<VirtDecorData>> {
         sign_hl_group,
         line_fill,
         line_hl_group,
+        gutter_text,
     }))
 }
 

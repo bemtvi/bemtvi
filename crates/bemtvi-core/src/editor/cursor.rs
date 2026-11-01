@@ -70,9 +70,10 @@ impl Editor {
 
     /// The focused window's text-area width in screen cells: its rect width minus a
     /// bordered float's one-cell inset (on each side) and every gutter — the fold
-    /// column, the sign column, and the number gutter. The horizontal analog of
-    /// [`text_height`], feeding the `leftcol` scroll math. Subtracts exactly what the
-    /// `width` `view::window_view` projects does, so on-screen and policy agree.
+    /// column, the sign column, the number gutter, and the gutter text column. The
+    /// horizontal analog of [`text_height`], feeding the `leftcol` scroll math.
+    /// Subtracts exactly what the `width` `view::window_view` projects does, so
+    /// on-screen and policy agree.
     pub(crate) fn text_width(&self) -> usize {
         self.window_text_width(self.windows.cur(), self.buffer())
     }
@@ -91,6 +92,7 @@ impl Editor {
             .saturating_sub(options.foldcolumn)
             .saturating_sub(super::windows::signcol_cells(w.sign_width, options))
             .saturating_sub(number_width)
+            .saturating_sub(buf.extmarks.gutter_text_width())
     }
 
     /// The last real line index (`line_count - 1`, saturating). The rope's phantom

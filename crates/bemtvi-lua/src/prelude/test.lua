@@ -737,7 +737,9 @@ function Ctx:view()
 end
 
 -- `t:gutter()` — the focused window's reserved gutter, as
--- `{ number_width = <cells>, sign_width = <cells>, total = <cells> }`.
+-- `{ number_width = <cells>, sign_width = <cells>, gutter_text_width = <cells>, total = <cells> }`.
+-- `gutter_text_width` is the column `gutter_text` marks fill, as wide as the widest of
+-- them in the buffer but never wider than the window has left beside its other gutters.
 --
 -- The CLIENT draws the number and sign columns from the widths the server
 -- reserves, so the gutter is in none of the row views — `t:screen()` is the text
@@ -757,10 +759,12 @@ function Ctx:gutter()
   -- `'nonumber'` and `'norelativenumber'` it is not drawn at all.
   local number_width = ui.number_shown and (ui.number_width or 0) or 0
   local sign_width = ui.sign_width or 0
+  local gutter_text_width = ui.gutter_text_width or 0
   return {
     number_width = number_width,
     sign_width = sign_width,
-    total = number_width + sign_width,
+    gutter_text_width = gutter_text_width,
+    total = number_width + sign_width + gutter_text_width,
   }
 end
 
@@ -843,10 +847,10 @@ local VIRT_POS =
   { [0] = "eol", [1] = "inline", [2] = "overlay", [3] = "right_align", [4] = "win_col" }
 
 -- `t:decor([row])` — the decoration drawn *beside* the focused window's rows:
--- virtual text, virtual lines, gutter signs, the full-width row tint, and the
--- end-of-line diagnostic message. A list of
--- `{ virt_text = "…", virt_pos = "eol", virt_col = 0, virt_lines = "…", sign = "▶",
--- line_bg = true, diagnostic = "…", severity = 1 }` per row (1-based *screen* rows,
+-- virtual text, virtual lines, gutter signs, the gutter text column, the full-width
+-- row tint, and the end-of-line diagnostic message. A list of
+-- `{ virt_text = "…", virt_pos = "eol", virt_col = 0, virt_lines = "…", sign = "▶",`
+-- `gutter = " 12  13", line_bg = true, diagnostic = "…", severity = 1 }` per row (1-based *screen* rows,
 -- matching `t:screen()`); with `row`, just that row's. Each key is absent on a row
 -- that carries nothing of that kind.
 --
@@ -867,10 +871,11 @@ local VIRT_POS =
 -- `virt_text` is the row's placements joined, since one row can carry several;
 -- `virt_pos`/`virt_col` describe the first. `virt_lines` is set on a row that *is* a
 -- virtual line — a whole extra screen row, so it reads blank in `t:screen()` and
--- carries its text here instead. `line_bg` is `true` on a row a `line_hl_group`
--- tints full width. Highlight *groups* are absent on purpose: the wire carries a
--- per-frame palette id for these layers, not a name, so `t:highlights()` stays the
--- group-level view.
+-- carries its text here instead. `gutter` is the row's `gutter_text` chunks joined, as
+-- sent: the client pads it to the column's width (`t:gutter().gutter_text_width`).
+-- `line_bg` is `true` on a row a `line_hl_group` tints full width. Highlight *groups*
+-- are absent on purpose: the wire carries a per-frame palette id for these layers, not
+-- a name, so `t:highlights()` stays the group-level view.
 --
 -- Only the focused window, like `t:screen()`.
 function Ctx:decor(row)
@@ -889,6 +894,7 @@ function Ctx:decor(row)
   -- on it is unreliable (it stops at the first gap); the painted-row count is the
   -- honest bound.
   local diags = (ui and ui.diagnostics_virt) or {}
+  local gutter = (ui and ui.gutter_text) or {}
   local rows, n = {}, math.max(#virt, #signs, #lines, last_bg, #((ui and ui.screen) or {}))
   for i = 1, n do
     local out = {}
@@ -917,6 +923,16 @@ function Ctx:decor(row)
     local sign = signs[i]
     if type(sign) == "table" then
       out.sign = sign[1]
+    end
+    -- The gutter text column's chunks, joined as sent (the client pads them to the
+    -- column's width).
+    local cells = gutter[i]
+    if type(cells) == "table" then
+      local texts = {}
+      for _, chunk in ipairs(cells) do
+        texts[#texts + 1] = chunk[1]
+      end
+      out.gutter = table.concat(texts)
     end
     out.line_bg = tinted[i] or nil
     -- The end-of-line diagnostic message, on its own layer beside the extmark

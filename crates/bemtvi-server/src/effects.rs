@@ -180,6 +180,7 @@ fn virt_decor_to_core(d: VirtDecorData) -> bemtvi_core::VirtDecor {
             hl_group: c.hl_group,
         }),
         line_hl_group: d.line_hl_group,
+        gutter_text: chunks(d.gutter_text),
     }
 }
 
@@ -297,7 +298,14 @@ fn extmark_dirty_window(
 /// `docs/plans/2026-08-07-incremental-buffer-mirror.md`.
 fn extmark_positions(buf: &bemtvi_core::Buffer, scope: PosScope) -> Vec<i64> {
     let mut flat = Vec::new();
-    for (ns, m) in buf.extmarks.iter_with_ns() {
+    // A windowed scope asks the store's position index for the marks reaching the
+    // window (a superset of the ones `touches` keeps: a range spanning the whole
+    // window is filtered out below), so an edit doesn't visit every mark.
+    let marks: Vec<(u32, &bemtvi_core::extmark::Extmark)> = match scope {
+        PosScope::All => buf.extmarks.iter_with_ns().collect(),
+        PosScope::Window { lo, hi } => buf.extmarks.reaching(lo, hi.unwrap_or(usize::MAX)),
+    };
+    for (ns, m) in marks {
         if is_reserved_ns(ns) {
             continue;
         }
@@ -2539,6 +2547,16 @@ impl EditHost {
                                     None => (None, None),
                                 };
                             let line_hl_group = d.and_then(|d| d.line_hl_group.clone());
+                            let gutter_text = d.filter(|d| !d.gutter_text.is_empty()).map(|d| {
+                                d.gutter_text
+                                    .iter()
+                                    .map(|c| {
+                                        std::iter::once(c.text.clone())
+                                            .chain(c.hl_group.clone())
+                                            .collect()
+                                    })
+                                    .collect()
+                            });
                             ExtmarkMirror {
                                 ns,
                                 id: m.id,
@@ -2553,6 +2571,7 @@ impl EditHost {
                                 line_fill_text,
                                 line_fill_hl,
                                 line_hl_group,
+                                gutter_text,
                                 right_gravity: m.right_gravity,
                                 end_right_gravity: m.end_right_gravity,
                             }

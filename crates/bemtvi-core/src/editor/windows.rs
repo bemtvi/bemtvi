@@ -1994,7 +1994,8 @@ impl Editor {
 
     /// Window `id`'s text offset — every gutter column before the first text cell,
     /// in the order the clients carve them off the left of the content box: the fold
-    /// column, the sign column, then the number gutter. `None` for an unknown id.
+    /// column, the sign column, the number gutter, then the gutter text column (its
+    /// buffer's widest `gutter_text` mark). `None` for an unknown id.
     /// Feeds the mouse hit-test, the completion popup's anchor, and the server's
     /// screen-column math for `vim.fn.screencol`.
     ///
@@ -2005,11 +2006,12 @@ impl Editor {
     pub fn window_textoff(&self, id: WindowId) -> Option<usize> {
         let (_, t) = self.tree_of_window(id)?;
         let w = t.get(id);
-        let lines = self.buffers.get(w.buffer).buffer.line_count();
+        let buf = &self.buffers.get(w.buffer).buffer;
         Some(
             w.options.foldcolumn
                 + signcol_cells(w.sign_width, &w.options)
-                + self.number_width_for(&w.options, lines),
+                + self.number_width_for(&w.options, buf.line_count())
+                + buf.extmarks.gutter_text_width(),
         )
     }
 

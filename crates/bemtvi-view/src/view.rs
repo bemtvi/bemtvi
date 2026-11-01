@@ -91,6 +91,10 @@ pub struct ScrollData {
     /// the signs slide with the text. Same shape as the per-window
     /// `diagnostics_signs`.
     pub diagnostics_signs: Vec<Option<DiagSign>>,
+    /// The gutter text column per band row (`Some(chunks)` on a row with some), so
+    /// a diff's numbers slide with their lines. Same shape as the per-window
+    /// [`WindowView::gutter_text`].
+    pub gutter_text: Vec<Option<Vec<VirtChunk>>>,
     /// The line-background layer for the band as `(band_row, style)` — the sibling
     /// of [`WindowView::line_bg`], so a code block's tint slides *with* the text
     /// instead of jumping to the settled position (or vanishing) during the slide.
@@ -245,6 +249,13 @@ pub struct WindowView {
     /// 2 (each sign column is 2 cells). The server resolves the `signcolumn` policy
     /// against the signs present, so the client just reserves this many cells.
     pub sign_width: u16,
+    /// Width in cells of the gutter text column, between the number gutter and the
+    /// text: the buffer's widest `gutter_text` extmark, `0` when it has none.
+    pub gutter_text_width: u16,
+    /// Per visible row, the gutter text column's chunks (`Some(chunks)`), or `None`
+    /// for a blank cell. A chunk with no style paints in the number column's
+    /// colours; [`fit_gutter_text`](crate::fit_gutter_text) fits a run to the width.
+    pub gutter_text: Vec<Option<Vec<VirtChunk>>>,
     /// Per visible row, the inline LSP inlay hints `(col, text, style_id)` in
     /// screen columns, sorted left to right. The renderer inserts each hint's text
     /// at its column, shifting the real glyphs (and the cursor) right. Empty inner
@@ -1405,6 +1416,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             virt_lines: parse_virt_lines(map_get(s, "virt_lines")),
             diagnostics: parse_diagnostics(map_get(s, "diagnostics")),
             diagnostics_signs: parse_diagnostics_signs(map_get(s, "diagnostics_signs")),
+            gutter_text: parse_virt_lines(map_get(s, "gutter_text")),
             diagnostics_virt: parse_diagnostics_virt(map_get(s, "diagnostics_virt")),
             line_bg: parse_line_bg(map_get(s, "line_bg"), styles),
             // The band's ids index this redraw's palette — snapshot it now, since
@@ -1451,6 +1463,8 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         virt_lines: parse_virt_lines(map_get(m, "virt_lines")),
         diagnostics_signs: parse_diagnostics_signs(map_get(m, "diagnostics_signs")),
         sign_width: map_u16(m, "sign_width"),
+        gutter_text_width: map_u16(m, "gutter_text_width"),
+        gutter_text: parse_virt_lines(map_get(m, "gutter_text")),
         inlay_hints: parse_inlay_hints(map_get(m, "inlay_hints")),
         scroll,
         numbers: parse_numbers(map_get(m, "numbers")),

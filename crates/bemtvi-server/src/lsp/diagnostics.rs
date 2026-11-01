@@ -357,11 +357,11 @@ impl EditHost {
     /// `window` when one is given.
     ///
     /// **Walked from the anchors, not from the diagnostics**, whenever a window is
-    /// asked for and the anchors are trustworthy. The anchors live in a `BTreeMap`
-    /// keyed by the diagnostic's position in the merged list, so iterating them
-    /// yields merged order for free and costs one integer compare per diagnostic —
-    /// where resolving from the diagnostic side costs a hash probe *and* a step
-    /// through the merged iterator each. Measured over 300 frames with 5000
+    /// asked for and the anchors are trustworthy. The anchors are found through the
+    /// extmark store's position index (`ExtmarkStore::reaching`), so the diagnostics
+    /// off screen cost nothing, and sorted back into id order, which is their position
+    /// in the merged list. Resolving from the diagnostic side instead costs a hash
+    /// probe *and* a step through the merged iterator each. Measured over 300 frames with 5000
     /// diagnostics, that difference was the entire remaining render cost: 2038 ms of
     /// resolution against 28 ms of index building and 83 ms of row emission
     /// (`docs/plans/2026-08-08-per-keystroke-costs-round-2.md`). Only the handful of
@@ -394,9 +394,18 @@ impl EditHost {
         // see it.
         let all_anchored = anchored && buf.extmarks.ns_len(DIAGNOSTIC_NS) == merged_len;
         if let (Some((lo, hi)), true) = (window, all_anchored) {
-            return buf
+            // The anchors reaching the window, from the store's position index, put
+            // back in id order (the merged-list order the anchors are addressed by).
+            let mut anchors: Vec<&bemtvi_core::Extmark> = buf
                 .extmarks
-                .iter_ns(DIAGNOSTIC_NS)
+                .reaching(lo, hi)
+                .into_iter()
+                .filter(|(ns, _)| *ns == DIAGNOSTIC_NS)
+                .map(|(_, m)| m)
+                .collect();
+            anchors.sort_by_key(|m| m.id);
+            return anchors
+                .into_iter()
                 .filter_map(|m| {
                     let start = m.start;
                     let end = m.end.unwrap_or(start).max(start);

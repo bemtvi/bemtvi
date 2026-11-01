@@ -28,10 +28,10 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use bemtvi_view::{
-    doc_box, elide_middle, fit_row, gutter_cell, pmenu_row, pmenu_start, row_head_col,
-    row_hl_extent, wrap_chars, Border, CellRect, DiagSign, DiagSpan, DiagVirt, Geometry, InlayHint,
-    MenuField, ResizeCursor, StatusSegment, Style, TabData, View, VirtChunk, VirtPlacement,
-    WindowRegion, WindowView,
+    doc_box, elide_middle, fit_gutter_text, fit_row, gutter_cell, pmenu_row, pmenu_start,
+    row_head_col, row_hl_extent, wrap_chars, Border, CellRect, DiagSign, DiagSpan, DiagVirt,
+    Geometry, InlayHint, MenuField, ResizeCursor, StatusSegment, Style, TabData, View, VirtChunk,
+    VirtPlacement, WindowRegion, WindowView,
 };
 use glyphon::{
     fontdb, Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping,
@@ -205,6 +205,9 @@ pub struct ScrollFrame<'a> {
     /// squiggles and signs slide with the text instead of blanking for the slide.
     pub diagnostics: &'a [Vec<DiagSpan>],
     pub diagnostics_signs: &'a [Option<DiagSign>],
+    /// Per-row gutter text column chunks for the band, so a diff's numbers slide
+    /// with their lines.
+    pub gutter_text: &'a [Option<Vec<VirtChunk>>],
     /// The line-background layer for the band as `(band_row, style)`, so a code
     /// block's tint slides with the text instead of vanishing for the slide (the
     /// settled window paints its own `line_bg`; the band branch skips it, so without
@@ -245,6 +248,7 @@ impl<'a> ScrollFrame<'a> {
             diagnostics_virt: &d.diagnostics_virt,
             diagnostics: &d.diagnostics,
             diagnostics_signs: &d.diagnostics_signs,
+            gutter_text: &d.gutter_text,
             line_bg: &d.line_bg,
             styles: &d.styles,
         }
@@ -1397,7 +1401,11 @@ impl Renderer {
         let fold_w = win.foldcolumn_width;
         let sign_x0 = ox + fold_w;
         let gutter_x0 = ox + fold_w + sign_w;
-        let text_x0 = ox + fold_w + sign_w + gutter;
+        // The gutter text column (`gutter_text` marks) sits between the numbers and
+        // the text.
+        let gutter_text_w = win.gutter_text_width;
+        let gutter_text_x0 = gutter_x0 + gutter;
+        let text_x0 = gutter_text_x0 + gutter_text_w;
         // Text-area height in cells (the window minus its status row).
         let text_rows = wrows.saturating_sub(u16::from(win.status_visible));
 
@@ -1618,6 +1626,16 @@ impl Renderer {
                         if let Some(Some(n)) = s.numbers.get(k) {
                             let pos = (gutter_x0 as f32 * self.cell_w, y);
                             self.push_gutter(items, (*n, current_line), win, view, pos, clip);
+                        }
+                    }
+                    // The gutter text column slides with its line. Chunk backgrounds
+                    // settle in when the slide ends, like other mid-slide decoration.
+                    if gutter_text_w > 0 {
+                        if let Some(Some(chunks)) = s.gutter_text.get(k) {
+                            let current = s.numbers.get(k).copied().flatten() == Some(current_line);
+                            let segs = self.gutter_text_segs(chunks, current, win, view, s.styles);
+                            let pos = (gutter_text_x0 as f32 * self.cell_w, y);
+                            self.push_text(items, &segs, pos, fg, clip);
                         }
                     }
                     let hl = s.highlights.get(k).map(Vec::as_slice).unwrap_or(&[]);
@@ -1938,6 +1956,29 @@ impl Renderer {
                                 pos,
                                 win_clip,
                             );
+                        }
+                    }
+
+                    // The gutter text column, its chunks fitted to the column and
+                    // backed by their own backgrounds (a diff's `DiffDelete` numbers).
+                    if gutter_text_w > 0 {
+                        if let Some(Some(chunks)) = win.gutter_text.get(i) {
+                            let segs = self.gutter_text_segs(
+                                chunks,
+                                win.numbers.get(i).copied().flatten() == Some(win.cursor_line),
+                                win,
+                                view,
+                                &view.styles,
+                            );
+                            self.push_seg_backgrounds(
+                                quads,
+                                &segs,
+                                gutter_text_x0,
+                                row,
+                                text_x0 as f32 * self.cell_w,
+                            );
+                            let pos = self.cell_px(gutter_text_x0, row as u16);
+                            self.push_text(items, &segs, pos, fg, win_clip);
                         }
                     }
 
@@ -2938,13 +2979,7 @@ impl Renderer {
         // `'padding'` insets the text body, so the popup anchors a margin in too.
         wx += win.padding.left;
         wy += win.padding.top;
-        let sign_w = win.sign_width;
-        let gutter = if win.number || win.relativenumber {
-            win.number_width
-        } else {
-            0
-        };
-        let text_x0 = wx + win.foldcolumn_width + sign_w + gutter;
+        let (text_x0, _) = text_anchor(win, origin);
 
         // The focused window's text area — the world the popup and its doc preview
         // are laid out in, the same rect the TUI hands `render_pmenu`: the window
@@ -3082,24 +3117,7 @@ impl Renderer {
             let Some(win) = view.focused() else {
                 return;
             };
-            let (mut wx, mut wy) = match win.rect {
-                Some(r) => (origin.0 + r.x, origin.1 + r.y),
-                None => (origin.0, origin.1),
-            };
-            if win.floating && win.border.is_some() {
-                wx += 1;
-                wy += 1;
-            }
-            // `'padding'` insets the text body, so the popup anchors a margin in too.
-            wx += win.padding.left;
-            wy += win.padding.top;
-            let sign_w = win.sign_width;
-            let gutter = if win.number || win.relativenumber {
-                win.number_width
-            } else {
-                0
-            };
-            (wx + sign_w + gutter, wy)
+            text_anchor(win, origin)
         };
 
         // Themed colors (nvim-cmp / telescope groups, resolved server-side), each
@@ -3510,24 +3528,7 @@ impl Renderer {
             let Some(win) = view.focused() else {
                 return;
             };
-            let (mut wx, mut wy) = match win.rect {
-                Some(r) => (origin.0 + r.x, origin.1 + r.y),
-                None => (origin.0, origin.1),
-            };
-            if win.floating && win.border.is_some() {
-                wx += 1;
-                wy += 1;
-            }
-            // `'padding'` insets the text body, so the popup anchors a margin in too.
-            wx += win.padding.left;
-            wy += win.padding.top;
-            let sign_w = win.sign_width;
-            let gutter = if win.number || win.relativenumber {
-                win.number_width
-            } else {
-                0
-            };
-            (wx + sign_w + gutter, wy)
+            text_anchor(win, origin)
         };
 
         // Prefer the colorscheme's float chrome (`NormalFloat` / `FloatBorder` /
@@ -3914,7 +3915,8 @@ impl Renderer {
         } else {
             0
         };
-        let text_x0 = (x + win.foldcolumn_width + win.sign_width + gutter).min(x + w);
+        let text_x0 =
+            (x + win.foldcolumn_width + win.sign_width + gutter + win.gutter_text_width).min(x + w);
         let (left, top) = self.cell_px(x, y);
         let (text_left, _) = self.cell_px(text_x0, y);
         let right = left + w as f32 * self.cell_w;
@@ -4093,6 +4095,30 @@ impl Renderer {
             style_fg(&win.line_nr(view)).unwrap_or(DEFAULT_LINE_NR)
         };
         self.push_plain(items, &text, pos, color, bounds);
+    }
+
+    /// One row of the gutter text column as painted segments: fitted to the column
+    /// ([`fit_gutter_text`]) and each chunk in its own style, a chunk with none in
+    /// the number column's colours (`CursorLineNr` on the cursor line, else
+    /// `LineNr`, through any `winhighlight` override). `styles` is the palette the
+    /// chunks' ids index — the frame's, or a scroll band's snapshot.
+    fn gutter_text_segs(
+        &self,
+        chunks: &[VirtChunk],
+        current: bool,
+        win: &WindowView,
+        view: &View,
+        styles: &[Style],
+    ) -> Vec<Seg> {
+        let fg = if current {
+            style_fg(&win.cursor_line_nr(view)).unwrap_or(DEFAULT_FG)
+        } else {
+            style_fg(&win.line_nr(view)).unwrap_or(DEFAULT_LINE_NR)
+        };
+        fit_gutter_text(Some(chunks), win.gutter_text_width as usize)
+            .iter()
+            .map(|(t, id)| virt_chunk_seg(t, *id, styles, fg))
+            .collect()
     }
 
     /// Queue `segments` (each its own color) at `pos`, clipped to `bounds`,
@@ -5628,6 +5654,36 @@ pub fn menu_box_origin(
             win_anchor.1 + menu_row,
         )
     }
+}
+
+/// The screen cell where window `win`'s text body starts, given the windows-area
+/// `origin`: its rect, inset past a float's border and its `'padding'`, then past
+/// every left gutter — the fold column, the sign column, the number gutter (when
+/// numbers are on) and the gutter text column. The text paint, the completion
+/// popup, the `btv.ui.select` menu and a cursor-anchored content float (hover) all
+/// anchor here, so they agree with each other and with the TUI's text rect.
+///
+/// Pure, so it's tested in `tests/menu.rs`.
+pub fn text_anchor(win: &WindowView, origin: (u16, u16)) -> (u16, u16) {
+    let (mut wx, mut wy) = match win.rect {
+        Some(r) => (origin.0 + r.x, origin.1 + r.y),
+        None => (origin.0, origin.1),
+    };
+    if win.floating && win.border.is_some() {
+        wx += 1;
+        wy += 1;
+    }
+    wx += win.padding.left;
+    wy += win.padding.top;
+    let number = if win.number || win.relativenumber {
+        win.number_width
+    } else {
+        0
+    };
+    (
+        wx + win.foldcolumn_width + win.sign_width + number + win.gutter_text_width,
+        wy,
+    )
 }
 
 /// The rasterised ink box of an off-grid cluster's first glyph, at scale 1: the

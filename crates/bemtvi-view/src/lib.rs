@@ -28,8 +28,8 @@ mod view;
 
 pub use anim::{arm_scroll, lerp, ScrollAnim};
 pub use fit::{
-    doc_box, elide_keep_tail, elide_middle, fit_row, gutter_cell, pmenu_row, pmenu_start,
-    row_head_col, row_hl_extent, wrap_chars, CellRect,
+    doc_box, elide_keep_tail, elide_middle, fit_gutter_text, fit_row, gutter_cell, pmenu_row,
+    pmenu_start, row_head_col, row_hl_extent, wrap_chars, CellRect,
 };
 pub use hit_test::{resize_handle_at, text_pointer_at, Geometry, ResizeCursor};
 pub use keys::{encode_paste, encode_text, mouse_modifier, notation, notation_cmd, Key};

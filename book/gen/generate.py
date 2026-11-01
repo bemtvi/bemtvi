@@ -85,6 +85,7 @@ IMPORTS = [
     ("docs/features/docks.md", "features/docks.md"),
     ("docs/features/picker.md", "features/picker.md"),
     ("docs/features/quickfix-dock-lists.md", "features/quickfix-dock-lists.md"),
+    ("docs/features/gutter-text.md", "features/gutter-text.md"),
     ("docs/browser-editor.md", "features/browser-editor.md"),
     ("docs/edit-host-split.md", "features/edit-host-split.md"),
     ("docs/features/embedding.md", "features/embedding.md"),

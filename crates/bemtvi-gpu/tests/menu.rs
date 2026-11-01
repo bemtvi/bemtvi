@@ -62,3 +62,40 @@ fn a_window_anchored_menu_at_column_zero_does_not_underflow() {
     // A bordered popup (`left_shift` 0) at the very left of an undocked window.
     assert_eq!(menu_box_origin(false, (0, 0), 0, 0, 1, CMD_ROW, 6), (0, 0));
 }
+
+/// A window at `(10, 2)` with every left gutter on: a 2-cell fold column, a 2-cell
+/// sign column, a 4-cell number gutter and a 5-cell gutter text column.
+fn guttered_window() -> bemtvi_view::WindowView {
+    bemtvi_view::WindowView {
+        rect: Some(bemtvi_view::WinRect {
+            x: 10,
+            y: 2,
+            width: 60,
+            height: 20,
+        }),
+        foldcolumn_width: 2,
+        sign_width: 2,
+        number: true,
+        number_width: 4,
+        gutter_text_width: 5,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn the_text_anchor_is_past_every_left_gutter() {
+    // The completion popup, the `btv.ui.select` menu and a hover float all anchor
+    // here, so it must be where the text body starts: 10 + 2 + 2 + 4 + 5. Leaving
+    // the fold column out put the select menu and the hover float two cells left of
+    // the text they belong to, while the completion popup (and the TUI) sat right.
+    assert_eq!(bemtvi_gpu::text_anchor(&guttered_window(), (0, 1)), (23, 3));
+}
+
+#[test]
+fn the_text_anchor_skips_the_number_gutter_when_numbers_are_off() {
+    let win = bemtvi_view::WindowView {
+        number: false,
+        ..guttered_window()
+    };
+    assert_eq!(bemtvi_gpu::text_anchor(&win, (0, 0)), (19, 2));
+}

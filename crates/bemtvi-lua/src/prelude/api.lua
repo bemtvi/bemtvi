@@ -1700,6 +1700,50 @@ function btv.hl.palette()
   return out
 end
 
+-- A colour as its three channels: a `"#rrggbb"` string (either case) or the colour number
+-- `btv.hl.get` returns. `nil` for anything else.
+local function hl_rgb(c)
+  local n
+  if type(c) == "number" and c % 1 == 0 and c >= 0 and c <= 0xffffff then
+    n = c
+  elseif type(c) == "string" and c:match("^#%x%x%x%x%x%x$") then
+    n = tonumber(c:sub(2), 16)
+  else
+    return nil
+  end
+  return (n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff
+end
+
+-- `btv.hl.blend(a, b, ratio)` -> `"#rrggbb"`: colour `a` mixed into colour `b`, `ratio`
+-- of the way (`0` is `b`, `1` is `a`; each channel is `ratio * a + (1 - ratio) * b`,
+-- rounded). Each colour is a `"#rrggbb"` string or a colour number as `btv.hl.get`
+-- returns it. This is how a plugin derives a *background tint* from the active theme,
+-- which `btv.hl.palette` alone can't give: a palette accent faded into the palette
+-- background reads as that theme's own "added" line or highlighted row, on a dark and
+-- a light flavour alike. A colour that isn't one, or a `ratio` outside `0`..`1`, raises.
+--
+-- ```lua
+-- local p = btv.hl.palette()
+-- btv.hl.fallback("MyPluginAdded", { bg = btv.hl.blend(p.green, p.bg, 0.2) })
+-- ```
+function btv.hl.blend(a, b, ratio)
+  local ar, ag, ab = hl_rgb(a)
+  if not ar then
+    error('btv.hl.blend: `a` must be a "#rrggbb" colour or a colour number, got ' .. tostring(a), 2)
+  end
+  local br, bg, bb = hl_rgb(b)
+  if not br then
+    error('btv.hl.blend: `b` must be a "#rrggbb" colour or a colour number, got ' .. tostring(b), 2)
+  end
+  if type(ratio) ~= "number" or ratio < 0 or ratio > 1 then
+    error("btv.hl.blend: `ratio` must be a number from 0 to 1, got " .. tostring(ratio), 2)
+  end
+  local function mix(x, y)
+    return math.floor(ratio * x + (1 - ratio) * y + 0.5)
+  end
+  return string.format("#%02x%02x%02x", mix(ar, br), mix(ag, bg), mix(ab, bb))
+end
+
 -- The groups `btv.hl.fallback` has installed, `name -> the spec it wrote`. This is the
 -- ownership ledger that lets a re-apply tell "still holding OUR default" apart from
 -- "a theme or the user has since claimed it". Kept above the docstring so the

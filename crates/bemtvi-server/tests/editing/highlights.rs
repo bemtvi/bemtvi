@@ -1416,3 +1416,63 @@ async fn status_line_nc_chrome_group_resolves_into_the_frame_chrome() {
         "the focused bar still carries StatusLine"
     );
 }
+
+/// `btv.hl.blend(a, b, ratio)` mixes two colours, `ratio` of `a` into `b`: how a
+/// plugin derives a background tint (a diff line, a picked row) from the active
+/// palette instead of hardcoding one theme's hex.
+#[tokio::test]
+async fn hl_blend_mixes_ratio_of_the_first_colour_into_the_second() {
+    let dir = temp_dir("hl_blend");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    let blend = |a: &str, b: &str, r: &str| format!("return btv.hl.blend({a}, {b}, {r})");
+    let got = |v: Value| v.as_str().map(str::to_string);
+    // Each channel is `ratio * a + (1 - ratio) * b`, rounded.
+    assert_eq!(
+        got(exec_lua(&rpc, &blend("'#ff0000'", "'#0000ff'", "0.25")).await).as_deref(),
+        Some("#4000bf")
+    );
+    assert_eq!(
+        got(exec_lua(&rpc, &blend("'#ffffff'", "'#000000'", "0.5")).await).as_deref(),
+        Some("#808080")
+    );
+    // The ends of the ratio are the two colours themselves.
+    assert_eq!(
+        got(exec_lua(&rpc, &blend("'#123456'", "'#abcdef'", "1")).await).as_deref(),
+        Some("#123456")
+    );
+    assert_eq!(
+        got(exec_lua(&rpc, &blend("'#123456'", "'#abcdef'", "0")).await).as_deref(),
+        Some("#abcdef")
+    );
+    // A colour number (what `btv.hl.get` returns) is taken too, and case is ignored.
+    assert_eq!(
+        got(exec_lua(&rpc, &blend("0xff0000", "'#0000FF'", "0.25")).await).as_deref(),
+        Some("#4000bf")
+    );
+    // A palette slot blends straight into the background: the intended use.
+    let tint = exec_lua(
+        &rpc,
+        "local p = btv.hl.palette() return btv.hl.blend(p.green, p.bg, 0.2)",
+    )
+    .await;
+    assert!(
+        tint.as_str()
+            .is_some_and(|s| s.len() == 7 && s.starts_with('#')),
+        "{tint:?}"
+    );
+    // Bad input is an error naming the argument, never a silent black.
+    for (args, needle) in [
+        ("'red', '#000000', 0.5", "`a`"),
+        ("'#000000', '#12345', 0.5", "`b`"),
+        ("'#000000', '#ffffff', 1.5", "`ratio`"),
+        ("'#000000', '#ffffff', nil", "`ratio`"),
+    ] {
+        let err = exec_lua(
+            &rpc,
+            &format!("local ok, e = pcall(btv.hl.blend, {args}) return ok and 'OK' or tostring(e)"),
+        )
+        .await;
+        let err = err.as_str().unwrap_or_default().to_string();
+        assert!(err != "OK" && err.contains(needle), "{args}: {err}");
+    }
+}

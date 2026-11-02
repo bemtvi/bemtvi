@@ -553,8 +553,7 @@ impl Renderer {
 
         let font_size = physical_font_size(cfg.font_size, scale);
         let line_height = (font_size * LINE_SPACING).round();
-        let (cell_w, cell_h) =
-            measure_cell(&mut font_system, chain.primary(), font_size, line_height);
+        let (cell_w, cell_h) = measure_cell(&mut font_system, &chain, font_size, line_height);
         let italic_face = ItalicFace::resolve(&mut font_system, chain.primary());
 
         let rects = RectPipeline::new(&device, format);
@@ -615,7 +614,7 @@ impl Renderer {
         self.line_height = (self.font_size * LINE_SPACING).round();
         let (cell_w, cell_h) = measure_cell(
             &mut self.font_system,
-            self.chain.primary(),
+            &self.chain,
             self.font_size,
             self.line_height,
         );
@@ -5617,7 +5616,95 @@ pub fn shape_with_fonts(
     if let Some(name) = first {
         db.set_monospace_family(name);
     }
+    shape_in_db(db, fonts, text, (bold, italic))
+}
+
+/// [`shape_with_fonts`] with no font list, over a database of `files` whose system
+/// monospace isn't among them, for the Tier-1 default-font test. Each file is loaded in
+/// the order given, so a test decides which face the database reaches first.
+pub fn shape_with_default_font(files: &[std::path::PathBuf], text: &str) -> Vec<TestGlyph> {
+    let mut db = fontdb::Database::new();
+    for f in files {
+        db.load_font_file(f).expect("a test font loads");
+    }
+    db.set_monospace_family("BtvTest Not Installed");
+    shape_in_db(db, &[], text, (false, false)).0
+}
+
+/// The families list `fonts` resolves to, in order, over a database of `files` whose
+/// system monospace isn't among them, for the Tier-1 default-font test.
+pub fn resolved_fonts(
+    files: &[std::path::PathBuf],
+    fonts: &[bemtvi_view::FontSpec],
+) -> Vec<String> {
+    let mut db = fontdb::Database::new();
+    for f in files {
+        db.load_font_file(f).expect("a test font loads");
+    }
+    db.set_monospace_family("BtvTest Not Installed");
     let mut font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
+    let chain = FontChain::resolve(&mut font_system, fonts);
+    chain.fonts.into_iter().map(|f| f.family).collect()
+}
+
+/// The cell width at 10px with list `fonts` over a database of `files`, for the Tier-1
+/// font-chain tests.
+pub fn measured_cell_width(files: &[std::path::PathBuf], fonts: &[bemtvi_view::FontSpec]) -> f32 {
+    let mut db = fontdb::Database::new();
+    for f in files {
+        db.load_font_file(f).expect("a test font loads");
+    }
+    let mut font_system = test_font_system(db);
+    let chain = FontChain::resolve(&mut font_system, fonts);
+    measure_cell(&mut font_system, &chain, 10.0, 12.0).0
+}
+
+/// The family this machine's real font database gives the text when nothing is
+/// configured, and whether the face is an italic one.
+pub fn system_default_font() -> Option<(String, bool)> {
+    let mut font_system = FontSystem::new();
+    let chain = FontChain::resolve(&mut font_system, &[]);
+    let family = chain.fonts.first()?.family.clone();
+    let italic = font_system
+        .db()
+        .query(&fontdb::Query {
+            families: &[Family::Name(&family)],
+            ..Default::default()
+        })
+        .and_then(|id| font_system.db().face(id))
+        .is_some_and(|f| f.style != fontdb::Style::Normal);
+    Some((family, italic))
+}
+
+/// A font system whose fallback list holds test fonts where a platform's holds `.SF NS`,
+/// so the font tests hit that path on any machine.
+fn test_font_system(db: fontdb::Database) -> FontSystem {
+    struct TestFallback;
+    impl cosmic_text::Fallback for TestFallback {
+        fn common_fallback(&self) -> &'static [&'static str] {
+            &["BtvTest Wider", "BtvTest Elsewhere"]
+        }
+        fn forbidden_fallback(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn script_fallback(
+            &self,
+            _script: unicode_script::Script,
+            _locale: &str,
+        ) -> &'static [&'static str] {
+            &[]
+        }
+    }
+    FontSystem::new_with_locale_and_db_and_fallback("en-US".to_string(), db, TestFallback)
+}
+
+fn shape_in_db(
+    db: fontdb::Database,
+    fonts: &[bemtvi_view::FontSpec],
+    text: &str,
+    (bold, italic): (bool, bool),
+) -> (Vec<TestGlyph>, Vec<String>) {
+    let mut font_system = test_font_system(db);
     let chain = FontChain::resolve(&mut font_system, fonts);
     let metrics = Metrics::new(10.0, 12.0);
     let segments = [Seg {
@@ -5654,15 +5741,18 @@ pub fn shape_with_fonts(
     (glyphs, chain.missing.clone())
 }
 
-/// Measure the cell size from the configured font by shaping a single `M`.
+/// Measure the cell size from the primary font by shaping a single `M`.
 fn measure_cell(
     font_system: &mut FontSystem,
-    family: Family,
+    chain: &FontChain,
     font_size: f32,
     line_height: f32,
 ) -> (f32, f32) {
     let mut buf = Buffer::new(font_system, Metrics::new(font_size, line_height));
-    buf.set_text("M", &Attrs::new().family(family), Shaping::Advanced, None);
+    let attrs = Attrs::new()
+        .family(chain.primary())
+        .weight(chain.primary_weight());
+    buf.set_text("M", &attrs, Shaping::Advanced, None);
     buf.shape_until_scroll(font_system, false);
     let advance = buf
         .layout_runs()

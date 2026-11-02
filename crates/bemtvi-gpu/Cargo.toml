@@ -19,6 +19,8 @@ glyphon.workspace = true
 # Direct dep only to turn on cosmic-text's `monospace_fallback` feature (see the
 # workspace dep note); glyphon still owns the actual text-render types we use.
 cosmic-text.workspace = true
+# Names a test font list as the fallback in the font-chain test helpers (render.rs).
+unicode-script.workspace = true
 # Cell-width accounting for the wide-glyph / emoji renderer (render.rs): how many
 # grid cells a cluster occupies, matching the server's column model.
 unicode-width.workspace = true

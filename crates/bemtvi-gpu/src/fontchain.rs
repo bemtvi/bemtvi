@@ -20,9 +20,28 @@ pub(crate) struct ChainFont {
     /// The characters its regular face draws.
     coverage: HashSet<u32>,
     weight: Option<Weight>,
+    /// The weights its upright faces draw: one per static face, the `wght` axis's range
+    /// for a variable one.
+    weights: Vec<(u16, u16)>,
     scale: Option<f32>,
     features: FontFeatures,
 }
+
+/// The fonts the system monospace means on this platform, best first. Named outright
+/// because the database's own idea of it is cosmic-text's hardcoded `Noto Sans Mono` on
+/// every platform; where that isn't installed, cosmic-text falls back to the first
+/// monospaced face it holds, whatever its style (Courier New Italic on macOS).
+const PLATFORM_MONOSPACE: &[&str] = if cfg!(target_os = "macos") {
+    &["Menlo", "Monaco"]
+} else if cfg!(windows) {
+    &["Cascadia Mono", "Consolas", "Courier New"]
+} else {
+    &["Noto Sans Mono", "DejaVu Sans Mono", "Liberation Mono"]
+};
+
+/// Added after the system monospace when it stands in for an unset first font, so the
+/// icons plugins draw work out of the box. Not bundled, so only if it's installed.
+const DEFAULT_SYMBOLS: &str = "Symbols Nerd Font Mono";
 
 /// The configured list as installed: the fonts the database has, in order, and the
 /// names it doesn't. The first entry is the primary, measured for the cell. When the
@@ -44,6 +63,7 @@ fn decides_font(ch: char) -> bool {
 impl FontChain {
     pub(crate) fn resolve(font_system: &mut FontSystem, specs: &[FontSpec]) -> Self {
         let mut chain = Self::default();
+        let mut stood_in = specs.is_empty();
         for (i, spec) in specs.iter().enumerate() {
             match installed_family(font_system, &spec.family) {
                 Some(family) => {
@@ -53,6 +73,7 @@ impl FontChain {
                 None => {
                     chain.missing.push(spec.family.clone());
                     if i == 0 {
+                        stood_in = true;
                         chain.push_monospace(font_system);
                     }
                 }
@@ -61,12 +82,24 @@ impl FontChain {
         if specs.is_empty() {
             chain.push_monospace(font_system);
         }
+        if stood_in {
+            chain.push_default_symbols(font_system);
+        }
         chain
     }
 
     fn push_monospace(&mut self, font_system: &mut FontSystem) {
-        let name = font_system.db().family_name(&Family::Monospace).to_string();
-        if installed_family(font_system, &name).is_some() {
+        if let Some(name) = monospace_family(font_system) {
+            let font = ChainFont::load(font_system, name, &FontSpec::default());
+            self.fonts.push(font);
+        }
+    }
+
+    fn push_default_symbols(&mut self, font_system: &mut FontSystem) {
+        let Some(name) = installed_family(font_system, DEFAULT_SYMBOLS) else {
+            return;
+        };
+        if !self.fonts.iter().any(|f| f.family == name) {
             let font = ChainFont::load(font_system, name, &FontSpec::default());
             self.fonts.push(font);
         }
@@ -90,6 +123,13 @@ impl FontChain {
         })
     }
 
+    /// The weight the primary draws regular text at, the one the cell is measured from.
+    pub(crate) fn primary_weight(&self) -> Weight {
+        self.fonts.first().map_or(Weight::NORMAL, |f| {
+            f.drawable_weight(f.weight.unwrap_or(Weight::NORMAL))
+        })
+    }
+
     /// `attrs` for text drawn by listed font `font`: its family named outright, its
     /// weight for regular text (bold stays bold), its features, and its scale on the
     /// size. `None` (no listed font covers the text) names the primary and lets
@@ -101,19 +141,18 @@ impl FontChain {
         bold: bool,
         metrics: Metrics,
     ) -> Attrs<'a> {
-        let weight = |w: Option<Weight>| {
-            if bold {
-                Weight::BOLD
-            } else {
-                w.unwrap_or(Weight::NORMAL)
-            }
-        };
         let Some(f) = font.and_then(|i| self.fonts.get(i)) else {
-            return attrs.family(self.primary()).weight(weight(None));
+            let weight = if bold { Weight::BOLD } else { Weight::NORMAL };
+            return attrs.family(self.primary()).weight(weight);
+        };
+        let weight = if bold {
+            Weight::BOLD
+        } else {
+            f.weight.unwrap_or(Weight::NORMAL)
         };
         let mut attrs = attrs
             .family(Family::Name(&f.family))
-            .weight(weight(f.weight))
+            .weight(f.drawable_weight(weight))
             .font_features(f.features.clone());
         if let Some(scale) = f.scale {
             attrs = attrs.metrics(Metrics::new(metrics.font_size * scale, metrics.line_height));
@@ -127,13 +166,21 @@ impl ChainFont {
         let weight = spec.weight.map(Weight);
         // The face its regular text uses: upright, at the nearest weight.
         let want = weight.unwrap_or(Weight::NORMAL).0;
-        let face = font_system
+        let upright: Vec<(fontdb::ID, u16)> = font_system
             .db()
             .faces()
             .filter(|f| f.families.iter().any(|(n, _)| *n == family))
             .filter(|f| f.style == fontdb::Style::Normal)
-            .min_by_key(|f| f.weight.0.abs_diff(want))
-            .map(|f| f.id);
+            .map(|f| (f.id, f.weight.0))
+            .collect();
+        let face = upright
+            .iter()
+            .min_by_key(|(_, w)| w.abs_diff(want))
+            .map(|(id, _)| *id);
+        let weights = upright
+            .iter()
+            .map(|&(id, w)| weight_range(font_system.db(), id, w))
+            .collect();
         let coverage = face
             .map(|id| coverage(font_system.db(), id))
             .unwrap_or_default();
@@ -148,10 +195,37 @@ impl ChainFont {
             family,
             coverage,
             weight,
+            weights,
             scale: spec.scale,
             features,
         }
     }
+
+    /// The weight to ask for to draw at `want` in this font: `want` if it has it, else
+    /// the nearest it has. Asking for a weight the family lacks sends cosmic-text to its
+    /// fallback list (`.SF NS` first on macOS, which isn't monospaced), not to the
+    /// family's nearest face. A font with no bold face draws bold text at its own weight.
+    fn drawable_weight(&self, want: Weight) -> Weight {
+        self.weights
+            .iter()
+            .map(|&(low, high)| want.0.clamp(low, high))
+            .min_by_key(|w| w.abs_diff(want.0))
+            .map_or(want, Weight)
+    }
+}
+
+/// The weights face `id` draws: its `wght` axis's range if it's variable, else `weight`.
+fn weight_range(db: &fontdb::Database, id: fontdb::ID, weight: u16) -> (u16, u16) {
+    db.with_face_data(id, |data, index| {
+        let face = ttf_parser::Face::parse(data, index).ok()?;
+        let axis = face
+            .variation_axes()
+            .into_iter()
+            .find(|a| a.tag == ttf_parser::Tag::from_bytes(b"wght"))?;
+        Some((axis.min_value as u16, axis.max_value as u16))
+    })
+    .flatten()
+    .unwrap_or((weight, weight))
 }
 
 /// The characters face `id` draws: every code point its Unicode `cmap` subtables map.
@@ -187,6 +261,27 @@ fn installed_family(font_system: &FontSystem, name: &str) -> Option<String> {
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(n, _)| n.clone())
     })
+}
+
+/// The family that stands in as the system monospace: the platform's own, then the one
+/// the database names, then any installed monospaced family with an upright face.
+fn monospace_family(font_system: &FontSystem) -> Option<String> {
+    let db_name = font_system.db().family_name(&Family::Monospace);
+    PLATFORM_MONOSPACE
+        .iter()
+        .copied()
+        .chain([db_name])
+        .find_map(|name| installed_family(font_system, name))
+        .or_else(|| {
+            font_system
+                .db()
+                .faces()
+                .filter(|f| f.monospaced && f.style == fontdb::Style::Normal)
+                .filter(|f| !f.post_script_name.contains("Emoji"))
+                .filter_map(|f| f.families.first().map(|(n, _)| n.clone()))
+                .filter(|n| !n.eq_ignore_ascii_case(DEFAULT_SYMBOLS))
+                .min()
+        })
 }
 
 /// Split `text` into maximal runs of grapheme clusters that `key` maps to the same

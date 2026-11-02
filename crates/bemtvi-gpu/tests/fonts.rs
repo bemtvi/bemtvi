@@ -5,7 +5,10 @@
 
 use std::path::PathBuf;
 
-use bemtvi_gpu::{runs_by, shape_with_fonts, TestGlyph};
+use bemtvi_gpu::{
+    measured_cell_width, resolved_fonts, runs_by, shape_with_default_font, shape_with_fonts,
+    TestGlyph,
+};
 use bemtvi_view::FontSpec;
 
 fn fonts() -> Vec<PathBuf> {
@@ -84,15 +87,16 @@ fn a_font_draws_its_characters_at_its_own_weight_and_scale() {
     let second = FontSpec {
         weight: Some(600),
         scale: Some(1.5),
-        ..FontSpec::named("BtvTest Second")
+        ..FontSpec::named("BtvTest Var")
     };
     let specs = vec![FontSpec::named("BtvTest Mono"), second];
-    let (glyphs, _) = shape_with_fonts(&fonts(), &specs, "ax", (false, false));
+    let files = [fonts(), vec![test_font("BtvTestVar.ttf")]].concat();
+    let (glyphs, _) = shape_with_fonts(&files, &specs, "ax", (false, false));
     let at = |t: &str| glyphs.iter().find(|g| g.text == t).expect("a glyph");
     assert_eq!((at("a").weight, at("a").font_size), (400, 10.0));
     assert_eq!((at("x").weight, at("x").font_size), (600, 15.0));
     // Bold text stays bold whatever the font's own weight.
-    let (glyphs, _) = shape_with_fonts(&fonts(), &specs, "x", (true, false));
+    let (glyphs, _) = shape_with_fonts(&files, &specs, "x", (true, false));
     assert_eq!(glyphs[0].weight, 700);
 }
 
@@ -177,10 +181,131 @@ fn a_variation_selector_or_joiner_doesnt_decide_the_font() {
         FontSpec::named("BtvTest Second"),
         FontSpec {
             weight: Some(600),
-            ..FontSpec::named("BtvTest Mono")
+            ..FontSpec::named("BtvTest Var")
         },
     ];
-    let (glyphs, _) = shape_with_fonts(&fonts(), &specs, "b\u{FE0F}", (false, false));
-    assert_eq!(glyphs[0].family, "BtvTest Mono");
+    let files = [fonts(), vec![test_font("BtvTestVar.ttf")]].concat();
+    let (glyphs, _) = shape_with_fonts(&files, &specs, "b\u{FE0F}", (false, false));
+    assert_eq!(glyphs[0].family, "BtvTest Var");
     assert_eq!(glyphs[0].weight, 600);
+}
+
+#[test]
+fn the_default_font_is_never_an_italic_face() {
+    // No font configured and the database's monospace isn't installed: the face the
+    // database happens to reach first is the italic one, and it must not draw the text.
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fonts");
+    let files = [
+        dir.join("BtvTestMonoItalic.ttf"),
+        dir.join("BtvTestMono.ttf"),
+    ];
+    let glyphs = shape_with_default_font(&files, "ab");
+    assert_eq!(
+        drawn_by(&glyphs),
+        vec![("a", "BtvTest Mono"), ("b", "BtvTest Mono")]
+    );
+    assert!(glyphs.iter().all(|g| !g.italic), "{glyphs:?}");
+}
+
+fn test_font(file: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fonts")
+        .join(file)
+}
+
+const SYMBOLS: &str = "Symbols Nerd Font Mono";
+
+#[test]
+fn the_symbols_font_follows_the_default_monospace() {
+    let files = [test_font("BtvTestSymbols.ttf"), test_font("BtvTestZz.ttf")];
+    assert_eq!(resolved_fonts(&files, &[]), vec!["Zz Mono", SYMBOLS]);
+}
+
+#[test]
+fn the_default_list_does_without_a_symbols_font_that_isnt_installed() {
+    let files = [test_font("BtvTestZz.ttf")];
+    assert_eq!(resolved_fonts(&files, &[]), vec!["Zz Mono"]);
+}
+
+#[test]
+fn a_stand_in_monospace_keeps_the_lists_fonts_ahead_of_the_symbols_font() {
+    let files = [
+        test_font("BtvTestMono.ttf"),
+        test_font("BtvTestSecond.ttf"),
+        test_font("BtvTestSymbols.ttf"),
+    ];
+    assert_eq!(
+        resolved_fonts(&files, &list(&["Fira Kode", "BtvTest Second"])),
+        vec!["BtvTest Mono", "BtvTest Second", SYMBOLS]
+    );
+    // Listed already: it keeps its place and isn't added twice.
+    assert_eq!(
+        resolved_fonts(&files, &list(&["Fira Kode", SYMBOLS, "BtvTest Second"])),
+        vec!["BtvTest Mono", SYMBOLS, "BtvTest Second"]
+    );
+}
+
+#[test]
+fn a_list_whose_first_font_is_installed_gets_no_symbols_font_added() {
+    let files = [test_font("BtvTestZz.ttf"), test_font("BtvTestSymbols.ttf")];
+    assert_eq!(resolved_fonts(&files, &list(&["Zz Mono"])), vec!["Zz Mono"]);
+}
+
+#[test]
+fn bold_text_stays_in_a_font_that_has_no_bold_face() {
+    // Another font has these characters at exactly the bold weight, and must not win.
+    let files = [
+        test_font("BtvTestSecond.ttf"),
+        test_font("BtvTestElsewhere.ttf"),
+    ];
+    let (glyphs, _) = shape_with_fonts(&files, &list(&["BtvTest Second"]), "ax", (true, false));
+    assert_eq!(
+        drawn_by(&glyphs),
+        vec![("a", "BtvTest Second"), ("x", "BtvTest Second")]
+    );
+}
+
+#[test]
+fn a_fonts_weight_option_it_has_no_face_for_stays_in_that_font() {
+    let files = [
+        test_font("BtvTestSecond.ttf"),
+        test_font("BtvTestElsewhere.ttf"),
+    ];
+    let spec = FontSpec {
+        weight: Some(700),
+        ..FontSpec::named("BtvTest Second")
+    };
+    let (glyphs, _) = shape_with_fonts(&files, &[spec], "a", (false, false));
+    assert_eq!(drawn_by(&glyphs), vec![("a", "BtvTest Second")]);
+}
+
+#[test]
+fn a_font_with_no_regular_face_still_draws_regular_text_and_sets_the_cell() {
+    let files = [test_font("BtvTestLight.ttf"), test_font("BtvTestWider.ttf")];
+    let specs = list(&["BtvTest Light"]);
+    let (glyphs, _) = shape_with_fonts(&files, &specs, "a", (false, false));
+    assert_eq!(drawn_by(&glyphs), vec![("a", "BtvTest Light")]);
+    // 500 units of 1000 at 10px, BtvTest Light's own advance, not BtvTest Wider's 9.
+    assert_eq!(measured_cell_width(&files, &specs), 5.0);
+}
+
+#[test]
+fn a_variable_font_draws_bold_at_the_bold_weight() {
+    let files = [
+        test_font("BtvTestVar.ttf"),
+        test_font("BtvTestElsewhere.ttf"),
+    ];
+    let (glyphs, _) = shape_with_fonts(&files, &list(&["BtvTest Var"]), "x", (true, false));
+    assert_eq!(drawn_by(&glyphs), vec![("x", "BtvTest Var")]);
+    assert_eq!(glyphs[0].weight, 700);
+}
+
+/// Menlo ships with macOS, so this one reads the real font database.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_default_font_on_macos_is_menlo() {
+    assert_eq!(
+        bemtvi_gpu::system_default_font(),
+        Some(("Menlo".to_string(), false))
+    );
 }

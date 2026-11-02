@@ -8,6 +8,12 @@ Rerun to regenerate (needs fontTools): python3 make.py
   face draws a and b only
 - BtvTest Second: a, x, y, z (its `a` must lose to the first font in a chain)
 - BtvTest Wide: x and 中 (U+4E2D)
+- Symbols Nerd Font Mono: an icon (U+F015), under the real name the default list asks for
+- BtvTest Var: space, a, b, x, with a variable wght axis from 100 to 800
+- BtvTest Light: a, M, only at weight 300, narrow
+- BtvTest Wider: a, M, at weight 400, wide (what a family lacking 400 must not lose to)
+- BtvTest Elsewhere: a, b, x, only at weight 700, wide (the same for a family lacking bold)
+- Zz Mono: a; sorts after the symbols font, which it must still beat as the primary
 """
 
 import os
@@ -33,7 +39,7 @@ def empty():
     return TTGlyphPen(None).glyph()
 
 
-def build(file, family, chars, advance=600, wide=(), features="", italic=False):
+def build(file, family, chars, advance=600, wide=(), features="", italic=False, weight=400, axes=None):
     names = [".notdef"]
     cmap = {}
     for ch in chars:
@@ -67,10 +73,15 @@ def build(file, family, chars, advance=600, wide=(), features="", italic=False):
         sTypoDescender=-200,
         usWinAscent=800,
         usWinDescent=200,
-        fsSelection=0x01 if italic else 0x40,
+        usWeightClass=weight,
+        fsSelection=0x01 if italic else (0x20 if weight >= 700 else 0x40),
     )
+    if axes:
+        fb.setupFvar(axes=[("wght", *axes, "Weight")], instances=[])
     if italic:
         fb.font["head"].macStyle = 0x02
+    elif weight >= 700:
+        fb.font["head"].macStyle = 0x01
     fb.setupPost(isFixedPitch=1)
     if features:
         addOpenTypeFeaturesFromString(fb.font, features)
@@ -86,3 +97,9 @@ build(
 build("BtvTestMonoItalic.ttf", "BtvTest Mono", "ab", italic=True)
 build("BtvTestSecond.ttf", "BtvTest Second", "axyz")
 build("BtvTestWide.ttf", "BtvTest Wide", "x中", wide="中")
+build("BtvTestSymbols.ttf", "Symbols Nerd Font Mono", "\uf015")
+build("BtvTestZz.ttf", "Zz Mono", " a")
+build("BtvTestVar.ttf", "BtvTest Var", " abx", axes=(100, 400, 800))
+build("BtvTestLight.ttf", "BtvTest Light", "aM", advance=500, weight=300)
+build("BtvTestWider.ttf", "BtvTest Wider", "aM", advance=900)
+build("BtvTestElsewhere.ttf", "BtvTest Elsewhere", "abx", advance=900, weight=700)

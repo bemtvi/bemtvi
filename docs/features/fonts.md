@@ -30,12 +30,16 @@ Options go in brackets after a font's name, separated by `;`:
 
 | Option | Value | Does |
 | --- | --- | --- |
-| `weight` | 1–1000, or `thin`, `extralight`, `light`, `normal`, `medium`, `semibold`, `bold`, `extrabold`, `black` | The weight of its regular text. Bold text stays bold. |
+| `weight` | 1–1000, or `thin`, `extralight`, `light`, `normal`, `medium`, `semibold`, `bold`, `extrabold`, `black` | The weight of its regular text. Bold text uses the font's bold. |
 | `scale` | a factor in (0, 4] | Draws its glyphs that much bigger or smaller. A glyph that no longer fits its cell is shrunk to fit unless `'guiglyphoverflow'` lets it spill into the next cell. |
 | `features` | space-separated `+tag`, `-tag`, `tag` or `tag=N` | OpenType features: `+ss01` turns a stylistic set on, `-calt` turns contextual alternates (most ligatures) off, `cv01=2` picks an alternate. |
 
 After the list, `:h<size>` sets the size. Other `:` flags (`:b`, `:i`, `:w…`, `:#e-…`)
 are accepted and ignored, as in Neovide.
+
+A font draws only the weights it has, so text never leaves it for lack of one. A
+font with no bold face draws bold text at its nearest weight, not in another font and
+not with a synthesized bold. The same goes for a `weight` it has no face for.
 
 ## When something is wrong
 
@@ -57,6 +61,17 @@ The browser takes the list, the size and each font's weight and scale. It can't 
 OpenType features per font, so the first font's features apply to all the text,
 which is where they're almost always wanted. Features on a later font are reported
 on the message line as not applied in the browser.
+
+## With no font set
+
+The GUI uses the platform's monospace, the first of these that's installed: Menlo
+then Monaco on macOS; Cascadia Mono, Consolas then Courier New on Windows; Noto Sans
+Mono, DejaVu Sans Mono then Liberation Mono elsewhere. If none is, it takes any
+installed monospaced font with an upright face.
+
+Symbols Nerd Font Mono comes after it, if installed, so icons work without a config.
+The same happens when the first font in your list isn't installed, with your other
+fonts ahead of it. A list whose first font is installed is used exactly as written.
 
 ## Limits
 

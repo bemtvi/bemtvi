@@ -71,7 +71,10 @@ pub use render::{
     DEFAULT_VISUAL_BG, DEFAULT_WIN_SEPARATOR, DIAG_ERROR, DIAG_HINT, DIAG_INFO, DIAG_WARN,
     MULTICURSOR_ACCENT,
 };
-pub use render::{shape_with_fonts, TestGlyph};
+pub use render::{
+    measured_cell_width, resolved_fonts, shape_with_default_font, shape_with_fonts,
+    system_default_font, TestGlyph,
+};
 // The pure per-row syntax-coloring layer (run splitting + the no-colorscheme group
 // fallback), exported so the Tier-1 `syntax` test can exercise it without a GPU.
 pub use render::{

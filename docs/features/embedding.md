@@ -15,13 +15,13 @@ runs a small notes app built this way (`crates/bemtvi-mitsuami/examples/embed.rs
 ## Depending on it
 
 The crates aren't on crates.io yet: an app takes `bemtvi-mitsuami` from git, and the
-same mitsuami revision bemtvi builds against (the editor's view is a mitsuami view, so
-both must be one mitsuami):
+mitsuami from crates.io at a version compatible with bemtvi's (the editor's view is a
+mitsuami view, so both must resolve to one mitsuami):
 
 ```toml
 [dependencies]
 bemtvi-mitsuami = { git = "https://github.com/bemtvi/bemtvi" }
-mitsuami = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "59db232086e13cf92ec65cab8acd4bf897582235" }
+mitsuami = "2.0.0"
 ```
 
 `bemtvi-mitsuami` is a thin layer: the editor's client itself, with no toolkit, is

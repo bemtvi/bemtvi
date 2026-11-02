@@ -150,12 +150,9 @@ windows-sys = "0.61.2"
 # re-exports cosmic-text, so the GUI reaches `FontSystem`/`Buffer`/`Attrs`/… through
 # `glyphon::`). glyphon 0.12 builds against wgpu 30 — bump the two together. `pollster`
 # blocks on wgpu's async device/adapter requests while the surface is set up.
-# Pinned to a GitHub revision rather than a crates.io release while embedding
-# (`bemtvi-mitsuami`) needs mitsuami changes no release has yet; back to a version
-# requirement once one does. `mitsuami-test` (bemtvi-mitsuami's embed tests) comes from the
-# same revision, so the two can't drift apart.
-mitsuami = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "59db232086e13cf92ec65cab8acd4bf897582235" }
-mitsuami-test = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "59db232086e13cf92ec65cab8acd4bf897582235" }
+mitsuami = "2.0.0"
+# `bemtvi-mitsuami`'s embed tests; same release as `mitsuami`, so the two can't drift apart.
+mitsuami-test = "2.0.0"
 wgpu = "30.0.1"
 # The window handle a host's toolkit gives `bemtvi-gpu`'s renderer: the version wgpu
 # and mitsuami both speak, so a handle from one is a surface target for the other.

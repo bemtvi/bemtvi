@@ -4841,6 +4841,20 @@ impl LuaRuntime {
         }
     }
 
+    /// Refresh `btv._cur_selection`, the live selection's extent `{ s_row, s_col,
+    /// e_row, e_col }` (0-based rows, byte columns, end-exclusive), or nil outside a
+    /// selection. Backs `btv.win.selection()`.
+    pub fn set_selection(&self, sel: Option<(u64, u64, u64, u64)>) -> mlua::Result<()> {
+        let btv = self.btv()?;
+        match sel {
+            Some((sr, sc, er, ec)) => btv.set(
+                "_cur_selection",
+                self.lua.create_sequence_from([sr, sc, er, ec])?,
+            ),
+            None => btv.set("_cur_selection", mlua::Value::Nil),
+        }
+    }
+
     pub fn set_screen_cursor(&self, row: u64, col: u64) -> mlua::Result<()> {
         let btv = self.btv()?;
         btv.set("_cur_screenrow", row)?;

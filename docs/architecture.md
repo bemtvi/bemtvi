@@ -519,12 +519,15 @@ break, typing/deleting switch, pause, or cursor move (`Editor::before_typed_edit
 server brackets mapping output with `begin_undo_atomic`/`end_undo_atomic`, since only
 it knows which keys a mapping produced. See [Undo steps](features/undo.md).
 
-A modeless session (`'modeless'`, GUI and web only) adds no `Mode`. A modifiable
-buffer *rests* in Insert instead of Normal, and one settle point keeps it there:
-`Editor::settle_modeless` (`editor/modeless.rs`) moves a clean Normal over a
-modifiable buffer into Insert. The server calls it after every applied key and
-command, before it diffs the mode for `InsertEnter`/`ModeChanged`, and the core calls
-it when a mapping or fed span closes. Any path that drops into Normal is corrected
+A modeless session (`'modeless'`, GUI and web only) adds no `Mode`. Every buffer
+*rests* in Insert instead of Normal (a live terminal in Terminal), and one settle
+point keeps it there: `Editor::settle_modeless` (`editor/modeless.rs`) moves a clean
+Normal into Insert. A read-only buffer rests there too; one guard ahead of the
+Insert/Select dispatch (`Editor::refuses_modeless_key`) refuses every key that would
+edit it with `E21`, so its own keys must be maps in the `modeless` layer. The server
+calls `settle_modeless` after every applied key and command, before it diffs the mode
+for `InsertEnter`/`ModeChanged`, and the core calls it when a mapping or fed span
+closes. Any path that drops into Normal is corrected
 there rather than taught about the setting. The selection is Select mode with a caret
 anchor and head of its own (`CaretSel`), and the key layout is a keymap layer the
 server matches in tries built as the Insert (or Select) maps with the `modeless` maps

@@ -438,6 +438,17 @@ impl Editor {
             self.visual_operate_multi(op);
             return;
         }
+        // Only `y` and `zf` leave the text alone. The others reach it below through
+        // their own helpers, not `apply_operator_to_range`'s check, so a read-only
+        // buffer refuses them here; vim has ended Visual by then, as here.
+        if op != 'y' && op != FOLD_OP && !self.modifiable() {
+            self.record_visual_marks();
+            self.refuse_edit();
+            self.mode = Mode::Normal;
+            self.reset_pending();
+            self.clamp_cursor();
+            return;
+        }
         let (lo, hi, linewise, first_line) = self.visual_range();
         // Every visual operator leaves `` `< `` / `` `> `` on the selection it
         // consumed; the ones handled before the register check below record them
@@ -1921,6 +1932,12 @@ impl Editor {
     /// register text (see [`Editor::cursor_registers`]) through the same logic.
     pub(crate) fn paste_text(&mut self, text: &str, linewise: bool, count: usize, after: bool) {
         if text.is_empty() || self.paste_too_long(text, count) {
+            return;
+        }
+        // The chokepoint for every put, including the middle-click paste, which
+        // reaches here from the mouse engine without passing a command's own check.
+        if !self.modifiable() {
+            self.refuse_edit();
             return;
         }
         let before = self.buffer().line_count();

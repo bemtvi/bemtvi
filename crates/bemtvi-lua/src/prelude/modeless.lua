@@ -1,14 +1,20 @@
 -- bemtvi Lua prelude — the modeless key layout (opt-in, GUI and web only).
 --
--- `'modeless'` makes a modifiable buffer rest in Insert, the way a GUI editor
--- edits: see `docs/plans/2026-10-22-modeless-editing.md`. The core does the editing
+-- `'modeless'` makes every buffer rest in Insert, the way a GUI editor edits, with
+-- no Normal mode anywhere: see `docs/plans/2026-10-22-modeless-editing.md` and
+-- `docs/plans/2026-11-01-modeless-read-only-buffers.md`. The core does the editing
 -- model: the resting mode, Shift-motion selection, typing over a selection, and the
 -- named verbs behind `btv._modeless_action` -> `Editor::apply_modeless_action`. This
 -- module is the KEYS: the familiar Ctrl chords, bound in the `modeless` keymap
--- layer. The server matches that layer only while a modeless session is typing or
--- selecting, laid over the Insert maps, so a layout key wins there and every other
--- key still reaches its Insert map (completion, snippets, your own). A vim session
--- never sees these maps.
+-- layer. The server matches that layer while a modeless session is typing or
+-- selecting, in any buffer but a live terminal, laid over the Insert maps, so a
+-- layout key wins there and every other key still reaches its Insert map
+-- (completion, snippets, your own). A vim session never sees these maps.
+--
+-- A read-only buffer rests in Insert too and refuses every key that would edit it,
+-- so a plugin's read-only buffer (a tree, a sidebar) binds its own keys in this
+-- layer, buffer-local, next to its Normal maps:
+-- `btv.keymap.set({ "n", "modeless" }, "<CR>", open, { buffer = buf })`.
 --
 -- Every default is `default = true`, so `btv.keymap.set("modeless", lhs, rhs)` wins
 -- over it (bind an empty function to free a key).
@@ -23,7 +29,10 @@ btv.modeless = btv.modeless or {}
 -- view the wheel scrolled away back to the caret (what a client asks for when an input
 -- method starts composing there). The rest compose existing
 -- commands: `save`, `find`, `replace`, `command_line`, `palette`, `files`, `close`,
--- `next_buffer`, `prev_buffer`. Bind them with
+-- `next_buffer`, `prev_buffer`, and the language verbs (`definition`, `implementation`,
+-- `references`, `hover`, `signature_help`, `rename`, `code_action`, `format`,
+-- `document_symbol`, `workspace_symbol`, which run the `btv.lsp` verb of that name, and
+-- `next_diagnostic` / `prev_diagnostic`). Bind them with
 -- `btv.keymap.set("modeless", "<key>", btv.modeless.actions.<name>)`.
 btv.modeless.actions = btv.modeless.actions or {}
 for _, name in ipairs({
@@ -53,11 +62,29 @@ local actions = btv.modeless.actions
 actions.save = function()
   btv.cmd("write")
 end
+-- Find and replace start from the selected text, as an editor's find box does: a
+-- selection on one line becomes the pattern, escaped so it matches literally under
+-- either `'regexsyntax'` (and the `/` delimiter with it). A selection over several lines
+-- has no single-line pattern, so they open empty, as with nothing selected.
+local REGEX_SPECIAL = {
+  pcre = "[%^%$%.%|%?%*%+%(%)%[%]{}\\/]",
+  vim = "[%^%$%.%*%[%]~\\/]",
+}
+local function selected_pattern()
+  local sel = btv.win.selection()
+  if not sel or sel[1] ~= sel[3] or sel[2] == sel[4] then
+    return nil
+  end
+  local text = btv.buf.text(0, sel[1], sel[2], sel[3], sel[4])[1]
+  local special = REGEX_SPECIAL[btv.o.regexsyntax] or REGEX_SPECIAL.pcre
+  return (text:gsub(special, "\\%0"))
+end
 actions.find = function()
-  btv.cmdline.open("", { kind = "/" })
+  btv.cmdline.open(selected_pattern() or "", { kind = "/" })
 end
 actions.replace = function()
-  btv.cmdline.open("%s/")
+  local pattern = selected_pattern()
+  btv.cmdline.open(pattern and ("%s/" .. pattern .. "/") or "%s/")
 end
 actions.command_line = function()
   btv.cmdline.open("")
@@ -77,6 +104,31 @@ actions.next_buffer = function()
 end
 actions.prev_buffer = function()
   btv.cmd("bprevious")
+end
+-- The language verbs, vim's `gd` / `gr` / `K` / `]d` and the rest, which are Normal-mode
+-- letters a modeless session can't reach. Each looks its `btv.lsp` verb up when it runs,
+-- so a plugin that wraps one gets its version.
+for _, verb in ipairs({
+  "definition",
+  "implementation",
+  "references",
+  "hover",
+  "signature_help",
+  "rename",
+  "code_action",
+  "format",
+  "document_symbol",
+  "workspace_symbol",
+}) do
+  actions[verb] = function()
+    btv.lsp[verb]()
+  end
+end
+actions.next_diagnostic = function()
+  btv.diagnostic.goto_next()
+end
+actions.prev_diagnostic = function()
+  btv.diagnostic.goto_prev()
 end
 
 -- `btv.modeless.enable()` turns the session's `'modeless'` option on, the same as
@@ -127,6 +179,19 @@ local LAYOUT = {
   { "<C-S-d>", "<D-S-d>", "duplicate_line", "Duplicate line" },
   { "<A-Up>", "<A-Up>", "move_line_up", "Move line up" },
   { "<A-Down>", "<A-Down>", "move_line_down", "Move line down" },
+  -- The language keys, VS Code's.
+  { "<F12>", "<F12>", "definition", "Go to definition" },
+  { "<C-F12>", "<D-F12>", "implementation", "Go to implementation" },
+  { "<S-F12>", "<S-F12>", "references", "Find references" },
+  { "<C-k><C-i>", "<D-k><D-i>", "hover", "Show hover" },
+  { "<C-S-Space>", "<D-S-Space>", "signature_help", "Signature help" },
+  { "<F2>", "<F2>", "rename", "Rename symbol" },
+  { "<C-.>", "<D-.>", "code_action", "Quick fix / code actions" },
+  { "<S-A-f>", "<S-A-f>", "format", "Format document" },
+  { "<C-S-o>", "<D-S-o>", "document_symbol", "Go to symbol in file" },
+  { "<C-t>", "<D-t>", "workspace_symbol", "Go to symbol in workspace" },
+  { "<F8>", "<F8>", "next_diagnostic", "Next problem" },
+  { "<S-F8>", "<S-F8>", "prev_diagnostic", "Previous problem" },
 }
 
 local function set(lhs, action, desc)

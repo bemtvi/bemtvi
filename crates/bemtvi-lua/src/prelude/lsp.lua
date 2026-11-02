@@ -70,6 +70,7 @@ btv.lsp._registrations = btv.lsp._registrations or {}
 -- Resolve a `0`/`nil` bufnr to the current buffer id (matching the diagnostics
 -- and semantic-token surfaces).
 local function cur_bufnr(bufnr)
+  btv._refuse_pending_buffer(bufnr, "btv.lsp")
   if bufnr == nil or bufnr == 0 then
     return btv.buf.current()
   end
@@ -1093,7 +1094,7 @@ end
 function btv.lsp.start(cfg, opts)
   refuse_lsp("btv.lsp.start")
   opts = opts or {}
-  local bufnr = opts.bufnr or cur_bufnr(0)
+  local bufnr = btv._refuse_pending_buffer(opts.bufnr, "btv.lsp.start") or cur_bufnr(0)
   local ft = opts.filetype or (btv._cur_buf and btv._cur_buf.filetype) or ""
   start_resolved(cfg.name or "?", cfg, bufnr, ft, cfg.root_dir)
 end
@@ -1768,7 +1769,7 @@ end
 local function request_client(verb, target)
   local filter = { bufnr = 0 }
   if type(target) == "table" then
-    filter.bufnr = target.bufnr or 0
+    filter.bufnr = btv._refuse_pending_buffer(target.bufnr, verb) or 0
     filter.name = target.name
   elseif target ~= nil then
     filter.bufnr = target
@@ -1893,7 +1894,8 @@ end
 function btv.lsp.position_params(opts)
   opts = opts or {}
   local win = opts.win or 0
-  local bufnr = cur_bufnr(opts.bufnr or btv.win.buf(win))
+  local bufnr =
+    cur_bufnr(btv._refuse_pending_buffer(opts.bufnr, "btv.lsp.position_params") or btv.win.buf(win))
   local pos = btv.cursor.get(win)
   local row, col = pos[1], pos[2]
   local line = btv.buf.lines(bufnr, row - 1, row, false)[1] or ""

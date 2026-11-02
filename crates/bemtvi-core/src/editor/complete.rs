@@ -406,6 +406,13 @@ impl Editor {
         let Some(acc) = self.complete_take_accept() else {
             return false;
         };
+        // The chokepoint for every accept (a confirm key, a mapped
+        // `btv.complete.accept`, a click on a row): a modeless session rests in
+        // Insert over a read-only buffer too, so a popup can be open there.
+        if !self.modifiable() {
+            self.refuse_edit();
+            return true;
+        }
         let cursor_byte = self.cursor_char();
         // Under `Replace`, extend the replaced span rightward over the rest of the
         // word the caret sits inside; `Insert` stops at the cursor. `anchor` is always

@@ -281,6 +281,29 @@ async fn ctrl_backslash_ctrl_n_leaves_terminal_mode() {
     assert_eq!(mode(&rpc).await, "t", "`i` re-enters the terminal job");
 }
 
+/// A modeless session has no Normal mode, so a live terminal rests in the job:
+/// `<C-\><C-n>` lands straight back in it, and once the child exits the buffer is
+/// ordinary text that rests in Insert like any other.
+#[tokio::test]
+async fn a_modeless_terminal_rests_in_the_job() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+    command(&rpc, "set modeless").await;
+
+    command(&rpc, &format!("terminal {CAT}")).await;
+    feed(&rpc, "hi<CR>");
+    wait_lines(&rpc, "cat to echo 'hi'", |ls| has_line(ls, "hi")).await;
+    feed(&rpc, "<C-\\><C-n>");
+    assert_eq!(mode(&rpc).await, "t", "no terminal-normal mode to rest in");
+
+    feed(&rpc, EOF_KEYS);
+    wait_lines(&rpc, "the exit notice", |ls| {
+        ls.iter().any(|l| l.starts_with("[Process exited"))
+    })
+    .await;
+    assert_eq!(mode(&rpc).await, "i", "the dead buffer rests in Insert");
+}
+
 /// The cursor sits at the child's next-write position (one past the last typed
 /// char), not on top of it — terminal mode allows the cursor past end-of-line.
 #[tokio::test]
@@ -1469,4 +1492,28 @@ async fn a_live_terminal_reads_nomodifiable_until_its_child_exits() {
     })
     .await;
     assert_eq!(bo(&rpc).await, Some(true), "an exited terminal");
+}
+
+/// A refresh that shrinks the mirror (the window got smaller, so the PTY did) must
+/// pull a terminal-normal cursor back inside it: left past the last line, the next
+/// paint read a line that no longer exists and the server panicked.
+#[tokio::test]
+async fn shrinking_the_terminal_keeps_a_terminal_normal_cursor_in_the_buffer() {
+    let (rpc, _incoming) = start().await;
+    command(&rpc, "split").await;
+    command(&rpc, &format!("terminal {CAT}")).await;
+    for _ in 0..5 {
+        exec_lua(&rpc, "return 1").await;
+    }
+    feed(&rpc, "<C-\\><C-n>G");
+    let tall = lines(&rpc).await.len();
+    assert_eq!(cursor(&rpc).await.0, tall, "on the last line");
+    command(&rpc, "resize 2").await;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        exec_lua(&rpc, "return 1").await;
+    }
+    let n = lines(&rpc).await.len();
+    assert!(n < tall, "the mirror shrank: {n} of {tall}");
+    assert!(cursor(&rpc).await.0 <= n, "the cursor stays in the buffer");
 }

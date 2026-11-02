@@ -762,6 +762,189 @@ async fn rename_reaches_an_unopened_file() {
     );
 }
 
+/// Poll the redraw stream until the message line contains `want`; returns the last
+/// message seen (so a failure reports what the line said instead).
+async fn await_message_contains(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: &str,
+) -> String {
+    let mut last = String::new();
+    for _ in 0..200 {
+        barrier(rpc).await;
+        if let Some(m) = drain_to_latest_redraw(incoming, |_| true) {
+            last = message(&m);
+            if last.contains(want) {
+                return last;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    last
+}
+
+/// Formatting a `nomodifiable` buffer is refused with vim's `E21`, as neovim's
+/// `nvim_buf_set_text` refuses it — the edits never land. (Reachable from modeless
+/// `<S-A-f>` on a read-only buffer.)
+#[tokio::test]
+async fn format_on_a_nomodifiable_buffer_is_refused_with_e21() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_fmt_nomodifiable");
+    arm_mock(
+        &dir,
+        r#"{
+            "formatting": [
+                {
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 9 } },
+                    "newText": "let x = 1"
+                }
+            ]
+        }"#,
+    );
+    let (rpc, mut incoming) = open_with_server(&dir, "let  x=1\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+    exec_lua(&rpc, "vim.bo[0].modifiable = false").await;
+    assert!(await_lua_eq(&rpc, "vim.bo[0].modifiable", "false").await);
+
+    exec_lua(&rpc, "btv.lsp.format()").await;
+    let msg = await_message_contains(&rpc, &mut incoming, "E21").await;
+    assert!(
+        msg.contains("E21"),
+        "the format should be refused with E21, got {msg:?}"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["let  x=1"],
+        "a nomodifiable buffer must not be formatted"
+    );
+}
+
+/// A multi-file `WorkspaceEdit` that reaches a `nomodifiable` buffer is refused as a
+/// whole: the modifiable file it names *first* is left alone too, so the refactor is
+/// never half-applied. (Reachable from modeless `F2` on a read-only buffer.)
+#[tokio::test]
+async fn a_rename_reaching_a_nomodifiable_buffer_applies_nowhere() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_rename_nomodifiable");
+    let b_path = dir.join("b.rs");
+    std::fs::write(&b_path, "use a::foo;\n").expect("write b.rs");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "rename": {{ "documentChanges": [
+                    {{ "textDocument": {{ "uri": "{a}", "version": null }},
+                       "edits": [ {{ "range": {{ "start": {{ "line": 0, "character": 4 }},
+                                                 "end": {{ "line": 0, "character": 7 }} }},
+                                    "newText": "bar" }} ] }},
+                    {{ "textDocument": {{ "uri": "{b}", "version": null }},
+                       "edits": [ {{ "range": {{ "start": {{ "line": 0, "character": 7 }},
+                                                 "end": {{ "line": 0, "character": 10 }} }},
+                                    "newText": "bar" }} ] }}
+                ] }}
+            }}"#,
+            a = file_uri(&dir, "a.rs"),
+            b = file_uri(&dir, "b.rs"),
+        ),
+    );
+    let (rpc, mut incoming) = open_with_server(&dir, "let foo = 1\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+    // Open `b.rs`, lock it, and come back to `a.rs`.
+    exec_lua(
+        &rpc,
+        &format!(
+            "local a = btv.buf.name(0) btv.cmd('edit {}') vim.bo[0].modifiable = false \
+             btv.cmd('edit ' .. a)",
+            q(&b_path)
+        ),
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "btv.buf.name(0):match('a%.rs$') ~= nil", "true").await,
+        "precondition: back on a.rs"
+    );
+
+    exec_lua(&rpc, "btv.lsp.rename('bar')").await;
+    let msg = await_message_contains(&rpc, &mut incoming, "E21").await;
+    assert!(
+        msg.contains("E21"),
+        "the rename should be refused with E21, got {msg:?}"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["let foo = 1"],
+        "the modifiable file must not be half-renamed"
+    );
+    feed(&rpc, &format!(":edit {}<CR>", b_path.display()));
+    barrier(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["use a::foo;"],
+        "the locked file is untouched"
+    );
+}
+
+/// A server's `workspace/applyEdit` over a `nomodifiable` buffer is answered
+/// `applied: false` with the `E21` reason, so the server knows its edit didn't land.
+#[tokio::test]
+async fn a_servers_apply_edit_on_a_nomodifiable_buffer_is_answered_not_applied() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_apply_edit_nomodifiable");
+    let record = dir.join("rec.jsonl");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "record": "{rec}",
+                "code_action": [
+                    {{ "title": "Rewrite", "kind": "refactor",
+                       "command": {{ "title": "run", "command": "mock.rewrite" }} }}
+                ],
+                "apply_edit": {{ "changes": {{ "{a}": [ {{
+                    "range": {{ "start": {{ "line": 0, "character": 4 }},
+                                "end": {{ "line": 0, "character": 7 }} }},
+                    "newText": "bar" }} ] }} }}
+            }}"#,
+            rec = q(&record),
+            a = file_uri(&dir, "a.rs"),
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "let foo = 1\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+    exec_lua(&rpc, "vim.bo[0].modifiable = false").await;
+    assert!(await_lua_eq(&rpc, "vim.bo[0].modifiable", "false").await);
+
+    exec_lua(&rpc, "btv.lsp.code_action({ apply = true })").await;
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "the server must hear the edit was not applied, got {answer:?}"
+    );
+    let reason = answer
+        .as_ref()
+        .and_then(|v| v.get("failureReason"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        reason.contains("E21"),
+        "with the E21 reason, got {answer:?}"
+    );
+    assert_eq!(lines(&rpc).await, vec!["let foo = 1"]);
+}
+
 /// A rename whose `WorkspaceEdit` inserts a line *above* the cursor (e.g. an added
 /// `use` import) must carry the cursor down with the text it sits on — like
 /// neovim's `apply_text_edits` — not leave it pinned to a now-stale absolute line.

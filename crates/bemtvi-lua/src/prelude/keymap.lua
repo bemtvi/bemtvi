@@ -67,9 +67,7 @@ end
 -- same convention `nvim_create_autocmd` uses), so a buffer-local map declared with
 -- `buffer = 0` is pinned to the buffer that was current when it was set.
 local function keymap_resolve_buffer(buffer)
-  if buffer == false then
-    return nil
-  end
+  btv._refuse_pending_buffer(buffer, "btv.keymap")
   if buffer ~= nil and buffer ~= true and (type(buffer) ~= "number" or buffer % 1 ~= 0) then
     error("btv.keymap: `buffer` must be a buffer number or true, got " .. tostring(buffer), 0)
   end
@@ -286,6 +284,12 @@ end
 -- but unused; `opts.buffer` ties the map to one buffer (0 = current), `opts.default`
 -- marks an overridable built-in — both feed the precedence ladder the server applies.
 --
+-- `opts.buffer` may also be a `btv.view` handle: the map binds to the view's buffer,
+-- and when that buffer doesn't exist yet (it is created after the chunk that creates
+-- the view) it binds as soon as it does. A view's `:bufnr()` reads `false` until then,
+-- and `buffer = false` is refused, so a map meant for one buffer never lands globally.
+-- A view that is already closed is refused; one closed while the bind waits drops it.
+--
 -- There is no `<Cmd>` key: a string `rhs` spelling one raises `E5806` (it would type
 -- `<`, `C`, `m`, `d`, `>`). To run a command, map to a function, or to `:Command<CR>`:
 --
@@ -296,6 +300,42 @@ end
 function btv.keymap.set(mode, lhs, rhs, opts)
   opts = opts or {}
   keymap_check_opts("btv.keymap.set", opts, KEYMAP_SET_OPTS)
+  -- `btv._view_handle` comes with prelude/view.lua, which loads after the prelude's
+  -- own early default maps (none of which names a view).
+  local view = btv._view_handle and btv._view_handle(opts.buffer)
+  if view then
+    local resolved = {}
+    for k, v in pairs(opts) do
+      resolved[k] = v
+    end
+    if not btv._view_is_open(view) then
+      error("btv.keymap.set: the view is closed (" .. tostring(lhs) .. ")", 2)
+    end
+    local buf = view:bufnr()
+    if buf then
+      resolved.buffer = buf
+      return btv.keymap.set(mode, lhs, rhs, resolved)
+    end
+    local never = "btv.keymap.set: the view has no buffer (it was never created, or was"
+      .. " deleted) to bind "
+      .. tostring(lhs)
+      .. " to"
+    -- Closing the view while the bind waits ends the wait: the map's buffer went with it.
+    local ready = btv.wait_for(function()
+      return view:bufnr() or (not btv._view_is_open(view) and "closed")
+    end, { message = never })
+    ready
+      :next(function(b)
+        if b ~= "closed" then
+          resolved.buffer = b
+          btv.keymap.set(mode, lhs, rhs, resolved)
+        end
+      end)
+      :catch(function(e)
+        btv.notify(type(e) == "table" and e.message or tostring(e), btv.log.levels.ERROR)
+      end)
+    return
+  end
   -- noremap unless either `noremap = false` or `remap = true` is given.
   local noremap = opts.noremap ~= false and not opts.remap
   keymap_register(keymap_modes(mode), lhs, rhs, {
@@ -532,6 +572,10 @@ vim.fn.maparg = btv.keymap.arg
 -- prelude/view.lua.) See docs/plans/2026-06-16-unify-special-buffer-kinds.md.
 btv.explorer = btv.explorer or {}
 
+-- The modes a read-only surface's keys go in: Normal for a vim session, the `modeless`
+-- layer for a modeless one.
+local ACTIVATION_MODES = { "n", "modeless" }
+
 btv.qf = btv.qf or {}
 btv.qf.actions = btv.qf.actions or {}
 -- `btv.qf.actions.jump`(): the default `<CR>` action in the quickfix window — jump to
@@ -543,7 +587,9 @@ btv.qf.actions.jump = function()
 end
 
 -- `default = true` so a user/plugin map on the same key wins; `buffer = args.buf`
--- scopes each map to the just-typed special buffer only. The explorer listing buffer
+-- scopes each map to the just-typed special buffer only. Each binds in Normal and in
+-- the `modeless` layer (`ACTIVATION_MODES`): a modeless session has no Normal mode, and
+-- its read-only buffers take keys only through that layer (the rest echo `E21`). The explorer listing buffer
 -- (`btvdir`) is filled by the `BufReadCmd` handler in prelude/explorer.lua, which sets
 -- this filetype — so these maps land on the listing the moment it exists.
 btv.autocmd.create("FileType", {
@@ -551,9 +597,14 @@ btv.autocmd.create("FileType", {
   callback = function(args)
     local buf = args.buf
     local open = btv.explorer.actions.open
-    btv.keymap.set("n", "<CR>", open, { buffer = buf, default = true, desc = "Open entry" })
     btv.keymap.set(
-      "n",
+      ACTIVATION_MODES,
+      "<CR>",
+      open,
+      { buffer = buf, default = true, desc = "Open entry" }
+    )
+    btv.keymap.set(
+      ACTIVATION_MODES,
       "-",
       btv.explorer.actions.up,
       { buffer = buf, default = true, desc = "Parent directory" }
@@ -562,7 +613,7 @@ btv.autocmd.create("FileType", {
     -- `<CR>`. `<2-LeftMouse>` is an ordinary mappable key (the general mouse-mapping
     -- primitive): the single click placed the cursor on the row, the double fires this.
     btv.keymap.set(
-      "n",
+      ACTIVATION_MODES,
       "<2-LeftMouse>",
       open,
       { buffer = buf, default = true, desc = "Open entry" }
@@ -574,7 +625,7 @@ btv.autocmd.create("FileType", {
   pattern = "qf",
   callback = function(args)
     btv.keymap.set(
-      "n",
+      ACTIVATION_MODES,
       "<CR>",
       btv.qf.actions.jump,
       { buffer = args.buf, default = true, desc = "Jump to entry" }
@@ -612,7 +663,7 @@ btv.autocmd.create("FileType", {
   pattern = "btvbuffers",
   callback = function(args)
     btv.keymap.set(
-      "n",
+      ACTIVATION_MODES,
       "<CR>",
       btv.buffers.actions.open,
       { buffer = args.buf, default = true, desc = "Open buffer" }
@@ -638,7 +689,7 @@ btv.autocmd.create("FileType", {
   pattern = "btvpanels",
   callback = function(args)
     btv.keymap.set(
-      "n",
+      ACTIVATION_MODES,
       "<CR>",
       btv.panels.actions.open,
       { buffer = args.buf, default = true, desc = "Open panel" }
@@ -664,7 +715,7 @@ btv.autocmd.create("FileType", {
   pattern = "btvmessages",
   callback = function(args)
     btv.keymap.set(
-      "n",
+      ACTIVATION_MODES,
       "C",
       btv.messages.actions.clear,
       { buffer = args.buf, default = true, desc = "Clear the message log" }
@@ -683,7 +734,7 @@ btv.autocmd.create("FileType", {
   callback = function(args)
     for _, key in ipairs({ "q", "<Esc>" }) do
       btv.keymap.set(
-        "n",
+        ACTIVATION_MODES,
         key,
         btv.panel.close,
         { buffer = args.buf, default = true, desc = "Close panel" }

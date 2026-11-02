@@ -1084,6 +1084,12 @@ impl Editor {
     }
 
     pub(crate) fn undo(&mut self) {
+        // Every undo-tree move rewrites the text, so a read-only buffer refuses it
+        // as vim does (`u` there is `E21`), whichever key or command asked.
+        if !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
         let id = self.cur_buffer();
         self.commit_undo(id);
         let tree = &self.buffers.get(id).undo;
@@ -1098,6 +1104,10 @@ impl Editor {
     }
 
     pub(crate) fn redo(&mut self) {
+        if !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
         let id = self.cur_buffer();
         self.commit_undo(id);
         let tree = &self.buffers.get(id).undo;
@@ -1116,6 +1126,10 @@ impl Editor {
     /// in the tree (including an abandoned branch a stack-based undo could never
     /// reach). `:undo 0` returns to the original loaded text.
     pub(crate) fn undo_to_seq(&mut self, target: u64) {
+        if !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
         let id = self.cur_buffer();
         self.commit_undo(id);
         let tree = &self.buffers.get(id).undo;
@@ -1219,6 +1233,10 @@ impl Editor {
             } else {
                 "Already at newest change"
             });
+            return;
+        }
+        if !self.modifiable() {
+            self.refuse_edit();
             return;
         }
         let snap = tree.nodes[node].snap.clone();

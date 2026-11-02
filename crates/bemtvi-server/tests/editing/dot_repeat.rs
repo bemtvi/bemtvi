@@ -294,3 +294,16 @@ async fn dot_repeats_a_shift_that_moved_nothing() {
     edit_probe(&rpc, &["alpha", "    beta"], (2, 0), "xk<<j.").await;
     assert_eq!(lines(&rpc).await, vec!["alpha", "beta"]);
 }
+
+#[tokio::test]
+async fn dot_whose_change_fails_its_motion_does_not_replay_itself() {
+    // `ct)` on a line with no `)` fails and stays in Normal, so the text the change
+    // typed runs as commands; a typed `.` among them must not replay the change
+    // again inside its own replay (it recursed until the stack overflowed).
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ia)b<CR>xyz<Esc>gg0");
+    feed(&rpc, "ct).<Esc>");
+    assert_eq!(lines(&rpc).await, vec![".)b", "xyz"]);
+    feed(&rpc, "j0.");
+    assert_eq!(lines(&rpc).await, vec![".)b", "xyz"]);
+}

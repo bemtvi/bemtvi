@@ -5,8 +5,9 @@ use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
     attach_with_caps, command, cursor, exec_lua, feed, feed_mouse, feed_mouse_mod, feed_sync,
-    field, lines, map_get, menu_items, menu_of, message_after, mode, poll_menu, poll_true,
-    redraw_after, redraw_after_matching, spawn, start_clocked_init, write_temp, FakeClipboard,
+    field, lines, map_get, menu_items, menu_of, message_after, mode, panel_is_open, poll_menu,
+    poll_true, redraw_after, redraw_after_matching, spawn, start_clocked_init, write_temp,
+    FakeClipboard,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -177,22 +178,56 @@ async fn an_ex_command_comes_back_to_insert() {
 }
 
 #[tokio::test]
-async fn a_read_only_buffer_rests_in_normal() {
-    let (rpc, _inc) = start_modeless("one\ntwo\n").await;
+async fn a_read_only_buffer_rests_in_insert_and_refuses_what_would_edit() {
+    let (rpc, mut inc) = start_modeless("one\ntwo\n").await;
     command(&rpc, "setlocal nomodifiable").await;
-    assert_eq!(mode(&rpc).await, "n");
-    feed_sync(&rpc, "j").await;
-    assert_eq!(
-        lines(&rpc).await,
-        v(&["one", "two"]),
-        "j moved, didn't type"
-    );
+    assert_eq!(mode(&rpc).await, "i", "no Normal mode, even read-only");
+    for key in ["j", "<CR>", "<BS>", "<Tab>", "<C-u>"] {
+        let msg = message_after(&rpc, &mut inc, key).await;
+        assert!(msg.starts_with("E21"), "{key}: {msg:?}");
+    }
+    assert_eq!(lines(&rpc).await, v(&["one", "two"]));
+    assert_eq!(mode(&rpc).await, "i");
     command(&rpc, "setlocal modifiable").await;
+    feed(&rpc, "x");
+    assert_eq!(lines(&rpc).await, v(&["xone", "two"]));
+}
+
+#[tokio::test]
+async fn a_read_only_buffer_moves_and_selects_like_an_editable_one() {
+    let (rpc, mut inc) = start_modeless("one\ntwo\n").await;
+    command(&rpc, "setlocal nomodifiable").await;
+    feed(&rpc, "<Down><Right><S-Right><S-Right>");
+    assert_eq!(mode(&rpc).await, "s");
+    // Type-over is an edit: refused, and the selection stays.
+    let msg = message_after(&rpc, &mut inc, "X").await;
+    assert!(msg.starts_with("E21"), "{msg:?}");
+    assert_eq!(mode(&rpc).await, "s");
+    assert_eq!(lines(&rpc).await, v(&["one", "two"]));
+    feed(&rpc, "<Esc>");
     assert_eq!(mode(&rpc).await, "i");
 }
 
 #[tokio::test]
-async fn the_quickfix_window_rests_in_normal_and_closing_it_returns_to_insert() {
+async fn a_buffer_local_modeless_map_drives_a_read_only_buffer() {
+    // The contract for a plugin's read-only surface: its keys live in the
+    // `modeless` layer, buffer-local, and beat the layout's defaults there.
+    let (rpc, _inc) = start_modeless("one\ntwo\n").await;
+    command(&rpc, "setlocal nomodifiable").await;
+    exec_lua(
+        &rpc,
+        "_G.hits = {} \
+         btv.keymap.set('modeless', '<CR>', function() table.insert(_G.hits, 'cr') end, { buffer = 0 }) \
+         btv.keymap.set('modeless', '<C-p>', function() table.insert(_G.hits, 'p') end, { buffer = 0 })",
+    )
+    .await;
+    feed(&rpc, "<CR><C-p>");
+    let hits = exec_lua(&rpc, "return table.concat(_G.hits, ',')").await;
+    assert_eq!(hits.as_str(), Some("cr,p"));
+    assert_eq!(mode(&rpc).await, "i");
+}
+#[tokio::test]
+async fn the_quickfix_window_rests_in_insert_too() {
     let (rpc, _inc) = start_modeless("one\ntwo\n").await;
     exec_lua(
         &rpc,
@@ -200,11 +235,10 @@ async fn the_quickfix_window_rests_in_normal_and_closing_it_returns_to_insert() 
     )
     .await;
     command(&rpc, "copen").await;
-    assert_eq!(mode(&rpc).await, "n");
+    assert_eq!(mode(&rpc).await, "i");
     command(&rpc, "cclose").await;
     assert_eq!(mode(&rpc).await, "i");
 }
-
 #[tokio::test]
 async fn keys_a_plugin_feeds_still_mean_normal_mode_after_esc() {
     // A fed `<Esc>` leaves Insert, as plugins expect, and what follows it runs as
@@ -250,9 +284,9 @@ async fn insert_enter_fires_once_when_it_turns_on() {
 
 #[tokio::test]
 async fn a_key_after_leaving_a_read_only_window_types_in_the_same_message() {
-    // Typed fast, `:cclose<CR>x` arrives as one message: the cmdline closes the list
-    // and lands back in the file in Normal, and the `x` right behind it must type,
-    // not delete, so the mode has to settle between the keys of one message.
+    // Typed fast, `<C-;>cclose<CR>x` arrives as one message: the cmdline closes the
+    // list and lands back in the file in Normal, and the `x` right behind it must
+    // type, not delete, so the mode has to settle between the keys of one message.
     let (rpc, _inc) = start_modeless("one\ntwo\n").await;
     exec_lua(
         &rpc,
@@ -260,8 +294,7 @@ async fn a_key_after_leaving_a_read_only_window_types_in_the_same_message() {
     )
     .await;
     command(&rpc, "copen").await;
-    assert_eq!(mode(&rpc).await, "n");
-    feed(&rpc, ":cclose<CR>x");
+    feed(&rpc, "<C-;>cclose<CR>x");
     assert_eq!(lines(&rpc).await, v(&["xone", "two"]));
     assert_eq!(mode(&rpc).await, "i");
 }
@@ -902,6 +935,114 @@ async fn ctrl_h_opens_a_substitute() {
     assert_eq!(mode(&rpc).await, "i");
 }
 
+/// Find with text selected searches for that text: the selection seeds the
+/// command line, escaped, so `a.b` finds `a.b` and not `axb`.
+#[tokio::test]
+async fn find_with_a_selection_searches_for_the_selected_text() {
+    let (rpc, _inc) = start_modeless("a.b axb a.b\n").await;
+    feed(&rpc, "<Home><S-Right><S-Right><S-Right><C-f><CR>");
+    assert_eq!(mode(&rpc).await, "s", "the next match comes up selected");
+    feed(&rpc, "1");
+    assert_eq!(lines(&rpc).await, v(&["a.b axb 1"]));
+}
+
+/// Replace with text selected opens the substitute with the selected text as its
+/// pattern, escaped, so only the replacement is left to type.
+#[tokio::test]
+async fn replace_with_a_selection_substitutes_the_selected_text() {
+    let (rpc, _inc) = start_modeless("a.b axb a.b\n").await;
+    feed(&rpc, "<Home><S-Right><S-Right><S-Right><C-h>z/g<CR>");
+    assert_eq!(lines(&rpc).await, v(&["z axb z"]));
+    assert_eq!(mode(&rpc).await, "i");
+}
+
+/// The selected text's own `/` and regex metacharacters are escaped too, so they
+/// neither end the pattern nor change what it matches.
+#[tokio::test]
+async fn replace_escapes_the_delimiter_and_groups_in_the_selection() {
+    let (rpc, _inc) = start_modeless("f(x)/2 fx2 f(x)/2\n").await;
+    feed(&rpc, "<Home>");
+    for _ in 0..6 {
+        feed(&rpc, "<S-Right>");
+    }
+    feed(&rpc, "<C-h>y/g<CR>");
+    assert_eq!(lines(&rpc).await, v(&["y fx2 y"]));
+}
+
+/// A selection over multi-byte text seeds whole characters and whole graphemes: an
+/// accented letter, a combining sequence (`e` + U+0301) and a ZWJ family emoji are
+/// each one Shift-step, and the pattern holds all their bytes, never a cut one.
+#[tokio::test]
+async fn find_seeds_whole_graphemes_from_a_multi_byte_selection() {
+    let text = "x naïve e\u{301}👩\u{200d}👩\u{200d}👧 y naïve e\u{301}👩\u{200d}👩\u{200d}👧\n";
+    let (rpc, _inc) = start_modeless(text).await;
+    // Past `x `, then select `naïve é👩‍👩‍👧`: 5 letters, a space, 2 graphemes.
+    feed(&rpc, "<Home><Right><Right>");
+    for _ in 0..8 {
+        feed(&rpc, "<S-Right>");
+    }
+    let sel = exec_lua(
+        &rpc,
+        "local s = btv.win.selection() \
+         return btv.buf.text(0, s[1], s[2], s[3], s[4])[1]",
+    )
+    .await;
+    assert_eq!(
+        sel.as_str(),
+        Some("naïve e\u{301}👩\u{200d}👩\u{200d}👧"),
+        "the range covers whole graphemes"
+    );
+    feed(&rpc, "<C-f><CR>");
+    assert_eq!(mode(&rpc).await, "s", "the next match comes up selected");
+    feed(&rpc, "Z");
+    assert_eq!(
+        lines(&rpc).await,
+        v(&["x naïve e\u{301}👩\u{200d}👩\u{200d}👧 y Z"])
+    );
+}
+
+/// The selection's end can be a combining sequence on its own, and the pattern still
+/// takes the whole grapheme: selecting just `é` (`e` + U+0301) finds the next `é`,
+/// not a bare `e`.
+#[tokio::test]
+async fn find_takes_a_combining_sequence_whole() {
+    let (rpc, _inc) = start_modeless("e\u{301} e x e\u{301}\n").await;
+    feed(&rpc, "<Home><S-Right><C-f><CR>");
+    feed(&rpc, "Z");
+    assert_eq!(lines(&rpc).await, v(&["e\u{301} e x Z"]));
+}
+
+/// A selection over more than one line has no single-line pattern to search for, so
+/// find opens empty, as with nothing selected.
+#[tokio::test]
+async fn find_with_a_multi_line_selection_opens_empty() {
+    let (rpc, _inc) = start_modeless("one\ntwo one\n").await;
+    feed(&rpc, "<Home><S-Down><C-f>one<CR>");
+    assert_eq!(
+        cursor(&rpc).await.0,
+        2,
+        "the typed pattern alone was searched"
+    );
+}
+
+/// `btv.win.selection()` reads the live selection's extent: 0-based rows, byte
+/// columns, end-exclusive, and nil with nothing selected.
+#[tokio::test]
+async fn btv_win_selection_reads_the_live_selection() {
+    let (rpc, _inc) = start_modeless("hello world\nsecond\n").await;
+    let none = exec_lua(&rpc, "return btv.win.selection() == nil").await;
+    assert_eq!(none.as_bool(), Some(true), "nothing selected reads nil");
+    feed(&rpc, "<Home><S-Right><S-Right>");
+    let sel = exec_lua(&rpc, "return btv.win.selection()").await;
+    let got: Vec<u64> = sel
+        .as_array()
+        .expect("an extent")
+        .iter()
+        .map(|n| n.as_u64().unwrap())
+        .collect();
+    assert_eq!(got, vec![0, 0, 0, 2], "`he` selected");
+}
+
 #[tokio::test]
 async fn ctrl_h_is_left_to_backspace_without_the_keyboard_protocol() {
     // A client that can't tell `<C-h>` from `<BS>` gets no replace key, so
@@ -1339,7 +1480,7 @@ async fn typing_shows_a_caret_and_selecting_puts_it_at_the_head() {
 }
 
 #[tokio::test]
-async fn vim_mode_and_a_read_only_window_have_no_caret() {
+async fn vim_mode_has_no_caret_and_a_read_only_window_has_one() {
     let (rpc, mut inc) = start_as("gui", "hello\n").await;
     let map = redraw_after(&rpc, &mut inc, "i").await;
     assert!(!flag(&map, "caret"), "vim's Insert keeps vim's cursor");
@@ -1348,16 +1489,18 @@ async fn vim_mode_and_a_read_only_window_have_no_caret() {
     command(&rpc, "new").await;
     command(&rpc, "setlocal nomodifiable").await;
     let map = redraw_after(&rpc, &mut inc, "").await;
-    assert!(!flag(&map, "caret"), "a read-only window rests in Normal");
+    assert!(
+        flag(&map, "caret"),
+        "a read-only window rests in Insert too"
+    );
     let mut pointers = text_pointers(&map);
     pointers.sort();
     assert_eq!(
         pointers,
-        vec![(false, true), (true, false)],
-        "the I-beam over the editable window only, focused or not"
+        vec![(false, true), (true, true)],
+        "the I-beam over every window, read-only or not"
     );
 }
-
 #[tokio::test]
 async fn page_down_and_up_slide_like_they_do_in_normal_mode() {
     let text: String = (0..200).map(|i| format!("line{i}\n")).collect();
@@ -1463,16 +1606,21 @@ async fn a_page_key_after_the_wheel_pages_from_the_caret() {
 }
 
 #[tokio::test]
-async fn vim_mode_and_a_read_only_window_keep_the_cursor_in_view() {
+async fn vim_mode_pulls_the_cursor_along_and_a_read_only_window_leaves_it() {
     let text: String = (0..200).map(|i| format!("line{i}\n")).collect();
     let (rpc, _inc) = start_as("gui", &text).await;
     wheel_down(&rpc, 10);
     assert!(cursor(&rpc).await.0 > 20, "vim pulls the cursor along");
     command(&rpc, "set modeless").await;
     command(&rpc, "setlocal nomodifiable").await;
-    feed(&rpc, "gg");
+    feed(&rpc, "<C-Home>");
+    assert_eq!(cursor(&rpc).await.0, 1);
     wheel_down(&rpc, 10);
-    assert!(cursor(&rpc).await.0 > 20, "a read-only window does too");
+    assert_eq!(
+        cursor(&rpc).await.0,
+        1,
+        "a read-only window keeps its caret too"
+    );
 }
 
 #[tokio::test]
@@ -2147,6 +2295,22 @@ async fn lsp_rows_show_with_a_server_and_skip_what_it_cant_do() {
             "Code Actions"
         ]
     );
+    // Each shows the VS Code key the layout gives its verb.
+    let hints: Vec<Option<String>> = menu_rows(&menu)[at..at + 5]
+        .iter()
+        .map(|(_, d)| d.clone())
+        .collect();
+    let d = |s: &str| Some(s.to_string());
+    assert_eq!(
+        hints,
+        [
+            d("F12"),
+            d("Shift+F12"),
+            d("F2"),
+            d("Alt+Shift+F"),
+            d("Ctrl+.")
+        ]
+    );
     // The first `j` lights Undo; each next one steps to the next row that can be
     // chosen. Undo, Redo, Cut, Copy, Paste, Select All, Go to Definition, Find
     // References, then Format Document: the separators and Rename Symbol are skipped.
@@ -2168,26 +2332,24 @@ async fn without_a_server_there_are_no_lsp_rows() {
     assert!(!menu_items(&menu).iter().any(|l| l.starts_with("Go to")));
 }
 
-// A read-only buffer rests in Normal and selects in Visual. Of the verbs, `copy` and
-// `select_all` still make sense there; the rest refuse.
+// A read-only buffer rests in Insert and selects in Select, like an editable one.
+// The verbs that don't edit work there; the rest refuse with `E21`.
 
 /// A modeless GUI session with a clipboard, over a read-only buffer.
 async fn start_read_only(content: &str) -> (Rpc, FakeClipboard, UnboundedReceiver<Incoming>) {
     let (rpc, clip, inc) = start_clip(content).await;
     command(&rpc, "set nonumber norelativenumber nomodifiable").await;
-    assert_eq!(mode(&rpc).await, "n");
+    assert_eq!(mode(&rpc).await, "i");
     (rpc, clip, inc)
 }
 
 #[tokio::test]
-async fn copy_in_a_read_only_buffer_takes_the_visual_selection_and_keeps_it() {
+async fn ctrl_c_in_a_read_only_buffer_copies_the_selection_and_keeps_it() {
     let (rpc, clip, _inc) = start_read_only("hello world\n").await;
-    feed(&rpc, "vll");
-    act(&rpc, "copy").await;
+    feed_sync(&rpc, "<S-Right><S-Right><S-Right><C-c>").await;
     assert_eq!(clip.peek(), Some(("hel".to_string(), false)));
-    assert_eq!(mode(&rpc).await, "v");
+    assert_eq!(mode(&rpc).await, "s");
 }
-
 #[tokio::test]
 async fn copy_in_a_read_only_buffer_with_nothing_selected_takes_the_line() {
     let (rpc, clip, _inc) = start_read_only("hello world\nnext\n").await;
@@ -2198,63 +2360,66 @@ async fn copy_in_a_read_only_buffer_with_nothing_selected_takes_the_line() {
 #[tokio::test]
 async fn select_all_in_a_read_only_buffer_selects_everything() {
     let (rpc, clip, _inc) = start_read_only("hello world\nnext\n").await;
-    act(&rpc, "select_all").await;
-    assert_eq!(mode(&rpc).await, "v");
+    feed(&rpc, "<C-a>");
+    assert_eq!(mode(&rpc).await, "s");
     act(&rpc, "copy").await;
     assert_eq!(clip.peek(), Some(("hello world\nnext".to_string(), false)));
 }
 
 #[tokio::test]
-async fn the_editing_verbs_still_refuse_in_a_read_only_buffer() {
-    let (rpc, _clip, mut inc) = start_read_only(
-        "hello world
-",
-    )
-    .await;
+async fn find_next_in_a_read_only_buffer_selects_the_match() {
+    let (rpc, clip, _inc) = start_read_only("one two\ntwo\n").await;
+    feed(&rpc, "<C-f>two<CR>");
+    assert_eq!(mode(&rpc).await, "s");
+    feed_sync(&rpc, "<C-g><C-c>").await;
+    assert_eq!(clip.peek(), Some(("two".to_string(), false)));
+    assert_eq!(cursor(&rpc).await.0, 2, "the second match, on line 2");
+}
+#[tokio::test]
+async fn the_editing_verbs_refuse_in_a_read_only_buffer() {
+    let (rpc, _clip, mut inc) = start_read_only("hello world\n").await;
     for verb in ["cut", "paste", "undo", "duplicate_line"] {
         act(&rpc, verb).await;
         let msg = message_after(&rpc, &mut inc, "").await;
-        assert!(msg.contains("editable buffer"), "{verb}: {msg:?}");
+        assert!(msg.starts_with("E21"), "{verb}: {msg:?}");
+    }
+    for key in ["<C-x>", "<C-v>", "<C-z>", "<C-S-d>", "<A-Down>"] {
+        let msg = message_after(&rpc, &mut inc, key).await;
+        assert!(msg.starts_with("E21"), "{key}: {msg:?}");
     }
     assert_eq!(lines(&rpc).await, v(&["hello world"]));
 }
-
 #[tokio::test]
-async fn a_read_only_buffer_offers_select_all_and_with_a_selection_copy() {
-    let (rpc, clip, mut inc) = start_read_only(
-        "hello world
-next
-",
-    )
-    .await;
-    // Nothing selected: only Select All. No key hints, since the layout's keys
-    // don't run in a read-only buffer.
+async fn a_read_only_buffer_offers_copy_and_select_all_with_their_keys() {
+    let (rpc, clip, mut inc) = start_read_only("hello world\nnext\n").await;
+    let d = |s: &str| Some(s.to_string());
     feed_mouse(&rpc, "right", "press", 0, 4);
     let menu = menu_of(&poll_menu(&rpc, &mut inc).await.expect("a menu opens"));
-    assert_eq!(menu_rows(&menu), [("Select All".into(), None)]);
-    feed_mouse(&rpc, "left", "press", 1, 6);
-    assert_eq!(mode(&rpc).await, "v");
-    // A right-click inside the selection: Copy joins it.
-    feed_mouse(&rpc, "right", "press", 1, 2);
-    let menu = menu_of(&poll_menu(&rpc, &mut inc).await.expect("a menu opens again"));
     assert_eq!(
         menu_rows(&menu),
-        [("Copy".into(), None), ("Select All".into(), None)]
+        [
+            ("Copy".into(), d("Ctrl+C")),
+            ("Select All".into(), d("Ctrl+A"))
+        ]
     );
+    // Select All is the second row under the border at (0, 4).
+    feed_mouse(&rpc, "left", "press", 2, 6);
+    feed_mouse(&rpc, "left", "release", 2, 6);
+    assert!(
+        poll_true(&rpc, "return btv.mode().mode == 's'").await,
+        "Select All selects"
+    );
+    feed_mouse(&rpc, "right", "press", 1, 2);
+    poll_menu(&rpc, &mut inc).await.expect("a menu opens again");
     feed_mouse(&rpc, "left", "press", 2, 4);
+    feed_mouse(&rpc, "left", "release", 2, 4);
     assert_eq!(
         clip_eventually(&clip).await,
-        Some((
-            "hello world
-next"
-                .to_string(),
-            false
-        ))
+        Some(("hello world\nnext".to_string(), false))
     );
-    assert_eq!(mode(&rpc).await, "v", "the selection stays");
+    assert_eq!(mode(&rpc).await, "s", "the selection stays");
     assert_eq!(lines(&rpc).await, v(&["hello world", "next"]));
 }
-
 /// A bracketed paste (the GUI's Cmd+V) over a modeless selection replaces it and
 /// leaves the caret after the pasted text, as typing over it does.
 #[tokio::test]
@@ -2325,4 +2490,512 @@ async fn switching_between_modeless_and_helix_in_one_chunk() {
 
     exec_lua(&rpc, "btv.helix.disable(); btv.o.modeless = true").await;
     assert_eq!(mode(&rpc).await, "i", "Helix to modeless");
+}
+
+// ===== Bundled read-only surfaces =============================================
+// Each first-party read-only surface binds its keys in the `modeless` layer too, so
+// a modeless session drives it with the same keys a vim one does.
+
+/// Poll until the current buffer's lines satisfy `pred` (an async listing or jump).
+async fn wait_for_lines(rpc: &Rpc, what: &str, pred: impl Fn(&[String]) -> bool) -> Vec<String> {
+    for _ in 0..150 {
+        let got = lines(rpc).await;
+        if pred(&got) {
+            return got;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {what}: {:?}", lines(rpc).await);
+}
+
+/// Put the cursor on the first line that reads `text`.
+async fn cursor_to_line(rpc: &Rpc, text: &str) {
+    let row = lines(rpc)
+        .await
+        .iter()
+        .position(|l| l == text)
+        .unwrap_or_else(|| panic!("no line {text:?}"));
+    exec_lua(rpc, &format!("btv.cursor.set({{ {}, 0 }})", row + 1)).await;
+}
+
+#[tokio::test]
+async fn enter_in_the_quickfix_list_jumps() {
+    let (rpc, _inc) = start_modeless("one\ntwo\n").await;
+    exec_lua(
+        &rpc,
+        "btv.qf.setqflist({ { filename = btv.buf.name(0), lnum = 2, text = 'x' } })",
+    )
+    .await;
+    command(&rpc, "copen").await;
+    feed_sync(&rpc, "<CR>").await;
+    assert_eq!(cursor(&rpc).await.0, 2, "on the entry's line");
+    assert_eq!(lines(&rpc).await, v(&["one", "two"]), "in the file");
+    assert_eq!(mode(&rpc).await, "i");
+}
+
+#[tokio::test]
+async fn q_and_esc_dismiss_a_panel() {
+    let (rpc, _inc) = start_modeless("one\n").await;
+    for key in ["q", "<Esc>"] {
+        command(&rpc, "registers").await;
+        assert!(panel_is_open(&rpc).await, "{key}: the listing opened");
+        feed_sync(&rpc, key).await;
+        assert!(!panel_is_open(&rpc).await, "{key} closed it");
+        assert_eq!(mode(&rpc).await, "i");
+    }
+}
+
+#[tokio::test]
+async fn enter_in_the_buffer_list_switches_to_the_buffer() {
+    let other = write_temp("modeless_other", "txt", "other\n");
+    let (rpc, _inc) = start_modeless("one\n").await;
+    command(&rpc, &format!("edit {other}")).await;
+    command(&rpc, "buffer 1").await;
+    assert_eq!(lines(&rpc).await, v(&["one"]));
+    command(&rpc, "ls").await;
+    let listing = lines(&rpc).await;
+    let row = listing
+        .iter()
+        .position(|l| l.contains("modeless_other"))
+        .unwrap_or_else(|| panic!("the other buffer is listed: {listing:?}"));
+    exec_lua(&rpc, &format!("btv.cursor.set({{ {}, 0 }})", row + 1)).await;
+    feed_sync(&rpc, "<CR>").await;
+    wait_for_lines(&rpc, "the other buffer", |ls| ls == ["other"]).await;
+    assert!(!panel_is_open(&rpc).await);
+}
+
+#[tokio::test]
+async fn c_in_the_message_log_clears_it() {
+    let (rpc, _inc) = start_modeless("one\n").await;
+    exec_lua(&rpc, "btv.notify('remember me')").await;
+    command(&rpc, "messages").await;
+    assert!(lines(&rpc).await.iter().any(|l| l.contains("remember me")));
+    feed_sync(&rpc, "C").await;
+    wait_for_lines(&rpc, "an empty log", |ls| {
+        !ls.iter().any(|l| l.contains("remember me"))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn enter_and_double_click_confirm_a_view_row() {
+    let (rpc, clock, _inc) = start_clocked_init(ServerInit::default()).await;
+    command(&rpc, "set modeless").await;
+    exec_lua(
+        &rpc,
+        r#"vw = btv.view.create{}
+           vw:set_lines{ "alpha", "beta", "gamma" }
+           vw:on_select(function(line) _G.picked = line end)
+           vw:mount{ dock = "left", size = 20 }"#,
+    )
+    .await;
+    assert_eq!(mode(&rpc).await, "i");
+    feed_sync(&rpc, "<Down><CR>").await;
+    assert_eq!(exec_lua(&rpc, "return _G.picked").await.as_u64(), Some(2));
+    clock.set_ms(1_000);
+    feed_mouse(&rpc, "left", "press", 2, 2);
+    feed_mouse(&rpc, "left", "release", 2, 2);
+    clock.set_ms(1_100);
+    feed_mouse(&rpc, "left", "press", 2, 2);
+    feed_mouse(&rpc, "left", "release", 2, 2);
+    assert!(
+        poll_true(&rpc, "return _G.picked == 3").await,
+        "the double-click confirmed row 3"
+    );
+}
+
+#[tokio::test]
+async fn the_explorer_opens_entries_and_goes_up() {
+    let dir = bemtvi_test_harness::temp_dir("modeless_explorer");
+    std::fs::write(dir.join("alpha.txt"), "a\n").expect("write alpha");
+    std::fs::create_dir_all(dir.join("sub")).expect("mkdir sub");
+    std::fs::write(dir.join("sub").join("inner.txt"), "i\n").expect("write inner");
+    let (rpc, _inc) = start_modeless("one\n").await;
+    let sub = dir.join("sub").display().to_string().replace('\\', "/");
+    exec_lua(&rpc, &format!("btv.cmd('edit {sub}')")).await;
+    wait_for_lines(&rpc, "the sub listing", |ls| {
+        ls.iter().any(|l| l == "inner.txt")
+    })
+    .await;
+    assert_eq!(mode(&rpc).await, "i");
+    feed_sync(&rpc, "-").await;
+    wait_for_lines(&rpc, "the parent listing", |ls| {
+        ls.iter().any(|l| l == "alpha.txt")
+    })
+    .await;
+    cursor_to_line(&rpc, "alpha.txt").await;
+    feed_sync(&rpc, "<CR>").await;
+    wait_for_lines(&rpc, "alpha.txt opened", |ls| ls == ["a"]).await;
+    assert_eq!(mode(&rpc).await, "i");
+}
+
+// ===== The VS Code language keys ==============================================
+// The language verbs are Normal-mode letters in vim (`gd`, `gr`, `K`, `]d`), which a
+// modeless session can't reach. The layout gives them VS Code's keys instead.
+
+/// Replace each `btv.lsp` verb with a recorder, so a test sees which verb a key ran.
+async fn record_lsp_verbs(rpc: &Rpc) {
+    exec_lua(
+        rpc,
+        "_G.ran = {} \
+         for _, v in ipairs({ 'definition', 'implementation', 'references', 'hover', \
+           'signature_help', 'rename', 'code_action', 'format', 'document_symbol', \
+           'workspace_symbol' }) do \
+           btv.lsp[v] = function() table.insert(_G.ran, v) end \
+         end",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn the_vs_code_keys_run_the_language_verbs() {
+    let (rpc, _inc) = start_modeless("hello world\n").await;
+    record_lsp_verbs(&rpc).await;
+    for (key, verb) in [
+        ("<F12>", "definition"),
+        ("<C-F12>", "implementation"),
+        ("<S-F12>", "references"),
+        ("<C-k><C-i>", "hover"),
+        ("<C-S-Space>", "signature_help"),
+        ("<F2>", "rename"),
+        ("<C-.>", "code_action"),
+        ("<S-A-f>", "format"),
+        ("<C-S-o>", "document_symbol"),
+        ("<C-t>", "workspace_symbol"),
+    ] {
+        exec_lua(&rpc, "_G.ran = {}").await;
+        feed_sync(&rpc, key).await;
+        let ran = exec_lua(&rpc, "return table.concat(_G.ran, ',')").await;
+        assert_eq!(ran.as_str(), Some(verb), "{key}");
+    }
+    assert_eq!(lines(&rpc).await, v(&["hello world"]), "nothing typed");
+    assert_eq!(mode(&rpc).await, "i");
+}
+
+#[tokio::test]
+async fn f8_and_shift_f8_walk_the_diagnostics() {
+    let (rpc, _inc) = start_modeless("one\ntwo\nthree\nfour\n").await;
+    // A modeless session is always in Insert, where the default holds diagnostic
+    // updates until typing goes quiet; land these at once rather than wait it out.
+    exec_lua(&rpc, "btv.diagnostic.config({ update_in_insert = true })").await;
+    exec_lua(
+        &rpc,
+        "local ns = btv.ns.create('modeless-f8') \
+         btv.diagnostic.set(ns, 0, { \
+           { lnum = 1, col = 0, message = 'a', severity = 1 }, \
+           { lnum = 3, col = 0, message = 'b', severity = 1 }, \
+         })",
+    )
+    .await;
+    feed_sync(&rpc, "<F8>").await;
+    assert_eq!(cursor(&rpc).await.0, 2, "F8: the next diagnostic, line 2");
+    feed_sync(&rpc, "<F8>").await;
+    assert_eq!(cursor(&rpc).await.0, 4, "F8 again: line 4");
+    feed_sync(&rpc, "<S-F8>").await;
+    assert_eq!(cursor(&rpc).await.0, 2, "Shift+F8: back to line 2");
+    assert_eq!(mode(&rpc).await, "i");
+}
+
+#[tokio::test]
+async fn the_language_keys_work_in_a_read_only_buffer_too() {
+    let (rpc, _inc) = start_modeless("hello\n").await;
+    command(&rpc, "setlocal nomodifiable").await;
+    record_lsp_verbs(&rpc).await;
+    feed_sync(&rpc, "<F12>").await;
+    let ran = exec_lua(&rpc, "return table.concat(_G.ran, ',')").await;
+    assert_eq!(ran.as_str(), Some("definition"));
+}
+
+// ===== Read-only refusal: keys that reach the core from a span ==================
+
+#[tokio::test]
+async fn a_mapping_that_types_cannot_edit_a_read_only_buffer() {
+    // A mapping's right-hand side runs inside an atomic span, where typing rules
+    // stand down; the edit must still be refused.
+    let (rpc, _inc) = start_modeless("one\ntwo\n").await;
+    command(&rpc, "setlocal nomodifiable").await;
+    exec_lua(
+        &rpc,
+        "btv.keymap.set('modeless', '<F5>', 'zz<CR>', { buffer = 0 })",
+    )
+    .await;
+    feed_sync(&rpc, "<F5>").await;
+    assert_eq!(lines(&rpc).await, v(&["one", "two"]));
+    assert_eq!(mode(&rpc).await, "i");
+}
+
+#[tokio::test]
+async fn fed_keys_cannot_edit_a_read_only_buffer() {
+    let (rpc, _inc) = start_modeless("one\ntwo\n").await;
+    command(&rpc, "setlocal nomodifiable").await;
+    exec_lua(&rpc, "btv._feedkeys('abc', false, false)").await;
+    assert_eq!(lines(&rpc).await, v(&["one", "two"]));
+    feed(&rpc, "<S-Right><S-Right>");
+    assert_eq!(mode(&rpc).await, "s");
+    exec_lua(&rpc, "btv._feedkeys('q', false, false)").await;
+    assert_eq!(lines(&rpc).await, v(&["one", "two"]), "no type-over either");
+}
+
+#[tokio::test]
+async fn focusing_a_live_terminal_from_insert_rests_in_the_job() {
+    let (rpc, _inc) = start_modeless("one\n").await;
+    let cat = if cfg!(windows) {
+        "cmd /c type con"
+    } else {
+        "cat"
+    };
+    command(&rpc, "split").await;
+    command(&rpc, &format!("terminal {cat}")).await;
+    assert_eq!(mode(&rpc).await, "t");
+    focus_other(&rpc).await;
+    assert_eq!(mode(&rpc).await, "i");
+    focus_other(&rpc).await;
+    assert_eq!(mode(&rpc).await, "t", "back on the terminal");
+}
+
+#[tokio::test]
+async fn a_middle_click_cannot_paste_into_a_read_only_buffer() {
+    let (rpc, clip, mut inc) = start_clip("one\ntwo\n").await;
+    command(&rpc, "setlocal nomodifiable").await;
+    clip.seed("PASTED", false);
+    feed_mouse(&rpc, "middle", "press", 0, 1);
+    feed_mouse(&rpc, "middle", "release", 0, 1);
+    let msg = message_after(&rpc, &mut inc, "<Right>").await;
+    assert_eq!(lines(&rpc).await, v(&["one", "two"]));
+    assert!(msg.starts_with("E21"), "{msg:?}");
+}
+
+// ===== Turning 'modeless' off brings the view back to the cursor ===============
+
+#[tokio::test]
+async fn turning_it_off_after_scrolling_away_brings_the_cursor_into_view() {
+    // Vim keeps its cursor in view; a modeless scroll that left the caret behind
+    // must not carry over once the session is a vim one again.
+    let (rpc, _inc) = start_wide(200).await;
+    for _ in 0..30 {
+        feed_mouse_mod(&rpc, "wheel", "down", "S", 5, 5);
+    }
+    assert!(
+        leftcol(&rpc).await > 100,
+        "scrolled sideways, caret left behind"
+    );
+    for _ in 0..10 {
+        wheel_down(&rpc, 1);
+    }
+    assert!(topline(&rpc).await > 1, "and down");
+    exec_lua(&rpc, "btv.o.modeless = false").await;
+    assert_eq!(mode(&rpc).await, "n");
+    assert_eq!(cursor(&rpc).await, (1, 0));
+    assert_eq!(leftcol(&rpc).await, 0, "the view came back to the cursor");
+    assert_eq!(topline(&rpc).await, 1);
+}
+
+// ===== Read-only refusal: keys that don't edit still run from a span ============
+
+#[tokio::test]
+async fn a_mapping_through_ctrl_o_still_moves_in_a_read_only_buffer() {
+    // `<C-o>` runs one Normal-mode command, whose own edits check 'modifiable'; it
+    // edits nothing itself, so a read-only buffer's map may use it to reach a
+    // Normal-mode motion.
+    let (rpc, mut inc) = start_modeless("one\ntwo\nthree\n").await;
+    command(&rpc, "setlocal nomodifiable").await;
+    exec_lua(
+        &rpc,
+        "btv.keymap.set('modeless', '<F6>', '<C-o>G', { buffer = 0 })",
+    )
+    .await;
+    let msg = message_after(&rpc, &mut inc, "<F6>").await;
+    assert!(!msg.starts_with("E21"), "{msg:?}");
+    assert_eq!(cursor(&rpc).await.0, 3, "on the last line");
+    assert_eq!(lines(&rpc).await, v(&["one", "two", "three"]));
+    assert_eq!(mode(&rpc).await, "i");
+    // A Normal command that edits is still refused, by Normal's own check.
+    exec_lua(
+        &rpc,
+        "btv.keymap.set('modeless', '<F7>', '<C-o>dd', { buffer = 0 })",
+    )
+    .await;
+    let msg = message_after(&rpc, &mut inc, "<F7>").await;
+    assert!(msg.starts_with("E21"), "{msg:?}");
+    assert_eq!(lines(&rpc).await, v(&["one", "two", "three"]));
+    assert_eq!(mode(&rpc).await, "i");
+}
+
+#[tokio::test]
+async fn turning_it_off_over_a_read_only_selection_cannot_type_over_it() {
+    // A modeless selection held when the session goes back to the vim model must
+    // not carry the modeless type-over with it, where no read-only guard applies.
+    let (rpc, _inc) = start_modeless("one\ntwo\n").await;
+    command(&rpc, "setlocal nomodifiable").await;
+    feed(&rpc, "<S-Right><S-Right>");
+    assert_eq!(mode(&rpc).await, "s");
+    exec_lua(&rpc, "btv.o.modeless = false").await;
+    assert_eq!(mode(&rpc).await, "n");
+    feed(&rpc, "X");
+    assert_eq!(lines(&rpc).await, v(&["one", "two"]));
+    assert_eq!(mode(&rpc).await, "n");
+}
+
+#[tokio::test]
+async fn a_map_that_turns_it_off_leaves_insert_once_it_returns() {
+    // A map's Lua runs inside the mapping's span, where the mode stays as its keys
+    // set it; turning 'modeless' off there must still end in Normal, or a read-only
+    // buffer is left in a vim Insert nothing guards.
+    let (rpc, _inc) = start_modeless("one\ntwo\n").await;
+    command(&rpc, "setlocal nomodifiable").await;
+    exec_lua(
+        &rpc,
+        "btv.keymap.set('modeless', '<F9>', function() btv.o.modeless = false end, { buffer = 0 })",
+    )
+    .await;
+    feed_sync(&rpc, "<F9>").await;
+    assert!(!modeless_on(&rpc).await);
+    assert_eq!(mode(&rpc).await, "n");
+    feed(&rpc, "X");
+    assert_eq!(lines(&rpc).await, v(&["one", "two"]));
+}
+
+#[tokio::test]
+async fn ctrl_o_undo_cannot_edit_a_read_only_buffer() {
+    // `<C-o>` reaches a Normal command; Normal's `u` must refuse there as the
+    // layout's undo does.
+    let (rpc, mut inc) = start_modeless("one\n").await;
+    feed(&rpc, "abc");
+    assert_eq!(lines(&rpc).await, v(&["abcone"]));
+    command(&rpc, "setlocal nomodifiable").await;
+    let msg = message_after(&rpc, &mut inc, "<C-o>u").await;
+    assert!(msg.starts_with("E21"), "{msg:?}");
+    assert_eq!(lines(&rpc).await, v(&["abcone"]));
+    let msg = message_after(&rpc, &mut inc, "<C-o><C-r>").await;
+    assert!(msg.starts_with("E21"), "{msg:?}");
+    assert_eq!(mode(&rpc).await, "i");
+}
+
+#[tokio::test]
+async fn a_completion_accept_cannot_edit_a_read_only_buffer() {
+    // A read-only buffer rests in Insert here, so an Insert map that accepts a
+    // completion reaches it, as does the manual trigger; the accept writes the
+    // buffer without passing a key the refusal sees.
+    let (rpc, mut inc) = start_modeless("AN_OTHER\nAN\n").await;
+    exec_lua(
+        &rpc,
+        "btv.complete.setup { sources = { { 'buffer', min_chars = 2 } }, auto = false } \
+         btv.keymap.set('i', '<C-j>', function() btv.complete.accept('insert') end)",
+    )
+    .await;
+    command(&rpc, "setlocal nomodifiable").await;
+    feed(&rpc, "<Down><End>");
+    exec_lua(&rpc, "btv.complete.trigger()").await;
+    poll_menu(&rpc, &mut inc).await.expect("the popup opens");
+    feed(&rpc, "<Down>");
+    let msg = message_after(&rpc, &mut inc, "<C-j>").await;
+    assert!(msg.starts_with("E21"), "{msg:?}");
+    assert_eq!(lines(&rpc).await, v(&["AN_OTHER", "AN"]));
+}
+
+#[tokio::test]
+async fn a_map_that_turns_it_off_then_enters_insert_stays_in_insert() {
+    // The leave a span owes is for the resting Insert it turned the option off in.
+    // A map whose own keys left that Insert and then entered Insert again asked for
+    // the Insert it ends in, as any vim map may.
+    let (rpc, _inc) = start_modeless("one\ntwo\n").await;
+    exec_lua(
+        &rpc,
+        "btv.keymap.set('modeless', '<F4>', '<Esc>:set nomodeless<CR>i')",
+    )
+    .await;
+    feed_sync(&rpc, "<F4>").await;
+    assert!(!modeless_on(&rpc).await);
+    assert_eq!(mode(&rpc).await, "i");
+    feed(&rpc, "Z");
+    assert_eq!(lines(&rpc).await, v(&["Zone", "two"]));
+}
+
+#[tokio::test]
+async fn redo_and_undo_tree_travel_cannot_edit_a_read_only_buffer() {
+    // A change undone while the buffer could still change leaves something to redo,
+    // and a history to travel; neither may rewrite the text once it is read-only.
+    let (rpc, mut inc) = start_modeless("one\n").await;
+    feed(&rpc, "abc");
+    assert_eq!(lines(&rpc).await, v(&["abcone"]));
+    command(&rpc, "undo").await;
+    assert_eq!(lines(&rpc).await, v(&["one"]));
+    command(&rpc, "setlocal nomodifiable").await;
+    let msg = message_after(&rpc, &mut inc, "<C-o><C-r>").await;
+    assert!(msg.starts_with("E21"), "{msg:?}");
+    assert_eq!(lines(&rpc).await, v(&["one"]), "redo");
+    for travel in ["undo 1", "later", "later 1f"] {
+        command(&rpc, travel).await;
+        assert_eq!(lines(&rpc).await, v(&["one"]), ":{travel}");
+    }
+    command(&rpc, "setlocal modifiable").await;
+    command(&rpc, "redo").await;
+    assert_eq!(lines(&rpc).await, v(&["abcone"]), "the redo is still there");
+}
+
+#[tokio::test]
+async fn turning_it_off_while_ctrl_o_waits_cannot_resume_typing_into_a_read_only_buffer() {
+    // `<C-o>`'s one command resumes the Insert it left. Once the session is a vim
+    // one that Insert is no modeless rest, but over a read-only buffer it still
+    // refuses each typed key, as vim's does.
+    let (rpc, mut inc) = start_modeless("one two\n").await;
+    command(&rpc, "setlocal nomodifiable").await;
+    feed(&rpc, "<C-o>");
+    exec_lua(&rpc, "btv.o.modeless = false").await;
+    feed(&rpc, "l");
+    assert_eq!(mode(&rpc).await, "i");
+    let msg = message_after(&rpc, &mut inc, "D").await;
+    assert!(msg.starts_with("E21"), "{msg:?}");
+    assert_eq!(lines(&rpc).await, v(&["one two"]));
+    feed(&rpc, "<C-[>");
+    assert_eq!(mode(&rpc).await, "n", "<C-[> still leaves");
+}
+
+#[tokio::test]
+async fn a_vim_insert_refuses_typing_into_a_buffer_ctrl_o_made_read_only() {
+    let (rpc, _inc) = start_as("gui", "one\n").await;
+    feed_sync(&rpc, "i<C-o>:setlocal nomodifiable<CR>abc<CR><BS>").await;
+    assert_eq!(lines(&rpc).await, v(&["one"]));
+    assert_eq!(mode(&rpc).await, "i");
+    feed(&rpc, "<Esc>");
+    assert_eq!(mode(&rpc).await, "n");
+}
+
+#[tokio::test]
+async fn turning_it_off_while_the_command_line_is_open_closes_it_to_normal() {
+    // A command line the layout opened from the resting Insert goes back to it.
+    // Once the session is a vim one there is no resting Insert to go back to, and
+    // over a read-only buffer a vim Insert has no guard.
+    let (rpc, _inc) = start_modeless("one\n").await;
+    command(&rpc, "setlocal nomodifiable").await;
+    feed(&rpc, "<C-;>");
+    assert_eq!(mode(&rpc).await, "c");
+    exec_lua(&rpc, "btv.o.modeless = false").await;
+    feed(&rpc, "<Esc>");
+    assert_eq!(mode(&rpc).await, "n");
+    feed(&rpc, "\"abc");
+    assert_eq!(lines(&rpc).await, v(&["one"]));
+}
+
+#[tokio::test]
+async fn ctrl_o_does_not_make_the_typing_before_it_a_repeatable_command() {
+    // The resting Insert was never entered with `i`, so the text typed in it is no
+    // Normal-mode change: `.` must not replay it as commands (`dd` would delete).
+    let (rpc, _inc) = start_modeless("one\ntwo\n").await;
+    feed(&rpc, "dd<C-o>l");
+    assert_eq!(lines(&rpc).await, v(&["ddone", "two"]));
+    feed(&rpc, "<C-o>.");
+    assert_eq!(lines(&rpc).await, v(&["ddone", "two"]), "<C-o>.");
+    exec_lua(&rpc, "btv.o.modeless = false").await;
+    feed(&rpc, ".");
+    assert_eq!(lines(&rpc).await, v(&["ddone", "two"]), "a vim `.`");
+}
+
+#[tokio::test]
+async fn ctrl_o_still_repeats_the_last_normal_change() {
+    let (rpc, _inc) = start_modeless("abc\n").await;
+    feed(&rpc, "<C-o>~");
+    assert_eq!(lines(&rpc).await, v(&["Abc"]));
+    feed(&rpc, "xy<C-o>.");
+    assert_eq!(lines(&rpc).await, v(&["AxyBc"]));
 }

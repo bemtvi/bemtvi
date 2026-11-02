@@ -308,12 +308,12 @@ local function verb(name, vim)
   end
 end
 
--- The key that runs modeless verb `name`, as a hint: only in a modeless editable
--- buffer, where the layout's keys run. Vim's keys are verbs plus motions, not one
--- chord, so a vim session shows none.
+-- The key that runs modeless verb `name`, as a hint: only in a modeless session,
+-- where the layout's keys run in every buffer. Vim's keys are verbs plus motions,
+-- not one chord, so a vim session shows none.
 local function hint(name)
   return function(ctx)
-    if ctx.modeless and ctx.modifiable then
+    if ctx.modeless then
       return btv.modeless.key_hint(name)
     end
     return nil
@@ -363,9 +363,10 @@ btv.contextmenu.groups.clipboard = btv.contextmenu.groups.clipboard
       {
         label = "Copy",
         detail = hint("copy"),
-        -- Takes the line in an editable buffer when nothing is selected.
+        -- Takes the line when nothing is selected: in any modeless buffer, and in
+        -- an editable vim one.
         when = function(ctx)
-          return ctx.selection or ctx.modifiable
+          return ctx.selection or ctx.modifiable or ctx.modeless
         end,
         action = verb("copy", function(ctx)
           vim_keys(ctx, ctx.selection and '"+y' or '"+yy')
@@ -399,12 +400,14 @@ local function lsp_supports(buf, method)
   return false
 end
 
--- An LSP row, greyed out unless an attached server answers `method`.
-local function lsp_row(label, method, run)
+-- An LSP row, greyed out unless an attached server answers `method`. `lsp_verb` names
+-- the `btv.lsp` verb it runs, which is also its modeless action, for the key hint.
+local function lsp_row(label, method, lsp_verb)
   return {
     label = label,
+    detail = hint(lsp_verb),
     action = function()
-      run()
+      btv.lsp[lsp_verb]()
     end,
     enabled = function(ctx)
       return lsp_supports(ctx.buf, method)
@@ -418,21 +421,11 @@ btv.contextmenu.groups.lsp = btv.contextmenu.groups.lsp
       return #btv.lsp.clients({ bufnr = ctx.buf }) > 0
     end,
     items = {
-      lsp_row("Go to Definition", "textDocument/definition", function()
-        btv.lsp.definition()
-      end),
-      lsp_row("Find References", "textDocument/references", function()
-        btv.lsp.references()
-      end),
-      lsp_row("Rename Symbol", "textDocument/rename", function()
-        btv.lsp.rename()
-      end),
-      lsp_row("Format Document", "textDocument/formatting", function()
-        btv.lsp.format()
-      end),
-      lsp_row("Code Actions", "textDocument/codeAction", function()
-        btv.lsp.code_action()
-      end),
+      lsp_row("Go to Definition", "textDocument/definition", "definition"),
+      lsp_row("Find References", "textDocument/references", "references"),
+      lsp_row("Rename Symbol", "textDocument/rename", "rename"),
+      lsp_row("Format Document", "textDocument/formatting", "format"),
+      lsp_row("Code Actions", "textDocument/codeAction", "code_action"),
     },
   }
 

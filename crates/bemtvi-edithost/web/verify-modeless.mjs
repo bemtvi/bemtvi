@@ -124,6 +124,24 @@ try {
       (await waitText(page, "foo bar")) === "foo bar",
       `text = ${JSON.stringify(await text(page))}`);
 
+    // The language keys reach their `btv.lsp` verbs (stubbed to record, since no server
+    // runs here): a two-chord hover, a punctuation chord, Shift+Alt with a letter, and
+    // the modified F12s (only a bare F12 stays with the browser, for its devtools).
+    await luaStr(page, "_G.ran = {} for _, v in ipairs({ 'hover', 'code_action', 'format', " +
+      "'document_symbol', 'signature_help', 'implementation', 'references', 'rename' }) " +
+      "do btv.lsp[v] = function() table.insert(_G.ran, v) end end return 'ok'");
+    for (const k of ["Control+k", "Control+i", "Control+Period", "Shift+Alt+F",
+      "Control+Shift+O", "Control+Shift+Space", "Control+F12", "Shift+F12", "F2"]) {
+      await page.keyboard.press(k);
+    }
+    await sleep(200);
+    const ran = await luaStr(page, "return table.concat(_G.ran, ',')");
+    check("the language chords reach their verbs",
+      ran === "hover,code_action,format,document_symbol,signature_help,implementation," +
+        "references,rename", `ran = ${ran}`);
+    check("and type nothing", (await text(page)) === "foo bar",
+      `text = ${JSON.stringify(await text(page))}`);
+
     await page.keyboard.press("Home");
     await page.keyboard.press("Shift+ArrowRight");
     await page.keyboard.press("Shift+ArrowRight");
@@ -297,6 +315,20 @@ try {
     check("Command+A selects all and typing replaces it", (await waitText(page, "Y")) === "Y",
       `text = ${JSON.stringify(await text(page))}`);
 
+    // The language keys' Command forms reach the editor.
+    await luaStr(page, "_G.ran = {} for _, v in ipairs({ 'hover', 'code_action', " +
+      "'document_symbol', 'signature_help', 'implementation', 'references' }) do " +
+      "btv.lsp[v] = function() table.insert(_G.ran, v) end end return 'ok'");
+    for (const k of ["Meta+k", "Meta+i", "Meta+Period", "Meta+Shift+O", "Meta+Shift+Space",
+      "Meta+F12", "Shift+F12"]) {
+      await page.keyboard.press(k);
+    }
+    await sleep(200);
+    const ran = await luaStr(page, "return table.concat(_G.ran, ',')");
+    check("the language Command chords reach their verbs",
+      ran === "hover,code_action,document_symbol,signature_help,implementation,references",
+      `ran = ${ran}`);
+
     // A Command chord outside the layout stays with the browser, so the editor never
     // types its letter.
     await page.keyboard.press("Meta+e");
@@ -304,6 +336,26 @@ try {
     check("a Command chord the layout doesn't bind never reaches the editor",
       (await waitText(page, "Y!")) === "Y!",
       `text = ${JSON.stringify(await text(page))}`);
+
+    // The language keys are forwarded only as the layout spells them: Command+Option+I is
+    // the browser's devtools and a plain Command+O its open-file, so neither is
+    // swallowed, while the layout's own chords on those keys are.
+    await page.evaluate(() => {
+      window.__prevented = [];
+      window.addEventListener("keydown", (e) => {
+        if (e.metaKey && e.key !== "Meta" && e.key !== "Shift" && e.key !== "Alt") {
+          window.__prevented.push(`${e.code}${e.altKey ? "+alt" : ""}${e.shiftKey ? "+shift" : ""}=${e.defaultPrevented}`);
+        }
+      });
+    });
+    for (const k of ["Meta+Alt+i", "Meta+o", "Meta+Alt+Period", "Meta+i", "Meta+Shift+O"]) {
+      await page.keyboard.press(k);
+    }
+    await sleep(100);
+    const prevented = await page.evaluate(() => window.__prevented.join(","));
+    check("Command+Option+I and Command+O stay with the browser; the layout's chords don't",
+      prevented === "KeyI+alt=false,KeyO=false,Period+alt=false,KeyI=true,KeyO+shift=true",
+      `keydowns = ${prevented}`);
     await page.close();
   }
 

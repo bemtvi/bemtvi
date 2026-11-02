@@ -2919,7 +2919,11 @@ impl Editor {
                 let bot = self.visual_anchor.line.max(self.cursor.line);
                 self.mode = Mode::Normal;
                 // With no line below there is nothing to join, and the cursor stays.
-                if top + 1 < self.buffer().line_count() {
+                // Normal `J` refuses a read-only buffer in `edit_each_cursor`; this
+                // path skips it, so it refuses here.
+                if !self.modifiable() {
+                    self.refuse_edit();
+                } else if top + 1 < self.buffer().line_count() {
                     self.cursor = Cursor { line: top, col: 0 };
                     self.join_lines_with((bot - top + 1).max(2), spaces);
                 }
@@ -3025,7 +3029,9 @@ impl Editor {
     /// text) re-parses and re-executes exactly as typed. No-op when nothing has
     /// been recorded yet (vim beeps; bemtvi has no bell).
     fn repeat_change(&mut self) {
-        if self.last_change.is_empty() {
+        // A `.` reached inside a replay is text the change typed, run as a command
+        // because the replay's insert was refused; replaying again would never end.
+        if self.last_change.is_empty() || self.replaying_change {
             return;
         }
         // `.` itself must never become the new last change — mark this command
@@ -3060,6 +3066,11 @@ impl Editor {
         self.replaying_change = true;
         for key in keys {
             self.input(key);
+            // Vim drops the rest of the redo once an edit fails: past a refused `i`
+            // the typed text would run as Normal-mode commands.
+            if self.edit_refused {
+                break;
+            }
         }
         self.replaying_change = false;
     }

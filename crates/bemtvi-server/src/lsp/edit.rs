@@ -54,6 +54,12 @@ impl EditHost {
             return;
         }
         let id = self.editor.current_buffer_id();
+        // A `nomodifiable` buffer refuses the format outright, as neovim's
+        // `nvim_buf_set_text` does (modeless `<S-A-f>` reaches here on a read-only one).
+        if !self.editor.buffer_modifiable(id) {
+            self.editor.echo(E21);
+            return;
+        }
         let buffer = self.editor.buffer();
         let (byte_edits, endofline) = lsp_edits_to_byte_edits(
             buffer,
@@ -498,6 +504,19 @@ impl EditHost {
             // which applying now would write into an empty buffer the landing then
             // clobbers, silently losing the edit.
             let defer = self.editor.has_pending_open(id);
+            // A `nomodifiable` buffer refuses its edits (`E21`, as neovim's
+            // `nvim_buf_set_text` does), and refusing it here, while still resolving,
+            // refuses the *whole* edit: nothing has been applied yet, so a rename is
+            // never left done in some files and not in the locked one.
+            if !self.editor.buffer_modifiable(id) {
+                let name = self
+                    .editor
+                    .buffer_of(id)
+                    .and_then(|b| b.path.as_ref())
+                    .map_or_else(|| uri.to_string(), |p| p.display().to_string());
+                failure = Some((index, format!("{E21}: {name}")));
+                break;
+            }
             staged.push((id, edits, defer));
         }
 
@@ -1277,6 +1296,13 @@ impl EditHost {
         let Some(pending) = self.pending_replica_edits.remove(&buffer) else {
             return;
         };
+        // The edit was decided while these bytes were in flight; a buffer that came in
+        // `nomodifiable` (a `BufReadPost` handler locking it) still refuses them, loudly.
+        // The rest of that edit has already applied — the one case it can be partial.
+        if !self.editor.buffer_modifiable(buffer) {
+            self.editor.echo(format!("apply_workspace_edit: {E21}"));
+            return;
+        }
         let Some(buf) = self.editor.buffer_of(buffer) else {
             return;
         };
@@ -1531,6 +1557,9 @@ impl EditHost {
             .lsp_request(key, token, LspRequest::ResolveCodeAction { action });
     }
 }
+
+/// vim's refusal for an edit to a `nomodifiable` buffer.
+const E21: &str = "E21: Cannot make changes, 'modifiable' is off";
 
 /// The [`PositionEncoding`] a Lua caller named (`btv.lsp.apply_workspace_edit` /
 /// `btv.lsp.show_document`'s `opts.encoding`). Anything but the two exact alternatives

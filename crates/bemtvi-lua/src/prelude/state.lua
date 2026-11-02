@@ -1715,6 +1715,9 @@ btv._cur_win = btv._cur_win or 1000
 -- The live Visual selection's fixed end, `{ row, col }` like `btv._cur_cursor`, or `nil`
 -- outside a selection mode. Refreshed beside the cursor; read by `btv.pos.get("v")`.
 btv._cur_visual_anchor = btv._cur_visual_anchor or nil
+-- The live selection's extent `{ s_row, s_col, e_row, e_col }` (0-based rows, byte
+-- columns, end-exclusive), or `nil` outside a selection. Read by `btv.win.selection()`.
+btv._cur_selection = btv._cur_selection or nil
 -- The editor's current mode() short code (`"n"`/`"i"`/`"v"`/…), refreshed alongside
 -- the buffer mirror so `vim.fn.mode`() (and a %{} statusline expression calling it)
 -- reflects the live mode.
@@ -2075,9 +2078,39 @@ function btv._set_tab_mirror(tabs, cur)
   btv._cur_tab = cur or 1
 end
 
+-- `btv._refuse_pending_buffer(buf, who)`: raise when `buf` is `false`, what a
+-- `btv.view`'s `:bufnr()` reads before its buffer exists (the buffer is created after
+-- the chunk that creates the view). A buffer argument that took the value would
+-- otherwise act on the current buffer, or bind a "buffer-local" keymap, autocmd or
+-- command globally, without a word. `who` names the API for the message.
+function btv._refuse_pending_buffer(buf, who)
+  if buf == false then
+    error(
+      who
+        .. ": the buffer doesn't exist yet (`false` is a btv.view's :bufnr() before its"
+        .. " buffer is created, after the current chunk); wait for it with btv.wait_for,"
+        .. " or give btv.keymap.set the view itself: { buffer = view }",
+      0
+    )
+  end
+  -- A view handle, which `btv.keymap.set` alone takes in a buffer's place: anywhere
+  -- else it would match no buffer, reading nothing or registering what never runs.
+  -- (`btv._view_handle` comes with prelude/view.lua, which loads after this file.)
+  if btv._view_handle and btv._view_handle(buf) then
+    error(
+      who
+        .. ": got a btv.view handle where a buffer number goes; pass view:bufnr()"
+        .. " (only btv.keymap.set takes the view itself)",
+      0
+    )
+  end
+  return buf
+end
+
 -- Resolve a buffer handle to a concrete bufnr (0 / nil -> current buffer), the
 -- one place the buffer-read API maps neovim's "0 means current" convention.
 function btv._resolve_bufnr(bufnr)
+  btv._refuse_pending_buffer(bufnr, "buffer")
   if bufnr == nil or bufnr == 0 then
     return (btv._cur_buf or {}).bufnr or 0
   end
@@ -2161,6 +2194,7 @@ end
 -- `buf` / `win` narrows it back to that instance.
 function btv.option.set(name, value, opts)
   opts = opts or {}
+  btv._refuse_pending_buffer(opts.buf, "btv.option.set")
   local scope = opt_scope_of(opts, "nvim_set_option_value", true)
   if scope == "global" then
     btv.go[name] = value
@@ -2187,6 +2221,7 @@ end
 -- default for the getter, where the setter's is `:set`).
 function btv.option.get(name, opts)
   opts = opts or {}
+  btv._refuse_pending_buffer(opts.buf, "btv.option.get")
   if opt_scope_of(opts, "nvim_get_option_value", false) == "global" then
     return btv.go[name]
   end

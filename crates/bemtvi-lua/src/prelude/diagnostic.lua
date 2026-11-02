@@ -136,6 +136,7 @@ end
 -- severities. The entries are copied out (callers must not mutate the mirror), each
 -- tagged with its `bufnr`, matching neovim's shape.
 function btv.diagnostic.get(bufnr, opts)
+  btv._refuse_pending_buffer(bufnr, "btv.diagnostic.get")
   opts = opts or {}
   local out = {}
   local wanted = diag_severity_filter(opts.severity)
@@ -275,6 +276,7 @@ function btv.diagnostic.setloclist(opts)
   -- Capture the owner window explicitly so the list lands on this window even
   -- though the `:lopen` below moves focus into the (new) loclist window.
   local win = btv.win.current()
+  btv._refuse_pending_buffer(opts.bufnr, "btv.diagnostic.setloclist")
   local diags = btv.diagnostic.get(opts.bufnr or 0, { severity = opts.severity })
   local items = btv.diagnostic.toqflist(diags)
   btv.setloclist(win, {}, " ", { title = opts.title or "Diagnostics", items = items })

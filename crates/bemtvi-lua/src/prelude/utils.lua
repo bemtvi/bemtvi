@@ -413,6 +413,7 @@ end
 -- current buffer), or `""` for a buffer with no file — which is what a server should
 -- be told, rather than a `file://` naming nothing.
 function btv.utils.uri_from_buf(bufnr)
+  btv._refuse_pending_buffer(bufnr, "btv.utils.uri_from_buf")
   local name = btv.buf.name(bufnr or 0)
   return (name == nil or name == "") and "" or btv.utils.uri_from_path(name)
 end

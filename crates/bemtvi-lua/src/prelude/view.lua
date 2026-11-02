@@ -43,15 +43,19 @@ end
 -- `<2-LeftMouse>` is the mouse form of `<CR>`: a single left-click positions the cursor
 -- on a row (core dock/window mouse handling) and the double-click confirms it, so every
 -- view is clickable for free — a plugin needn't wire the mouse itself.
+--
+-- Both bind in Normal and in the `modeless` layer: a modeless session rests in Insert
+-- over a view too, and takes a read-only buffer's keys only through that layer. A
+-- plugin's own view keys need the same `{ "n", "modeless" }` pair.
 function btv._install_view_keymaps(buf)
   btv.keymap.set(
-    "n",
+    { "n", "modeless" },
     "<CR>",
     btv.view.actions.confirm,
     { buffer = buf, default = true, desc = "Select entry" }
   )
   btv.keymap.set(
-    "n",
+    { "n", "modeless" },
     "<2-LeftMouse>",
     btv.view.actions.confirm,
     { buffer = buf, default = true, desc = "Select entry (double-click)" }
@@ -272,10 +276,30 @@ function View:on_close(fn)
   return self
 end
 
--- `:bufnr()` — the backing buffer number (from the mirror), or nil before the view's
--- buffer exists (i.e. before the create op has drained). The target for extmarks.
+-- `:bufnr()` — the backing buffer number (from the mirror), or `false` before the
+-- view's buffer exists: it is created after the chunk that creates the view. `false`,
+-- not `nil`, so it can't pass for an absent option: `{ buffer = view:bufnr() }` would
+-- otherwise read as "no buffer" and bind globally. The buffer APIs refuse `false`
+-- loudly. Wait for the number with
+-- `btv.wait_for(function() return view:bufnr() end)`, or give `btv.keymap.set` the
+-- view itself (`{ buffer = view }`), which binds once the buffer exists.
 function View:bufnr()
-  return btv._view_buf and btv._view_buf[self.id]
+  return btv._view_buf and btv._view_buf[self.id] or false
+end
+
+-- `btv._view_handle(x)` -> `x` when it is a `btv.view` handle, else nil. Lets a
+-- `buffer` option take the view itself (see `btv.keymap.set`).
+function btv._view_handle(x)
+  if type(x) == "table" and getmetatable(x) == View then
+    return x
+  end
+  return nil
+end
+
+-- `btv._view_is_open(v)` -> whether view handle `v` is still registered: false once
+-- `:close()` dropped it.
+function btv._view_is_open(v)
+  return btv._views[v.id] == v
 end
 
 -- `:winid()` — the window currently showing the view (from the mirror), or nil while the

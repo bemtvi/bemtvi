@@ -806,6 +806,40 @@ async fn welcome_confirm_opens_the_manager_and_installs_there() {
     );
 }
 
+// A modeless session has no Normal mode, so the welcome view's keys must reach it
+// through the `modeless` layer: <CR> still confirms and opens the manager.
+#[tokio::test]
+async fn welcome_confirm_works_in_a_modeless_session() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_wmodeless_src");
+    let repo = make_repo(&src, "kappa");
+    let (_root, _cfg) = setup_root_and_config(&rpc, "plug_wmodeless").await;
+    exec_lua(&rpc, "btv.o.modeless = true").await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "btv.plugins.recommend({{ {{ \"file://{repo}\", name = \"kappa\" }} }})\n\
+             btv.plugins.bootstrap()",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(poll_true(&rpc, "return vim.bo.filetype == 'btvpluginswelcome'").await);
+    assert!(
+        poll_true(&rpc, "return btv.mode().mode == 'i'").await,
+        "the welcome rests in Insert"
+    );
+    assert!(
+        feed_until(&rpc, "<CR>", "return vim.bo.filetype == 'btvplugins'").await,
+        "<CR> confirms the welcome in a modeless session"
+    );
+    assert!(
+        poll_true(&rpc, "return btv.plugins._loaded.kappa == true").await,
+        "the chosen set installs"
+    );
+}
+
 // Skipping the welcome (Esc) records the marker (so it never asks again) and writes
 // nothing to the user's config.
 #[tokio::test]

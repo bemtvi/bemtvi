@@ -733,13 +733,23 @@
     // layout's (undo/redo, cut/copy, select all, save, find and next/previous, files and
     // the palette, the command line, duplicate, indent), plus the arrows and
     // Backspace/Delete it navigates and deletes with. Everything else stays with the
-    // browser: Cmd+V (the `paste` event carries the clipboard), and Cmd+W, which the
-    // browser keeps for itself and never shows the page.
+    // browser: Cmd+V (the `paste` event carries the clipboard), and Cmd+W and Cmd+T,
+    // which the browser keeps for itself and never shows the page.
     const FORWARD_CMD = new Set([
       "KeyZ", "KeyC", "KeyX", "KeyA", "KeyS", "KeyF", "KeyG", "KeyP", "KeyD",
       "Semicolon", "BracketRight",
       "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Backspace", "Delete",
     ]);
+    // The language keys, sent only in the one form the layout binds (the value: whether
+    // Shift is held; never Option): hover Cmd+K Cmd+I, quick fix Cmd+., symbols
+    // Cmd+Shift+O, signature help Cmd+Shift+Space, implementation Cmd+F12. Their other
+    // forms are the browser's: Cmd+Option+I opens devtools, Cmd+O opens a file.
+    const FORWARD_CMD_EXACT = {
+      KeyK: false, KeyI: false, Period: false, F12: false, KeyO: true, Space: true,
+    };
+    const forwardCmd = (e) => FORWARD_CMD.has(e.code)
+      || (Object.hasOwn(FORWARD_CMD_EXACT, e.code) && !e.altKey
+        && e.shiftKey === FORWARD_CMD_EXACT[e.code]);
     // Case-insensitive on purpose: the two sources spell it differently — `userAgentData`
     // reports `"macOS"`, the legacy `platform` reports `"MacIntel"`.
     const IS_MAC = /mac|iphone|ipad|ipod/i.test(
@@ -3611,7 +3621,11 @@
       // for printable keys it's already folded into the character (Shift+a → "A"), and
       // a Ctrl/Alt+letter combo carries it via the capitalized base above — so without
       // this, Shift+Tab collapsed to a plain `<Tab>` and never sent the back-cycle.
-      if (e.shiftKey && (isSpecial || shiftedLetter)) mods.push("S");
+      // Space is the same with Ctrl, Alt or Cmd held: Shift folds into nothing there, so
+      // it is carried (`<C-S-Space>`, signature help), as the GUI client does. A bare
+      // Shift+Space stays `<Space>`, typed like any space.
+      const shiftedSpace = base === "Space" && (ctrlKey || altKey || e.metaKey);
+      if (e.shiftKey && (isSpecial || shiftedLetter || shiftedSpace)) mods.push("S");
       if (altKey) mods.push("A");
       if (e.metaKey) mods.push("D");
       if (mods.length === 0) {
@@ -3820,14 +3834,18 @@
     // EditContext-host #ime div (Chrome). Bind both so focus landing on either is covered;
     // only one is ever focused, so a key fires the handler once.
     const onProxyKeydown = (e) => {
-      // F5 (reload) and F12 (devtools) stay with the browser; other F-keys (F6/F10/F11…)
-      // are encoded by keyToNotation and fed. So a web dap session uses :DapContinue for
-      // "continue" (the F5 default is browser-reserved here) but F10/F11/F6 work as keys.
-      if (e.key === "F5" || e.key === "F12") return;
+      // F5 (reload, and its Ctrl/Shift hard-reload forms) and a bare F12 (devtools) stay
+      // with the browser; other F-keys (F6/F10/F11…) are encoded by keyToNotation and
+      // fed. So a web dap session uses :DapContinue for "continue" (the F5 default is
+      // browser-reserved here) but F10/F11/F6 work as keys. A modified F12 is no browser
+      // shortcut and is fed: the modeless layout's Ctrl/Cmd+F12 (implementation) and
+      // Shift+F12 (references).
+      const bareF12 = e.key === "F12" && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
+      if (e.key === "F5" || bareF12) return;
       // Cmd shortcuts stay with the browser, except on a Mac the chords the modeless
       // key layout binds (Command is that layout's modifier there). Cmd+V is not among
       // them: the browser's `paste` event already feeds the clipboard in.
-      if (e.metaKey && !e.ctrlKey && !(IS_MAC && FORWARD_CMD.has(e.code))) return;
+      if (e.metaKey && !e.ctrlKey && !(IS_MAC && forwardCmd(e))) return;
       const n = keyToNotation(e);
       if (n == null) return;
       e.preventDefault();

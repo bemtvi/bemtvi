@@ -2845,6 +2845,14 @@ impl EditHost {
                 .visual_anchor_pos()
                 .map(|(line, col)| ((line + 1) as u64, col as u64)),
         );
+        // …and the whole selection's extent, which is what reads its text
+        // (`btv.win.selection()`): the anchor alone can't say whether the selection is
+        // linewise or where its inclusive end falls.
+        let _ = self.lua.set_selection(
+            self.editor
+                .selection_extent()
+                .map(|(sr, sc, er, ec)| (sr as u64, sc as u64, er as u64, ec as u64)),
+        );
         // The alternate file name (`#`), the twin of the `%` name in the current-buffer
         // snapshot — refreshed here so `vim.fn.expand("#")` tracks the same `#` the
         // ex-command token expands to.

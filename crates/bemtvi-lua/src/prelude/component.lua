@@ -222,6 +222,39 @@ local function view_backend(opts)
       :catch(function() end)
   end
 
+  -- The view's buffer / window for a `ctx.bo` / `ctx.wo` access (`how` is "read" or
+  -- "set", `k` the option), raising when there is none: the buffer was deleted or the
+  -- window closed, so the access has nowhere to go and must not read as `nil` or drop
+  -- the value.
+  local function view_buf(how, k)
+    local b = v:bufnr()
+    if not b then
+      error(
+        "btv.view.component: can't "
+          .. how
+          .. " ctx.bo."
+          .. tostring(k)
+          .. ": the view has no buffer",
+        3
+      )
+    end
+    return b
+  end
+  local function view_win(how, k)
+    local w = v:winid()
+    if not w then
+      error(
+        "btv.view.component: can't "
+          .. how
+          .. " ctx.wo."
+          .. tostring(k)
+          .. ": the view has no window (closed or not shown)",
+        3
+      )
+    end
+    return w
+  end
+
   -- `show(mode)` — put the view on screen. `mode.place` adopts a reserved restore slot (the
   -- persisted-view path); otherwise mount fresh per the dock / split / float opts.
   local function show(mode)
@@ -241,7 +274,7 @@ local function view_backend(opts)
     show = show,
     -- The backing buffer number arrives a tick after create/mount (the `btv._view_buf` mirror).
     ready = function()
-      return v:bufnr() ~= nil
+      return v:bufnr() and true or false
     end,
     apply = function(out)
       if type(out) ~= "table" then
@@ -291,41 +324,28 @@ local function view_backend(opts)
         -- `ctx.wo.wrap = false`). Use the option's real scope — display options like
         -- `number` / `wrap` are window-local (`wo`), content options like `shiftwidth` /
         -- `expandtab` are buffer-local (`bo`). Valid in `setup` and handlers (the buffer +
-        -- window exist by then).
+        -- window exist by then). With no buffer (deleted) or no window (closed, not
+        -- shown), a read or write raises rather than reading `nil` or dropping the value.
         bo = setmetatable({}, {
           __index = function(_, k)
-            local b = v:bufnr()
-            if not b then
-              return nil
-            end
-            return vim.bo[b][k]
+            return vim.bo[view_buf("read", k)][k]
           end,
           __newindex = function(_, k, val)
-            local b = v:bufnr()
-            if b then
-              vim.bo[b][k] = val
-            end
+            vim.bo[view_buf("set", k)][k] = val
           end,
         }),
         wo = setmetatable({}, {
           __index = function(_, k)
-            local w = v:winid()
-            if not w then
-              return nil
-            end
-            return vim.wo[w][k]
+            return vim.wo[view_win("read", k)][k]
           end,
           __newindex = function(_, k, val)
-            local w = v:winid()
-            if w then
-              vim.wo[w][k] = val
-            end
+            vim.wo[view_win("set", k)][k] = val
           end,
         }),
         -- A thin wrapper over `btv.keymap.set(mode, lhs, rhs, opts)` — same signature — that
         -- defaults `buffer` to this view and `nowait` on; any field the caller passes wins.
         keymap_set = function(mode, lhs, rhs, user_opts)
-          local merged = { buffer = v:bufnr(), nowait = true }
+          local merged = { buffer = v, nowait = true }
           for k, val in pairs(user_opts or {}) do
             merged[k] = val
           end
@@ -481,7 +501,9 @@ end
 --   On the `"view"` surface `ctx` also gains: `ctx.view`, `ctx.bufnr()`, `ctx.winid()`,
 --   `ctx.line()`, `ctx.set_cursor(n)`, `ctx.bo` / `ctx.wo` (the view's buffer/window-local
 --   option tables), and `ctx.keymap_set(mode, lhs, rhs, opts)` (buffer-scoped + `nowait`
---   by default).
+--   by default). A view is read-only, so in a modeless session (`'modeless'`) its keys
+--   reach it only through the `modeless` layer: pass `{ "n", "modeless" }` as `mode` to
+--   serve both editing models.
 --
 -- Surfaces — what `render` returns, and how the surface behaves:
 --   * `"view"`  — a focus-taking, navigable `btv.view` buffer (dock / split / grabbing
@@ -519,8 +541,9 @@ end
 -- local Counter = btv.component({
 --   setup = function(ctx)
 --     local s = ctx.reactive({ n = 0 })
---     ctx.keymap_set("n", "+", function() s.n = s.n + 1 end)  -- write -> re-render
---     ctx.keymap_set("n", "q", ctx.close)
+--     local keys = { "n", "modeless" } -- both editing models
+--     ctx.keymap_set(keys, "+", function() s.n = s.n + 1 end)  -- write -> re-render
+--     ctx.keymap_set(keys, "q", ctx.close)
 --     return s
 --   end,
 --   render = function(s)
@@ -656,9 +679,14 @@ function btv.component(def)
     -- setup (awaiting it if async), then the first render. Subsequent renders are reactive.
     btv
       .async(function()
-        btv.await(
-          btv.wait_for(backend.ready, { message = "the component surface never became ready" })
-        )
+        -- Closing the instance first (in the chunk that mounted it, say) ends the wait:
+        -- its surface is gone, so there is nothing to set up.
+        btv.await(btv.wait_for(function()
+          return inst._closed or backend.ready()
+        end, { message = "the component surface never became ready" }))
+        if inst._closed then
+          return
+        end
         -- `btv.promise.resolve` makes this uniform whether `setup` returns a plain value or a
         -- promise; and because we're inside an `btv.async` coroutine, a `setup` that calls
         -- `btv.await(...)` directly suspends here too. Either async style works.
@@ -668,7 +696,10 @@ function btv.component(def)
         do_render()
       end)()
       :catch(function(e)
-        btv.notify("btv.component: setup error: " .. tostring(e), 4)
+        btv.notify(
+          "btv.component: setup error: " .. (type(e) == "table" and e.message or tostring(e)),
+          4
+        )
       end)
 
     return inst

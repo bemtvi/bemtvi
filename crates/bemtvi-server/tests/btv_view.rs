@@ -12,7 +12,7 @@ use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
     cursor, drain_to_latest_redraw, exec_lua, feed_mouse_at, feed_sync, lines, lua_u64, map_get,
-    mode, start_attached, start_clocked, write_temp,
+    mode, poll_true, start_attached, start_clocked, write_temp,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -1445,11 +1445,13 @@ async fn deleting_a_views_buffer_cleans_it_up_without_panicking() {
     feed_sync(&rpc, ":bd!<CR>").await;
     // Writing to the now-orphaned handle must be a safe no-op, not a panic.
     exec_lua(&rpc, r#"vw:set_lines{ "three", "four" }"#).await;
-    // The view is cleaned up: its bufnr mirror is cleared.
+    // The view is cleaned up: its bufnr mirror is cleared, and `:bufnr()` reads
+    // `false`, the "no buffer" a buffer API refuses rather than reading as absent.
     let bufnr = exec_lua(&rpc, r#"return vw:bufnr()"#).await;
-    assert!(
-        bufnr.is_nil(),
-        "view bufnr should be nil after its buffer is deleted, got {bufnr:?}"
+    assert_eq!(
+        bufnr.as_bool(),
+        Some(false),
+        "view bufnr should be false after its buffer is deleted, got {bufnr:?}"
     );
 }
 
@@ -1533,4 +1535,472 @@ async fn mount_here_takes_the_current_window() {
     assert_eq!(shown.as_str(), Some("shown"));
     let same = exec_lua(&rpc, "return vw:winid() == btv.win.current()").await;
     assert_eq!(same.as_bool(), Some(true));
+}
+
+// ===== A view's buffer before it exists =========================================
+// A view's buffer is created after the chunk that creates the view. Until then
+// `:bufnr()` is `false`, never `nil`: `{ buffer = nil }` is the same table as `{}`, so
+// a nil there bound a "buffer-local" map globally without a word.
+
+#[tokio::test]
+async fn a_view_bufnr_is_false_until_its_buffer_exists() {
+    let (rpc, _incoming) = start().await;
+    let early = exec_lua(&rpc, "vw = btv.view.create{} return vw:bufnr() == false").await;
+    assert_eq!(
+        early.as_bool(),
+        Some(true),
+        "false, not nil, in the create chunk"
+    );
+    let later = lua_u64(&rpc, "return vw:bufnr()").await;
+    assert!(later.is_some(), "a number once the buffer exists");
+}
+
+#[tokio::test]
+async fn binding_a_map_to_a_view_buffer_that_does_not_exist_yet_fails_loud() {
+    let (rpc, _incoming) = start().await;
+    let err = exec_lua(
+        &rpc,
+        "vw = btv.view.create{} \
+         local ok, e = pcall(btv.keymap.set, 'n', 'Q', function() end, { buffer = vw:bufnr() }) \
+         return (not ok) and tostring(e) or 'bound'",
+    )
+    .await;
+    let err = err.as_str().unwrap_or_default().to_string();
+    assert!(err.contains("doesn't exist yet"), "{err:?}");
+    let global = exec_lua(
+        &rpc,
+        "for _, m in ipairs(btv.keymap.get('n')) do if m.lhs == 'Q' then return true end end return false",
+    )
+    .await;
+    assert_eq!(global.as_bool(), Some(false), "nothing was bound globally");
+}
+
+#[tokio::test]
+async fn the_buffer_apis_refuse_a_view_buffer_that_does_not_exist_yet() {
+    let (rpc, _incoming) = start().await;
+    let err = exec_lua(
+        &rpc,
+        "vw = btv.view.create{} \
+         local ok, e = pcall(btv.buf.lines, vw:bufnr(), 0, -1) \
+         return (not ok) and tostring(e) or 'read the current buffer'",
+    )
+    .await;
+    let err = err.as_str().unwrap_or_default().to_string();
+    assert!(err.contains("doesn't exist yet"), "{err:?}");
+}
+
+#[tokio::test]
+async fn buffer_local_autocmds_and_commands_refuse_a_view_buffer_that_does_not_exist_yet() {
+    let (rpc, _incoming) = start().await;
+    let errs = exec_lua(
+        &rpc,
+        "vw = btv.view.create{} \
+         local out = {} \
+         local ok1, e1 = pcall(btv.autocmd.create, 'BufEnter', \
+           { buffer = vw:bufnr(), callback = function() end }) \
+         out[1] = (not ok1) and tostring(e1) or 'registered' \
+         local ok2, e2 = pcall(btv.user_command.buf_create, vw:bufnr(), 'Zed', function() end, {}) \
+         out[2] = (not ok2) and tostring(e2) or 'registered' \
+         return out",
+    )
+    .await;
+    let Value::Array(errs) = errs else {
+        panic!("expected a list, got {errs:?}")
+    };
+    for (what, e) in ["autocmd", "user command"].iter().zip(errs) {
+        let e = e.as_str().unwrap_or_default().to_string();
+        assert!(e.contains("doesn't exist yet"), "{what}: {e:?}");
+    }
+}
+
+// `btv.keymap.set` takes the view itself as `buffer`. Every other buffer argument
+// takes a number, and a view handle there must not read as some buffer that has no
+// lines, maps or diagnostics, or register an autocmd or command that never runs.
+#[tokio::test]
+async fn the_buffer_apis_refuse_a_view_handle_in_place_of_its_number() {
+    let (rpc, _incoming) = start().await;
+    let errs = exec_lua(
+        &rpc,
+        "vw = btv.view.create{} \
+         local out = {} \
+         local function try(f) \
+           local ok, e = pcall(f) \
+           out[#out + 1] = (not ok) and tostring(e) or 'accepted' \
+         end \
+         try(function() return btv.buf.lines(vw, 0, -1, false) end) \
+         try(function() return btv.keymap.buf_get(vw, 'n') end) \
+         try(function() btv.keymap.del('n', 'Q', { buffer = vw }) end) \
+         try(function() return btv.diagnostic.get(vw) end) \
+         try(function() \
+           btv.autocmd.create('BufEnter', { buffer = vw, callback = function() end }) \
+         end) \
+         try(function() btv.user_command.buf_create(vw, 'Zed', function() end, {}) end) \
+         return out",
+    )
+    .await;
+    let Value::Array(errs) = errs else {
+        panic!("expected a list, got {errs:?}")
+    };
+    let apis = [
+        "btv.buf.lines",
+        "btv.keymap.buf_get",
+        "btv.keymap.del",
+        "btv.diagnostic.get",
+        "btv.autocmd.create",
+        "btv.user_command.buf_create",
+    ];
+    assert_eq!(errs.len(), apis.len());
+    for (what, e) in apis.iter().zip(errs) {
+        let e = e.as_str().unwrap_or_default().to_string();
+        assert!(e.contains("view:bufnr()"), "{what}: {e:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_map_bound_to_a_view_handle_lands_on_its_buffer_once_it_exists() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, "imain<Esc>").await;
+    exec_lua(
+        &rpc,
+        r#"_G.hits = 0
+           main = btv.win.current()
+           vw = btv.view.create{}
+           vw:set_lines{ "one", "two" }
+           vw:mount{ split = "split" }
+           btv.keymap.set("n", "Q", function() _G.hits = _G.hits + 1 end, { buffer = vw })"#,
+    )
+    .await;
+    assert!(
+        poll_true(
+            &rpc,
+            "for _, m in ipairs(btv.keymap.buf_get(0, 'n')) do \
+               if m.lhs == 'Q' then return true end \
+             end return false",
+        )
+        .await,
+        "the map lands on the view's buffer once it exists"
+    );
+    feed_sync(&rpc, "Q").await;
+    assert_eq!(
+        lua_u64(&rpc, "return _G.hits").await,
+        Some(1),
+        "Q fires in the view"
+    );
+    exec_lua(&rpc, "btv.win.set_current(main)").await;
+    feed_sync(&rpc, "Q").await;
+    assert_eq!(
+        lua_u64(&rpc, "return _G.hits").await,
+        Some(1),
+        "and only there: the map is the view's, not global"
+    );
+}
+
+// ===== A component's ctx.bo / ctx.wo ===========================================
+// Inside `setup` and the handlers both exist. With no buffer (deleted) or no window
+// (closed, unmounted), a read or write has nowhere to go and raises, rather than
+// reading `nil` or dropping the value without a word.
+
+#[tokio::test]
+async fn a_component_window_option_set_in_setup_lands_on_its_window() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"local C = btv.view.component({
+             setup = function(ctx)
+               _G.c = ctx
+               ctx.wo.wrap = false
+               ctx.wo.number = true
+               return {}
+             end,
+             render = function() return { lines = { "one" } } end,
+           })
+           C.mount({ float = { width = 20, height = 3, grab = true } })"#,
+    )
+    .await;
+    assert!(
+        poll_true(
+            &rpc,
+            "local w = _G.c and _G.c.winid() \
+             return w and vim.wo[w].wrap == false and vim.wo[w].number == true or false",
+        )
+        .await,
+        "the setup-time window options reached the window"
+    );
+}
+
+#[tokio::test]
+async fn a_component_buffer_option_with_no_buffer_raises() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"local C = btv.view.component({
+             setup = function(ctx) _G.c = ctx return {} end,
+             render = function() return { lines = { "one" } } end,
+           })
+           C.mount({ split = "split" })"#,
+    )
+    .await;
+    assert!(poll_true(&rpc, "return _G.c ~= nil and _G.c.bufnr() ~= false").await);
+    feed_sync(&rpc, ":bd!<CR>").await;
+    let errs = exec_lua(
+        &rpc,
+        "local ok1, e1 = pcall(function() _G.c.bo.shiftwidth = 3 end) \
+         local ok2, e2 = pcall(function() return _G.c.bo.shiftwidth end) \
+         return { (not ok1) and tostring(e1) or 'wrote', (not ok2) and tostring(e2) or 'read' }",
+    )
+    .await;
+    let Value::Array(errs) = errs else {
+        panic!("expected a list, got {errs:?}")
+    };
+    for (what, e) in ["write", "read"].iter().zip(errs) {
+        let e = e.as_str().unwrap_or_default().to_string();
+        assert!(e.contains("no buffer"), "{what}: {e:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_component_window_option_with_no_window_raises() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"local C = btv.view.component({
+             setup = function(ctx) _G.c = ctx return {} end,
+             render = function() return { lines = { "one" } } end,
+           })
+           _G.inst = C.mount({ split = "split" })"#,
+    )
+    .await;
+    assert!(poll_true(&rpc, "return _G.c ~= nil and _G.c.winid() ~= nil").await);
+    exec_lua(&rpc, "_G.inst:close()").await;
+    assert!(poll_true(&rpc, "return _G.c.winid() == nil").await);
+    let errs = exec_lua(
+        &rpc,
+        "local ok1, e1 = pcall(function() _G.c.wo.wrap = false end) \
+         local ok2, e2 = pcall(function() return _G.c.wo.wrap end) \
+         return { (not ok1) and tostring(e1) or 'wrote', (not ok2) and tostring(e2) or 'read' }",
+    )
+    .await;
+    let Value::Array(errs) = errs else {
+        panic!("expected a list, got {errs:?}")
+    };
+    for (what, e) in ["write", "read"].iter().zip(errs) {
+        let e = e.as_str().unwrap_or_default().to_string();
+        assert!(e.contains("no window"), "{what}: {e:?}");
+    }
+}
+
+#[tokio::test]
+async fn buffer_option_setters_refuse_a_view_buffer_that_does_not_exist_yet() {
+    let (rpc, _incoming) = start().await;
+    let r = exec_lua(
+        &rpc,
+        r#"local before_local, before_global = btv.bo.shiftwidth, btv.go.shiftwidth
+           vw = btv.view.create{}
+           local out = {}
+           local calls = {
+             function() btv.buf.set_option(vw:bufnr(), "shiftwidth", 3) end,
+             function() btv.option.set("shiftwidth", 3, { buf = vw:bufnr() }) end,
+             function() return btv.buf.get_option(vw:bufnr(), "shiftwidth") end,
+             function() return btv.option.get("shiftwidth", { buf = vw:bufnr() }) end,
+           }
+           for i, f in ipairs(calls) do
+             local ok, e = pcall(f)
+             out[i] = (not ok) and tostring(e) or ("went to the current buffer: " .. tostring(e))
+           end
+           out[#out + 1] = (btv.bo.shiftwidth == before_local and btv.go.shiftwidth == before_global)
+             and "untouched" or "the current buffer / global value moved"
+           return out"#,
+    )
+    .await;
+    let Value::Array(r) = r else {
+        panic!("expected a list, got {r:?}")
+    };
+    let (last, errs) = r.split_last().expect("results");
+    for (i, e) in errs.iter().enumerate() {
+        let e = e.as_str().unwrap_or_default().to_string();
+        assert!(e.contains("doesn't exist yet"), "call {i}: {e:?}");
+    }
+    assert_eq!(last.as_str(), Some("untouched"));
+}
+
+#[tokio::test]
+async fn clearing_autocmds_refuses_a_view_buffer_that_does_not_exist_yet() {
+    let (rpc, _incoming) = start().await;
+    let e = exec_lua(
+        &rpc,
+        "vw = btv.view.create{} \
+         local ok, e = pcall(btv.autocmd.clear, { buffer = vw:bufnr() }) \
+         return (not ok) and tostring(e) or 'cleared nothing, said nothing'",
+    )
+    .await;
+    let e = e.as_str().unwrap_or_default().to_string();
+    assert!(e.contains("doesn't exist yet"), "{e:?}");
+}
+
+#[tokio::test]
+async fn lsp_bufnr_fields_refuse_a_view_buffer_that_does_not_exist_yet() {
+    let (rpc, _incoming) = start().await;
+    let r = exec_lua(
+        &rpc,
+        r#"vw = btv.view.create{}
+           local out = {}
+           local calls = {
+             function() return btv.lsp.position_params({ bufnr = vw:bufnr() }) end,
+             function() return btv.lsp.request("x", {}, function() end, { bufnr = vw:bufnr() }) end,
+             function() return btv.lsp.start({ name = "probe", cmd = { "true" } }, { bufnr = vw:bufnr() }) end,
+           }
+           for i, f in ipairs(calls) do
+             local ok, e = pcall(f)
+             out[i] = (not ok) and tostring(e) or "acted on the current buffer"
+           end
+           return out"#,
+    )
+    .await;
+    let Value::Array(r) = r else {
+        panic!("expected a list, got {r:?}")
+    };
+    for (what, e) in ["position_params", "request", "start"].iter().zip(r) {
+        let e = e.as_str().unwrap_or_default().to_string();
+        assert!(e.contains("doesn't exist yet"), "{what}: {e:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_map_bound_to_a_view_whose_buffer_is_gone_says_why() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"_G.notes = {}
+           btv.notify = function(m) _G.notes[#_G.notes + 1] = tostring(m) end
+           vw = btv.view.create{}
+           vw:mount{ split = "split" }"#,
+    )
+    .await;
+    assert!(poll_true(&rpc, "return vw:bufnr() ~= false").await);
+    feed_sync(&rpc, ":bd!<CR>").await;
+    exec_lua(
+        &rpc,
+        r#"btv.keymap.set("n", "Q", function() end, { buffer = vw })"#,
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return #_G.notes > 0").await,
+        "the failed bind is reported"
+    );
+    let note = exec_lua(&rpc, "return _G.notes[1]").await;
+    let note = note.as_str().unwrap_or_default().to_string();
+    assert!(note.contains("the view has no buffer"), "{note:?}");
+}
+
+#[tokio::test]
+async fn a_map_bound_to_a_view_closed_before_its_buffer_comes_is_dropped_quietly() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"_G.notes = {}
+           btv.notify = function(m) _G.notes[#_G.notes + 1] = tostring(m) end
+           local vw = btv.view.create{}
+           btv.keymap.set("n", "Q", function() end, { buffer = vw })
+           vw:close()
+           live = btv.view.create{}"#,
+    )
+    .await;
+    assert!(poll_true(&rpc, "return live:bufnr() ~= false").await);
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        exec_lua(&rpc, "return 1").await;
+    }
+    let r = exec_lua(
+        &rpc,
+        r#"local o = {}
+           for _, n in ipairs(_G.notes) do o[#o + 1] = n end
+           for _, b in ipairs(btv.buf.list()) do
+             for _, m in ipairs(btv.keymap.buf_get(b, "n")) do
+               if m.lhs == "Q" then o[#o + 1] = "bound on " .. b end
+             end
+           end
+           for _, m in ipairs(btv.keymap.get("n")) do
+             if m.lhs == "Q" then o[#o + 1] = "bound globally" end
+           end
+           return table.concat(o, " | ")"#,
+    )
+    .await;
+    assert_eq!(r.as_str(), Some(""), "nothing reported, nothing bound");
+}
+
+#[tokio::test]
+async fn binding_a_map_to_a_closed_view_fails_loud() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, "vw = btv.view.create{}").await;
+    assert!(poll_true(&rpc, "return vw:bufnr() ~= false").await);
+    let e = exec_lua(
+        &rpc,
+        "vw:close() \
+         local ok, e = pcall(btv.keymap.set, 'n', 'Q', function() end, { buffer = vw }) \
+         return (not ok) and tostring(e) or 'accepted'",
+    )
+    .await;
+    let e = e.as_str().unwrap_or_default().to_string();
+    assert!(e.contains("the view is closed"), "{e:?}");
+}
+
+#[tokio::test]
+async fn a_component_closed_before_its_surface_is_ready_is_not_a_setup_error() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"_G.notes = {}
+           _G.setups = 0
+           btv.notify = function(m) _G.notes[#_G.notes + 1] = tostring(m) end
+           local C = btv.view.component({
+             setup = function() _G.setups = _G.setups + 1 return {} end,
+             render = function() return { lines = { "one" } } end,
+           })
+           -- Closed in the chunk that mounted it: its view's buffer never comes.
+           C.mount({ split = "split" }):close()
+           -- A second, live component: once it has set up, the first one's wait is over.
+           _G.live = false
+           local L = btv.view.component({
+             setup = function() _G.live = true return {} end,
+             render = function() return { lines = { "two" } } end,
+           })
+           L.mount({ split = "split" })"#,
+    )
+    .await;
+    assert!(poll_true(&rpc, "return _G.live").await);
+    // Past the first component's whole ready budget (200 ticks).
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        exec_lua(&rpc, "return 1").await;
+    }
+    let r = exec_lua(
+        &rpc,
+        "return tostring(_G.setups) .. ' ' .. table.concat(_G.notes, ' | ')",
+    )
+    .await;
+    assert_eq!(r.as_str(), Some("0 "), "no setup, and nothing reported");
+}
+
+#[tokio::test]
+async fn a_component_setup_error_from_a_rejected_wait_says_why() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"_G.notes = {}
+           btv.notify = function(m) _G.notes[#_G.notes + 1] = tostring(m) end
+           local C = btv.view.component({
+             setup = function()
+               btv.await(btv.wait_for(function() return false end,
+                 { tries = 1, message = "the data never came" }))
+               return {}
+             end,
+             render = function() return { lines = { "one" } } end,
+           })
+           C.mount({ split = "split" })"#,
+    )
+    .await;
+    assert!(poll_true(&rpc, "return #_G.notes > 0").await);
+    let note = exec_lua(&rpc, "return _G.notes[1]").await;
+    let note = note.as_str().unwrap_or_default().to_string();
+    assert!(note.contains("the data never came"), "{note:?}");
 }

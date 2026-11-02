@@ -3,7 +3,7 @@
 //! frame needs a real client, but the column math below is what put scrolled text
 //! over the gutter and out from under the cursor (the regression these pin down).
 
-use bemtvi_gpu::{col_to_screen, text_run_origin};
+use bemtvi_gpu::{col_to_screen, overlay_span_cols, text_run_origin};
 
 /// The window's text area in these cases starts at column 8 (a sign column + a
 /// number gutter to its left); the exact value doesn't matter, only that the
@@ -55,4 +55,51 @@ fn columns_slide_left_by_the_scroll_and_clamp_off_screen() {
     // A column scrolled off the left clamps to the text origin (it isn't painted,
     // but the mapping must not underflow past the gutter).
     assert_eq!(col_to_screen(TEXT_X0, 1, 5), TEXT_X0);
+}
+
+/// The window's right edge (exclusive) in the overlay cases below: the text area is
+/// columns `[TEXT_X0, RIGHT)`, and the next split starts at `RIGHT`.
+const RIGHT: u16 = 40;
+
+#[test]
+fn an_overlay_past_the_right_edge_stops_at_the_window() {
+    // Under `nowrap` the server sends a selection / search span in buffer columns,
+    // whatever the window's width: a match at columns 30..60 of a long line. The
+    // part past the edge belongs to no cell of this window, and painting it put the
+    // tint over the split to the right.
+    assert_eq!(
+        overlay_span_cols(TEXT_X0, RIGHT, (30, 60), 0, &[], &[]),
+        Some((38, RIGHT)),
+        "the span is cut at the window's right edge"
+    );
+    // Scrolled sideways, the same span is measured from leftcol and still cut there.
+    assert_eq!(
+        overlay_span_cols(TEXT_X0, RIGHT, (30, 60), 10, &[], &[]),
+        Some((28, RIGHT))
+    );
+}
+
+#[test]
+fn an_overlay_wholly_past_the_right_edge_paints_nothing() {
+    // A match that starts beyond the visible text has no cell in this window.
+    assert_eq!(
+        overlay_span_cols(TEXT_X0, RIGHT, (50, 55), 0, &[], &[]),
+        None
+    );
+    assert_eq!(
+        overlay_span_cols(TEXT_X0, RIGHT, (32, 36), 0, &[], &[]),
+        None
+    );
+}
+
+#[test]
+fn an_overlay_inside_the_window_is_untouched() {
+    assert_eq!(
+        overlay_span_cols(TEXT_X0, RIGHT, (2, 7), 0, &[], &[]),
+        Some((10, 15))
+    );
+    assert_eq!(
+        overlay_span_cols(TEXT_X0, RIGHT, (12, 17), 10, &[], &[]),
+        Some((10, 15))
+    );
 }

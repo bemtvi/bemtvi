@@ -171,6 +171,7 @@ impl Editor {
 
     /// Echo vim's `E21` when an edit is refused on a read-only (live terminal) buffer.
     pub(crate) fn refuse_edit(&mut self) {
+        self.edit_refused = true;
         self.echo("E21: Cannot make changes, 'modifiable' is off".to_string());
     }
 
@@ -256,6 +257,10 @@ impl Editor {
                     .line_count()
                     .saturating_sub(self.text_height());
                 self.ensure_visible();
+            } else {
+                // Terminal-normal keeps its own cursor, but a shrunk mirror may have
+                // taken the line it was on.
+                self.clamp_cursor();
             }
         }
     }

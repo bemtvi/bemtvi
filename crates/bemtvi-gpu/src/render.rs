@@ -257,6 +257,9 @@ impl<'a> ScrollFrame<'a> {
 
 /// The GPU renderer. Owns the surface and everything needed to paint one frame.
 pub struct Renderer {
+    /// The right edge (exclusive screen column) of the window `build_window` is
+    /// painting, which bounds its cell-keyed overlays (see [`overlay_span_cols`]).
+    span_right: u16,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -586,6 +589,7 @@ impl Renderer {
             cursor_px: None,
             caret_hidden: false,
             popup_px: Vec::new(),
+            span_right: u16::MAX,
             preedit: None,
             frame_quads: Vec::new(),
             frame_items: Vec::new(),
@@ -1345,6 +1349,10 @@ impl Renderer {
         // `rect` is the window's content rect in absolute screen cells, already
         // offset by the windows-area origin (and inset past a float's border).
         let (ox, oy, wcols, wrows) = rect;
+        // Selection, search and the other cell-keyed overlays stop at this window's
+        // right edge: under `nowrap` the server sends a span in buffer columns, so
+        // one past the edge would otherwise paint over the next split.
+        self.span_right = ox.saturating_add(wcols);
 
         // An image-preview buffer (`'imagepreview'`): blit the picture over the
         // whole text body and skip the gutter / text machinery entirely (the buffer
@@ -2754,16 +2762,12 @@ impl Renderer {
         };
         let ox = origin.0 + r.x;
         let oy = origin.1 + r.y;
-        // Clip every glyph an earlier (lower-z) float already queued so this float's
-        // opaque fill hides it — floats share one overlay layer that draws all
-        // backgrounds before all glyphs, so a lower float's text would otherwise
-        // bleed through this one's background (stacked floats read as "mixed").
-        Self::occlude_overlay_text(items, self.text_bounds(ox, oy, r.width, r.height));
         // Prefer the colorscheme's float chrome (`NormalFloat` bg) when defined,
         // else the historical fallback: a slightly lightened `Normal` background.
         let bg = float_bg(view, 0x10);
-        // Clear the whole float rect to its own background (see `fill_popup`).
-        self.fill_popup(quads, ox, oy, r.width, r.height, bg);
+        // Clear the whole float rect to its own background, hiding any lower float's
+        // text under it (see `fill_popup`).
+        self.fill_popup(quads, items, ox, oy, r.width, r.height, bg);
 
         let inner = match win.border {
             Some(border) => {
@@ -2932,7 +2936,24 @@ impl Renderer {
     /// float's own thinned background are behind its text. At `100` it's the plain
     /// opaque backing it always was. The float's border, selection and text draw on
     /// top.
-    fn fill_popup(&self, quads: &mut Vec<Quad>, x: u16, y: u16, w: u16, h: u16, bg: u32) {
+    ///
+    /// Every glyph already queued in `items` is clipped out of the rect too. Floats
+    /// and popups share one overlay layer that draws all backgrounds before all
+    /// glyphs, so without it a lower float's text shows through whatever sits over
+    /// it: a stacked float, the completion popup, a menu (the context menu over
+    /// `:Plugins` read as transparent).
+    #[allow(clippy::too_many_arguments)]
+    fn fill_popup(
+        &self,
+        quads: &mut Vec<Quad>,
+        items: &mut Vec<TextItem>,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        bg: u32,
+    ) {
+        Self::occlude_overlay_text(items, self.text_bounds(x, y, w, h));
         let (px, py) = self.cell_px(x, y);
         quads.push(Quad {
             x: px,
@@ -3015,7 +3036,7 @@ impl Renderer {
         let by = wy + pmenu.row;
         let box_w = pmenu.width + 2;
         let box_h = pmenu.height + 2;
-        self.fill_popup(quads, bx, by, box_w, box_h, popup_bg);
+        self.fill_popup(quads, items, bx, by, box_w, box_h, popup_bg);
         self.draw_glyph_border(
             items,
             Border::Single,
@@ -3055,7 +3076,7 @@ impl Renderer {
         // either side of the popup, in which case nothing is drawn.
         let popup_rect = CellRect::new(bx, by, box_w, box_h);
         if let Some(d) = doc_box(text_area, popup_rect, &pmenu.doc) {
-            self.fill_popup(quads, d.x, d.y, d.w, d.h, popup_bg);
+            self.fill_popup(quads, items, d.x, d.y, d.w, d.h, popup_bg);
             self.draw_glyph_border(
                 items,
                 Border::Single,
@@ -3160,7 +3181,7 @@ impl Renderer {
         // completion-style popup (`!border_top`) its top edge, a bordered select/picker
         // keeps all four.
         let (border_top, border_bottom) = (menu.border_top || menu.cmdline, !menu.cmdline);
-        self.fill_popup(quads, bx, by, box_w, box_h, popup_bg);
+        self.fill_popup(quads, items, bx, by, box_w, box_h, popup_bg);
         self.draw_glyph_border(
             items,
             Border::Single,
@@ -3542,7 +3563,7 @@ impl Renderer {
             // so the border *style* reads — rounded corners look rounded — and the
             // title rides the top edge, integrated with the line like the TUI's
             // `title_top`. Same path as a window float (`draw_float_border`).
-            self.fill_popup(quads, bx, by, bw, bh, popup_bg);
+            self.fill_popup(quads, items, bx, by, bw, bh, popup_bg);
             self.draw_float_border(
                 items,
                 border_style,
@@ -3612,12 +3633,10 @@ impl Renderer {
         self.fill_cells(quads, 0, row, cols, color);
     }
 
-    /// Resolve a buffer-column `span` to the on-screen cell range `[start, end)` it
-    /// covers: anchored at column `base`, shifted left by `leftcol`, and pushed right
-    /// past any inlay hints inserted before each endpoint. `None` when the span lands
-    /// empty (or fully scrolled off the left), so a span-quad / underline / strike
-    /// caller can early-out. Shared by [`Self::push_underline_at`],
-    /// [`Self::push_strike`], [`Self::push_span_quad`], and [`Self::push_span_quad_at`].
+    /// Resolve a buffer-column `span` to the on-screen cell range it covers in the
+    /// window being built (see [`overlay_span_cols`], bounded by `span_right`).
+    /// Shared by [`Self::push_underline_at`], [`Self::push_strike`],
+    /// [`Self::push_span_quad`], and [`Self::push_span_quad_at`].
     fn span_cols(
         &self,
         base: u16,
@@ -3626,20 +3645,7 @@ impl Renderer {
         inlay: &[InlayHint],
         vtext: &[VirtPlacement],
     ) -> Option<(u16, u16)> {
-        let (s, e) = span;
-        // A cell-keyed overlay (selection, search, underline, strike) rides the same
-        // inline splice the glyphs do, so it shifts by BOTH the inlay hints and the
-        // inline `virt_text` before its columns — otherwise e.g. a `:s///g` diff's
-        // struck deletion past the first inline replacement lands cells too far left.
-        let start = base
-            + s.saturating_sub(leftcol)
-            + inlay_shift(inlay, leftcol, s, true)
-            + virt_inline_shift(vtext, leftcol, s, true);
-        let end = base
-            + e.saturating_sub(leftcol)
-            + inlay_shift(inlay, leftcol, e, false)
-            + virt_inline_shift(vtext, leftcol, e, false);
-        (end > start).then_some((start, end))
+        overlay_span_cols(base, self.span_right, span, leftcol, inlay, vtext)
     }
 
     /// Push a thin underline rule under cells `[s, e)` of `row` (a diagnostic
@@ -4672,6 +4678,39 @@ fn take_cells(s: &str, max: usize) -> String {
 /// (`take` saturates), and one landing inside a cluster measures its leading part.
 fn cells_before(s: &str, chars: usize) -> u16 {
     cells(&s.chars().take(chars).collect::<String>()) as u16
+}
+
+/// Resolve a buffer-column `span` to the on-screen cell range `[start, end)` a
+/// cell-keyed overlay (selection, search, underline, strike) covers: anchored at
+/// column `base` (the window's text origin), shifted left by `leftcol`, and pushed
+/// right past the inlay hints and inline `virt_text` inserted before each endpoint.
+/// `right` is the window's right edge (exclusive). `None` when the span lands
+/// empty, so a caller can early-out.
+pub fn overlay_span_cols(
+    base: u16,
+    right: u16,
+    span: (u16, u16),
+    leftcol: u16,
+    inlay: &[InlayHint],
+    vtext: &[VirtPlacement],
+) -> Option<(u16, u16)> {
+    let (s, e) = span;
+    // A cell-keyed overlay rides the same inline splice the glyphs do, so it shifts
+    // by BOTH the inlay hints and the inline `virt_text` before its columns —
+    // otherwise e.g. a `:s///g` diff's struck deletion past the first inline
+    // replacement lands cells too far left.
+    let start = base
+        + s.saturating_sub(leftcol)
+        + inlay_shift(inlay, leftcol, s, true)
+        + virt_inline_shift(vtext, leftcol, s, true);
+    let end = base
+        + e.saturating_sub(leftcol)
+        + inlay_shift(inlay, leftcol, e, false)
+        + virt_inline_shift(vtext, leftcol, e, false);
+    // Past the window's right edge is the next split, not this window: under
+    // `nowrap` a span arrives in buffer columns however wide the window is.
+    let (start, end) = (start.min(right), end.min(right));
+    (end > start).then_some((start, end))
 }
 
 /// Map a buffer screen-column to its absolute screen cell in a window whose text

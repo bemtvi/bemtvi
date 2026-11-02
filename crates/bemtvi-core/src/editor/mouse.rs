@@ -1748,14 +1748,16 @@ impl Editor {
     ) -> Option<(usize, usize)> {
         let (abs_x, abs_y) = self.window_screen_pos(win)?;
         let (text_width, text_height) = self.window_text_area(win)?;
-        // `'padding'` insets the text body from the window's top-left, so the band
-        // starts a margin in; `text_cell_to_buf` expects padded-content-relative
-        // coords, so `rel_x`/`rel_y` are measured from the padded origin too.
+        // A bordered float's border and then `'padding'` inset the text body from the
+        // window's top-left, so the band starts that far in; `text_cell_to_buf`
+        // expects padded-content-relative coords (what the press's `probe_window`
+        // hands it), so `rel_x`/`rel_y` are measured from the same origin.
         let pad = self.window_options(win)?.padding;
+        let inset = self.window_border_inset(win);
         // The window's text band in global screen rows: `[top_edge, bottom_edge]`.
         // `abs_y` is the window's absolute top, so this is correct in any region (a
         // dock band as much as the main area), not just below the main tabline.
-        let top_edge = abs_y.saturating_add(pad.top);
+        let top_edge = abs_y.saturating_add(inset).saturating_add(pad.top);
         let bottom_edge = top_edge.saturating_add(text_height.saturating_sub(1));
         let rel_y = if row <= top_edge {
             self.drag_scroll(false); // at/above the first line → reveal the line above
@@ -1769,7 +1771,7 @@ impl Editor {
         // Sideways the same, under `nowrap`: reaching the text's first column (the
         // gutter left of it included) or its last pans the view a column that way and
         // lands on the newly-exposed edge column. A `wrap`ped window never pans.
-        let origin = abs_x.saturating_add(pad.left);
+        let origin = abs_x.saturating_add(inset).saturating_add(pad.left);
         let gutter = self.window_textoff(win).unwrap_or(0);
         let rel_x = if !self.window_options(win)?.wrap && text_width > gutter + 1 {
             let first = origin + gutter;
@@ -2955,6 +2957,16 @@ impl Editor {
         }
         let (ox, oy) = self.window_region_origin(win)?;
         Some((ox.saturating_add(wx), oy.saturating_add(wy)))
+    }
+
+    /// The cells a bordered float spends on each side for its border (`1`), or `0`
+    /// for a borderless float, a tiled window or an unknown id — the inset
+    /// [`probe_window`] takes off the rect before `'padding'`.
+    fn window_border_inset(&self, win: WindowId) -> usize {
+        self.tree_of_window(win)
+            .and_then(|(_, t)| t.try_get(win))
+            .is_some_and(|w| matches!(&w.float, Some(c) if c.border != BorderStyle::None))
+            as usize
     }
 
     /// Whether `win` is an `editor`-relative float — laid out in screen cells rather

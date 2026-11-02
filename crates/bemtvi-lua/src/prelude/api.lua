@@ -42,6 +42,7 @@ local resolve_win = btv._resolve_win
 -- an unnamed or unknown buffer. Read from the buffer mirror, so it can name any open
 -- buffer — e.g. a custom 'tabline' labelling a buffer shown in another tab.
 function btv.buf.name(bufnr)
+  btv._refuse_pending_buffer(bufnr, "btv.buf.name")
   local cur = btv._cur_buf or { bufnr = 0, name = "" }
   if bufnr == nil or bufnr == 0 or bufnr == cur.bufnr then
     return cur.name
@@ -1349,6 +1350,25 @@ end
 -- further typing lands at the new spot.
 function btv.win.set_cursor(win, line, col)
   btv._win_set_cursor(win or 0, math.max(0, (line or 1) - 1), math.max(0, col or 0))
+end
+
+-- `btv.win.selection([win])` -> `{ s_row, s_col, e_row, e_col }` or `nil`: the live
+-- selection in the current window (a Visual or Select selection, a modeless Shift
+-- selection), as the 0-based, end-exclusive byte range `btv.win.select_range` takes and
+-- `btv.buf.text` reads. Both ends fall on grapheme boundaries (a combining sequence or a
+-- ZWJ emoji is selected whole), so the text between them is never a cut character. A
+-- linewise selection runs from column `0` of its first line to
+-- column `0` of the line after its last. `nil` when nothing is selected. Only the
+-- current window has a live selection, so `win` must be `0`, `nil` or its id.
+function btv.win.selection(win)
+  if win ~= nil and win ~= 0 and win ~= btv._cur_win then
+    error(
+      "btv.win.selection: only the current window has a live selection, got " .. tostring(win),
+      2
+    )
+  end
+  local sel = btv._cur_selection
+  return sel and { sel[1], sel[2], sel[3], sel[4] } or nil
 end
 
 -- `btv.win.select_range(win, s_row, s_col, e_row, e_col[, opts])`: enter **Select mode**

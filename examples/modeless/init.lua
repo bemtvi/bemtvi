@@ -28,7 +28,10 @@ btv.o.modeless = true
 --    Select a word and `<C-x>` cuts it.
 
 -- 5. Find. Press `<C-f>`, type `fox`, `<Enter>`: the match comes up selected. `<C-g>`
---    selects the next one, `<C-S-g>` the one before. Type to replace a match.
+--    selects the next one, `<C-S-g>` the one before. Type to replace a match. With
+--    text selected, `<C-f>` starts from it: double-click `fox` on line 1, and `<C-f>`
+--    shows `/fox`, so `<Enter>` finds the next one. `<C-h>` the same way opens
+--    `:%s/fox/`, waiting for the replacement.
 
 -- 6. Lines. On `second`, `<A-Up>` moves it above `first`, `<A-Down>` back, and
 --    `<C-S-d>` duplicates it. Select from the start of `first` to the end of
@@ -62,3 +65,26 @@ btv.contextmenu.groups.lines = {
   items = { { label = "Duplicate Line", action = btv.modeless.actions.duplicate_line } },
 }
 table.insert(btv.contextmenu.default, "lines")
+
+-- 11. Read-only buffers are modeless too. `<C-;>` `Outline` `<Enter>` opens a dock
+--     listing this file's lines. It is a `btv.view`, read-only, yet there is no
+--     Normal mode in it either: the arrows move the caret, `<S-Down>` selects and
+--     `<C-c>` copies, and typing a letter says `E21` instead of editing. `<Enter>`
+--     jumps the file to that line; `q` closes the outline. A read-only buffer takes
+--     its keys only through the `modeless` layer in this session, so the outline
+--     binds `q` with `{ "n", "modeless" }`, for both editing models (`btv.view`
+--     binds its own `<Enter>` the same way).
+btv.command("Outline", function()
+  local main = btv.win.current()
+  local outline = btv.view.create({ name = "[Outline]" })
+  outline:set_lines(btv.buf.lines(0, 0, -1))
+  outline:on_select(function(line)
+    btv.cursor.set({ line, 0 }, main)
+  end)
+  outline:mount({ dock = "left", size = 30 })
+  -- `buffer = outline`: the view's buffer is created after this chunk, and the map
+  -- lands on it as soon as it exists.
+  btv.keymap.set({ "n", "modeless" }, "q", function()
+    outline:close()
+  end, { buffer = outline, desc = "Close the outline" })
+end, { desc = "List this file's lines in a dock" })

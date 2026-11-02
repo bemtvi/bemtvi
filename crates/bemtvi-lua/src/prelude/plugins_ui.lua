@@ -21,6 +21,10 @@
 -- btv.view.component / btv.hl / btv.command / btv.timer — all installed above.
 
 local M = btv.plugins
+
+-- The modes the screens' keys go in: Normal for a vim session, and the `modeless`
+-- layer, which is the only way keys reach a read-only view in a modeless session.
+local KEY_MODES = { "n", "modeless" }
 M.ui = M.ui or {}
 
 -- ----- highlights -------------------------------------------------------------
@@ -165,27 +169,27 @@ local Customize = btv.view.component({
       idx = ((idx - 1 + delta) % n) + 1
       ctx.set_cursor(WELCOME_HEADER + idx)
     end
-    ctx.keymap_set("n", "j", function()
+    ctx.keymap_set(KEY_MODES, "j", function()
       move(1)
     end)
-    ctx.keymap_set("n", "k", function()
+    ctx.keymap_set(KEY_MODES, "k", function()
       move(-1)
     end)
-    ctx.keymap_set("n", "<Tab>", function()
+    ctx.keymap_set(KEY_MODES, "<Tab>", function()
       move(1)
     end, { desc = "Next" })
-    ctx.keymap_set("n", "<S-Tab>", function()
+    ctx.keymap_set(KEY_MODES, "<S-Tab>", function()
       move(-1)
     end, { desc = "Previous" })
 
-    ctx.keymap_set("n", "<Space>", function()
+    ctx.keymap_set(KEY_MODES, "<Space>", function()
       local it = state.items[(ctx.line() or 0) - WELCOME_HEADER]
       if it then
         it.checked = not it.checked -- reactive write → re-render
       end
     end, { desc = "Toggle item" })
 
-    ctx.keymap_set("n", "a", function()
+    ctx.keymap_set(KEY_MODES, "a", function()
       -- Toggle all: if everything is ticked, clear; otherwise tick everything.
       local all = true
       for _, it in ipairs(state.items) do
@@ -199,7 +203,7 @@ local Customize = btv.view.component({
       end
     end, { desc = "Toggle all" })
 
-    ctx.keymap_set("n", "<CR>", function()
+    ctx.keymap_set(KEY_MODES, "<CR>", function()
       local chosen = {}
       for _, it in ipairs(state.items) do
         if it.checked then
@@ -210,20 +214,20 @@ local Customize = btv.view.component({
       props.on_done(chosen)
     end, { desc = "Install selected" })
 
-    ctx.keymap_set("n", "?", open_doc, { desc = "Open the reference page for the set" })
+    ctx.keymap_set(KEY_MODES, "?", open_doc, { desc = "Open the reference page for the set" })
 
     -- `c` is what got the user HERE from the offer screen, so it is deliberately inert
     -- rather than unbound: a repeated press (this screen mounts a tick after the key)
     -- would otherwise reach the `c` operator and leave the view in operator-pending,
     -- swallowing the next keys.
-    ctx.keymap_set("n", "c", function() end, { desc = "Customize (already here)" })
+    ctx.keymap_set(KEY_MODES, "c", function() end, { desc = "Customize (already here)" })
 
     local function skip()
       ctx.close()
       props.on_done({}) -- {} = skipped / installed nothing
     end
-    ctx.keymap_set("n", "<Esc>", skip, { desc = "Skip" })
-    ctx.keymap_set("n", "q", skip, { desc = "Skip" })
+    ctx.keymap_set(KEY_MODES, "<Esc>", skip, { desc = "Skip" })
+    ctx.keymap_set(KEY_MODES, "q", skip, { desc = "Skip" })
 
     -- Once the window exists (winid lands a tick after mount, AFTER the float grab
     -- has settled), set the window-local display — wrap long lines (the intro / hint
@@ -365,10 +369,10 @@ local Offer = btv.view.component({
       ctx.close()
       props.on_done(props.recommended)
     end
-    ctx.keymap_set("n", "<CR>", accept, { desc = "Install the recommended set" })
-    ctx.keymap_set("n", "y", accept, { desc = "Install the recommended set" })
+    ctx.keymap_set(KEY_MODES, "<CR>", accept, { desc = "Install the recommended set" })
+    ctx.keymap_set(KEY_MODES, "y", accept, { desc = "Install the recommended set" })
 
-    ctx.keymap_set("n", "c", function()
+    ctx.keymap_set(KEY_MODES, "c", function()
       -- Hand off to the checklist on the NEXT tick: mounting a second grabbing float
       -- in the same tick this one closes races the layer teardown.
       ctx.close()
@@ -377,15 +381,15 @@ local Offer = btv.view.component({
       end)
     end, { desc = "Customize the set" })
 
-    ctx.keymap_set("n", "?", open_doc, { desc = "Open the reference page for the set" })
+    ctx.keymap_set(KEY_MODES, "?", open_doc, { desc = "Open the reference page for the set" })
 
     local function skip()
       ctx.close()
       props.on_done({}) -- {} = skipped / installed nothing
     end
-    ctx.keymap_set("n", "<Esc>", skip, { desc = "Skip" })
-    ctx.keymap_set("n", "q", skip, { desc = "Skip" })
-    ctx.keymap_set("n", "n", skip, { desc = "Skip" })
+    ctx.keymap_set(KEY_MODES, "<Esc>", skip, { desc = "Skip" })
+    ctx.keymap_set(KEY_MODES, "q", skip, { desc = "Skip" })
+    ctx.keymap_set(KEY_MODES, "n", skip, { desc = "Skip" })
 
     -- Wrap the long lines rather than clipping them at the border, and inset the
     -- content from it (both window-local, so they wait for the winid).
@@ -595,19 +599,19 @@ local Manager = btv.view.component({
     -- the plugin under the cursor. (A row is the obvious unit of work here — you open
     -- the dashboard because ONE plugin needs installing or updating — so the same verbs
     -- have to be reachable per row, not only wholesale.)
-    ctx.keymap_set("n", "I", function()
+    ctx.keymap_set(KEY_MODES, "I", function()
       run_installing(M.install())
     end, { desc = "Install missing" })
-    ctx.keymap_set("n", "U", function()
+    ctx.keymap_set(KEY_MODES, "U", function()
       run(M.update())
     end, { desc = "Update plugins" })
-    ctx.keymap_set("n", "S", function()
+    ctx.keymap_set(KEY_MODES, "S", function()
       run_installing(M.sync())
     end, { desc = "Sync (install + update)" })
-    ctx.keymap_set("n", "X", function()
+    ctx.keymap_set(KEY_MODES, "X", function()
       run(M.clean())
     end, { desc = "Clean undeclared" })
-    ctx.keymap_set("n", "R", function()
+    ctx.keymap_set(KEY_MODES, "R", function()
       -- Same reporting as `:PluginRestore` (per-plugin failures loud, then a summary) —
       -- shared rather than re-worded here so the two surfaces can't drift apart.
       run(M.restore():next(M._restore_notify))
@@ -625,7 +629,7 @@ local Manager = btv.view.component({
     end
     -- Bind a lower-case per-row verb: resolve the row, then run `fn(name)`.
     local function row_verb(key, verb, fn)
-      ctx.keymap_set("n", key, function()
+      ctx.keymap_set(KEY_MODES, key, function()
         local name = under_cursor(verb)
         if name then
           fn(name)
@@ -652,11 +656,11 @@ local Manager = btv.view.component({
 
     -- Refresh lives on `<C-r>` because `r` is the per-row restore above, matching the
     -- upper/lower split of every other verb.
-    ctx.keymap_set("n", "<C-r>", function()
+    ctx.keymap_set(KEY_MODES, "<C-r>", function()
       refresh_status()
       state.tick = state.tick + 1
     end, { desc = "Refresh" })
-    ctx.keymap_set("n", "<CR>", function()
+    ctx.keymap_set(KEY_MODES, "<CR>", function()
       local name = line_to_name[ctx.line()]
       if name then
         state.expanded[name] = not state.expanded[name]
@@ -665,8 +669,8 @@ local Manager = btv.view.component({
     local function close()
       ctx.close()
     end
-    ctx.keymap_set("n", "q", close, { desc = "Close" })
-    ctx.keymap_set("n", "<Esc>", close, { desc = "Close" })
+    ctx.keymap_set(KEY_MODES, "q", close, { desc = "Close" })
+    ctx.keymap_set(KEY_MODES, "<Esc>", close, { desc = "Close" })
 
     -- Window-local display, set once the window exists: wrap long rows (the key hint,
     -- a row's trailing status) instead of clipping at the border, and inset the

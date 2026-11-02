@@ -1383,6 +1383,10 @@ pub struct Editor {
     /// `100<F3>a` stop at the end of the buffer instead of grinding on the last
     /// line. bemtvi has no bell, so this flag *is* the failure signal.
     command_failed: bool,
+    /// Per-key: this keystroke had an edit refused (`E21`). Set by
+    /// [`Editor::refuse_edit`], cleared with [`Self::command_failed`]; a `.` replay
+    /// stops on it.
+    edit_refused: bool,
 
     /// The accumulated, not-yet-complete normal/visual command — the count, the
     /// pending operator, and the [`Stage`] of the in-progress sequence. Decided
@@ -1546,6 +1550,10 @@ pub struct Editor {
     /// wheel put it; the first change to it brings the view back to the caret. Kept
     /// per window, so a window keeps its scroll while focus is elsewhere.
     view_detached: HashMap<WindowId, modeless::ViewDetached>,
+    /// `'modeless'` went off inside a mapping or fed span, which keeps the mode its
+    /// keys set; the resting Insert (or selection) is left once the span closes, in
+    /// [`settle_modeless`](Self::settle_modeless).
+    modeless_leave_owed: bool,
     /// Whether Helix-session search defaults to **smart-case** (case-insensitive
     /// unless the pattern carries an uppercase char) — Helix's own default, kept
     /// self-contained from the global `'ignorecase'`/`'smartcase'` that vim-mode
@@ -2405,6 +2413,7 @@ impl Editor {
             macro_last_played: None,
             macro_executing: None,
             command_failed: false,
+            edit_refused: false,
             pending: PendingCommand::default(),
             last_find: None,
             redo_recording: Vec::new(),
@@ -2443,6 +2452,7 @@ impl Editor {
             nm_sel: None,
             entry_sel: None,
             view_detached: HashMap::new(),
+            modeless_leave_owed: false,
             helix_smart_case: true,
             helix_count: None,
             helix_find: None,
@@ -2686,6 +2696,16 @@ impl Editor {
         if key.cmd && !(self.modeless_keys_active() && modeless::is_nav_key(key.code)) {
             return;
         }
+        // A span that turned `'modeless'` off owes a leave of the Insert it rested
+        // in. Once its own keys are back at a clean Normal, that Insert is left, and
+        // whatever mode its next keys enter is theirs to keep (`<Esc>:set nomodeless<CR>i`).
+        if self.modeless_leave_owed
+            && self.mode == Mode::Normal
+            && self.pending.is_clean()
+            && self.insert_normal.is_none()
+        {
+            self.modeless_leave_owed = false;
+        }
         // The keyboard takes the viewport back from the mouse: any `'scrolloff'`
         // suspended for a click / drag is restored for this key, so the margin the
         // user configured is in force again from the next motion on (the cursor a
@@ -2786,6 +2806,7 @@ impl Editor {
         // Per-key failure flag (vim's beep): this keystroke starts out having
         // succeeded. A macro playing back reads it after every key.
         self.command_failed = false;
+        self.edit_refused = false;
 
         // The mode before dispatch: a Normal→Insert transition on this key starts
         // a fresh insert session, which resets the `".` last-insert accumulator.
@@ -2833,6 +2854,10 @@ impl Editor {
         }
 
         match self.mode {
+            // A modeless session over a read-only buffer keeps its caret and
+            // selection keys; a key that would edit is refused here, for every
+            // Insert and Select path at once.
+            _ if self.refuses_modeless_key(key) => self.refuse_edit(),
             Mode::Insert | Mode::Replace => {
                 self.handle_insert(crate::input::text_mode_ctrl_alias(key).unwrap_or(key))
             }
@@ -2863,7 +2888,18 @@ impl Editor {
         // enters Insert on its own (`o`/`a`/`cc`/…), which simply consumes the flag.
         // Runs before the dot-repeat `done` check below so the completing keystroke
         // isn't mistaken for the end of the change: the insert session continues.
-        if !was_insert && self.resume_insert_normal() && self.eol_request {
+        let resumed = !was_insert && self.resume_insert_normal();
+        // A modeless rest's `<C-o>` command is a change of its own: it ends where
+        // the rest resumes, and the typing after it is not part of it.
+        if resumed && recording && self.rests_in_insert() {
+            let changed = self.buffer().changedtick != self.change_start_tick;
+            if (changed || self.op_repeatable) && !self.change_not_repeatable {
+                self.last_change = std::mem::take(&mut self.redo_recording);
+            }
+            self.redo_recording.clear();
+            self.change_not_repeatable = true;
+        }
+        if resumed && self.eol_request {
             // `<C-o>$` resumes Insert *after* the last char, ready to append: the
             // `$` motion itself lands *on* the last char (Normal's EOL), but the
             // pending eol-request means the user asked for the line end, so honour

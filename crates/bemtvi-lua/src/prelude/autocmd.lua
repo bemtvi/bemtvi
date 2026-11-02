@@ -245,6 +245,7 @@ end
 -- per-bufnr table so the global registry stays clean; `btv._resolve_user_command`
 -- consults both at dispatch.
 function btv.user_command.buf_create(buffer, name, command, opts)
+  btv._refuse_pending_buffer(buffer, "btv.user_command.buf_create")
   check_command_name(name)
   check_definable(name)
   if buffer == nil or buffer == 0 then
@@ -523,7 +524,7 @@ function btv.autocmd.create(event, opts)
   au_check_patterns(event, opts.pattern)
   autocmd_seq = autocmd_seq + 1
   local group = au_resolve_group(opts.group, "nvim_create_autocmd")
-  local buffer = opts.buffer
+  local buffer = btv._refuse_pending_buffer(opts.buffer, "btv.autocmd.create")
   if buffer == 0 then
     buffer = btv._cur_buf and btv._cur_buf.bufnr or 0
   end
@@ -1388,7 +1389,7 @@ end
 function btv.autocmd.exec(event, opts)
   opts = opts or {}
   local events = au_canon_event(type(event) == "table" and event or { event })
-  local buf = opts.buffer
+  local buf = btv._refuse_pending_buffer(opts.buffer, "btv.autocmd.exec")
   -- 0 means "the current buffer", resolved like `btv.autocmd.create` does — a
   -- buffer-local autocmd registered for the current buffer must fire under it.
   if buf == nil or buf == 0 then
@@ -1985,6 +1986,7 @@ vim.api.nvim_exec = btv.exec
 -- `btv.autocmd.get`'s matching.
 function btv.autocmd.clear(opts)
   opts = opts or {}
+  btv._refuse_pending_buffer(opts.buffer, "btv.autocmd.clear")
   local want_events = opts.event
     and au_canon_event(type(opts.event) == "table" and opts.event or { opts.event })
   local want_group = au_resolve_group(opts.group, "nvim_clear_autocmds")
@@ -2078,6 +2080,7 @@ function btv.user_command.get(_opts)
   )
 end
 function btv.user_command.buf_get(buf, _opts)
+  btv._refuse_pending_buffer(buf, "btv.user_command.buf_get")
   if buf == nil or buf == 0 then
     buf = btv._cur_buf and btv._cur_buf.bufnr or 0
   end

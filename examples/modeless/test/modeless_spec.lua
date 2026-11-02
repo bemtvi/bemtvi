@@ -77,6 +77,30 @@ btv.test.describe("examples/modeless", function()
     btv.test.expect(t:line(2)).to_be("1 is the word to find, and 2 again here.")
   end)
 
+  btv.test.it("5 — <C-f> and <C-h> start from the selected text", function(t)
+    open(t)
+    -- Double-click `fox` (text columns 16-18 of line 1).
+    local function select_fox()
+      local r, c = 0, btv.win.textoff(btv.win.current()) + 17
+      for _ = 1, 2 do
+        t:mouse("left", "press", r, c)
+        t:mouse("left", "release", r, c)
+      end
+    end
+    select_fox()
+    t:feed("<C-f><CR>")
+    btv.test.expect(t:mode()).to_be("s")
+    t:feed("1")
+    btv.test.expect(t:line(2)).to_be("1 is the word to find, and fox again here.")
+    -- A click elsewhere first, so this double-click isn't counted on from the last.
+    t:mouse("left", "press", 2, btv.win.textoff(btv.win.current()))
+    t:mouse("left", "release", 2, btv.win.textoff(btv.win.current()))
+    select_fox()
+    t:feed("<C-h>FOX/g<CR>")
+    btv.test.expect(t:line(1)).to_be("The quick brown FOX jumps over the lazy dog.")
+    btv.test.expect(t:line(2)).to_be("1 is the word to find, and FOX again here.")
+  end)
+
   btv.test.it("6 — lines move, duplicate, and indent as a block", function(t)
     open(t)
     t:feed("<C-End><Up>")
@@ -211,5 +235,39 @@ btv.test.describe("examples/modeless", function()
     btv.test.expect(t:menu()).never.to_be_nil()
     t:feed("<Esc>")
     btv.test.expect(t:menu()).to_be_nil()
+  end)
+
+  btv.test.it("11 — a read-only view is modeless too: select, copy, <CR>, q", function(t)
+    open(t)
+    local main = btv.win.current()
+    t:feed("<C-;>Outline<CR>")
+    t:wait_for(function()
+      return btv.win.current() ~= main
+    end, { message = "the outline never took focus" })
+    btv.test.expect(t:line(1)).to_be("The quick brown fox jumps over the lazy dog.")
+    btv.test.expect(t:mode()).to_be("i")
+    -- Select `fox` on line 2 and copy it.
+    t:feed("<Down><S-Right><S-Right><S-Right><C-c>")
+    btv.test.expect(t:mode()).to_be("s")
+    btv.test.expect(btv.test.clipboard.peek()).to_be("fox")
+    -- Typing is refused, and changes nothing.
+    t:feed("<Esc>x")
+    btv.test.expect(t:message()).to_contain("E21")
+    btv.test.expect(t:line(2)).to_be("fox is the word to find, and fox again here.")
+    -- <Enter> on line 5 moves the file's caret there.
+    t:feed("<Down><Down><Down><CR>")
+    btv.test.expect(btv.cursor.get(main)[1]).to_be(5)
+    t:wait_for(function()
+      for _, m in ipairs(btv.keymap.buf_get(0, "modeless")) do
+        if m.lhs == "q" then
+          return true
+        end
+      end
+    end, { message = "the outline's q never got bound" })
+    local outline_buf = t:buf()
+    t:feed("q")
+    t:wait_for(function()
+      return btv.win.current() == main and t:buf() ~= outline_buf
+    end, { message = "q never closed the outline" })
   end)
 end)

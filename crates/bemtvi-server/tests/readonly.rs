@@ -210,3 +210,60 @@ async fn the_quickfix_display_reads_nomodifiable() {
     );
     assert_eq!(bo_modifiable(&rpc).await, Some(false));
 }
+
+/// The Visual operators reach the text through their own paths, not the
+/// operator-pending chokepoint, so each must refuse a read-only buffer itself.
+#[tokio::test]
+async fn visual_operators_cannot_edit_a_read_only_buffer() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"btv.buf.set_lines(0, 0, -1, false, { "  alpha beta", "gamma 1", "delta" })"#,
+    )
+    .await;
+    message_after(&rpc, &mut incoming, "yy:setlocal nomodifiable<CR>").await;
+    let before = lines(&rpc).await;
+    for keys in [
+        "Vd", "vx", "Vjd", "Vc", "vs", "V>", "V<", "V=", "Vgc", "VjJ", "v~", "vU", "vu", "Vrx",
+        "Vp", "v<C-a>", "VX", "VD", "VC", "VS", "VR",
+    ] {
+        message_after(&rpc, &mut incoming, &format!("gg0{keys}<Esc><Esc>")).await;
+        assert_eq!(
+            lines(&rpc).await,
+            before,
+            "{keys:?} edited the read-only text"
+        );
+    }
+}
+
+/// `.` over a buffer that went read-only after the change: the replay's `i` is
+/// refused, and the text it would have typed must not run as Normal-mode commands
+/// (vim drops the rest of the redo once an edit fails). Typed text that was itself
+/// `.` re-entered the replay without end and overflowed the stack.
+#[tokio::test]
+async fn repeating_an_insert_over_a_read_only_buffer_runs_none_of_its_text() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"btv.buf.set_lines(0, 0, -1, false, { "one", "two", "three" })"#,
+    )
+    .await;
+    message_after(&rpc, &mut incoming, "iG<Esc>gg0:setlocal nomodifiable<CR>").await;
+    let msg = message_after(&rpc, &mut incoming, ".").await;
+    assert_eq!(
+        bemtvi_test_harness::cursor(&rpc).await,
+        (1, 0),
+        "the typed G ran"
+    );
+    assert!(msg.contains("E21"), "{msg:?}");
+    message_after(
+        &rpc,
+        &mut incoming,
+        ":setlocal modifiable<CR>u0i.<Esc>:setlocal nomodifiable<CR>",
+    )
+    .await;
+    let before = lines(&rpc).await;
+    let msg = message_after(&rpc, &mut incoming, ".").await;
+    assert!(msg.contains("E21"), "{msg:?}");
+    assert_eq!(lines(&rpc).await, before);
+}

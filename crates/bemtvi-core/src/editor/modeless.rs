@@ -1,7 +1,10 @@
-//! The modeless editing model (`'modeless'`): a GUI and web session where a
-//! modifiable buffer rests in Insert, so typing always edits and there is no Normal
-//! mode to fall into. A read-only buffer (a `btv.view`, the quickfix list, help)
-//! keeps resting in Normal, where its keys are buffer-local Normal maps.
+//! The modeless editing model (`'modeless'`): a GUI and web session where every
+//! buffer rests in Insert, so typing always edits and there is no Normal mode to
+//! fall into. A read-only buffer (a `btv.view`, the quickfix list, help) rests in
+//! Insert too, with the same caret, selection and layout keys; only its edits are
+//! refused ([`Editor::refuses_modeless_key`]). A plugin binds the keys its read-only
+//! buffer needs (`<CR>`, `q`) in the `modeless` keymap layer. A live terminal rests
+//! in Terminal mode, where its keys go to the process.
 //!
 //! No new [`Mode`] exists for this. Insert already types and Select already holds a
 //! range that typing replaces; what changes is where the editor comes to rest.
@@ -102,18 +105,74 @@ impl Editor {
             return;
         }
         if self.options.modeless {
+            self.modeless_leave_owed = false;
             self.settle_modeless();
-        } else if self.mode.is_insert() && !self.typing_undo_suppressed() {
-            // Back to the vim model from where the session rested: leave Insert the
-            // ordinary way, so the step closes and `InsertLeave` fires.
-            self.handle_insert(Key::new(KeyCode::Esc));
+        } else if self.typing_undo_suppressed() {
+            // Inside a mapping or fed span (a map's Lua turning it off): its keys
+            // keep the mode they set, and the span's end leaves the resting mode.
+            self.modeless_leave_owed = true;
+        } else {
+            self.leave_modeless_rest();
+        }
+        if !self.options.modeless {
+            // Vim keeps its cursor in view; a view the wheel held away from the
+            // caret is a modeless thing, so it comes back to the cursor here.
+            self.view_detached.clear();
+            self.ensure_visible();
         }
     }
 
-    /// Whether the current window rests in Insert: `'modeless'` is on and its buffer
-    /// takes edits. A read-only buffer rests in Normal even then.
+    /// Back to the vim model from where a modeless session rested. A modeless
+    /// selection is a caret selection whose type-over only the modeless read-only
+    /// guard checks, so it drops to its caret first; then Insert is left the
+    /// ordinary way, so the step closes and `InsertLeave` fires. Vim never rests in
+    /// Insert, and over a read-only buffer nothing else would stop the typing.
+    fn leave_modeless_rest(&mut self) {
+        if self.mode == Mode::Select && self.nm_sel.is_some() {
+            let head = self.caret_selection().head;
+            self.collapse_selection_to(head);
+        }
+        if self.mode.is_insert() {
+            self.handle_insert(Key::new(KeyCode::Esc));
+        }
+        // A command line opened from the resting Insert would close back into it.
+        if self.mode == Mode::Command && self.cmdline_return_mode.is_insert() {
+            self.cmdline_return_mode = Mode::Normal;
+        }
+    }
+
+    /// Whether the current window rests in Insert: `'modeless'` is on and it isn't a
+    /// live terminal. A read-only buffer rests in Insert too; its edits are refused.
     pub(crate) fn rests_in_insert(&self) -> bool {
-        self.options.modeless && self.modifiable()
+        self.options.modeless && !self.buffer().is_terminal()
+    }
+
+    /// Whether a modeless session over a read-only buffer refuses `key`: every key
+    /// that reaches the core there edits, except the caret and selection keys and
+    /// `<Esc>`. The caller echoes `E21` and drops the key. A mapped key never gets
+    /// here; the server matched the `modeless` layer and the buffer's maps first.
+    /// That holds inside a mapping's right-hand side, fed keys and a macro too:
+    /// Insert's text paths don't consult `modifiable()` themselves, so this is the
+    /// only thing between such a span and the read-only text.
+    ///
+    /// A vim Insert reaches a read-only buffer too, when the buffer turns read-only
+    /// while it is open (a plugin, an autocmd, `<C-o>:setl noma`); vim then refuses
+    /// each typed key with `E21` the same way, and `<C-[>` still leaves.
+    pub(crate) fn refuses_modeless_key(&self, key: Key) -> bool {
+        matches!(self.mode, Mode::Insert | Mode::Replace | Mode::Select)
+            && !self.buffer().is_terminal()
+            && !self.modifiable()
+            && key.code != KeyCode::Esc
+            && !is_nav_key(key.code)
+            && !self.is_insert_ctrl_o(key)
+            && (self.rests_in_insert() || !is_vim_insert_leave(key))
+    }
+
+    /// `i_CTRL-O` from Insert or Replace: it runs one Normal-mode command, which
+    /// checks `'modifiable'` itself, and edits nothing on its own, so a read-only
+    /// buffer's map can reach a Normal motion through it (`<C-o>G`).
+    fn is_insert_ctrl_o(&self, key: Key) -> bool {
+        self.mode.is_insert() && key.code == KeyCode::Char('o') && key.ctrl && !key.alt
     }
 
     /// Whether the focused window's cursor is a modeless caret, for a client that
@@ -130,9 +189,10 @@ impl Editor {
     }
 
     /// Whether the pointer over the text of a window onto buffer `id` is the text
-    /// I-beam: a modeless session, over a buffer it would type into.
+    /// I-beam: a modeless session, over any buffer but a terminal. A read-only
+    /// buffer's text is selected the same way.
     pub fn text_pointer_over(&self, id: BufferId) -> bool {
-        self.options.modeless && self.buffer_modifiable(id)
+        self.options.modeless && !self.is_terminal_buffer(id)
     }
 
     /// The state a scroll leaves the caret in — see [`ViewDetached`].
@@ -236,13 +296,20 @@ impl Editor {
         self.rests_in_insert() && !self.typing_undo_suppressed()
     }
 
-    /// Bring the mode to where a modeless session rests: Insert over a modifiable
-    /// buffer, Normal over a read-only one. Moves only from a clean Normal (no count,
-    /// operator or `i_CTRL-O` in flight) or from an Insert the buffer can't take, and
-    /// never inside a replay, mapping or fed span, whose keys expect the mode they
-    /// set. A no-op when `'modeless'` is off.
+    /// Bring the mode to where a modeless session rests: Insert, or Terminal over a
+    /// live terminal. Moves only from a clean Normal (no count, operator or
+    /// `i_CTRL-O` in flight), and never inside a replay, mapping or fed span, whose
+    /// keys expect the mode they set. With `'modeless'` off it only
+    /// finishes leaving a resting mode a span turned the option off inside.
     pub fn settle_modeless(&mut self) {
-        if !self.options.modeless || self.typing_undo_suppressed() || self.insert_normal.is_some() {
+        if !self.options.modeless {
+            if self.modeless_leave_owed && !self.typing_undo_suppressed() {
+                self.modeless_leave_owed = false;
+                self.leave_modeless_rest();
+            }
+            return;
+        }
+        if self.typing_undo_suppressed() || self.insert_normal.is_some() {
             return;
         }
         if self.mode != Mode::Select {
@@ -260,8 +327,10 @@ impl Editor {
                     }
                 }
             }
-            Mode::Insert | Mode::Replace if !self.modifiable() => self.leave_resting_insert(),
-            // A selection is Select, never Visual, over a modifiable buffer: a mouse
+            Mode::Normal if self.pending.is_clean() && self.buffer().is_terminal() => {
+                self.enter_terminal_mode();
+            }
+            // A selection is Select, never Visual: a mouse
             // drag or double-click builds a Visual one (the mouse engine's own
             // representation), which becomes Select here. Each drag event rebuilds
             // it from the press, so converting mid-gesture loses nothing.
@@ -355,19 +424,10 @@ impl Editor {
         self.mode = Mode::Insert;
         self.insert_text.clear();
         self.reset_typing_undo();
-    }
-
-    /// Close an insert session over a buffer that stopped taking edits (a `FileType`
-    /// handler made it `nomodifiable`), leaving it in Normal like `<Esc>` without the
-    /// cursor backstep.
-    fn leave_resting_insert(&mut self) {
-        self.end_snippet();
-        self.close_completion();
-        if self.undo_batch_depth == 0 {
-            self.snapshot_taken = false;
-        }
-        self.mode = Mode::Normal;
-        self.clamp_cursor();
+        // No command entered this Insert, so what is typed in it is no change `.`
+        // can replay: as Normal keys, typed `dd` would delete a line.
+        self.redo_recording.clear();
+        self.change_not_repeatable = true;
     }
 }
 
@@ -828,6 +888,11 @@ impl Editor {
 }
 
 /// Whether `code` is one of the navigation keys a modeless session moves with.
+/// `<C-[>`, which leaves a vim Insert as `<Esc>` does.
+fn is_vim_insert_leave(key: Key) -> bool {
+    crate::input::text_mode_ctrl_alias(key).is_some_and(|k| k.code == KeyCode::Esc)
+}
+
 pub(crate) fn is_nav_key(code: KeyCode) -> bool {
     matches!(
         code,
@@ -839,6 +904,29 @@ pub(crate) fn is_nav_key(code: KeyCode) -> bool {
             | KeyCode::End
             | KeyCode::PageUp
             | KeyCode::PageDown
+    )
+}
+
+/// Whether `name` is one of [`Editor::apply_modeless_action`]'s verbs.
+fn is_action(name: &str) -> bool {
+    matches!(
+        name,
+        "copy"
+            | "cut"
+            | "paste"
+            | "undo"
+            | "redo"
+            | "select_all"
+            | "delete_word_back"
+            | "delete_word_forward"
+            | "indent"
+            | "outdent"
+            | "duplicate_line"
+            | "move_line_up"
+            | "move_line_down"
+            | "search_next"
+            | "search_prev"
+            | "reveal_caret"
     )
 }
 
@@ -854,27 +942,28 @@ impl Editor {
     /// Each verb is one undo step of its own. Unknown names, and any verb while
     /// `'modeless'` is off, fail loud; the server reports the `Err`.
     ///
-    /// A read-only buffer rests in Normal and selects in Visual. `copy` and
-    /// `select_all` work there too, on that Visual selection; every other verb needs
-    /// an editable buffer.
+    /// A read-only buffer rests in Insert like any other. The verbs that don't edit
+    /// (`copy`, `select_all`, `search_next`, `search_prev`, `reveal_caret`) work
+    /// there; the rest refuse with `E21`.
     pub fn apply_modeless_action(&mut self, name: &str) -> Result<(), String> {
         if !self.options.modeless {
             return Err(format!("modeless action {name}: 'modeless' is off"));
         }
-        let editing = matches!(self.mode, Mode::Insert | Mode::Replace | Mode::Select);
-        let read_only = !self.rests_in_insert()
-            && matches!(self.mode, Mode::Normal | Mode::Visual | Mode::VisualLine);
-        if !editing && !(read_only && matches!(name, "copy" | "select_all")) {
+        if !matches!(self.mode, Mode::Insert | Mode::Replace | Mode::Select) {
             return Err(format!(
-                "modeless action {name}: needs an editable buffer (mode is {})",
+                "modeless action {name}: needs Insert or Select (mode is {})",
                 self.mode.short_code()
             ));
         }
+        let edits = !matches!(
+            name,
+            "copy" | "select_all" | "search_next" | "search_prev" | "reveal_caret"
+        );
+        if edits && !self.modifiable() && is_action(name) {
+            self.refuse_edit();
+            return Ok(());
+        }
         match name {
-            "copy" if read_only => {
-                self.read_only_copy();
-            }
-            "select_all" if read_only => self.read_only_select_all(),
             "copy" => {
                 self.modeless_copy();
             }
@@ -989,47 +1078,6 @@ impl Editor {
         };
         self.clipboard_write(text, kind);
         true
-    }
-
-    /// `copy` in a read-only buffer: the Visual selection (linewise for `V`), kept
-    /// selected, or the cursor's whole line when nothing is selected.
-    fn read_only_copy(&mut self) {
-        if !self.mode.is_visual() {
-            self.modeless_copy();
-            return;
-        }
-        if self.clipboard.is_none() {
-            self.echo_err(CLIPBOARD_UNAVAILABLE);
-            return;
-        }
-        let (text, kind) = if self.mode == Mode::VisualLine {
-            let (lo, hi, _) = self.visual_range_lw(true);
-            (self.buffer().text.slice(lo..hi).to_string(), RegKind::Line)
-        } else {
-            // Visual is inclusive: from the first selected character through the
-            // whole of the last one, however many bytes it takes.
-            let a = self.anchor_byte(self.visual_anchor);
-            let c = self.anchor_byte(self.cursor);
-            let (lo, hi) = (a.min(c), self.next_grapheme_idx(a.max(c)));
-            (self.buffer().text.slice(lo..hi).to_string(), RegKind::Char)
-        };
-        self.clipboard_write(text, kind);
-    }
-
-    /// `select_all` in a read-only buffer: Visual from the first character to the
-    /// last one.
-    fn read_only_select_all(&mut self) {
-        let last = self.last_line();
-        let len = self.buffer().line_len(last);
-        let col = if len == 0 {
-            0
-        } else {
-            let end = self.buffer().byte_at(last, len);
-            self.prev_grapheme_idx(end) - self.buffer().line_start(last)
-        };
-        self.visual_anchor = Cursor { line: 0, col: 0 };
-        self.cursor = Cursor { line: last, col };
-        self.mode = Mode::Visual;
     }
 
     /// Delete the selection, or the caret's whole line when nothing is selected

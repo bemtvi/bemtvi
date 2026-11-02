@@ -374,6 +374,66 @@ async fn drag_release_keeps_visual() {
     assert_eq!(mode(&rpc).await, "v", "selection survives the release");
 }
 
+/// A drag inside a bordered float lands where its press did: both map the cell
+/// past the border (and the `'padding'` inside it), so dragging along the row the
+/// press was on stays on that line. The drag used to skip the border, so it
+/// continued a row down and a column right of the pointer (the `:Plugins` float).
+#[tokio::test]
+async fn drag_in_a_bordered_float_stays_on_the_pressed_line() {
+    let (rpc, _incoming) = start("zero\nfirst line\nsecond line\nthird line\nfourth").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        "btv._open_float({ buf = 0, enter = true, relative = 'editor', anchor = 'NW', \
+         row = 2, col = 4, width = '20', height = '5', zindex = 50, focusable = true, \
+         border = 'single' }) return 0",
+    )
+    .await;
+    // The border is screen row 2 / col 4, so the first text cell is (3, 5): line 1
+    // ("zero"). Row 4 is line 2 ("first line").
+    feed_mouse(&rpc, "left", "press", 4, 6);
+    assert_eq!(
+        cursor(&rpc).await,
+        (2, 1),
+        "the press lands under the pointer"
+    );
+    feed_mouse(&rpc, "left", "drag", 4, 9);
+    assert_eq!(mode(&rpc).await, "v");
+    assert_eq!(
+        cursor(&rpc).await,
+        (2, 4),
+        "the drag stays on the pressed line, under the pointer"
+    );
+}
+
+/// The same with `'padding'` inside the border: the drag skips both.
+#[tokio::test]
+async fn drag_in_a_padded_bordered_float_stays_on_the_pressed_line() {
+    let (rpc, _incoming) = start("zero\nfirst line\nsecond line\nthird line\nfourth").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        "btv._open_float({ buf = 0, enter = true, relative = 'editor', anchor = 'NW', \
+         row = 2, col = 4, width = '24', height = '7', zindex = 50, focusable = true, \
+         border = 'single' }) return 0",
+    )
+    .await;
+    exec_lua(&rpc, "btv.wo.padding = '1 2' return 0").await;
+    // Border at (2, 4), then a 1-row / 2-col padding: the first text cell is (4, 7).
+    feed_mouse(&rpc, "left", "press", 5, 8);
+    assert_eq!(
+        cursor(&rpc).await,
+        (2, 1),
+        "the press lands under the pointer"
+    );
+    feed_mouse(&rpc, "left", "drag", 5, 11);
+    assert_eq!(
+        cursor(&rpc).await,
+        (2, 4),
+        "the drag stays on the pressed line, under the pointer"
+    );
+}
+
 /// A bare click (press then release, no drag) leaves you in Normal mode — only a
 /// drag starts a selection.
 #[tokio::test]

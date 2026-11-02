@@ -7,8 +7,8 @@ the selection instead, so the menu acts on it.
 
 In an editable buffer the menu offers Undo and Redo; Cut, Copy, Paste and Select All;
 the LSP verbs while a language server is attached; and the command palette. A
-read-only buffer (help, the quickfix list) offers Select All, plus Copy when text is
-selected there.
+read-only buffer (help, the quickfix list) offers Select All, plus Copy: always in a
+modeless session, and when text is selected in a vim one.
 
 One click chooses a row, and the row under the pointer is highlighted. A click or
 right-click anywhere else dismisses the menu, and a right-click opens a new one where
@@ -40,12 +40,12 @@ btv.contextmenu.list(0)   --> { "undo", "clipboard", "lsp", "commands" }
 | `commands` | Command Palette | the palette | the palette |
 
 - `undo`, and Cut and Paste, show only in a buffer that is `'modifiable'`.
-- Copy with nothing selected copies the line in an editable buffer. A read-only
-  buffer needs a selection to copy. In a vim session Cut needs a selection too; a
-  modeless Cut takes the line.
+- Copy with nothing selected copies the line, in any modeless buffer and in an
+  editable vim one. A read-only buffer in a vim session needs a selection to copy.
+  In a vim session Cut needs a selection too; a modeless Cut takes the line.
 - `lsp` shows while a server is attached, and greys out a verb no attached server
   answers.
-- In a modeless editable buffer each row shows the key that does the same thing,
+- In a modeless session each row shows the key that does the same thing,
   read from the live layout, so a rebound key shows its new chord. A vim session
   shows no keys: vim's keys are verbs plus motions, not one chord.
 

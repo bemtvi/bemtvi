@@ -17,8 +17,8 @@ use bemtvi_core::pathstyle::PathStyle;
 use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
-    await_lines, command, cursor, exec_lua, file_uri, spawn_with_daemon_fs,
-    spawn_with_daemon_fs_init, temp_dir, DaemonFs,
+    await_lines, await_lines_where, barrier, command, cursor, drain_to_latest_redraw, exec_lua,
+    file_uri, message, spawn_with_daemon_fs, spawn_with_daemon_fs_init, temp_dir, DaemonFs,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -404,5 +404,63 @@ async fn a_goto_into_an_unopened_file_lands_on_the_column_off_tick() {
         landed,
         (2, 9),
         "a utf-16 column must be converted against the line that landed, not used raw"
+    );
+}
+
+/// A `WorkspaceEdit` that reaches a `nomodifiable` buffer is refused whole with `E21`
+/// in a daemon session too: the unopened file it names *first* — whose bytes are still
+/// crossing the wire when the edit is decided — never gets its edits either, so nothing
+/// is half-applied once the fetch lands.
+#[tokio::test]
+async fn an_edit_reaching_a_nomodifiable_buffer_is_refused_whole_off_tick() {
+    let fake = DaemonFs::with_files(&[
+        (&virt("a.rs"), "let foo = 1\n"),
+        (&virt("b.rs"), "use a::foo;\n"),
+    ]);
+    let (rpc, mut incoming) = spawn_with_daemon_fs(fake, &virt("a.rs")).await;
+    assert_eq!(
+        await_lines(&rpc, &["let foo = 1"]).await,
+        vec!["let foo = 1"]
+    );
+    exec_lua(&rpc, "vim.bo[0].modifiable = false").await;
+
+    let edit = format!(
+        "btv.lsp.apply_workspace_edit({{ documentChanges = {{ \
+        {{ textDocument = {{ uri = '{b}', version = 0 }}, \
+          edits = {{ {{ range = {{ start = {{ line = 0, character = 7 }}, \
+                                ['end'] = {{ line = 0, character = 10 }} }}, newText = 'bar' }} }} }}, \
+        {{ textDocument = {{ uri = '{a}', version = 0 }}, \
+          edits = {{ {{ range = {{ start = {{ line = 0, character = 4 }}, \
+                                ['end'] = {{ line = 0, character = 7 }} }}, newText = 'bar' }} }} }} }} }})",
+        a = virt_uri("a.rs"),
+        b = virt_uri("b.rs"),
+    );
+    exec_lua(&rpc, &edit).await;
+    let mut msg = String::new();
+    for _ in 0..100 {
+        barrier(&rpc).await;
+        if let Some(m) = drain_to_latest_redraw(&mut incoming, |_| true) {
+            msg = message(&m);
+            if msg.contains("E21") {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        msg.contains("E21"),
+        "the edit should be refused with E21, got {msg:?}"
+    );
+    assert_eq!(
+        await_lines(&rpc, &["let foo = 1"]).await,
+        vec!["let foo = 1"],
+        "the nomodifiable buffer is untouched"
+    );
+
+    command(&rpc, &format!("edit {}", virt("b.rs"))).await;
+    assert_eq!(
+        await_lines_where(&rpc, |l| l != [String::new()]).await,
+        vec!["use a::foo;"],
+        "the unopened file's edits must not land after the fetch either"
     );
 }

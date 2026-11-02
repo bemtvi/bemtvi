@@ -1,7 +1,7 @@
 //! The editor's surface in a mitsuami view: the client behind it, and what carries out
 //! its effects on mitsuami.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -238,12 +238,17 @@ impl App {
         ];
         on_cleanup(move || tasks.iter().for_each(|task| task.cancel()));
 
+        // Not yet focused, unless it's about to be: the backend reports each move after this.
+        this.borrow_mut().client.set_focus(autofocus);
+        // Whether the surface has the focus, and whether its window is the active one.
+        let keys = Rc::new((Cell::new(autofocus), Cell::new(true)));
         let surface = node_ref();
         if autofocus {
             surface.focus();
         }
         this.borrow_mut().node = Some((surface, ui.clone()));
-        let (ready, resized, input) = (this.clone(), this.clone(), this);
+        let (ready, resized, input, gained, lost) =
+            (this.clone(), this.clone(), this.clone(), this.clone(), this);
         GpuSurface::new()
             .label(label)
             .node_ref(surface)
@@ -262,6 +267,26 @@ impl App {
             .text_cursor(caret)
             .cursor(cursor)
             .on_ready(move |handle| ready.borrow_mut().surface = Some(handle))
+            .on_focus({
+                let (app, keys) = (gained.clone(), keys.clone());
+                move || {
+                    keys.0.set(true);
+                    Self::drive(&app, |c| c.set_focus(keys.1.get()));
+                }
+            })
+            .on_blur({
+                let keys = keys.clone();
+                move || {
+                    keys.0.set(false);
+                    Self::drive(&lost, |c| c.set_focus(false));
+                }
+            })
+            // Its window stopping being the active one takes no focus from it, and its caret
+            // stops all the same.
+            .on_window_active(move |active| {
+                keys.1.set(active);
+                Self::drive(&gained, |c| c.set_focus(active && keys.0.get()));
+            })
             .on_resize(move |size| Self::resized(&resized, size))
             // In the client's own types; what it has no use for (the pointer leaving, raw
             // motion) stops here.

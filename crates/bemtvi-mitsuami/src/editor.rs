@@ -277,6 +277,15 @@ impl EditorHandle {
         }
     }
 
+    /// Whether the editor has the keyboard focus. Without it no caret shows or blinks.
+    pub fn has_focus(&self) -> bool {
+        let state = self.0.borrow();
+        state
+            .app
+            .upgrade()
+            .is_some_and(|app| app.borrow().client.has_focus())
+    }
+
     /// Run an ex command in the editor, whatever mode it's in.
     pub fn command(&self, command: &str) -> Result<()> {
         self.rpc()?

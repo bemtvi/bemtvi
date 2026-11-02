@@ -191,6 +191,12 @@ editor never sees that chord. A mapping on it in the editor never fires. Everyth
 else goes to the editor while it has focus, Tab included. Control+Tab moves focus on,
 so a `<C-Tab>` mapping never fires in any mitsuami app, `bemtvi-gui` included.
 
+A modeless caret shows and blinks only while the editor has the focus, as a text field's
+does, so an app with several editors shows one caret. Vim's and Helix's block cursors are an
+outline without it, with the glyph in its own colour; Insert's bar and Replace's underline
+stay as they are. It's the same while the editor's window isn't the active one, though the
+editor keeps its focus.
+
 The editor's surface is a native child surface on GTK, Kirigami and Windows, drawn
 above the window's own content. Nothing the app draws inside the window can overlap
 it, so popovers and menus over it have to be the platform's own popup windows, as

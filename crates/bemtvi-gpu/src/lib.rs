@@ -91,7 +91,7 @@ pub use render::{cmdline_caret_col, popup_covers, query_caret_col};
 // The block cursor's reverse-video pair — the opaque quad's colour and the inverted
 // colour its covered glyph is re-drawn in — plus that recolor, exported for the
 // Tier-1 `cursor` test.
-pub use render::{apply_cursor_fg, block_cursor_colors};
+pub use render::{apply_cursor_fg, block_cursor_colors, hollow_block};
 // Where a floating menu box anchors — window-relative for a completion popup, but
 // screen-relative for the command-line wildmenu. Exported for the Tier-1 `menu` test.
 pub use render::{menu_box_origin, text_anchor};

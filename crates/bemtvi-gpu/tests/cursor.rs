@@ -10,7 +10,7 @@
 //! on top. That is what these tests pin.
 
 use bemtvi_gpu::{
-    apply_cursor_fg, block_cursor_colors, caret_blink, popup_covers, Seg, CARET_BLINK,
+    apply_cursor_fg, block_cursor_colors, caret_blink, hollow_block, popup_covers, Seg, CARET_BLINK,
 };
 use std::time::Duration;
 
@@ -23,6 +23,37 @@ fn seg(text: &str, fg: u32) -> Seg {
 
 fn texts(segs: &[Seg]) -> Vec<(&str, u32)> {
     segs.iter().map(|s| (s.text.as_str(), s.fg)).collect()
+}
+
+// ---------------------------------------------------------------------------
+// `hollow_block(x, y, w, h, thickness)`: an unfocused editor's block, as its four edges
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_hollow_block_keeps_the_cell_and_leaves_its_middle_open() {
+    let edges = hollow_block(10.0, 20.0, 8.0, 16.0, 1.0);
+    let inside = |px: f32, py: f32| {
+        edges
+            .iter()
+            .any(|&(x, y, w, h)| px >= x && px < x + w && py >= y && py < y + h)
+    };
+    // Every corner of the cell, and nothing outside it.
+    for (px, py) in [(10.5, 20.5), (17.5, 20.5), (10.5, 35.5), (17.5, 35.5)] {
+        assert!(inside(px, py), "({px}, {py})");
+    }
+    for &(x, y, w, h) in &edges {
+        assert!(x >= 10.0 && y >= 20.0 && x + w <= 18.0 && y + h <= 36.0);
+    }
+    // The glyph stays uncovered.
+    assert!(!inside(14.0, 28.0));
+}
+
+#[test]
+fn a_hollow_blocks_edges_dont_overlap() {
+    // The colour may be translucent in a theme's future, and overlaps would show.
+    let edges = hollow_block(0.0, 0.0, 8.0, 16.0, 2.0);
+    let area: f32 = edges.iter().map(|&(_, _, w, h)| w * h).sum();
+    assert_eq!(area, 8.0 * 16.0 - 4.0 * 12.0);
 }
 
 // ---------------------------------------------------------------------------

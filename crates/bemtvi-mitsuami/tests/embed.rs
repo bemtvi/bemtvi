@@ -683,6 +683,44 @@ async fn forwarded_edits_reach_the_app(app: TestApp) {
     assert!(!close(&handle));
 }
 
+/// The client follows the surface's focus, which is what shows its caret and blinks it, as a
+/// text field's. Headless has no frames, so no caret to look at.
+#[mitsuami_test::test]
+async fn the_editor_knows_when_it_has_the_focus(app: TestApp) {
+    let (first, second) = (EditorHandle::new(), EditorHandle::new());
+    let exits = Rc::new(Cell::new(0));
+    let (a, b) = (editor(&first, &exits), editor(&second, &exits));
+    app.mount(move || Column::new().children((a, b)));
+    app.settle().await;
+    assert!(!first.has_focus(), "nothing has focused it");
+    assert!(!second.has_focus(), "nothing has focused it");
+
+    first.focus().unwrap();
+    until(&app, "the first to have it", || first.has_focus()).await;
+    assert!(!second.has_focus());
+
+    second.focus().unwrap();
+    until(&app, "the second to have it", || second.has_focus()).await;
+    assert!(!first.has_focus(), "the focus left it");
+    assert!(!close(&first));
+    assert!(!close(&second));
+}
+
+/// Its window stops being the active one: the surface keeps its focus, and the editor stops
+/// treating itself as focused until the window comes back.
+#[mitsuami_test::test(headless)]
+async fn the_editor_follows_its_window_being_active(app: TestApp) {
+    let (handle, _) = mount(&app, session()).await;
+    handle.focus().unwrap();
+    until(&app, "the focus", || handle.has_focus()).await;
+
+    app.headless().set_window_active(app.window(), false);
+    until(&app, "the window to go", || !handle.has_focus()).await;
+    app.headless().set_window_active(app.window(), true);
+    until(&app, "the window to come back", || handle.has_focus()).await;
+    assert!(!close(&handle));
+}
+
 /// `open` edits a file; `focus` gives the editor the keyboard.
 #[mitsuami_test::test]
 async fn open_and_focus(app: TestApp) {

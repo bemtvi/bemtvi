@@ -348,6 +348,9 @@ pub struct Renderer {
     /// The client flips it on a timer ([`Renderer::set_caret_hidden`]); the caret's
     /// place is still recorded for the input method while it's hidden.
     caret_hidden: bool,
+    /// Whether the editor has the keyboard focus: without it a block cursor is an outline
+    /// ([`Renderer::set_focused`]).
+    focused: bool,
 
     /// The cells the last frame's popups (completion, the menu or picker, a hover
     /// float) painted their backgrounds over, in physical pixels `(x, y, w, h)`. The
@@ -588,6 +591,7 @@ impl Renderer {
             scale,
             cursor_px: None,
             caret_hidden: false,
+            focused: true,
             popup_px: Vec::new(),
             span_right: u16::MAX,
             preedit: None,
@@ -1288,6 +1292,13 @@ impl Renderer {
         self.caret_hidden = hidden;
     }
 
+    /// Whether the editor has the keyboard focus. Without it a block cursor is drawn as an
+    /// outline, the convention for a cursor that isn't taking keys, and shows where the
+    /// keys aren't going.
+    pub fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
     /// Set (or, with empty `text`, clear) the input method's composition painted at
     /// the text cursor; `cursor` is its own caret, in bytes into `text`.
     pub fn set_preedit(&mut self, text: &str, cursor: Option<usize>) {
@@ -1432,7 +1443,9 @@ impl Renderer {
                 && !picker_open
                 && !view.bar_cursor()
                 && !view.is_replace()
-                && self.preedit.is_none();
+                && self.preedit.is_none()
+                // An outline leaves the glyph as it is.
+                && self.focused;
             block.then(|| {
                 let (_, glyph) = block_cursor_colors(
                     style_fg(&view.cursor),
@@ -2352,6 +2365,20 @@ impl Renderer {
                     color: c,
                     punch: false,
                 });
+                return;
+            }
+            if !self.focused && !view.bar_cursor() {
+                let thickness = (self.cell_w * 0.1).round().max(1.0);
+                for (x, y, w, h) in hollow_block(px, py, w, self.cell_h, thickness) {
+                    quads.push(Quad {
+                        x,
+                        y,
+                        w,
+                        h,
+                        color: c,
+                        punch: false,
+                    });
+                }
                 return;
             }
             quads.push(Quad {
@@ -4852,6 +4879,19 @@ pub fn block_cursor_colors(
             normal_bg
         },
     )
+}
+
+/// A block's four edges, each `(x, y, w, h)`, `thickness` wide and inside it: the cursor of
+/// an editor without the focus. They don't overlap. Pure, so it's tested in
+/// `tests/cursor.rs`.
+pub fn hollow_block(x: f32, y: f32, w: f32, h: f32, thickness: f32) -> [(f32, f32, f32, f32); 4] {
+    let inner = (h - 2.0 * thickness).max(0.0);
+    [
+        (x, y, w, thickness),
+        (x, y + h - thickness, w, thickness),
+        (x, y + thickness, thickness, inner),
+        (x + w - thickness, y + thickness, thickness, inner),
+    ]
 }
 
 /// Recolor the grapheme the block cursor covers to `fg` — the inverted colour from

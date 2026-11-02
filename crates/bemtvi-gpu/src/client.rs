@@ -311,6 +311,9 @@ pub struct Client {
     /// When the modeless caret's blink last restarted ([`caret_blink`]): the caret
     /// moved, or a frame turned it on.
     blink_since: Instant,
+    /// Whether the editor has the keyboard focus ([`Client::set_focus`]). True until a
+    /// host says otherwise: a client alone in a window has it.
+    focused: bool,
     /// What the blink restarts on: whether the caret is up, and its place.
     blink_key: (bool, u16, u16),
     /// When the caret next flips, while there is one.
@@ -434,6 +437,7 @@ impl Client {
             resize_hint: None,
             text_hint: false,
             blink_since: now,
+            focused: true,
             blink_key: (false, 0, 0),
             blink_next: now + CARET_BLINK,
             autoscroll: None,
@@ -620,10 +624,33 @@ impl Client {
         }
     }
 
+    /// Whether the editor has the keyboard focus, as the host told it.
+    pub fn has_focus(&self) -> bool {
+        self.focused
+    }
+
+    /// The host says whether the editor has the keyboard focus. A caret shows only while it
+    /// does, as a text field's, and comes back on, with its blink from the start. A block
+    /// cursor is an outline without it.
+    pub fn set_focus(&mut self, focused: bool) {
+        if focused == self.focused {
+            return;
+        }
+        self.focused = focused;
+        self.blink_since = Instant::now();
+        self.blink_next = self.blink_since + CARET_BLINK;
+        self.request_redraw();
+    }
+
+    /// Whether a caret is blinking: one with no focus isn't there to blink.
+    fn caret_blinks(&self) -> bool {
+        self.view.caret && self.focused
+    }
+
     /// When the client next needs [`Client::tick`]: the `timeoutlen` flush, a drag's
     /// auto-scroll repeat, the caret's next blink. `None` when nothing is due.
     pub fn next_deadline(&self) -> Option<Instant> {
-        let blink = self.view.caret.then_some(self.blink_next);
+        let blink = self.caret_blinks().then_some(self.blink_next);
         let autoscroll = self.autoscroll.map(|_| self.autoscroll_next);
         [self.flush_deadline, autoscroll, blink]
             .into_iter()
@@ -648,7 +675,7 @@ impl Client {
             }
         }
         // The caret flips: repaint, and wait for the next flip.
-        if self.view.caret && now >= self.blink_next {
+        if self.caret_blinks() && now >= self.blink_next {
             let left = caret_blink(now.saturating_duration_since(self.blink_since)).1;
             self.blink_next = now + left;
             self.request_redraw();
@@ -663,9 +690,11 @@ impl Client {
             self.scroll = None;
         }
         let frame = self.scroll.as_ref().map(ScrollFrame::of);
-        let hidden = self.view.caret && caret_blink(self.blink_since.elapsed()).0;
+        let hidden =
+            self.view.caret && (!self.focused || caret_blink(self.blink_since.elapsed()).0);
         if let Some(r) = self.renderer.as_mut() {
             r.set_caret_hidden(hidden);
+            r.set_focused(self.focused);
             if let Err(e) = r.render(&self.view, frame.as_ref()) {
                 eprintln!("bemtvi-gpu: render error: {e}");
             }

@@ -663,6 +663,7 @@ impl Editor {
             self.collapse_selection_to(self.cursor);
         }
         self.set_window_cursor(win, line, bcol);
+        self.helix_click_collapses();
 
         let count = self.next_click_count(row, col, stamp_ms);
         // Record the gesture with a provisional single-click (char) anchor — enough
@@ -1523,6 +1524,7 @@ impl Editor {
                         }
                     }
                     self.set_window_cursor(win, line, bcol);
+                    self.helix_click_collapses();
                 }
                 self.popup_request = true;
             }
@@ -1530,9 +1532,24 @@ impl Editor {
         }
     }
 
+    /// A click in Helix ends the selection there, as Esc and `;` do: its anchor would
+    /// otherwise stay behind, so the cursor's move stretched the selection to the click.
+    fn helix_click_collapses(&mut self) {
+        if self.mode.is_helix() {
+            self.helix_collapse_to_cursor();
+            self.mode = Mode::HelixNormal;
+        }
+    }
+
     /// Whether a click on buffer position `(line, col)` lands in the selection: the
     /// Visual one, or a Select one, whose caret span is end-exclusive.
     fn click_in_selection(&self, line: usize, col: usize) -> bool {
+        if self.mode.is_helix() {
+            let range = self.selections().primary();
+            let (anchor, head) = (self.anchor_byte(range.anchor), self.anchor_byte(range.head));
+            let at = self.anchor_byte(Cursor { line, col });
+            return (anchor.min(head)..self.next_grapheme_idx(anchor.max(head))).contains(&at);
+        }
         if self.mode == Mode::Select {
             let (lo, hi) = self.caret_span(self.caret_selection());
             let at = self.anchor_byte(Cursor { line, col });
@@ -2672,7 +2689,7 @@ impl Editor {
     /// column, mirroring [`ensure_visible_horizontal`](Editor::ensure_visible_horizontal)'s
     /// bounds so that — once the cursor sits inside them — that pass is a no-op and
     /// the wheel's `leftcol` survives the redraw.
-    fn keep_cursor_in_leftcol(&mut self) {
+    pub(crate) fn keep_cursor_in_leftcol(&mut self) {
         let tw = self.text_width();
         if tw == 0 {
             return;
@@ -2738,7 +2755,7 @@ impl Editor {
 
     /// Window `win`'s text-area height in rows (its content height minus the status
     /// line), at least 1 — the page size for a `Shift`+wheel notch.
-    fn window_text_height(&self, win: WindowId) -> usize {
+    pub(crate) fn window_text_height(&self, win: WindowId) -> usize {
         self.window_text_area(win).map_or(1, |(_, h)| h).max(1)
     }
 

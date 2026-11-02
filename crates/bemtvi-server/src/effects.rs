@@ -983,6 +983,10 @@ impl EditHost {
                     }
                 }
                 ViewOp::Adopt { id, win } => self.editor.adopt_view(id, WindowId(win)),
+                ViewOp::MountHere { id } => {
+                    let win = self.editor.current_window_id();
+                    self.editor.adopt_view(id, win);
+                }
                 ViewOp::Unmount { id } => self.editor.unmount_view(id),
                 ViewOp::Focus { id } => self.editor.focus_view(id),
                 ViewOp::Destroy { id } => self.editor.destroy_view(id),
@@ -1158,6 +1162,18 @@ impl EditHost {
                     self.settle_ts_highlight(lang, text, nlines, cb_id);
                 }
                 // The scan walks the grammar dirs, so it leaves the tick.
+                #[cfg(not(feature = "native"))]
+                TsOp::Reload { .. } => {
+                    self.editor
+                        .echo("E: btv.treesitter.reload is not available in the browser build yet");
+                }
+                #[cfg(feature = "native")]
+                TsOp::Reload { lang } => {
+                    // As after this editor's own install: the highlight memo is keyed on
+                    // what doesn't change when a grammar arrives.
+                    self.editor.reload_ts_language(&lang);
+                    self.syntax_states.clear();
+                }
                 #[cfg(feature = "native")]
                 TsOp::Installed { cb_id } => {
                     self.fx

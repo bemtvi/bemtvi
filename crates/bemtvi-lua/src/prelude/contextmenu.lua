@@ -119,7 +119,8 @@ function btv.contextmenu._lists_count()
   return n
 end
 
-local SELECTING = { v = true, V = true, ["\22"] = true, s = true, S = true, ["\19"] = true }
+local SELECTING =
+  { v = true, V = true, ["\22"] = true, s = true, S = true, ["\19"] = true, hs = true }
 
 -- The `ctx` every `when`, `enabled`, `detail`, `items` and `action` is passed: built
 -- once per right-click.
@@ -369,7 +370,9 @@ btv.contextmenu.groups.clipboard = btv.contextmenu.groups.clipboard
           return ctx.selection or ctx.modifiable or ctx.modeless
         end,
         action = verb("copy", function(ctx)
-          vim_keys(ctx, ctx.selection and '"+y' or '"+yy')
+          -- Helix's `y` takes the selection, so the line has to be one first.
+          local line = ctx.mode == "hn" and 'x"+y' or '"+yy'
+          vim_keys(ctx, ctx.selection and '"+y' or line)
         end),
       },
       {
@@ -383,8 +386,9 @@ btv.contextmenu.groups.clipboard = btv.contextmenu.groups.clipboard
       {
         label = "Select All",
         detail = hint("select_all"),
-        action = verb("select_all", function()
-          btv._feedkeys("<Esc>ggVG", false, false)
+        action = verb("select_all", function(ctx)
+          local helix = ctx.mode == "hn" or ctx.mode == "hs"
+          btv._feedkeys(helix and "%" or "<Esc>ggVG", false, false)
         end),
       },
     },
@@ -454,6 +458,8 @@ local MENU_MODES = {
   ["\19"] = true,
   i = true,
   R = true,
+  hn = true,
+  hs = true,
 }
 
 -- The right-click. A buffer-local `<RightMouse>` map replaces it for its buffer, and

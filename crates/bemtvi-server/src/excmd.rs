@@ -653,6 +653,7 @@ impl EditHost {
     #[cfg(feature = "native")]
     pub(crate) fn on_install_done(&mut self, outcome: crate::InstallOutcome) {
         let (lang, result) = outcome;
+        let mut error = None;
         match result {
             Ok(report) => {
                 self.editor.reload_ts_language(&report.lang);
@@ -685,8 +686,16 @@ impl EditHost {
                     report.lang, report.compiler
                 ));
             }
-            Err(e) => self.editor.echo(format!("TSInstall: {lang} failed: {e:#}")),
+            Err(e) => {
+                let why = format!("{e:#}");
+                self.editor.echo(format!("TSInstall: {lang} failed: {why}"));
+                error = Some(why);
+            }
         }
+        let buf = self.editor.current_buffer_id().0;
+        let r = self.lua.fire_ts_installed(&lang, error.as_deref(), buf);
+        self.report_autocmd_err("TSInstalled", r);
+        self.apply_lua_effects();
     }
 
     /// The default colorscheme every client starts on: the bundled `bemtvi` scheme

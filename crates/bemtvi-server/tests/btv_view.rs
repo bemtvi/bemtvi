@@ -2004,3 +2004,79 @@ async fn a_component_setup_error_from_a_rejected_wait_says_why() {
     let note = note.as_str().unwrap_or_default().to_string();
     assert!(note.contains("the data never came"), "{note:?}");
 }
+
+/// `set_topline` on the focused window holds, past where its cursor is: the cursor comes
+/// into the view, as under the wheel, or the next frame would scroll back to it.
+#[tokio::test]
+async fn set_topline_holds_on_the_focused_window() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"local lines = {}
+           for i = 1, 500 do lines[i] = "line " .. i end
+           btv.buf.set_lines(0, 0, -1, true, lines)"#,
+    )
+    .await;
+    exec_lua(&rpc, "btv.win.set_topline(0, 200)").await;
+    exec_lua(&rpc, "return 1").await;
+    let view = exec_lua(
+        &rpc,
+        "local v = btv.win.saveview(); return { v.topline, v.lnum }",
+    )
+    .await;
+    let view = view.as_array().expect("a list");
+    assert_eq!(view[0].as_i64(), Some(200), "the view held");
+    assert!(
+        view[1].as_i64().unwrap() >= 200,
+        "the cursor came along: {view:?}"
+    );
+}
+
+/// `set_leftcol` on the focused window holds: the cursor comes into the view, as under the
+/// wheel, or the next frame would scroll back to the cursor.
+#[tokio::test]
+async fn set_leftcol_holds_on_the_focused_window() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"btv.wo[0].wrap = false; btv.buf.set_lines(0, 0, -1, true, { string.rep("abcdefghij", 40) })"#,
+    )
+    .await;
+    exec_lua(&rpc, "btv.win.set_leftcol(0, 50)").await;
+    exec_lua(&rpc, "return 1").await;
+    let left = exec_lua(&rpc, "return btv.win.saveview().leftcol").await;
+    assert_eq!(left.as_i64(), Some(50));
+    let col = exec_lua(&rpc, "return btv.win.saveview().col").await;
+    assert!(
+        col.as_i64().unwrap() >= 50,
+        "the cursor came along: {col:?}"
+    );
+}
+
+/// `mount{ here = true }` takes the window that's current as it's applied, not the one Lua
+/// last heard of: closing the view showing there and mounting another in one chunk would
+/// otherwise aim at a window that's gone, and the view never shows.
+#[tokio::test]
+async fn mount_here_after_closing_in_the_same_chunk() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"a = btv.view.create({ name = "a" }); a:set_lines({ "a" }); a:mount({ here = true })
+           b = btv.view.create({ name = "b" }); b:set_lines({ "b" }); b:mount({ split = "vsplit" }); a:focus()"#,
+    )
+    .await;
+    exec_lua(&rpc, "return 1").await;
+    exec_lua(
+        &rpc,
+        r#"a:close(); b:close()
+           c = btv.view.create({ name = "c" }); c:set_lines({ "c" }); c:mount({ here = true })"#,
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return c:winid() ~= nil").await,
+        "the view shows"
+    );
+    let shown = exec_lua(&rpc, "return btv.buf.lines(0, 0, -1)[1]").await;
+    assert_eq!(shown.as_str(), Some("c"));
+    assert_eq!(win_count(&rpc).await, 1);
+}

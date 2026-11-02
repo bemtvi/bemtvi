@@ -987,6 +987,14 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     )?;
     let sh = shared.clone();
     view.set(
+        "_mount_here",
+        lua.create_function(move |_, id: u64| {
+            sh.borrow_mut().view_ops.push(ViewOp::MountHere { id });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    view.set(
         "_mount_dock",
         lua.create_function(move |_, (id, side, size): (u64, String, Option<u64>)| {
             sh.borrow_mut()
@@ -4712,6 +4720,16 @@ pub(crate) fn install_runtime_api(
             sh.borrow_mut()
                 .ts_ops
                 .push(TsOp::Highlight { lang, text, cb_id });
+            Ok(())
+        })?,
+    )?;
+
+    // `btv._ts_reload(lang)`: the native call behind `btv.treesitter.reload`.
+    let sh = shared.clone();
+    btv.set(
+        "_ts_reload",
+        lua.create_function(move |_, lang: String| {
+            sh.borrow_mut().ts_ops.push(TsOp::Reload { lang });
             Ok(())
         })?,
     )?;

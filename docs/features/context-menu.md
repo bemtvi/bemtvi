@@ -39,6 +39,8 @@ btv.contextmenu.list(0)   --> { "undo", "clipboard", "lsp", "commands" }
 | `lsp` | Go to Definition, Find References, Rename Symbol, Format Document, Code Actions | `btv.lsp.*` | `btv.lsp.*` |
 | `commands` | Command Palette | the palette | the palette |
 
+- Helix's modes are a vim session here, with Helix's `%` for Select All and `x` then `y`
+  for Copy with nothing selected, which leaves out the line's end.
 - `undo`, and Cut and Paste, show only in a buffer that is `'modifiable'`.
 - Copy with nothing selected copies the line, in any modeless buffer and in an
   editable vim one. A read-only buffer in a vim session needs a selection to copy.

@@ -386,6 +386,16 @@ function btv.treesitter.highlight(lang, text)
   end)
 end
 
+-- `btv.treesitter.reload(lang)`: look for `lang`'s grammar again, and repaint what's open in
+-- it. An editor remembers that a language has no grammar, and `:TSInstall` only tells the
+-- editor that ran it (`TSInstalled`), so this is for another editor that installed one: an app
+-- embedding several hears of it from the one, and tells the rest. Native only: the browser
+-- has one highlighter, outside the editor, and reports that this isn't there.
+function btv.treesitter.reload(lang)
+  assert(type(lang) == "string", "btv.treesitter.reload: lang must be a string")
+  btv._ts_reload(lang)
+end
+
 -- `btv.treesitter.installed()` -> promise of the list of languages with a grammar that
 -- can highlight: on native, a parser in bemtvi's data dir or a borrowed neovim `site/`
 -- with a `highlights` query (beside the parser, on the runtimepath, or from

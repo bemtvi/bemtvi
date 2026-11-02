@@ -204,6 +204,12 @@ no autocmd listens for them they cost nothing.
 | `LspDetach` | A language server detaches from a buffer. | `data = { client_id = … }`. |
 | `LspProgress` | A server reports on long-running work (`$/progress`) — indexing, loading a workspace. | The **pattern is the kind** (`begin` / `report` / `end`), so `pattern = "end"` narrows to completions. `data = { client_id, token, kind, title, message, percentage, cancellable }`, with `nil` for a field the server didn't send. Read the settled state with `btv.lsp.progress()` rather than accumulating updates yourself. |
 
+## Treesitter
+
+| Event | When it fires | Notes |
+| --- | --- | --- |
+| `TSInstalled` | A `:TSInstall` or `:TSUpdate` of one language ended, built or failed. | The **pattern is the language**. `data = { lang, ok, error }`, `error` being why when `ok` is false. Buffers repaint by themselves; this is for what a plugin paints from `btv.treesitter.highlight`. Fires only in the editor that ran the install; `btv.treesitter.reload` has another look again. |
+
 ## Files & environment
 
 | Event | When it fires | Notes |

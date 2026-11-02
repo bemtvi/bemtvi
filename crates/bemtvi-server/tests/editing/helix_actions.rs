@@ -187,3 +187,19 @@ async fn undo_in_select_mode_keeps_the_anchor_in_the_buffer() {
     feed(&rpc, "oxyz<Esc>vua<Esc>");
     assert_eq!(lines(&rpc).await, vec!["ab", "cd"]);
 }
+
+/// `btv.line("v")` is a Helix selection's fixed end too, as in vim's Visual: a mapping on a
+/// selection needs both ends, and read only the cursor's before.
+#[tokio::test]
+async fn line_v_is_the_selections_fixed_end_in_helix() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ione<CR>two<CR>three<Esc>gg");
+    exec_lua(&rpc, "btv.helix.enable()").await;
+    assert_eq!(mode(&rpc).await, "hn");
+    feed(&rpc, "vjj");
+    assert_eq!(mode(&rpc).await, "hs");
+    let ends = exec_lua(&rpc, r#"return { btv.line("v"), btv.line(".") }"#).await;
+    let ends = ends.as_array().expect("a list");
+    assert_eq!(ends[0].as_i64(), Some(1), "the fixed end");
+    assert_eq!(ends[1].as_i64(), Some(3), "the cursor");
+}

@@ -135,6 +135,10 @@ impl EditHost {
             self.editor
                 .echo(format!("E: btv.treesitter.highlight callback: {e}"));
         }
+        // What the promise goes on to is queued by that call, past where this pass of the
+        // effects took its queue, or with no pass to come at all (off a grammar load).
+        // Taken now, or the settle after this finds nothing to do, and it waits for input.
+        self.apply_lua_effects();
     }
 }
 
@@ -3686,6 +3690,15 @@ impl EditHost {
             let why = if msg.is_empty() { "failed" } else { &msg };
             self.editor.echo(format!("TSInstall: {lang} failed: {why}"));
         }
+        let error = (!ok).then_some(if msg.is_empty() {
+            "failed"
+        } else {
+            msg.as_str()
+        });
+        let buf = self.editor.current_buffer_id().0;
+        let r = self.lua.fire_ts_installed(&lang, error, buf);
+        self.report_autocmd_err("TSInstalled", r);
+        self.apply_lua_effects();
         // Project the echo into a fresh frame (this runs off the input tick, like the fs
         // completions — `eh_redraw_json` only returns the last *emitted* redraw, so the
         // echo would otherwise sit unseen until the next keystroke).

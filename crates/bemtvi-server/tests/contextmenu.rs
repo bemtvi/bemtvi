@@ -586,6 +586,63 @@ async fn vim_undo_undoes_the_last_change() {
     assert_eq!(lines_eventually(&rpc, &["hello"]).await, v(&["hello"]));
 }
 
+/// Helix's modes are a session too: a right-click opens the menu, and what it does is
+/// Helix's, whose `y` takes the selection and whose `%` selects the file.
+#[tokio::test]
+async fn a_helix_session_gets_the_menu() {
+    let (rpc, clip, mut inc) = start_gui("one\ntwo\nthree\n").await;
+    exec_lua(&rpc, "btv.helix.enable()").await;
+    poll_true(&rpc, "return btv.mode().mode == 'hn'").await;
+
+    choose(&rpc, &mut inc, (1, 1), "Copy").await;
+    assert_eq!(
+        clip_eventually(&clip).await,
+        Some(("two".to_string(), false))
+    );
+
+    choose(&rpc, &mut inc, (0, 1), "Select All").await;
+    poll_true(
+        &rpc,
+        "return btv.mode().mode == 'hs' or btv.mode().mode == 'hn'",
+    )
+    .await;
+    let sel = "local s = btv.win.selection(); return s and s[1] == 0 and s[3] >= 2";
+    poll_true(&rpc, sel).await;
+}
+
+/// A left click ends a Helix selection there, rather than stretching it to the click.
+#[tokio::test]
+async fn a_left_click_in_helix_leaves_no_selection_behind() {
+    let (rpc, clip, mut inc) = start_gui("one\ntwo\nthree\n").await;
+    exec_lua(&rpc, "btv.helix.enable()").await;
+    poll_true(&rpc, "return btv.mode().mode == 'hn'").await;
+    feed_mouse(&rpc, "left", "press", 2, 1);
+    feed_mouse(&rpc, "left", "release", 2, 1);
+    poll_true(&rpc, "return vim.fn.line('.') == 3").await;
+
+    choose(&rpc, &mut inc, (2, 1), "Copy").await;
+    assert_eq!(
+        clip_eventually(&clip).await,
+        Some(("three".to_string(), false))
+    );
+}
+
+/// Over a Helix selection the menu keeps it, and the row knows there is one.
+#[tokio::test]
+async fn a_helix_selection_is_a_selection_to_the_menu() {
+    let (rpc, clip, mut inc) = start_gui("one\ntwo\nthree\n").await;
+    exec_lua(&rpc, "btv.helix.enable()").await;
+    poll_true(&rpc, "return btv.mode().mode == 'hn'").await;
+    feed(&rpc, "vl");
+    poll_true(&rpc, "return btv.mode().mode == 'hs'").await;
+
+    choose(&rpc, &mut inc, (0, 0), "Copy").await;
+    assert_eq!(
+        clip_eventually(&clip).await,
+        Some(("on".to_string(), false))
+    );
+}
+
 #[tokio::test]
 async fn a_rows_action_gets_the_context_and_may_return_a_promise() {
     let (rpc, _clip, mut inc) = start_gui("hello\n").await;

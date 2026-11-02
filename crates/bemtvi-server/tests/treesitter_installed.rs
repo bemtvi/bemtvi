@@ -277,6 +277,31 @@ async fn set_query_counts_as_highlightable_and_checks_its_args() {
     assert!(bad.is_err());
 }
 
+/// A promise of `btv.treesitter.highlight` goes on with nothing else going on. Its answer
+/// comes off a grammar load, after the request that asked: no key or scroll follows to run
+/// what it queued, and a plugin's colours used to wait for one. A chain of two, as what
+/// comes of the first asks for the second.
+#[tokio::test]
+async fn highlight_goes_on_with_no_input() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, mut incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    exec_lua(
+        &rpc,
+        r#"btv.buf.set_lines(0, 0, -1, true, { "painted" })
+           btv.hl.define(0, "FromHighlight", { link = "Keyword" })
+           local ns = btv.ns.create("no-input")
+           btv.async(function()
+             btv.await(btv.treesitter.highlight("sourcegitnone", "1"))
+             btv.await(btv.treesitter.highlight("sourcegitnonetoo", "2"))
+             btv.buf.set_extmark(0, ns, 0, 0, { end_row = 0, end_col = 7, hl_group = "FromHighlight" })
+           end)()"#,
+    )
+    .await;
+    // From here on, only frames: a request would itself tick the editor.
+    let map = wait_redraw(&mut incoming, |m| paints(m, "FromHighlight")).await;
+    assert!(paints(&map, "FromHighlight"));
+}
+
 // ===== Real grammars: network + a C compiler, opt-in like the other ts e2e tests =====
 
 /// Whether any painted span has capture `group`.
@@ -334,6 +359,77 @@ async fn a_listed_runtimepath_query_really_paints() {
     assert_eq!(listed.as_bool(), Some(true));
     let map = wait_redraw(&mut incoming, |m| paints(m, "from.rtp")).await;
     assert!(paints(&map, "from.rtp"));
+}
+
+/// What a plugin paints from `btv.treesitter.highlight` as an install ends reaches the
+/// screen with nothing else going on: no key or scroll comes after it to bring the frame.
+/// Two parses in a row, as a diff's two versions need, the first waiting on the grammar.
+#[tokio::test]
+#[ignore = "needs network + a C compiler"]
+async fn colours_from_an_install_paint_with_no_input() {
+    let _guard = serial_lock().lock().await;
+    // Installed once beforehand, for the compiler: the wait below is for the frame.
+    let data = temp_dir("ts_paint_install");
+    bemtvi_ts::install::install(&data, "json")
+        .expect("install json grammar (network + C compiler required)");
+    use_data_dir(&data);
+    let file = write_temp("ts_paint_install", "txt", "{\"a\": 123}\n");
+    let (rpc, mut incoming) = start_attached(
+        ServerInit {
+            file: Some(file),
+            ..Default::default()
+        },
+        80,
+        24,
+    )
+    .await;
+    exec_lua(
+        &rpc,
+        r#"local ns = btv.ns.create("paint")
+           btv.hl.define(0, "FromInstall", { link = "Keyword" })
+           btv.on("TSInstalled", function()
+             btv.async(function()
+               btv.await(btv.treesitter.highlight("json", "1"))
+               btv.await(btv.treesitter.highlight("json", "2"))
+               btv.buf.set_extmark(0, ns, 0, 0, { end_row = 0, end_col = 3, hl_group = "FromInstall" })
+             end)()
+           end)
+           btv.cmd("TSInstall json")"#,
+    )
+    .await;
+    // From here on, only frames: a request would itself tick the editor.
+    let map = wait_redraw(&mut incoming, |m| paints(m, "FromInstall")).await;
+    assert!(paints(&map, "FromInstall"));
+}
+
+/// An editor that looked for a grammar and found none remembers. Another editor installing
+/// it can't tell this one, so `btv.treesitter.reload` has it look again.
+#[tokio::test]
+#[ignore = "needs network + a C compiler"]
+async fn reload_finds_a_grammar_another_editor_installed() {
+    let _guard = serial_lock().lock().await;
+    let data = temp_dir("ts_reload");
+    use_data_dir(&data);
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    let ask = r#"btv.g.spans = nil
+        btv.treesitter.highlight("json", "[1]"):next(function(s) btv.g.spans = #s end)"#;
+    exec_lua(&rpc, ask).await;
+    assert!(poll_true(&rpc, "return btv.g.spans == 0").await, "none yet");
+
+    bemtvi_ts::install::install(&data, "json")
+        .expect("install json grammar (network + C compiler required)");
+    exec_lua(&rpc, ask).await;
+    assert!(
+        poll_true(&rpc, "return btv.g.spans == 0").await,
+        "it still remembers"
+    );
+
+    exec_lua(&rpc, "btv.treesitter.reload('json')").await;
+    exec_lua(&rpc, ask).await;
+    assert!(
+        poll_true(&rpc, "return (btv.g.spans or 0) > 0").await,
+        "it found the grammar"
+    );
 }
 
 /// The grammar failed to load for want of a highlights query; handing it one is the cure,
@@ -401,4 +497,30 @@ async fn set_query_beats_the_runtimepath_until_cleared() {
     feed(&rpc, "j");
     let map = wait_redraw(&mut incoming, |m| paints(m, "from.rtp")).await;
     assert!(paints(&map, "from.rtp"));
+}
+
+/// `TSInstalled` says how an install went, with its language as the pattern: what's
+/// painted from a grammar off-buffer has no other way to hear of one. A mirror with
+/// nothing in it fails the fetch, without the network.
+#[tokio::test]
+async fn an_install_says_how_it_went() {
+    // SAFETY: nothing else in this binary installs.
+    unsafe { std::env::set_var("BEMTVI_TS_MIRROR", temp_dir("ts_installed_mirror")) };
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    exec_lua(
+        &rpc,
+        r#"btv.on("TSInstalled", function(args) btv.g.ts_event = { args.match, args.data.lang, args.data.ok, args.data.error } end)"#,
+    )
+    .await;
+    command(&rpc, "TSInstall sourcegitnonesuch").await;
+    assert!(
+        poll_true(&rpc, "return btv.g.ts_event ~= nil").await,
+        "the event fired"
+    );
+    let event = exec_lua(&rpc, "return btv.g.ts_event").await;
+    let event = event.as_array().expect("a list");
+    assert_eq!(event[0].as_str(), Some("sourcegitnonesuch"), "the pattern");
+    assert_eq!(event[1].as_str(), Some("sourcegitnonesuch"), "data.lang");
+    assert_eq!(event[2].as_bool(), Some(false), "data.ok");
+    assert!(!event[3].as_str().expect("data.error").is_empty());
 }

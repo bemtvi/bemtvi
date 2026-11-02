@@ -2029,7 +2029,9 @@ impl Editor {
     /// Scroll window `id` so its first visible line is `top` (0-based), clamped to
     /// the buffer's last line. The focused window moves its live viewport; an
     /// inactive window updates its stashed `top` (applied when next focused). A
-    /// no-op for an unknown id. Backs `vim.fn.winrestview`'s `topline`.
+    /// no-op for an unknown id. Backs `vim.fn.winrestview`'s `topline`. The focused
+    /// window's cursor comes into the view, as under the wheel, or the next frame would
+    /// scroll straight back to it; a modeless session's caret stays, its view detached.
     pub fn set_window_topline(&mut self, id: WindowId, top: usize) {
         let Some((_, t)) = self.tree_of_window(id) else {
             return;
@@ -2038,7 +2040,12 @@ impl Editor {
         let last = self.buffers.get(buf).buffer.line_count().saturating_sub(1);
         let top = top.min(last);
         if id == self.windows.current {
+            let old = self.top;
             self.top = top;
+            if top != old && !self.detach_view((old, self.leftcol)) {
+                let height = self.window_text_height(id);
+                self.keep_cursor_in_scroll_margin(height);
+            }
         } else {
             self.tree_of_window_mut(id)
                 .expect("checked above")
@@ -2051,14 +2058,19 @@ impl Editor {
     /// `leftcol` (0-based). The focused window moves its live viewport; an inactive
     /// window updates its stashed `leftcol` (applied when next focused). A no-op for
     /// an unknown id. Backs `vim.fn.winrestview`'s `leftcol` / `btv.win.set_leftcol`.
-    /// Only meaningful with `'nowrap'`; the next cursor move may re-derive `leftcol`
-    /// to keep the cursor visible, as in vim.
+    /// Only meaningful with `'nowrap'`. The focused window's cursor comes into the view,
+    /// as under the wheel, or the next frame would scroll straight back to it. A later
+    /// cursor move may re-derive `leftcol` to keep the cursor visible, as in vim.
     pub fn set_window_leftcol(&mut self, id: WindowId, leftcol: usize) {
         let Some((_, _)) = self.tree_of_window(id) else {
             return;
         };
         if id == self.windows.current {
+            let old = self.leftcol;
             self.leftcol = leftcol;
+            if leftcol != old && !self.detach_view((self.top, old)) {
+                self.keep_cursor_in_leftcol();
+            }
         } else {
             self.tree_of_window_mut(id)
                 .expect("checked above")

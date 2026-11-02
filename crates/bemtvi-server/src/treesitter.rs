@@ -136,6 +136,10 @@ impl EditHost {
             self.editor
                 .echo(format!("E: btv.treesitter.highlight callback: {e}"));
         }
+        // What the promise goes on to is queued by that call, past where this pass of the
+        // effects took its queue, or with no pass to come at all (off a grammar load).
+        // Taken now, or the settle after this finds nothing to do, and it waits for input.
+        self.apply_lua_effects();
     }
 
     /// Re-run the `btv.treesitter.highlight` asks parked on a grammar that has now
@@ -175,6 +179,10 @@ impl EditHost {
         // repainting for it is not free — every decoration provider is re-dispatched.
         if changed {
             self.settle_events(true);
+        } else {
+            // Nothing to paint, but a parked ask may have settled, and what it goes on to
+            // runs here. `settle_events` repaints only if there was some.
+            self.settle_events(false);
         }
     }
 

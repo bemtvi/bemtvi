@@ -153,6 +153,9 @@ pub enum ViewOp {
     /// placeholder window for a persisted view) for view `id`: retarget that window to the
     /// view's backing buffer. The `place(view)` step of an `btv.view.on_restore` handler.
     Adopt { id: u64, win: u64 },
+    /// `v:mount{ here = true }` — show view `id` in the window that's current as this
+    /// applies, which Lua's mirror of it can't tell after a window closed in the same chunk.
+    MountHere { id: u64 },
     /// `v:unmount()` — remove view `id` from view, keeping the backing buffer alive.
     Unmount { id: u64 },
     /// `v:focus()` — move focus to the window showing view `id`.
@@ -1659,6 +1662,8 @@ pub enum TsOp {
         text: String,
         cb_id: u64,
     },
+    /// `btv.treesitter.reload(lang)`: look for `lang`'s grammar again.
+    Reload { lang: String },
     /// `btv.treesitter.installed()`: settle `cb_id` with the languages that have a grammar
     /// to highlight with.
     Installed { cb_id: u64 },

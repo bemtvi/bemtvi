@@ -369,7 +369,7 @@ function View:mount(opts)
   elseif opts.tab then
     btv.view._mount_tab(self.id)
   elseif opts.here then
-    self:place_in(btv.win.current())
+    btv.view._mount_here(self.id)
   elseif opts.split then
     btv.view._mount_split(self.id, opts.split ~= "split")
   elseif opts.float then

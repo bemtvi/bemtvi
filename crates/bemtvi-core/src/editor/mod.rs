@@ -3338,11 +3338,11 @@ impl Editor {
 
     /// The live selection's fixed end as `(line, col)` (0-based line, byte col) —
     /// vim's `getpos("v")` — or `None` outside a selection mode (Visual, V-Line,
-    /// Select), where the anchor is stale and `v` means the cursor instead. Mirrored
+    /// Select, Helix's), where the anchor is stale and `v` means the cursor instead. Mirrored
     /// to Lua so a visual-mode mapping can read the whole selection, not just the
     /// cursor end.
     pub fn visual_anchor_pos(&self) -> Option<(usize, usize)> {
-        (self.mode.is_visual() || self.mode == Mode::Select)
+        (self.mode.is_visual() || self.mode.is_helix() || self.mode == Mode::Select)
             .then_some((self.visual_anchor.line, self.visual_anchor.col))
     }
 

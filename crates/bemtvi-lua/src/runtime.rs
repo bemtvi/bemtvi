@@ -2105,6 +2105,18 @@ impl LuaRuntime {
         fire.call(("LspProgress", kind, buf, "", data))
     }
 
+    /// Fire `TSInstalled` as a `:TSInstall` ends, with the language as the pattern. `error`
+    /// is why it failed, or `None` when it worked. `buf` is only the usual `args.buf`
+    /// context: a grammar belongs to no buffer.
+    pub fn fire_ts_installed(&self, lang: &str, error: Option<&str>, buf: u64) -> mlua::Result<()> {
+        let fire: mlua::Function = self.btv()?.get("_fire")?;
+        let data = self.lua.create_table()?;
+        data.set("lang", lang)?;
+        data.set("ok", error.is_none())?;
+        data.set("error", error)?;
+        fire.call(("TSInstalled", lang, buf, "", data))
+    }
+
     /// Forget an LSP client (`btv.lsp._clients[id] = nil`) when its server exits,
     /// so a stale `get_client_by_id` after a `LspDetach` returns `nil`.
     pub fn remove_lsp_client(&self, id: u64) -> mlua::Result<()> {

@@ -1570,26 +1570,29 @@ impl Renderer {
                     // the whole extent. The clip is in band-row space (`k` vs the
                     // cursor's band row). The quad clamps to the text area vertically
                     // (quads aren't scissored) so a partial row cuts off at the edge.
-                    if let Some(Some(span)) = s.selection.get(k) {
-                        let hidden = match s.sel_clip {
-                            Some(true) => k > cur_row0,
-                            Some(false) => k < cur_row0,
-                            None => false,
-                        };
-                        if !hidden {
-                            self.push_span_quad_at(
-                                quads,
-                                text_x0,
-                                y,
-                                *span,
-                                lc,
-                                inlay,
-                                vtext,
-                                sel_bg,
-                                clip.top as f32,
-                                clip.bottom as f32,
-                            );
-                        }
+                    let sel_span =
+                        s.selection
+                            .get(k)
+                            .copied()
+                            .flatten()
+                            .filter(|_| match s.sel_clip {
+                                Some(true) => k <= cur_row0,
+                                Some(false) => k >= cur_row0,
+                                None => true,
+                            });
+                    if let Some(span) = sel_span {
+                        self.push_span_quad_at(
+                            quads,
+                            text_x0,
+                            y,
+                            span,
+                            lc,
+                            inlay,
+                            vtext,
+                            sel_bg,
+                            clip.top as f32,
+                            clip.bottom as f32,
+                        );
                     }
                     // Secondary multi-cursor selections ride the slide too, painted
                     // with the same `Visual` background as the primary.
@@ -1677,6 +1680,15 @@ impl Renderer {
                         fg
                     };
                     let mut segments = row_segments(&display, hl, s.styles, row_fg, slide_bg, lc);
+                    // Selection / search win over a span's own background (inline
+                    // `code`), as on the settled path: its quad is pushed after theirs.
+                    let overlay: Vec<(u16, u16)> = sel_span
+                        .into_iter()
+                        .chain(s.secondary_selection.get(k).into_iter().flatten().copied())
+                        .chain(s.search.get(k).into_iter().flatten().copied())
+                        .chain(s.incsearch.get(k).copied().flatten())
+                        .collect();
+                    segments = clear_bg_under(segments, &overlay, lc);
                     // The cursor rides the band mid-slide (see `paint_cursor`), so its
                     // glyph inverts on the band row it sits on — otherwise the opaque
                     // block would swallow the character for the length of the slide.
@@ -1703,6 +1715,26 @@ impl Renderer {
                     };
                     let x = text_run_origin(text_x0, lc) as f32 * self.cell_w - dx;
                     self.push_text(items, &segments, (x, y), row_fg, text_clip);
+                    // Background quads for the runs whose group set a `bg` (markdown
+                    // inline `code`), so they slide with the text instead of
+                    // vanishing until the slide settles. Pushed after `q0`, so the pan
+                    // shift and the text-area clip below apply to them too.
+                    for (qx, qy, qw, qh, bg) in band_bg_rects(
+                        &segments,
+                        text_run_origin(text_x0, lc),
+                        y,
+                        (self.cell_w, self.cell_h),
+                        (clip.top as f32, clip.bottom as f32),
+                    ) {
+                        quads.push(Quad {
+                            x: qx,
+                            y: qy,
+                            w: qw,
+                            h: qh,
+                            color: self.bg_rgba(bg),
+                            punch: false,
+                        });
+                    }
 
                     // Diagnostic sign + underlines ride the band too, at the row's
                     // sub-pixel offset, so they slide with the text instead of
@@ -4543,6 +4575,38 @@ pub fn seg_bg_spans(segments: &[Seg], start_col: u16) -> Vec<(u16, u16, u32)> {
         .into_iter()
         .zip(segments)
         .filter_map(|((col, w), seg)| (w > 0).then_some((col, w, seg.bg?)))
+        .collect()
+}
+
+/// The background rects of a slide-band row: `(x, y, w, h, bg)` for each run of
+/// `segments` (laid out from cell `start_col`) whose group set a `bg`, the row's
+/// top at pixel `y` — fractional mid-slide — and clamped to the text area's
+/// vertical extent `clip_y` (`(top, bottom)`) so a partly scrolled-off row cuts off
+/// at the edge. The band's quads aren't scissored, hence the clamp; the horizontal
+/// pan shift and clip are applied by the caller to all of the band's quads.
+pub fn band_bg_rects(
+    segments: &[Seg],
+    start_col: u16,
+    y: f32,
+    (cell_w, cell_h): (f32, f32),
+    (clip_top, clip_bottom): (f32, f32),
+) -> Vec<(f32, f32, f32, f32, u32)> {
+    let top = y.max(clip_top);
+    let bottom = (y + cell_h).min(clip_bottom);
+    if bottom <= top {
+        return Vec::new();
+    }
+    seg_bg_spans(segments, start_col)
+        .into_iter()
+        .map(|(col, w, bg)| {
+            (
+                col as f32 * cell_w,
+                top,
+                w as f32 * cell_w,
+                bottom - top,
+                bg,
+            )
+        })
         .collect()
 }
 

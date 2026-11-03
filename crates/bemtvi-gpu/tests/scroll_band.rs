@@ -10,8 +10,8 @@
 
 use std::time::Duration;
 
-use bemtvi_gpu::{ScrollAnim, ScrollFrame};
-use bemtvi_view::ScrollData;
+use bemtvi_gpu::{band_bg_rects, row_segments, ScrollAnim, ScrollFrame};
+use bemtvi_view::{ScrollData, Style};
 
 /// A minimal three-row gesture with one overlay entry per layer under test.
 fn gesture() -> ScrollData {
@@ -46,4 +46,33 @@ fn band_frame_carries_inline_diagnostics() {
     assert_eq!(frame.diagnostics_signs, &data.diagnostics_signs[..]);
     // …and so does the gutter text column, so a diff's numbers slide with their lines.
     assert_eq!(frame.gutter_text, &data.gutter_text[..]);
+}
+
+/// Inline `code` keeps its background mid-slide. The band row's highlight spans
+/// carry the `@markup.raw` style (with its `bg`) like the settled row's, and the
+/// band paints a background rect for every run that set one, at the row's
+/// sub-pixel offset, clamped to the text area. Regression: the band painted only
+/// the glyphs, so markdown inline code lost its background for the whole slide
+/// and the background came back when it settled.
+#[test]
+fn band_row_paints_a_span_background_at_its_sub_pixel_offset() {
+    const CODE_BG: u32 = 0x30_30_30;
+    let styles = vec![Style {
+        fg: Some(0x80_c0_80),
+        bg: Some(CODE_BG),
+        ..Style::default()
+    }];
+    // "see `code` here", the backticked run [4, 10) on the code style.
+    let hl = vec![(4, 10, "markup.raw".to_string(), Some(0))];
+    let segs = row_segments("see `code` here", &hl, &styles, 0xc0_c0_c0, 0, 0);
+    let (cw, ch) = (10.0, 20.0);
+    // Laid out from column 2, the row's top 4px above the text area's top edge (a
+    // partly scrolled-off row): the rect starts at the text area's edge, 16px tall.
+    let rects = band_bg_rects(&segs, 2, -4.0, (cw, ch), (0.0, 200.0));
+    assert_eq!(rects, vec![(60.0, 0.0, 60.0, 16.0, CODE_BG)]);
+    // Fully inside: the whole cell height, at the fractional y.
+    let rects = band_bg_rects(&segs, 2, 30.5, (cw, ch), (0.0, 200.0));
+    assert_eq!(rects, vec![(60.0, 30.5, 60.0, 20.0, CODE_BG)]);
+    // Scrolled wholly past the text area: nothing paints outside it.
+    assert!(band_bg_rects(&segs, 2, 200.0, (cw, ch), (0.0, 200.0)).is_empty());
 }

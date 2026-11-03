@@ -749,6 +749,64 @@ async fn view_double_click_fires_on_select() {
     );
 }
 
+/// A view with nothing to confirm has no use for a double-click, so it's the word selection
+/// any other buffer has, in both editing models. A triple-click already was the line's.
+#[tokio::test]
+async fn view_without_on_select_double_click_selects_the_word() {
+    for (setup, what) in [("", "vim"), ("btv.o.modeless = true", "modeless")] {
+        let (rpc, clock, _incoming) = start_clocked().await;
+        exec_lua(
+            &rpc,
+            &format!(
+                r#"{setup}
+                   vw = btv.view.create{{}}
+                   vw:set_lines{{ "alpha", "beta gamma", "delta" }}
+                   vw:mount{{ dock = "left", size = 20 }}"#
+            ),
+        )
+        .await;
+        feed_mouse_at(&rpc, &clock, 0, "left", "press", 1, 2);
+        feed_mouse_at(&rpc, &clock, 100, "left", "press", 1, 2);
+        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+        // In its own rows: `[first row, first col, last row, last col]` or the marks' `v`.
+        let selected = exec_lua(
+            &rpc,
+            r#"local s = btv.win.selection()
+               if s then return s[1] .. ":" .. s[2] .. "-" .. s[3] .. ":" .. s[4] end
+               local v = btv.fn.getpos("v")
+               local c = btv.fn.getpos(".")
+               return btv.mode().mode .. " " .. v[3] .. "-" .. c[3]"#,
+        )
+        .await;
+        let selected = selected.as_str().unwrap_or_default().to_owned();
+        assert!(
+            selected == "1:0-1:4" || selected == "v 1-4",
+            "{what}: the word wasn't selected: {selected}"
+        );
+    }
+}
+
+/// A double-click still confirms once the view has something to confirm, whenever that's set.
+#[tokio::test]
+async fn view_on_select_set_after_mounting_takes_the_double_click() {
+    let (rpc, clock, _incoming) = start_clocked().await;
+    exec_lua(
+        &rpc,
+        r#"vw = btv.view.create{}
+           vw:set_lines{ "alpha", "beta" }
+           vw:mount{ dock = "left", size = 20 }"#,
+    )
+    .await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    exec_lua(&rpc, r#"vw:on_select(function(line) _G.picked = line end)"#).await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    feed_mouse_at(&rpc, &clock, 0, "left", "press", 1, 2);
+    feed_mouse_at(&rpc, &clock, 100, "left", "press", 1, 2);
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let picked = exec_lua(&rpc, "return _G.picked").await;
+    assert_eq!(picked.as_i64(), Some(2));
+}
+
 /// After navigating up, replacing the content and `set_cursor`-ing to the new last line
 /// lands the cursor there (the REPL "append output, keep cursor at the bottom" pattern —
 /// `set_lines` followed by `set_cursor` in the same batch must not leave the cursor where

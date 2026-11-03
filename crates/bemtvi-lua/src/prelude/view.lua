@@ -41,10 +41,12 @@ end
 -- the current buffer when `FileType` would fire, so it installs at create time.)
 --
 -- `<2-LeftMouse>` is the mouse form of `<CR>`: a single left-click positions the cursor
--- on a row (core dock/window mouse handling) and the double-click confirms it, so every
--- view is clickable for free — a plugin needn't wire the mouse itself.
+-- on a row (core dock/window mouse handling) and the double-click confirms it, so a
+-- view with an `on_select` is clickable for free — a plugin needn't wire the mouse itself.
+-- It's bound by `:on_select`, not here: a view with nothing to confirm keeps the word
+-- selection every other buffer has.
 --
--- Both bind in Normal and in the `modeless` layer: a modeless session rests in Insert
+-- These bind in Normal and in the `modeless` layer: a modeless session rests in Insert
 -- over a view too, and takes a read-only buffer's keys only through that layer. A
 -- plugin's own view keys need the same `{ "n", "modeless" }` pair.
 function btv._install_view_keymaps(buf)
@@ -53,12 +55,6 @@ function btv._install_view_keymaps(buf)
     "<CR>",
     btv.view.actions.confirm,
     { buffer = buf, default = true, desc = "Select entry" }
-  )
-  btv.keymap.set(
-    { "n", "modeless" },
-    "<2-LeftMouse>",
-    btv.view.actions.confirm,
-    { buffer = buf, default = true, desc = "Select entry (double-click)" }
   )
 end
 
@@ -259,10 +255,19 @@ function View:set_userdata(list)
   return self
 end
 
--- `:on_select(fn)` — `fn(line, userdata)` fires on `<CR>` / confirm, with the 1-based
--- cursor line and that line's userdata entry. Pure Lua state.
+-- `:on_select(fn)` — `fn(line, userdata)` fires on `<CR>` / confirm / double-click, with
+-- the 1-based cursor line and that line's userdata entry.
 function View:on_select(fn)
   self._on_select = fn
+  if fn and not self._double_click then
+    self._double_click = true
+    btv.keymap.set(
+      { "n", "modeless" },
+      "<2-LeftMouse>",
+      btv.view.actions.confirm,
+      { buffer = self, default = true, desc = "Select entry (double-click)" }
+    )
+  end
   return self
 end
 

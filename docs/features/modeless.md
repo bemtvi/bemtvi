@@ -186,7 +186,7 @@ A printable key such as `q` is safe in the `modeless` layer on a read-only buffe
 typing is refused there anyway, so the map takes nothing away. A buffer-local map
 in the layer beats the layout's own key on the same chord, so a view can bind
 `<C-v>` to "open in a split" without losing it to paste. `btv.view` installs its
-`<CR>` and double-click this way, and so do the quickfix list, the panels, the
+`<CR>`, and with an `on_select` its double-click, this way, and so do the quickfix list, the panels, the
 explorer and the `:Plugins` screens. On an editable buffer, keep to keys that don't
 type (chords, function keys), since the layer comes ahead of typing.
 

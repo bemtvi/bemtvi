@@ -1042,6 +1042,7 @@ fn daemon_command() -> Result<tokio::process::Command> {
     let exe = std::env::current_exe()?;
     let mut c = tokio::process::Command::new(exe);
     c.arg(DAEMON_FLAG);
+    bemtvi_core::process::no_console_window(c.as_std_mut());
     Ok(c)
 }
 

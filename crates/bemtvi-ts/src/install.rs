@@ -576,7 +576,8 @@ fn compile(cc: &[String], src_dir: &Path, parser_c: &Path, out: &Path) -> Result
     // so key off the subcommand, not the program name.
     let is_zig = prefix.first().is_some_and(|a| a == "cc");
     let mut cmd = Command::new(prog);
-    cmd.args(prefix)
+    bemtvi_core::process::no_console_window(&mut cmd)
+        .args(prefix)
         .args(["-shared", "-fPIC", "-O2"])
         .arg("-I")
         .arg(src_dir)
@@ -654,7 +655,7 @@ fn ensure_parser_c(grammar_root: &Path, what: &str) -> Result<()> {
              and re-run, or install a repo that commits the generated parser"
         );
     };
-    let output = Command::new(&cli)
+    let output = bemtvi_core::process::no_console_window(&mut Command::new(&cli))
         .arg("generate")
         .current_dir(grammar_root)
         .output()
@@ -689,7 +690,7 @@ fn tree_sitter_cli() -> Option<String> {
 
 /// Whether running `name <args…>` succeeds (the tool is present on PATH).
 fn program_exists(name: &str, args: &[&str]) -> bool {
-    Command::new(name)
+    bemtvi_core::process::no_console_window(&mut Command::new(name))
         .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

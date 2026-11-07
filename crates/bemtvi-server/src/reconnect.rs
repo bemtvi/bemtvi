@@ -29,7 +29,7 @@ impl SpawnCommand {
     /// The base [`Command`] (program + args) — the caller wires stdio / `kill_on_drop`.
     /// `Argv` runs the program directly (no shell); `Shell` runs the line through `sh -c`.
     pub fn to_command(&self) -> Command {
-        match self {
+        let mut c = match self {
             SpawnCommand::Argv(argv) => {
                 let mut c = Command::new(&argv[0]);
                 c.args(&argv[1..]);
@@ -40,7 +40,9 @@ impl SpawnCommand {
                 c.arg("-c").arg(line);
                 c
             }
-        }
+        };
+        bemtvi_core::process::no_console_window(c.as_std_mut());
+        c
     }
 }
 

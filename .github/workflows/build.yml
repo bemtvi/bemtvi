@@ -425,8 +425,20 @@ jobs:
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
+          $exe = "target/${{ matrix.target }}/release/${env:BIN}.exe"
+          # The PE optional header's Subsystem field (2 = GUI, 3 = console) decides
+          # whether Windows opens a console window beside the program. The GUI must
+          # be 2 (`#![windows_subsystem = "windows"]`) or every launch shows a stray
+          # console; the TUI must stay 3 so it gets one.
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          $pe = [System.BitConverter]::ToInt32($bytes, 0x3C)
+          $subsystem = [System.BitConverter]::ToUInt16($bytes, $pe + 0x5C)
+          $want = if ("${{ matrix.kind }}" -eq "gui") { 2 } else { 3 }
+          if ($subsystem -ne $want) {
+            throw "$exe has PE subsystem $subsystem, expected $want"
+          }
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${env:BIN}.exe" -DestinationPath "dist/${env:ASSET}"
+          Compress-Archive -Path $exe -DestinationPath "dist/${env:ASSET}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

@@ -35,6 +35,11 @@ bemtvi-view.workspace = true
 # default `native` on via feature unification.
 bemtvi-server = { workspace = true, features = ["native"] }
 
+# `AttachConsole`: the GUI-subsystem binary borrows the launching terminal's console so
+# `--help`/`--version` and startup errors print there (`attach_parent_console`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }
+
 # Windows host only: embeds the app icon into bemtvi-gui.exe (see build.rs). Gated
 # on the *host* (build scripts run on the host) — our CI builds Windows natively,
 # so host == target == windows. Cross-compiling Windows from another host skips

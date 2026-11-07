@@ -115,6 +115,7 @@ impl LspTransport for LocalLspTransport {
                 // blocks.
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
+            bemtvi_core::process::no_console_window(command.as_std_mut());
             // No `cwd` means inherit this process's — which is the editor's own, the
             // dir a `cmd_cwd`-less config wants the server launched in anyway.
             if let Some(cwd) = &cwd {

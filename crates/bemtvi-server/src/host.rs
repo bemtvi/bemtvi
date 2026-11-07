@@ -191,6 +191,7 @@ async fn run_local_process(spec: ProcSpec, mut kill_rx: oneshot::Receiver<()>, e
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    bemtvi_core::process::no_console_window(command.as_std_mut());
     // Detach the child from the editor's controlling terminal by putting it in its
     // own session (setsid). A session with no controlling terminal makes any
     // `/dev/tty` access fail, so an interactive tool — git/ssh prompting for a
@@ -454,6 +455,7 @@ pub async fn run_duplex_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    bemtvi_core::process::no_console_window(command.as_std_mut());
     // Detach from the editor's controlling terminal (see `run_local_process`): a
     // debug adapter must never read/write the tty bemtvi is painting.
     #[cfg(unix)]

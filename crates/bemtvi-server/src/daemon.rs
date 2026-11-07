@@ -3118,6 +3118,7 @@ async fn serve_one_lsp(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    bemtvi_core::process::no_console_window(command.as_std_mut());
     if !cwd.is_empty() {
         command.current_dir(&cwd);
     }

@@ -361,6 +361,7 @@ fn stdio_daemon_command() -> Result<tokio::process::Command> {
             }
             let mut c = tokio::process::Command::new(bemtvi);
             c.arg("--daemon");
+            bemtvi_core::process::no_console_window(c.as_std_mut());
             c
         }
     };

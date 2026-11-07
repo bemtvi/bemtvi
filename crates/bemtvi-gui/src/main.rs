@@ -22,6 +22,13 @@
 //! split keeps the editor local for a zero-round-trip keystroke path, moving only the
 //! fs/process/watch/LSP boundary across the wire.
 
+// A Windows GUI-subsystem binary: launched from Explorer or a shortcut it opens only its
+// window, not a console window beside it. Run from a terminal it attaches to that one
+// instead ([`attach_parent_console`]); with neither, a startup error is shown in a dialog
+// ([`cannot_start`]). The children it spawns stay windowless through
+// `bemtvi_core::process::no_console_window`.
+#![windows_subsystem = "windows"]
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -85,6 +92,47 @@ struct Cli {
     glyph_overflow: Option<GlyphOverflow>,
 }
 
+/// Borrow the console of the terminal that launched us, if any, so `--help`, `--version`,
+/// usage errors and a startup error still print there. A GUI-subsystem process gets no
+/// console of its own; with no parent console (an Explorer launch) this does nothing, and
+/// [`cannot_start`] falls back to a dialog.
+/// A stdout the parent already redirected (a pipe, a file) is kept, never swapped for the
+/// console. On other platforms stdio is simply inherited and this is a no-op.
+fn attach_parent_console() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{
+            AttachConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_OUTPUT_HANDLE,
+        };
+        // SAFETY: plain Win32 calls taking no pointers. A failed attach (no parent
+        // console) changes nothing.
+        unsafe {
+            if GetStdHandle(STD_OUTPUT_HANDLE).is_null() {
+                AttachConsole(ATTACH_PARENT_PROCESS);
+            }
+        }
+    }
+}
+
+/// Whether a terminal shows what we print: stdin or stderr is one. Launched from the
+/// desktop (Explorer, Finder, a `.desktop` file) neither is, and stderr goes to a log or
+/// nowhere, so [`cannot_start`] shows its error in a dialog too.
+fn has_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stderr().is_terminal() || std::io::stdin().is_terminal()
+}
+
+/// bemtvi-gui can't start: say why on stderr and, with no terminal to show it, in the
+/// platform's error dialog too (`mitsuami::fatal_error`, which needs no running app), so
+/// a launch from the desktop that fails says why instead of vanishing. Returns once the
+/// dialog is dismissed.
+fn cannot_start(message: &str) {
+    eprintln!("{message}");
+    if !has_terminal() {
+        mitsuami::fatal_error("bemtvi can't start", message.trim_end());
+    }
+}
+
 /// clap value parser for `--glyph-overflow`, so a misspelt mode is a usage error
 /// naming the alternatives rather than a silently-ignored flag.
 fn parse_glyph_overflow(spec: &str) -> Result<GlyphOverflow, String> {
@@ -100,9 +148,31 @@ fn main() -> Result<()> {
         return result;
     }
 
-    // clap parses, validates, and exits with usage/version itself for `--help`/`-h`,
-    // `--version`/`-V`, and unknown options.
-    let cli = Cli::parse();
+    attach_parent_console();
+
+    // A startup error is reported here rather than returned, so it reaches a dialog when
+    // there is no terminal.
+    if let Err(e) = start() {
+        cannot_start(&format!("Error: {e:?}"));
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Everything after the askpass check: parse the command line, build the startup
+/// session and run the window until it closes.
+fn start() -> Result<()> {
+    // clap validates and renders usage/version for `--help`/`-h`, `--version`/`-V`, and
+    // unknown options, and prints and exits itself; only a usage error with no terminal to
+    // read it also goes to the dialog.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) if !e.use_stderr() || has_terminal() => e.exit(),
+        Err(e) => {
+            cannot_start(&e.render().to_string());
+            std::process::exit(e.exit_code());
+        }
+    };
 
     // The render config starts from the `BEMTVI_GUI_FONT*` environment; the typed CLI
     // options (already validated by clap) override it.

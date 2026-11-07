@@ -31,6 +31,7 @@ pub fn env_daemon_command() -> Option<tokio::process::Command> {
     std::env::var_os(DAEMON_CMD_ENV).map(|cmd| {
         let mut c = tokio::process::Command::new("sh");
         c.arg("-c").arg(cmd);
+        bemtvi_core::process::no_console_window(c.as_std_mut());
         c
     })
 }

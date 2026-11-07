@@ -223,6 +223,7 @@ pub fn ssh_daemon_command(spec: &RemoteSpec) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+    bemtvi_core::process::no_console_window(cmd.as_std_mut());
 
     // Route ssh's interactive prompts — host-key acceptance, password / key passphrase
     // — to a GUI dialog by re-invoking *this* binary as ssh's askpass helper (see
@@ -432,18 +433,19 @@ fn confirm_dialog(prompt: &str) -> Result<String> {
 
 #[cfg(windows)]
 fn powershell(script: &str, prompt: &str) -> Result<String> {
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ])
-        .env("BEMTVI_ASKPASS_PROMPT", prompt)
-        .output()
-        .context("run powershell for the SSH dialog")?;
+    let output =
+        bemtvi_core::process::no_console_window(&mut std::process::Command::new("powershell"))
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ])
+            .env("BEMTVI_ASKPASS_PROMPT", prompt)
+            .output()
+            .context("run powershell for the SSH dialog")?;
     if !output.status.success() {
         anyhow::bail!("SSH dialog cancelled");
     }

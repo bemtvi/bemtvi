@@ -1327,6 +1327,10 @@ impl EditHost {
                 Value::from(s.to_cursor_row as u64),
             ),
             (
+                Value::from("cursor_off_band"),
+                Value::from(s.cursor_off_band),
+            ),
+            (
                 Value::from("from_leftcol"),
                 Value::from(s.from_leftcol as u64),
             ),

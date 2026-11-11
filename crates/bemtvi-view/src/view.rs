@@ -35,6 +35,10 @@ pub struct ScrollData {
     /// Screen-row offset of the cursor's row into the band at slide start / end.
     pub from_cursor_row: f32,
     pub to_cursor_row: f32,
+    /// Whether the cursor's line has no row in the band, its `*_cursor_row` only an
+    /// edge it was pinned to: a caret a modeless wheel left off screen. Read the
+    /// cursor's line through [`ScrollData::cursor_line_at`], which knows.
+    pub cursor_off_band: bool,
     /// The horizontal scroll (`leftcol`) the slide pans from / to under `nowrap`;
     /// the client paints the band's rows from the interpolated column. Equal for a
     /// purely vertical slide.
@@ -105,6 +109,19 @@ pub struct ScrollData {
     /// mid-slide replaces the live palette, which would leave the band's frozen
     /// style ids pointing at the wrong entries.
     pub styles: Vec<Style>,
+}
+
+impl ScrollData {
+    /// The 1-based buffer line the slide's cursor is on when it sits at band row
+    /// `row` (its interpolated `*_cursor_row`), for the gutter's `CursorLineNr` and
+    /// relative numbers. `None` when the cursor has no row in the band: the caller
+    /// falls back to the window's own `cursor_line`, which no band row matches.
+    pub fn cursor_line_at(&self, row: usize) -> Option<usize> {
+        if self.cursor_off_band {
+            return None;
+        }
+        self.numbers.get(row).copied().flatten()
+    }
 }
 
 /// A window's per-side blank margin (cells) mirrored from the redraw `padding`
@@ -1405,6 +1422,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             to_row: map_u64(s, "to_row") as f32,
             from_cursor_row: map_u64(s, "from_cursor_row") as f32,
             to_cursor_row: map_u64(s, "to_cursor_row") as f32,
+            cursor_off_band: map_get(s, "cursor_off_band").and_then(Value::as_bool) == Some(true),
             // A gesture without the keys pans nowhere: it rests at the window's own.
             from_leftcol: map_get(s, "from_leftcol")
                 .and_then(Value::as_u64)

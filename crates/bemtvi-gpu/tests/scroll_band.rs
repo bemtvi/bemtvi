@@ -76,3 +76,28 @@ fn band_row_paints_a_span_background_at_its_sub_pixel_offset() {
     // Scrolled wholly past the text area: nothing paints outside it.
     assert!(band_bg_rects(&segs, 2, 200.0, (cw, ch), (0.0, 200.0)).is_empty());
 }
+
+/// The band frame names the cursor's line only when the cursor has a row in the
+/// band. A caret a modeless wheel left off screen is pinned to an edge row, and the
+/// gutter took that row's line for the cursor's: its number lit in `CursorLineNr`
+/// for the length of every later notch's slide, then cleared on settle.
+#[test]
+fn band_frame_has_no_cursor_line_for_a_cursor_off_the_band() {
+    let data = gesture();
+    let frame_of = |data: &ScrollData| ScrollFrame::of(&ScrollAnim::new(data)).cursor_line;
+    // At progress 0 the cursor sits on band row 0, line 1.
+    assert_eq!(
+        frame_of(&data),
+        Some(1),
+        "a cursor in the band is on its row's line"
+    );
+    let off = ScrollData {
+        cursor_off_band: true,
+        ..gesture()
+    };
+    assert_eq!(
+        frame_of(&off),
+        None,
+        "the edge row it is pinned to isn't its line"
+    );
+}

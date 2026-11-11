@@ -1157,9 +1157,10 @@ fn render_window(
             frame_line_bg = &anim_line_bg;
             // The cursor's row within the viewport and its buffer line (for relative
             // numbers) come from the band: `cur_row - off` rows down, and the band's
-            // `numbers` at the cursor row gives the 1-based buffer line.
+            // `numbers` at the cursor row gives the 1-based buffer line — unless the
+            // cursor has no row in the band, when it is the window's own line.
             cursor_row = cur_row.saturating_sub(off) as u16;
-            current_line = a.numbers.get(cur_row).copied().flatten().unwrap_or(1);
+            current_line = a.cursor_line_at(cur_row).unwrap_or(win.cursor_line);
         }
         None => {
             frame_lines = &win.lines;

@@ -44,6 +44,11 @@ pub struct ScrollAnim {
     /// the cursor (and the relative-number gutter) tracks the moving text.
     pub from_cursor_row: usize,
     pub to_cursor_row: usize,
+    /// Whether the cursor's line at either end of the slide has no row in the band
+    /// (a modeless wheel scrolls a caret off screen and leaves it there). Its
+    /// `*_cursor_row` is then pinned to an edge row that isn't the cursor's, so a
+    /// client mustn't read the cursor's line off the band there.
+    pub cursor_off_band: bool,
     /// The horizontal scroll (`leftcol`, in screen columns) the slide pans from /
     /// to under `nowrap`. The client interpolates it alongside the row offset and
     /// paints the band's rows from that column; equal for a purely vertical slide.
@@ -1137,6 +1142,16 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                     })
                     .flatten()
             };
+            // Whether a cursor line has a row in the band. `in_band` pins one that
+            // hasn't to an edge, a row that isn't the cursor's.
+            let has_row = |line: usize| {
+                band_rows.iter().any(|r| match r.kind {
+                    RowKind::Line { line: l, .. } => l == line,
+                    RowKind::Fold { line: l, count } => (l..l + count).contains(&line),
+                    _ => false,
+                })
+            };
+            let cursor_off_band = !has_row(ps.from_cursor) || !has_row(ps.to_cursor);
             ScrollAnim {
                 from_row: screen_rows_between(
                     buf,
@@ -1180,6 +1195,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 duration_ms: ps.duration_ms,
                 rows: band_rows,
                 sel_extends_down,
+                cursor_off_band,
             }
         })
     } else {

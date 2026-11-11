@@ -6,8 +6,8 @@ use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
     attach_with_caps, command, cursor, exec_lua, feed, feed_mouse, feed_mouse_mod, feed_sync,
     field, lines, map_get, menu_items, menu_of, message_after, mode, panel_is_open, poll_menu,
-    poll_true, redraw_after, redraw_after_matching, spawn, start_clocked_init, write_temp,
-    FakeClipboard,
+    poll_true, redraw_after, redraw_after_matching, spawn, start_clocked_init, wait_redraw,
+    write_temp, FakeClipboard,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -1572,6 +1572,49 @@ async fn the_wheel_leaves_the_caret_and_the_selection_where_they_are() {
     feed(&rpc, "X");
     assert_eq!(lines(&rpc).await[0], "Xne0");
     assert_eq!(topline(&rpc).await, 1);
+}
+
+/// The slide a wheel notch starts says whether the caret is among its rows. A caret
+/// already scrolled off screen is pinned to the band's edge only to keep its row
+/// index small, so a client that took that row for the caret's line painted the
+/// edge line's number in `CursorLineNr` for the length of the slide.
+#[tokio::test]
+async fn a_slide_says_when_the_caret_is_off_its_band() {
+    let (rpc, mut inc) = start_long(200).await;
+    fn off_band(m: &[(Value, Value)]) -> Option<bool> {
+        let Some(Value::Map(s)) = field(m, "scroll") else {
+            return None;
+        };
+        Some(map_get(s, "cursor_off_band").and_then(Value::as_bool) == Some(true))
+    }
+    // One wheel notch's slide: what was queued before it is dropped first, so the
+    // frame read back is this notch's.
+    async fn notch(rpc: &Rpc, inc: &mut UnboundedReceiver<Incoming>, dir: &str) -> Option<bool> {
+        while inc.try_recv().is_ok() {}
+        feed_mouse(rpc, "wheel", dir, 5, 5);
+        let _ = cursor(rpc).await;
+        off_band(&wait_redraw(inc, |m| off_band(m).is_some()).await)
+    }
+    // From the top, the caret on line 1 slides out with its line.
+    assert_eq!(
+        notch(&rpc, &mut inc, "down").await,
+        Some(false),
+        "the caret's line is in the band"
+    );
+    // Once it is off screen, later notches slide rows it isn't on.
+    wheel_down(&rpc, 10);
+    assert!(topline(&rpc).await > 20, "the view scrolled");
+    assert_eq!(
+        notch(&rpc, &mut inc, "down").await,
+        Some(true),
+        "the caret is off the band"
+    );
+    // Back toward the top from below, it is off the band too.
+    assert_eq!(
+        notch(&rpc, &mut inc, "up").await,
+        Some(true),
+        "the caret is off the band"
+    );
 }
 
 #[tokio::test]

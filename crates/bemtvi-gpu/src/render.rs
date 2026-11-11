@@ -164,6 +164,9 @@ struct TextItem {
 pub struct ScrollFrame<'a> {
     pub row_off: f32,
     pub cursor_row: f32,
+    /// The 1-based buffer line at `cursor_row`, or `None` when the cursor has no
+    /// row in the band (see [`ScrollData::cursor_line_at`](bemtvi_view::ScrollData::cursor_line_at)).
+    pub cursor_line: Option<usize>,
     /// The interpolated horizontal scroll: the band's rows paint from this
     /// fractional column, so a `nowrap` pan slides sub-pixel like the rows do.
     pub leftcol: f32,
@@ -226,9 +229,11 @@ impl<'a> ScrollFrame<'a> {
         let t = anim.progress();
         let lerp = |a: f32, b: f32| a + (b - a) * t;
         let d = &anim.data;
+        let cursor_row = lerp(d.from_cursor_row, d.to_cursor_row);
         ScrollFrame {
             row_off: lerp(d.from_row, d.to_row),
-            cursor_row: lerp(d.from_cursor_row, d.to_cursor_row),
+            cursor_row,
+            cursor_line: d.cursor_line_at(cursor_row.round() as usize),
             leftcol: lerp(d.from_leftcol, d.to_leftcol),
             lines: &d.lines,
             selection: &d.selection,
@@ -1530,7 +1535,9 @@ impl Renderer {
                                                               // The row overlays below are the text area's own quads: they shift
                                                               // with the pan and clip to it (see after the loop).
                 let q0 = quads.len();
-                let current_line = s.numbers.get(cur_row0).copied().flatten().unwrap_or(1);
+                // A cursor with no row in the band is on the window's own line,
+                // which no band row is.
+                let current_line = s.cursor_line.unwrap_or(win.cursor_line);
                 for (k, raw) in s.lines.iter().enumerate() {
                     // Screen-row band: row `k` sits `k - row_off` rows below the
                     // viewport top, drawn sub-pixel. Interleaved `virt_lines` rows are

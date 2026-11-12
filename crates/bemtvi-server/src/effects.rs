@@ -931,7 +931,7 @@ impl EditHost {
                     // may never be the current buffer for a `FileType` event, so it
                     // installs at create rather than via a FileType autocmd).
                     if let Some(buf) = self.editor.view_buffer(id) {
-                        if let Err(e) = self.lua.install_view_keymaps(buf.0) {
+                        if let Err(e) = self.lua.install_view_keymaps(buf.0, id) {
                             self.editor.echo(format!("E5108: {e}"));
                         }
                     }

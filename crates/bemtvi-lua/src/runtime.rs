@@ -3586,16 +3586,16 @@ impl LuaRuntime {
         set.call((id, pid))
     }
 
-    /// Install view buffer `bufnr`'s buffer-local default activation map (`<CR>` →
-    /// `on_select`) by calling the prelude `btv._install_view_keymaps`. The server
+    /// Install view buffer `bufnr`'s buffer-local default activation maps (`<CR>` →
+    /// `on_select`, and the double-click when view `view` has an `on_select`) by calling the prelude `btv._install_view_keymaps`. The server
     /// calls this right after [`Editor::create_view`](bemtvi_core::Editor) mints the
     /// backing buffer — the bufnr is known synchronously in core, so the map exists
     /// before the user can reach the view (no dependence on the next-tick mirror or on
     /// the view ever becoming the current buffer for a `FileType` event).
-    pub fn install_view_keymaps(&self, bufnr: u64) -> mlua::Result<()> {
+    pub fn install_view_keymaps(&self, bufnr: u64, view: u64) -> mlua::Result<()> {
         let btv = self.btv()?;
         let f: mlua::Function = btv.get("_install_view_keymaps")?;
-        f.call::<()>(bufnr)?;
+        f.call::<()>((bufnr, view))?;
         Ok(())
     }
 

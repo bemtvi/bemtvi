@@ -43,19 +43,39 @@ end
 -- `<2-LeftMouse>` is the mouse form of `<CR>`: a single left-click positions the cursor
 -- on a row (core dock/window mouse handling) and the double-click confirms it, so a
 -- view with an `on_select` is clickable for free — a plugin needn't wire the mouse itself.
--- It's bound by `:on_select`, not here: a view with nothing to confirm keeps the word
--- selection every other buffer has.
+-- Only such a view binds it: one with nothing to confirm keeps the word selection every
+-- other buffer has. It binds here when `on_select` was set before the buffer existed
+-- (the usual create → `on_select` → mount chunk), else when `:on_select` is called.
+-- Either way it binds on the buffer's number known in core, not the next-tick mirror, so
+-- a double-click right after the view appears finds it.
 --
 -- These bind in Normal and in the `modeless` layer: a modeless session rests in Insert
 -- over a view too, and takes a read-only buffer's keys only through that layer. A
 -- plugin's own view keys need the same `{ "n", "modeless" }` pair.
-function btv._install_view_keymaps(buf)
+local function bind_double_click(view, buf)
+  view._double_click = true
+  btv.keymap.set(
+    { "n", "modeless" },
+    "<2-LeftMouse>",
+    btv.view.actions.confirm,
+    { buffer = buf, default = true, desc = "Select entry (double-click)" }
+  )
+end
+
+function btv._install_view_keymaps(buf, id)
   btv.keymap.set(
     { "n", "modeless" },
     "<CR>",
     btv.view.actions.confirm,
     { buffer = buf, default = true, desc = "Select entry" }
   )
+  local view = btv._views[id]
+  if view then
+    view._created_buf = buf
+    if view._on_select and not view._double_click then
+      bind_double_click(view, buf)
+    end
+  end
 end
 
 local View = {}
@@ -259,14 +279,10 @@ end
 -- the 1-based cursor line and that line's userdata entry.
 function View:on_select(fn)
   self._on_select = fn
-  if fn and not self._double_click then
-    self._double_click = true
-    btv.keymap.set(
-      { "n", "modeless" },
-      "<2-LeftMouse>",
-      btv.view.actions.confirm,
-      { buffer = self, default = true, desc = "Select entry (double-click)" }
-    )
+  -- Before the buffer exists, `btv._install_view_keymaps` binds the double-click.
+  local buf = self._created_buf or self:bufnr()
+  if fn and buf and not self._double_click then
+    bind_double_click(self, buf)
   end
   return self
 end

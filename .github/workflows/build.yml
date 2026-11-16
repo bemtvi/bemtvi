@@ -40,8 +40,8 @@ jobs:
           # (installs to /usr/local/bin). Windows: bare .exe in a zip.
           - { target: x86_64-unknown-linux-gnu,   runner: ubuntu-latest,    os: linux,   kind: tui, suffix: x86_64-linux,        ext: tar.gz }
           - { target: aarch64-unknown-linux-gnu,  runner: ubuntu-24.04-arm,  os: linux,   kind: tui, suffix: aarch64-linux,       ext: tar.gz }
-          - { target: x86_64-apple-darwin,        runner: macos-15-intel,    os: macos,   kind: tui, suffix: x86_64-macos,        ext: pkg }
-          - { target: aarch64-apple-darwin,       runner: macos-14,          os: macos,   kind: tui, suffix: aarch64-macos,       ext: pkg }
+          - { target: x86_64-apple-darwin,        runner: macos-26-intel,    os: macos,   kind: tui, suffix: x86_64-macos,        ext: pkg }
+          - { target: aarch64-apple-darwin,       runner: macos-26,          os: macos,   kind: tui, suffix: aarch64-macos,       ext: pkg }
           - { target: x86_64-pc-windows-msvc,     runner: windows-latest,    os: windows, kind: tui, suffix: x86_64-windows,      ext: zip }
           # ── GUI (`bemtvi-gui`, mitsuami + wgpu) ───────────────────────────
           # Linux: glibc (gnu) — the graphics stack won't link against static
@@ -51,8 +51,8 @@ jobs:
           # (needs the Windows App Runtime 2.4+, for mitsuami's WinUI 3 backend).
           - { target: x86_64-unknown-linux-gnu,   runner: ubuntu-latest,    os: linux,   kind: gui, suffix: x86_64-linux,        ext: tar.gz }
           - { target: aarch64-unknown-linux-gnu,  runner: ubuntu-24.04-arm,  os: linux,   kind: gui, suffix: aarch64-linux,       ext: tar.gz }
-          - { target: x86_64-apple-darwin,        runner: macos-15-intel,    os: macos,   kind: gui, suffix: x86_64-macos,        ext: dmg }
-          - { target: aarch64-apple-darwin,       runner: macos-14,          os: macos,   kind: gui, suffix: aarch64-macos,       ext: dmg }
+          - { target: x86_64-apple-darwin,        runner: macos-26-intel,    os: macos,   kind: gui, suffix: x86_64-macos,        ext: dmg }
+          - { target: aarch64-apple-darwin,       runner: macos-26,          os: macos,   kind: gui, suffix: aarch64-macos,       ext: dmg }
           - { target: x86_64-pc-windows-msvc,     runner: windows-latest,    os: windows, kind: gui, suffix: x86_64-windows,      ext: zip }
     steps:
       - uses: actions/checkout@v7
@@ -84,6 +84,13 @@ jobs:
             *)            PKG_VERSION="$V" ;;
           esac
           echo "PKG_VERSION=$PKG_VERSION" >> "$GITHUB_ENV"
+          # One macOS floor for every build: 11.0 (Big Sur), matching the .app's
+          # LSMinimumSystemVersion. Without it the Intel target falls back to
+          # rustc's 10.12 default, a floor nobody tests. Read by rustc and by cc
+          # for the C dependencies built via cc (e.g. the vendored Lua).
+          if [ "${{ matrix.os }}" = "macos" ]; then
+            echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

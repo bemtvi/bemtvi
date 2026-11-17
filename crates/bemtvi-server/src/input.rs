@@ -211,6 +211,9 @@ impl EditHost {
     fn apply_paste(&mut self, payload: Vec<Key>) {
         let text = payload_text(&payload);
         if self.editor.paste_literal(&text) || self.editor.paste_put(&text) {
+            // The paste lands outside `Editor::input`: note where it left the cursor
+            // now, before anything moves it (redo returns there).
+            self.editor.note_edit_end();
             return;
         }
         let first_line_only =

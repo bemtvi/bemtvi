@@ -918,3 +918,233 @@ async fn undo_and_redo_never_rewind_under_a_selection() {
     feed_sync(&rpc, "u").await;
     assert_eq!(lines(&rpc).await, v(&["YXalpha", "bravo"]));
 }
+
+// ----- Where undo and redo leave the cursor ----------------------------------
+//
+// Undo returns the cursor to where the change began, redo to where the change left
+// it — never to where it sat when the key was pressed. Moving away after an edit
+// and then undoing/redoing must not drag the cursor to that later spot.
+
+#[tokio::test]
+async fn redo_lands_at_the_change_not_where_the_cursor_was_left() {
+    let path = write_n_lines("redo_cursor", 6);
+    let (rpc, _incoming) = start(Some(path)).await;
+    feed(&rpc, "2G3G2lx5G"); // A → B, edit at B, then away to C
+    assert_eq!(lines(&rpc).await[2], "lie3");
+    feed(&rpc, "u");
+    assert_eq!(cursor(&rpc).await, (3, 2), "undo lands at the change");
+    feed(&rpc, "<C-r>");
+    assert_eq!(lines(&rpc).await[2], "lie3", "redone");
+    assert_eq!(
+        cursor(&rpc).await,
+        (3, 2),
+        "redo lands at the change, not at C"
+    );
+    feed(&rpc, "u<C-r>");
+    assert_eq!(cursor(&rpc).await, (3, 2), "and keeps landing there");
+}
+
+#[tokio::test]
+async fn undo_lands_at_an_inserts_start_and_redo_at_its_end() {
+    let path = write_n_lines("redo_cursor_insert", 6);
+    let (rpc, _incoming) = start(Some(path)).await;
+    feed(&rpc, "2G3G2lifoo<Esc>5G");
+    assert_eq!(lines(&rpc).await[2], "lifoone3");
+    feed(&rpc, "u");
+    assert_eq!(cursor(&rpc).await, (3, 2), "undo: where the insert began");
+    feed(&rpc, "<C-r>");
+    assert_eq!(lines(&rpc).await[2], "lifoone3", "redone");
+    assert_eq!(
+        cursor(&rpc).await,
+        (3, 4),
+        "redo: where `<Esc>` left it, on the last `o`"
+    );
+    feed(&rpc, "u<C-r>");
+    assert_eq!(cursor(&rpc).await, (3, 4), "and keeps landing there");
+}
+
+#[tokio::test]
+async fn a_click_before_leaving_insert_is_not_where_the_edit_ended() {
+    // Two typing steps (`foo`, ` bar`), then a click elsewhere, then `<Esc>`. The
+    // click is a move, not part of the edit: redoing ` bar` lands on its last char.
+    let path = write_n_lines("redo_cursor_click", 6);
+    let (rpc, _incoming) = start(Some(path)).await;
+    feed(&rpc, "3G2lifoo bar");
+    assert_eq!(lines(&rpc).await[2], "lifoo barne3");
+    bemtvi_test_harness::feed_mouse(&rpc, "left", "press", 4, 1);
+    feed(&rpc, "<Esc>");
+    assert_eq!(cursor(&rpc).await, (5, 0), "the click moved the cursor");
+    feed(&rpc, "u");
+    assert_eq!(lines(&rpc).await[2], "lifoone3", "undid ` bar`");
+    assert_eq!(cursor(&rpc).await, (3, 5), "undo: where ` bar` began");
+    feed(&rpc, "<C-r>");
+    assert_eq!(lines(&rpc).await[2], "lifoo barne3", "redone");
+    assert_eq!(cursor(&rpc).await, (3, 8), "redo: on the `r` that ended it");
+}
+
+#[tokio::test]
+async fn a_plugin_move_after_a_paste_is_not_where_the_paste_ended() {
+    // A bracketed paste lands outside the key path; a plugin then moves the cursor
+    // before the next key. Redo returns to where the paste left it.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iabc<CR>zzz<CR>yyy<Esc>gg0l");
+    feed(&rpc, "<PasteStart>XYZ<PasteEnd>");
+    assert_eq!(lines(&rpc).await[0], "abXYZc");
+    let after_paste = cursor(&rpc).await;
+    exec_lua(&rpc, "btv.win.set_cursor(0, 3, 1)").await;
+    assert_eq!(cursor(&rpc).await, (3, 1), "the plugin moved the cursor");
+    feed(&rpc, "u<C-r>");
+    assert_eq!(lines(&rpc).await[0], "abXYZc", "redone");
+    assert_eq!(cursor(&rpc).await, after_paste);
+}
+
+#[tokio::test]
+async fn a_plugin_move_after_a_plugin_edit_is_not_where_the_edit_ended() {
+    let path = write_n_lines("redo_cursor_plugin", 4);
+    let (rpc, _incoming) = start(Some(path)).await;
+    // The edit and the move are separate plugin calls, with no key between them.
+    feed(&rpc, "2G3l");
+    exec_lua(&rpc, "btv.buf.set_text(0, 1, 0, 1, 0, { 'NEW' })").await;
+    assert_eq!(lines(&rpc).await[1], "NEWline2");
+    exec_lua(&rpc, "btv.win.set_cursor(0, 4, 0)").await;
+    assert_eq!(cursor(&rpc).await, (4, 0));
+    feed(&rpc, "u<C-r>");
+    assert_eq!(lines(&rpc).await[1], "NEWline2", "redone");
+    assert_eq!(
+        cursor(&rpc).await,
+        (2, 3),
+        "where the cursor was when the edit landed"
+    );
+}
+
+#[tokio::test]
+async fn a_plugin_edit_then_placement_in_one_call_is_where_it_ended() {
+    // An autopairs-style plugin edits and places the cursor in one call: the
+    // placement is part of the edit, so redo lands where the plugin put it.
+    let path = write_n_lines("redo_cursor_place", 4);
+    let (rpc, _incoming) = start(Some(path)).await;
+    feed(&rpc, "4G");
+    exec_lua(
+        &rpc,
+        "btv.buf.set_text(0, 1, 0, 1, 0, { '()' }) btv.win.set_cursor(0, 2, 1)",
+    )
+    .await;
+    assert_eq!(lines(&rpc).await[1], "()line2");
+    assert_eq!(cursor(&rpc).await, (2, 1));
+    feed(&rpc, "Gu<C-r>");
+    assert_eq!(lines(&rpc).await[1], "()line2", "redone");
+    assert_eq!(cursor(&rpc).await, (2, 1), "where the plugin placed it");
+}
+
+#[tokio::test]
+async fn an_ex_move_after_a_plugin_edit_is_not_where_the_edit_ended() {
+    let path = write_n_lines("redo_cursor_excmd", 4);
+    let (rpc, _incoming) = start(Some(path)).await;
+    feed(&rpc, "2G3l");
+    exec_lua(&rpc, "btv.buf.set_text(0, 0, 0, 0, 0, { 'Q' })").await;
+    command(&rpc, "4").await;
+    assert_eq!(cursor(&rpc).await, (4, 0));
+    feed(&rpc, "ggu<C-r>");
+    assert_eq!(lines(&rpc).await[0], "Qline1", "redone");
+    assert_eq!(cursor(&rpc).await, (2, 3));
+}
+
+#[tokio::test]
+async fn a_client_move_after_a_client_ex_edit_is_not_where_the_edit_ended() {
+    // Both arrive as RPC requests from the client — no key, no Lua.
+    let path = write_n_lines("redo_cursor_rpc", 4);
+    let (rpc, _incoming) = start(Some(path)).await;
+    command(&rpc, "2s/i/X/").await;
+    assert_eq!(cursor(&rpc).await, (2, 0));
+    rpc.request(
+        "nvim_win_set_cursor",
+        vec![
+            Value::from(0u64),
+            Value::Array(vec![Value::from(4u64), Value::from(0u64)]),
+        ],
+    )
+    .await
+    .expect("set_cursor");
+    assert_eq!(cursor(&rpc).await, (4, 0));
+    feed(&rpc, "ggu<C-r>");
+    assert_eq!(lines(&rpc).await[1], "lXne2", "redone");
+    assert_eq!(cursor(&rpc).await, (2, 0), "where the `:s` left it");
+}
+
+#[tokio::test]
+async fn a_deferred_bar_chain_move_is_not_where_the_edit_ended() {
+    // `Ins` is a Lua user command, so the rest of the line waits for it to run.
+    let path = write_n_lines("redo_cursor_chain", 4);
+    let (rpc, _incoming) = start(Some(path)).await;
+    exec_lua(
+        &rpc,
+        "btv.command('Ins', function() btv.buf.set_text(0, 0, 0, 0, 0, { 'Q' }) end)",
+    )
+    .await;
+    feed(&rpc, "2G3l:Ins|4<CR>");
+    assert_eq!(lines(&rpc).await[0], "Qline1");
+    assert_eq!(cursor(&rpc).await, (4, 0));
+    feed(&rpc, "ggu<C-r>");
+    assert_eq!(lines(&rpc).await[0], "Qline1", "redone");
+    assert_eq!(cursor(&rpc).await, (2, 3));
+}
+
+#[tokio::test]
+async fn a_later_bar_command_is_not_where_the_edit_ended() {
+    let path = write_n_lines("redo_cursor_bar", 4);
+    let (rpc, _incoming) = start(Some(path)).await;
+    feed(&rpc, ":2s/i/X/|4<CR>");
+    assert_eq!(lines(&rpc).await[1], "lXne2");
+    assert_eq!(cursor(&rpc).await, (4, 0), "the bar's `4` moved the cursor");
+    feed(&rpc, "ggu<C-r>");
+    assert_eq!(lines(&rpc).await[1], "lXne2", "redone");
+    assert_eq!(cursor(&rpc).await, (2, 0), "where the `:s` left it");
+}
+
+#[tokio::test]
+async fn redo_of_a_line_delete_lands_at_the_change() {
+    let path = write_n_lines("redo_cursor_dd", 6);
+    let (rpc, _incoming) = start(Some(path)).await;
+    feed(&rpc, "3Gdd5G");
+    feed(&rpc, "u<C-r>");
+    assert_eq!(lines(&rpc).await.len(), 5, "redone");
+    assert_eq!(cursor(&rpc).await, (3, 0));
+}
+
+#[tokio::test]
+async fn redo_of_a_put_above_lands_on_the_put_line() {
+    let path = write_n_lines("redo_cursor_put", 6);
+    let (rpc, _incoming) = start(Some(path)).await;
+    feed(&rpc, "1Gyy4GP6G");
+    assert_eq!(lines(&rpc).await[3], "line1");
+    feed(&rpc, "u<C-r>");
+    assert_eq!(lines(&rpc).await[3], "line1", "redone");
+    assert_eq!(cursor(&rpc).await, (4, 0), "on the line the put put back");
+}
+
+#[tokio::test]
+async fn later_lands_at_the_change_it_redoes() {
+    let path = write_n_lines("later_cursor", 6);
+    let (rpc, _incoming) = start(Some(path)).await;
+    feed(&rpc, "3G2lifoo<Esc>5G");
+    feed(&rpc, "ug+");
+    assert_eq!(lines(&rpc).await[2], "lifoone3", "g+ redid the change");
+    assert_eq!(cursor(&rpc).await, (3, 4));
+    feed(&rpc, "u:undo 1<CR>");
+    assert_eq!(cursor(&rpc).await, (3, 4), "`:undo 1` forward too");
+}
+
+#[tokio::test]
+async fn undo_of_an_older_branch_lands_at_its_own_change() {
+    // Two branches fork off the original: `x` on line 2, then (after undoing it)
+    // `x` on line 5. Back on the first branch via `:undo 1`, a plain `u` undoes
+    // *that* change — so it lands on line 2, not where the newer branch began.
+    let path = write_n_lines("undo_branch_cursor", 6);
+    let (rpc, _incoming) = start(Some(path)).await;
+    feed(&rpc, "2G1lx");
+    feed(&rpc, "u5G3lx");
+    feed(&rpc, ":undo 1<CR>");
+    assert_eq!(lines(&rpc).await[1], "lne2");
+    feed(&rpc, "u");
+    assert_eq!(cursor(&rpc).await, (2, 1));
+}

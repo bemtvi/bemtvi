@@ -457,6 +457,18 @@ struct UndoNode {
     /// `save` field of `vim.fn.undotree()` entries (neovim's `uh_save_nr`).
     save: Option<u64>,
     snap: Snapshot,
+    /// Where the cursor was when the change that made this state *began* — vim's
+    /// `uh_cursor`. Undoing this change lands here. `snap.cursor` can't serve: it is
+    /// where the cursor sat when focus *left* the state (snapshots are taken lazily,
+    /// and re-synced when the next change starts), so after an edit, a move elsewhere
+    /// and an undo, it is that later spot. The root's is unused.
+    edit_cursor: Cursor,
+    /// Where the change that made this state *left* the cursor — redoing it lands
+    /// here. Noted as edits happen (see [`UndoTree::edit_end`]), for the same reason
+    /// `snap.cursor` can't serve as [`edit_cursor`](Self::edit_cursor) either. The
+    /// flag says it was noted in Insert, where the cursor sits *after* the last
+    /// typed character; a redo landing in Normal steps back onto it, as `<Esc>` does.
+    end_cursor: (Cursor, bool),
     /// The live [`ExtmarkStore::generation`] this node's `snap.extmarks` was last
     /// made equal to. `push_undo` re-syncs the snapshot's marks against the live
     /// store, and cloning the whole store on every change group is work that scales
@@ -497,6 +509,13 @@ struct UndoTree {
     /// node's `save` number. `vim.fn.undotree()` reports it as `save_last`.
     /// (Neovim's `b_u_save_nr_last`.)
     save_last: u64,
+    /// The buffer's `changedtick` after its latest edit, and where that edit left
+    /// the cursor (and whether in Insert) — what a commit records as the new state's
+    /// [`UndoNode::end_cursor`]. Noted around every key and mouse gesture
+    /// ([`Editor::note_edit_end`]); an edit made outside them (an LSP format, a
+    /// plugin's write) is noted before the next one, so cursor moves after an edit
+    /// never count as where it ended.
+    edit_end: Option<(u64, Cursor, bool)>,
 }
 
 /// A buffer as the editor holds it: the text [`Buffer`] plus the state vim keeps
@@ -2671,6 +2690,15 @@ impl Editor {
 
     /// Feed a single key into the editor.
     pub fn input(&mut self, key: Key) {
+        // Where an edit leaves the cursor is what redo returns to — see
+        // [`Editor::note_edit_end`]. Before the key: an edit made outside any key.
+        // After it: this key's own edit.
+        self.note_edit_end();
+        self.input_key(key);
+        self.note_edit_end();
+    }
+
+    fn input_key(&mut self, key: Key) {
         // The bracketed-paste markers carry no text and mutate nothing — they only
         // open / close the span in which insert mode takes keys literally. The live
         // input path consumes them server-side (it buffers the payload and inserts it

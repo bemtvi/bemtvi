@@ -859,6 +859,8 @@ impl Editor {
             };
             let deferred_before = self.deferred_commands.len();
             self.execute_ex_one(seg);
+            // `:s/…/|4`: the next segment's move is not where this one's edit ended.
+            self.note_edit_end();
             let Some(tail) = tail else { return };
             if self.message_error {
                 return;

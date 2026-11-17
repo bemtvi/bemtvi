@@ -733,6 +733,24 @@ async fn undo_and_redo_stay_in_insert() {
 }
 
 #[tokio::test]
+async fn undo_lands_at_the_edits_start_and_redo_at_its_end() {
+    let (rpc, _inc) = start_modeless("one\ntwo\nthree\nfour\n").await;
+    feed(&rpc, "<Down><Right>XY<Down><Down><End>");
+    assert_eq!(lines(&rpc).await, v(&["one", "tXYwo", "three", "four"]));
+    assert_eq!(cursor(&rpc).await, (4, 4));
+    feed(&rpc, "<C-z>");
+    assert_eq!(lines(&rpc).await, v(&["one", "two", "three", "four"]));
+    assert_eq!(cursor(&rpc).await, (2, 1), "undo: where the typing began");
+    feed(&rpc, "<C-y>");
+    assert_eq!(lines(&rpc).await, v(&["one", "tXYwo", "three", "four"]));
+    assert_eq!(
+        cursor(&rpc).await,
+        (2, 3),
+        "redo: where the typing left the caret"
+    );
+}
+
+#[tokio::test]
 async fn a_paste_undoes_as_one_step() {
     let (rpc, clip, _inc) = start_clip("\n").await;
     feed(&rpc, "abc ");
@@ -2794,6 +2812,29 @@ async fn focusing_a_live_terminal_from_insert_rests_in_the_job() {
     assert_eq!(mode(&rpc).await, "i");
     focus_other(&rpc).await;
     assert_eq!(mode(&rpc).await, "t", "back on the terminal");
+}
+
+#[tokio::test]
+async fn redo_of_a_middle_click_paste_lands_where_the_paste_left_the_caret() {
+    // The paste is a mouse edit; a plugin then moves the caret (no key, no click in
+    // between). Redo must land after the pasted text, not where the plugin left it.
+    let (rpc, clip, _inc) = start_clip("one\ntwo\n").await;
+    clip.seed("PASTED", false);
+    feed_mouse(&rpc, "middle", "press", 0, 1);
+    feed_mouse(&rpc, "middle", "release", 0, 1);
+    assert_eq!(lines(&rpc).await, v(&["oPASTEDne", "two"]));
+    let after_paste = cursor(&rpc).await;
+    exec_lua(&rpc, "btv.win.set_cursor(0, 2, 2)").await;
+    assert_eq!(cursor(&rpc).await, (2, 2), "the plugin moved the caret");
+    feed(&rpc, "<C-z>");
+    assert_eq!(lines(&rpc).await, v(&["one", "two"]));
+    feed(&rpc, "<C-y>");
+    assert_eq!(lines(&rpc).await, v(&["oPASTEDne", "two"]));
+    assert_eq!(
+        cursor(&rpc).await,
+        after_paste,
+        "redo: where the paste left it"
+    );
 }
 
 #[tokio::test]

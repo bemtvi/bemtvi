@@ -70,6 +70,8 @@ impl UndoTree {
             children: Vec::new(),
             time: 0,
             save: None,
+            edit_cursor: Cursor::default(),
+            end_cursor: (Cursor::default(), false),
             snap_extmark_gen: buffer.extmarks.generation(),
             snap: Snapshot {
                 text: buffer.text.clone(),
@@ -89,6 +91,7 @@ impl UndoTree {
             dirty_since: 0,
             dirty_tick: 0,
             save_last: 0,
+            edit_end: None,
         }
     }
 
@@ -155,6 +158,27 @@ impl UndoTree {
     /// see [`UndoNode::snap_extmark_gen`].
     fn cur_snapshot_extmark_gen(&self) -> u64 {
         self.nodes[self.cur].snap_extmark_gen
+    }
+
+    /// Where the cursor lands when moving from `cur` to `target`: at the last change
+    /// the move undoes or redoes — never where the cursor happened to be when focus
+    /// left `target`.
+    ///
+    /// Going back to an ancestor, the last change undone is the one just below
+    /// `target` on the path from `cur`, and the cursor returns to where that change
+    /// began ([`UndoNode::edit_cursor`], already in `target`'s text). Any other move
+    /// ends by redoing `target`'s own change, and lands where that change left the
+    /// cursor ([`UndoNode::end_cursor`]); the flag is set when that was noted in
+    /// Insert (see [`Editor::undo_landing`]).
+    fn landing_cursor(&self, target: NodeIdx) -> (Cursor, bool) {
+        let mut at = self.cur;
+        while let Some(parent) = self.nodes[at].parent {
+            if parent == target {
+                return (self.nodes[at].edit_cursor, false);
+            }
+            at = parent;
+        }
+        self.nodes[target].end_cursor
     }
 
     /// Seq of the current state (`b_u_seq_cur`).
@@ -370,7 +394,7 @@ impl UndoTree {
     /// reports for the state while it is still pending: without this the same state
     /// would silently change its `undotree()` timestamp on commit, and `:earlier {N}s`
     /// would measure from when a change *ended* rather than when it was made.
-    fn commit(&mut self, snap: Snapshot) {
+    fn commit(&mut self, snap: Snapshot, end_cursor: (Cursor, bool)) {
         let now = self.dirty_since;
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -379,12 +403,17 @@ impl UndoTree {
         // construction — recorded here so the re-sync in `set_cur_snapshot_cursors`
         // can skip a second clone of the very same marks.
         let snap_extmark_gen = snap.extmarks.generation();
+        // The parent's snapshot cursor was re-synced when this change began (see
+        // `Editor::refresh_undo_cursor_marks`), and nothing touches it since.
+        let edit_cursor = self.nodes[self.cur].snap.cursor;
         self.nodes.push(UndoNode {
             seq,
             parent: Some(self.cur),
             children: Vec::new(),
             time: now,
             save: None,
+            edit_cursor,
+            end_cursor,
             snap_extmark_gen,
             snap,
         });
@@ -707,13 +736,59 @@ impl Editor {
             return;
         }
         let snap = self.snapshot_of(id);
+        // Where the edit left the cursor. Nothing noted at this tick (an edit made
+        // since the last key, committed before the next) means the cursor hasn't
+        // been moved past it yet, so the snapshot's live one is it.
+        let tick = self.buffers.get(id).buffer.changedtick;
+        let end_cursor = match self.buffers.get(id).undo.edit_end {
+            Some((at, cursor, insert)) if at == tick => (cursor, insert),
+            _ => (snap.cursor, self.mode.is_insert()),
+        };
         let keep = undo_levels_to_keep(self.buffers.get(id).buffer.options.undolevels);
         let ob = self.buffers.get_mut(id);
-        ob.undo.commit(snap);
+        ob.undo.commit(snap, end_cursor);
         // Bound the history to `'undolevels'`. Pruning here (rather than when the
         // option is set) matches vim: a new limit governs what is kept from the next
         // change on, it does not retroactively free what is already recorded.
         ob.undo.prune(keep);
+    }
+
+    /// Note where the latest edit to the current buffer left the cursor, as the
+    /// [`UndoTree::edit_end`] a commit turns into [`UndoNode::end_cursor`]. Only
+    /// when the buffer changed since the last note: a cursor move alone — an arrow,
+    /// a click, the `<Esc>` that leaves Insert — never counts. Called around every
+    /// key and mouse gesture and between `|`-chained ex commands; the server calls it
+    /// after each Lua chunk's effects (every plugin, RPC and LSP-callback edit lands
+    /// through one) and after a bracketed paste. The edits and cursor placement one
+    /// chunk makes count together; a move made after it never does.
+    pub fn note_edit_end(&mut self) {
+        let tick = self.buffer().changedtick;
+        let cursor = self.cursor;
+        let insert = self.mode.is_insert();
+        let t = &mut self.cur_mut().undo;
+        if t.edit_end.is_none_or(|(at, _, _)| at != tick) {
+            t.edit_end = Some((tick, cursor, insert));
+        }
+    }
+
+    /// Point `snap` (the state at `node`, about to be restored) at where moving onto
+    /// `node` lands — see [`UndoTree::landing_cursor`]. An end noted in Insert sits
+    /// just past the last typed character; landing in Normal, step back onto it, as
+    /// the `<Esc>` that ended the typing did (or would have).
+    fn undo_landing(&self, id: BufferId, node: NodeIdx, snap: &mut Snapshot) {
+        let (mut cursor, in_insert) = self.buffers.get(id).undo.landing_cursor(node);
+        if in_insert && !self.mode.is_insert() && cursor.col > 0 {
+            use ropey::LineType::LF_CR as LT;
+            if cursor.line < snap.text.len_lines(LT) {
+                let line = snap.text.line(cursor.line, LT).to_string();
+                if let Some(before) = line.get(..cursor.col) {
+                    if let Some(ch) = before.chars().next_back() {
+                        cursor.col -= ch.len_utf8();
+                    }
+                }
+            }
+        }
+        snap.cursor = cursor;
     }
 
     /// Record that buffer `id` was just written to disk: commit any pending edit
@@ -827,12 +902,26 @@ impl Editor {
             // commits it, a reload or a switch to another buffer brings a tree with
             // none open. Edits made then would belong to no group at all, and the next
             // undo would step back past them for good. Open this buffer's group now.
+            //
             if !self.cur_mut().undo.dirty {
                 let id = self.cur_buffer();
                 self.refresh_undo_cursor_marks(id);
                 let now = self.now_mono;
                 let ob = self.cur_mut();
                 ob.undo.mark_dirty(now, ob.buffer.changedtick);
+            } else {
+                // Open but unchanged, the group still matches `cur`'s text: an insert
+                // session opens its group on entry, and the caret may have moved
+                // (arrows, a click) before the first edit, so undo must land where that
+                // edit is made, not where the session began. Only the primary cursor
+                // is re-synced — the selection was taken by `mark_undo_point` before an
+                // edit that drops it, and must survive the drop.
+                let cursor = self.cursor;
+                let ob = self.cur_mut();
+                if !ob.undo.pending(ob.buffer.changedtick) {
+                    let cur = ob.undo.cur;
+                    ob.undo.nodes[cur].snap.cursor = cursor;
+                }
             }
             return;
         }
@@ -1097,7 +1186,8 @@ impl Editor {
             self.echo("Already at oldest change");
             return;
         };
-        let snap = tree.nodes[parent].snap.clone();
+        let mut snap = tree.nodes[parent].snap.clone();
+        self.undo_landing(id, parent, &mut snap);
         let seq = tree.nodes[parent].seq;
         self.buffers.get_mut(id).undo.cur = parent;
         self.restore_snapshot(snap, seq);
@@ -1116,7 +1206,8 @@ impl Editor {
             self.echo("Already at newest change");
             return;
         };
-        let snap = tree.nodes[child].snap.clone();
+        let mut snap = tree.nodes[child].snap.clone();
+        self.undo_landing(id, child, &mut snap);
         let seq = tree.nodes[child].seq;
         self.buffers.get_mut(id).undo.cur = child;
         self.restore_snapshot(snap, seq);
@@ -1140,7 +1231,8 @@ impl Editor {
         if node == tree.cur {
             return;
         }
-        let snap = tree.nodes[node].snap.clone();
+        let mut snap = tree.nodes[node].snap.clone();
+        self.undo_landing(id, node, &mut snap);
         self.buffers.get_mut(id).undo.cur = node;
         self.restore_snapshot(snap, target);
     }
@@ -1239,7 +1331,8 @@ impl Editor {
             self.refuse_edit();
             return;
         }
-        let snap = tree.nodes[node].snap.clone();
+        let mut snap = tree.nodes[node].snap.clone();
+        self.undo_landing(id, node, &mut snap);
         let seq = tree.nodes[node].seq;
         self.buffers.get_mut(id).undo.cur = node;
         self.restore_snapshot(snap, seq);

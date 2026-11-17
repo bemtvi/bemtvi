@@ -322,6 +322,9 @@ impl Editor {
     /// mode (vim-faithful — the gesture is simply ignored, not an error). Only the
     /// gestures implemented so far act; the rest are no-ops until their phase.
     pub fn mouse(&mut self, ev: MouseEvent) {
+        // A click after an edit made outside any key must not count as where it
+        // ended — see [`Editor::note_edit_end`].
+        self.note_edit_end();
         // The command-line wildmenu is bemtvi's own interactive overlay (neovim doesn't
         // click it at all), so a press / wheel that lands on it acts regardless of the
         // command-mode `'c'` flag — which the default `'mouse'` ("nvi") omits, and which

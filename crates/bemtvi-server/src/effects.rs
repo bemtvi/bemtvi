@@ -698,6 +698,10 @@ impl EditHost {
         self.apply_lua_effects_inner();
         let edited = self.editor.buffer().changedtick != pre_tick;
         self.editor.end_scroll_gesture(edited);
+        // Lua's edits land here, not in `Editor::input`: a chunk that edits and then
+        // places the cursor ended its edit there. Note it before anything after the
+        // chunk — the next event, a deferred `|` chain — moves the cursor on.
+        self.editor.note_edit_end();
     }
 
     /// A Helix verb Lua fired, opening the insert session it may have left Normal for.

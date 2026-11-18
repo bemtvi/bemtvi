@@ -17,6 +17,10 @@ pub fn caret_blink(elapsed: Duration) -> (bool, Duration) {
     (hidden, Duration::from_millis(left as u64))
 }
 
+/// The window options' modes (`'guimaximize'`, `'guiposition'`, `'guisize'`): the
+/// core's, which validates them, so the GUI reads them as the core accepts them.
+pub use bemtvi_core::gui_window::{WindowMaximize, WindowPosition, WindowSizing};
+
 /// When a single-cell glyph may be drawn bigger than the one cell the editor reserved
 /// for it, spilling its ink into the cell to its right.
 ///

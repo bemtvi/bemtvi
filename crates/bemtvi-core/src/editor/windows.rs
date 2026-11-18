@@ -1733,6 +1733,15 @@ impl Editor {
         if canon == "modeless" {
             return Err("modeless: a session setting, it takes no workspace override".into());
         }
+        // An enumerated window option takes only what `:set` would, canonical.
+        let value = match value {
+            Some(OptionScalar::Str(s)) => match crate::gui_window::check(canon, &s) {
+                Some(Ok(spec)) => Some(OptionScalar::Str(spec)),
+                Some(Err(e)) => return Err(e),
+                None => Some(OptionScalar::Str(s)),
+            },
+            other => other,
+        };
         if let Some(ref v) = value {
             let ok = matches!(
                 (kind, v),
@@ -1763,7 +1772,23 @@ impl Editor {
     /// Seed the per-workspace option overlay from the loaded workspace shada and apply it,
     /// at boot. The overlay wins over whatever `init.lua` set as the global base (recompute
     /// re-applies it on top), so workspace options take precedence regardless of load order.
-    pub fn seed_workspace_options(&mut self, overlay: crate::options::WorkspaceOptions) {
+    pub fn seed_workspace_options(&mut self, mut overlay: crate::options::WorkspaceOptions) {
+        // A saved override of a window option is checked as a new one is (written by
+        // another build, or by hand): one `:set` would refuse is dropped, said so.
+        let mut refused = Vec::new();
+        for (name, value) in overlay.iter_mut() {
+            if let crate::options::OptionScalar::Str(s) = value {
+                match crate::gui_window::check(name, s) {
+                    Some(Ok(spec)) => *s = spec,
+                    Some(Err(e)) => refused.push((name.clone(), e)),
+                    None => {}
+                }
+            }
+        }
+        for (name, e) in refused {
+            overlay.remove(&name);
+            self.echo_err(format!("{e} (a saved workspace override, dropped)"));
+        }
         self.workspace_options = overlay;
         self.recompute_effective_options();
     }
@@ -1887,6 +1912,19 @@ impl Editor {
                 return true;
             }
         }
+        // The window options likewise: only what they accept, stored canonical.
+        let canon;
+        let value = match crate::gui_window::check(name, value) {
+            Some(Ok(spec)) => {
+                canon = spec;
+                canon.as_str()
+            }
+            Some(Err(e)) => {
+                self.echo_err(e);
+                return true;
+            }
+            None => value,
+        };
         // Write the *base* layer; recompute applies the workspace overlay on top. The
         // shared name→field map (`Options::set_scalar`) reports whether `name` is a wired
         // string global, so the `:set` path can still fail loud (E518) on an unknown name.

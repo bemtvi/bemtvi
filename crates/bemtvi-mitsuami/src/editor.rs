@@ -12,7 +12,10 @@ use bemtvi_server::ConfigSource;
 use mitsuami::prelude::{on_cleanup, NodeId, Owner, Ui, View};
 use rmpv::Value;
 
-use bemtvi_gpu::{Client, ClientHandle, ClientOptions, GuiConfig, IoThread, Session};
+use bemtvi_gpu::{
+    Client, ClientHandle, ClientOptions, GuiConfig, IoThread, Session, WindowMaximize,
+    WindowPosition, WindowSizing,
+};
 
 use crate::app::App;
 
@@ -34,6 +37,15 @@ pub struct Editor {
     label: String,
     native_dialogs: bool,
     on_event: Option<Rc<dyn Fn(EditorEvent)>>,
+    window: WindowHooks,
+}
+
+/// What an app that owns the editor's window does with the editor's window options.
+#[derive(Clone, Default)]
+pub(crate) struct WindowHooks {
+    pub(crate) maximize: Option<Rc<dyn Fn(WindowMaximize)>>,
+    pub(crate) position: Option<Rc<dyn Fn(WindowPosition)>>,
+    pub(crate) sizing: Option<Rc<dyn Fn(WindowSizing)>>,
 }
 
 /// What the editor tells the app embedding it, besides that it quit (`on_exit`).
@@ -58,7 +70,35 @@ impl Editor {
             label: "bemtvi".to_owned(),
             native_dialogs: true,
             on_event: None,
+            window: WindowHooks::default(),
         }
+    }
+
+    /// What the app does when the editor's `'guimaximize'` changes (its first value
+    /// counts): whether the window the editor is in opens maximized, and with
+    /// `Always`/`Never`, is so now. For an app that owns that window, as `bemtvi-gui`
+    /// does; without it the option has nothing to act on, like `'guiopacity'` in the
+    /// TUI. Called on the UI thread.
+    pub fn on_window_maximize(mut self, on_change: impl Fn(WindowMaximize) + 'static) -> Editor {
+        self.window.maximize = Some(Rc::new(on_change));
+        self
+    }
+
+    /// What the app does when the editor's `'guiposition'` changes (its first value
+    /// counts): where the window the editor is in opens, and with `Centered`, centre it
+    /// now. For an app that owns that window, as `on_window_maximize`.
+    pub fn on_window_position(mut self, on_change: impl Fn(WindowPosition) + 'static) -> Editor {
+        self.window.position = Some(Rc::new(on_change));
+        self
+    }
+
+    /// What the app does when the editor's `'guisize'` changes (its first value
+    /// counts): how large the window the editor is in opens, and with a share of the
+    /// screen, size it so now. For an app that owns that window, as
+    /// `on_window_maximize`.
+    pub fn on_window_sizing(mut self, on_change: impl Fn(WindowSizing) + 'static) -> Editor {
+        self.window.sizing = Some(Rc::new(on_change));
+        self
     }
 
     /// What the app does with what the editor tells it ([`EditorEvent`]). Called on the
@@ -133,6 +173,7 @@ impl Editor {
             label,
             native_dialogs,
             on_event,
+            window,
         } = self;
         let handle = handle.unwrap_or_default();
         // The IO thread's wake, from any thread, for the UI-thread pump.
@@ -150,7 +191,7 @@ impl Editor {
             Arc::new(move || waker.notify_one()),
         );
         let client_handle = client.handle();
-        let app = App::new(client, on_exit, on_event);
+        let app = App::new(client, on_exit, on_event, window);
         handle.attach(&app, client_handle, io);
         {
             let (app, handle) = (app.clone(), handle.clone());

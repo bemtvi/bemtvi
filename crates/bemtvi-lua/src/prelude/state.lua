@@ -134,6 +134,9 @@ local O_GLOBAL = {
   guifont = "guifont",
   gfn = "guifont",
   guiglyphoverflow = "guiglyphoverflow",
+  guimaximize = "guimaximize",
+  guiposition = "guiposition",
+  guisize = "guisize",
   guiopacity = "guiopacity",
   guihlopacity = "guihlopacity",
   imdisable = "imdisable",
@@ -207,6 +210,9 @@ local O_GLOBAL_DEFAULT = {
   tabline = "",
   guifont = "",
   guiglyphoverflow = "",
+  guimaximize = "remember",
+  guiposition = "remember",
+  guisize = "remember",
   guiopacity = 100,
   guihlopacity = 100,
   imdisable = false,
@@ -443,6 +449,21 @@ function btv._o_route(k)
   return nil
 end
 
+-- The native GUI's window options (`guimaximize`, `guiposition`, `guisize`) checked by
+-- the core's own rules: E474 for what `:set` refuses, raised `level` up; else the value
+-- as the core stores it (lower case). Any other option's value is returned as given.
+local GUI_WINDOW = { guimaximize = true, guiposition = true, guisize = true }
+local function gui_window_value(canon, v, level)
+  if not GUI_WINDOW[canon] or type(v) ~= "string" then
+    return v
+  end
+  local spec, err = btv._gui_window_check(canon, v)
+  if not spec then
+    error(err, level + 1)
+  end
+  return spec
+end
+
 local function o_set(k, v)
   if O_WIN[k] then
     vim.wo[k] = v
@@ -472,6 +493,8 @@ local function o_set(k, v)
     if canon == "background" and v ~= "light" and v ~= "dark" then
       error("E474: Invalid argument: background=" .. tostring(v), 3)
     end
+    -- The GUI's window options take what `:set` takes, canonical (the core's check).
+    v = gui_window_value(canon, v, 3)
     -- Queue the change for the core and write through the mirror so a
     -- read-after-write within this chunk is consistent (the server overwrites it
     -- on the next push).
@@ -531,6 +554,7 @@ btv.wso = setmetatable({}, {
   end,
   __newindex = function(_, k, v)
     local canon = wso_canon(k)
+    v = gui_window_value(canon, v, 2)
     -- Queue the override (v == nil clears it) and write through the mirror so a
     -- read-after-write within this chunk is consistent (the server overwrites it on the
     -- next push, reflecting the core's validated/merged overlay).
@@ -1033,6 +1057,8 @@ local function go_set(k, v)
   end
   local canon = O_GLOBAL[k]
   if canon then
+    -- The GUI's window options take what `:set` takes, canonical (as `btv.o`).
+    v = gui_window_value(canon, v, 3)
     btv._set_global_option(canon, v)
     btv._go_mirror[canon] = v
     return

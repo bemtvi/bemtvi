@@ -1,0 +1,9 @@
+A window that opens the way you left it.
+
+Move this window, resize it, maximize it if you like, then quit with :qa and
+start bemtvi-gui again: it opens where you left it, as large, maximized or not.
+
+:set guiposition=centered  centres it now, and every time from now on.
+:set guisize=60%x70%       sizes it to a share of the screen, now and from now on.
+:set guimaximize=always    maximizes it now, and every time from now on.
+:set guisize&              back to remembering (the same & for the others).

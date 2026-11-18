@@ -594,6 +594,13 @@ pub struct GoMirror {
     /// `'guiglyphoverflow'` — when a square one-cell glyph may render over the cell to
     /// its right. Backs `vim.o.guiglyphoverflow` / `btv.o.guiglyphoverflow`.
     pub guiglyphoverflow: String,
+    /// `'guimaximize'` — whether the native GUI's window opens maximized
+    /// (`remember`/`always`/`never`). Backs `vim.o.guimaximize` / `btv.o.guimaximize`.
+    pub guimaximize: String,
+    /// `'guiposition'` — where the native GUI's window opens (`remember`/`centered`).
+    pub guiposition: String,
+    /// `'guisize'` — how large it opens (`remember` or `{W}%x{H}%`).
+    pub guisize: String,
     /// `'guiopacity'` — how opaque (`0`–`100`) the GUI paints the `Normal` background.
     /// Backs `vim.o.guiopacity` / `btv.o.guiopacity`.
     pub guiopacity: u8,

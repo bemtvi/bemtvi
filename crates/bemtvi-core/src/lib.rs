@@ -19,6 +19,7 @@ pub mod ex_names;
 pub mod extmark;
 pub mod fuzzy;
 pub mod glob;
+pub mod gui_window;
 pub mod guifont;
 pub mod highlight;
 pub mod host;

@@ -38,8 +38,8 @@ pub use editor::{Editor, EditorEvent, EditorHandle};
 // How a session starts, from the client: re-exported so an app needs this crate only.
 pub use bemtvi_gpu::remote::ConnectTarget;
 pub use bemtvi_gpu::{
-    Config, GlyphOverflow, GuiConfig, Session, SessionOptions, Shada,
-    SINGLE_FILE_DISABLED_COMMANDS, SINGLE_FILE_DISABLED_PICKERS,
+    Config, GlyphOverflow, GuiConfig, Session, SessionOptions, Shada, WindowMaximize,
+    WindowPosition, WindowSizing, SINGLE_FILE_DISABLED_COMMANDS, SINGLE_FILE_DISABLED_PICKERS,
 };
 pub use bemtvi_server::ConfigSource;
 pub use rmpv::Value;

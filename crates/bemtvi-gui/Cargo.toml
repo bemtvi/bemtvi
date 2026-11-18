@@ -23,6 +23,9 @@ tokio.workspace = true
 # The client without a toolkit (sessions, the font config), and its mitsuami view, which
 # is this window's whole content.
 bemtvi-gpu.workspace = true
+# `stdpath::state_dir`, where the window's state (where, how large, maximized) is kept
+# between runs, and `host::StdHostFs`'s atomic write that saves it.
+bemtvi-core.workspace = true
 bemtvi-mitsuami.workspace = true
 # The window and its run loop (see the root Cargo.toml).
 mitsuami.workspace = true
@@ -46,6 +49,12 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_
 # the embed rather than failing.
 [target.'cfg(windows)'.build-dependencies]
 winresource.workspace = true
+
+# The window-state e2e tests: the primary display's work area and scale (to place a
+# window by them), the screen's pixels (to see the window's opening animation), and
+# the keyboard (to type into it as it opens).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 
 # `kill(2)` in the signal e2e test: the killed binary must still run its exit
 # sequence (`tests/signal_exit.rs`).

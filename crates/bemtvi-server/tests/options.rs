@@ -342,6 +342,149 @@ async fn guiglyphoverflow_rejects_an_unknown_mode() {
     );
 }
 
+/// `'guimaximize'` — whether the native GUI's window opens maximized — defaults to
+/// `remember`, takes `always`/`never` from `btv.o` and `:set`, and is relayed on the
+/// redraw for the GUI, which owns the window. `&` goes back to `remember`.
+#[tokio::test]
+async fn guimaximize_round_trips_and_reaches_the_redraw() {
+    let (rpc, mut incoming) = start().await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.o.guimaximize").await.as_str(),
+        Some("remember")
+    );
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert_eq!(field_str(&frame, "guimaximize"), "remember");
+
+    exec_lua(&rpc, "btv.o.guimaximize = 'always'").await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.guimaximize").await.as_str(),
+        Some("always"),
+        "the option reads back through vim.o too"
+    );
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert_eq!(field_str(&frame, "guimaximize"), "always");
+
+    let msg = set_message(&rpc, &mut incoming, "guimaximize=Never").await;
+    assert!(msg.is_empty(), "a valid set is silent, got {msg:?}");
+    let msg = set_message(&rpc, &mut incoming, "guimaximize?").await;
+    assert_eq!(msg, "guimaximize=never", "stored as the canonical spelling");
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert_eq!(field_str(&frame, "guimaximize"), "never");
+
+    set_message(&rpc, &mut incoming, "guimaximize&").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.o.guimaximize").await.as_str(),
+        Some("remember")
+    );
+}
+
+#[tokio::test]
+async fn guimaximize_rejects_an_unknown_mode() {
+    // A typo fails loud (E474) on both surfaces and keeps the previous mode, rather
+    // than leaving the window on a mode nobody asked for.
+    let (rpc, mut incoming) = start().await;
+    set_message(&rpc, &mut incoming, "guimaximize=always").await;
+    let msg = set_message(&rpc, &mut incoming, "guimaximize=yes").await;
+    assert!(
+        msg.contains("E474") && msg.contains("guimaximize=yes"),
+        "a bad mode must fail loud naming it, got {msg:?}"
+    );
+    let err = exec_lua(
+        &rpc,
+        "local ok, e = pcall(function() btv.o.guimaximize = 'maximized' end); return tostring(e)",
+    )
+    .await;
+    let err = err.as_str().unwrap_or_default();
+    assert!(
+        err.contains("E474") && err.contains("guimaximize=maximized"),
+        "`btv.o` must fail loud too, got {err:?}"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv.o.guimaximize").await.as_str(),
+        Some("always"),
+        "the rejected writes left the previous mode alone"
+    );
+}
+
+/// `'guiposition'` and `'guisize'` — where and how large the native GUI's window
+/// opens — default to `remember`, take `centered` / a share of the screen from `btv.o`
+/// and `:set`, and are relayed on the redraw for the GUI.
+#[tokio::test]
+async fn guiposition_and_guisize_round_trip_and_reach_the_redraw() {
+    let (rpc, mut incoming) = start().await;
+    for name in ["guiposition", "guisize"] {
+        assert_eq!(
+            exec_lua(&rpc, &format!("return btv.o.{name}"))
+                .await
+                .as_str(),
+            Some("remember")
+        );
+    }
+    exec_lua(
+        &rpc,
+        "btv.o.guiposition = 'centered'; btv.o.guisize = '60%x70%'",
+    )
+    .await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert_eq!(field_str(&frame, "guiposition"), "centered");
+    assert_eq!(field_str(&frame, "guisize"), "60%x70%");
+
+    // Spaces and case are the user's; the stored value is canonical.
+    let msg = set_message(&rpc, &mut incoming, "guisize=100%X50%").await;
+    assert!(msg.is_empty(), "a valid set is silent, got {msg:?}");
+    let msg = set_message(&rpc, &mut incoming, "guisize?").await;
+    assert_eq!(msg, "guisize=100%x50%");
+
+    set_message(&rpc, &mut incoming, "guiposition&").await;
+    set_message(&rpc, &mut incoming, "guisize&").await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert_eq!(field_str(&frame, "guiposition"), "remember");
+    assert_eq!(field_str(&frame, "guisize"), "remember");
+}
+
+#[tokio::test]
+async fn guiposition_and_guisize_reject_what_they_cant_do() {
+    // A typo, an unsupported mode, or a share out of range fails loud (E474) on
+    // both surfaces and keeps the mode in effect.
+    let (rpc, mut incoming) = start().await;
+    set_message(&rpc, &mut incoming, "guiposition=centered").await;
+    set_message(&rpc, &mut incoming, "guisize=50%x50%").await;
+    for (set, needle) in [
+        ("guiposition=center", "guiposition=center"),
+        ("guiposition=topleft", "guiposition=topleft"),
+        ("guisize=0%x50%", "guisize=0%x50%"),
+        ("guisize=101%x50%", "guisize=101%x50%"),
+        ("guisize=960x640", "guisize=960x640"),
+        ("guisize=50%", "guisize=50%"),
+    ] {
+        let msg = set_message(&rpc, &mut incoming, set).await;
+        assert!(
+            msg.contains("E474") && msg.contains(needle),
+            "`:set {set}` must fail loud naming it, got {msg:?}"
+        );
+    }
+    let err = exec_lua(
+        &rpc,
+        "local ok, e = pcall(function() btv.o.guisize = 'big' end); return tostring(e)",
+    )
+    .await;
+    let err = err.as_str().unwrap_or_default();
+    assert!(
+        err.contains("E474") && err.contains("guisize=big"),
+        "got {err:?}"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return { btv.o.guiposition, btv.o.guisize }").await,
+        rmpv::Value::Array(vec!["centered".into(), "50%x50%".into()]),
+        "the rejected writes left the modes alone"
+    );
+}
+
 /// The redraw's `guiopacity` field, which a GUI clears its `Normal` background with.
 fn guiopacity_field(frame: &[(rmpv::Value, rmpv::Value)]) -> Option<u64> {
     field(frame, "guiopacity").and_then(rmpv::Value::as_u64)
@@ -2420,4 +2563,67 @@ async fn neovim_string_spellings_of_numeric_options_are_coerced() {
             "`{chunk}` must still fail loud naming {needle:?}, got {msg:?}"
         );
     }
+}
+
+/// A window option written from Lua is checked where it's written: a value `:set`
+/// refuses raises E474 at the call site (as `background` does) and reads back as it
+/// was in the same chunk; an accepted one reads back canonical at once, not as typed
+/// until the server's next push.
+#[tokio::test]
+async fn window_options_written_from_lua_read_back_as_the_core_has_them() {
+    let (rpc, _incoming) = start().await;
+    for (name, bad) in [
+        ("guisize", "150%x50%"),
+        ("guiposition", "left"),
+        ("guimaximize", "yes"),
+    ] {
+        let got = exec_lua(
+            &rpc,
+            &format!(
+                "local ok, e = pcall(function() btv.o.{name} = '{bad}' end)\n\
+                 return {{ tostring(e), btv.o.{name} }}"
+            ),
+        )
+        .await;
+        let got = got.as_array().expect("two values");
+        let (err, now) = (got[0].as_str().unwrap_or_default(), got[1].as_str());
+        assert!(
+            err.contains("E474") && err.contains(&format!("{name}={bad}")),
+            "`btv.o.{name} = '{bad}'` must raise E474, got {err:?}"
+        );
+        assert_eq!(now, Some("remember"), "{name} reads back as it was");
+    }
+    assert_eq!(
+        exec_lua(&rpc, "btv.o.guisize = '60%X70%'; return btv.o.guisize")
+            .await
+            .as_str(),
+        Some("60%x70%")
+    );
+}
+
+/// `btv.go` (`vim.go`, `vim.opt_global`, a global `nvim_set_option_value`) checks a
+/// window option where it's written, as `btv.o` does: it skipped the check.
+#[tokio::test]
+async fn window_options_written_through_btv_go_are_checked_too() {
+    let (rpc, _incoming) = start().await;
+    let got = exec_lua(
+        &rpc,
+        "local ok, e = pcall(function() btv.go.guimaximize = 'bogus' end)\n\
+         return { tostring(e), btv.go.guimaximize }",
+    )
+    .await;
+    let got = got.as_array().expect("two values");
+    assert!(
+        got[0]
+            .as_str()
+            .is_some_and(|e| e.contains("E474") && e.contains("guimaximize=bogus")),
+        "got {got:?}"
+    );
+    assert_eq!(got[1].as_str(), Some("remember"));
+    assert_eq!(
+        exec_lua(&rpc, "btv.go.guisize = '60%X70%'; return btv.go.guisize")
+            .await
+            .as_str(),
+        Some("60%x70%")
+    );
 }

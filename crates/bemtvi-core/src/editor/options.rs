@@ -771,6 +771,29 @@ impl Editor {
             }
             return;
         }
+        // The native GUI's window options (`guimaximize`, `guiposition`, `guisize`):
+        // global enumerated strings the core only relays, checked against
+        // `crate::gui_window` where every path in writes them
+        // (`set_global_option_str`), so a typo fails loud (E474) instead of reaching
+        // the GUI to be ignored there. `&` resets to `remember`.
+        if crate::gui_window::is_window_option(name) {
+            match op {
+                StrOp::Set(value) => {
+                    self.set_global_option_str(name, &value);
+                }
+                StrOp::Reset => {
+                    self.set_global_option_str(name, "remember");
+                }
+                StrOp::Query => {
+                    if let Some(crate::options::OptionScalar::Str(v)) =
+                        self.options.get_scalar(name)
+                    {
+                        self.echo(format!("{name}={v}"));
+                    }
+                }
+            }
+            return;
+        }
         // `fileencoding` is buffer-local and enumerated: only a real encoding
         // label (or empty, meaning UTF-8) is valid, and a bad value must fail
         // loud (E474) rather than silently sticking the buffer on the wrong

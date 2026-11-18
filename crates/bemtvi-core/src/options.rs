@@ -92,6 +92,24 @@ pub struct Options {
     /// glyphs). Empty (the default) means the client's own setting, i.e. its
     /// `--glyph-overflow` flag.
     pub guiglyphoverflow: String,
+    /// The `'guimaximize'` mode: whether the native GUI's window opens maximized. One
+    /// of `"remember"` (the default: as it was when the GUI last closed), `"always"`
+    /// or `"never"`. Like `'guifont'` the core doesn't use it — it relays it to the
+    /// native GUI, which owns the window. The window opens before a config runs, so
+    /// the GUI saves the resolved state when it closes and opens by that next time;
+    /// changing it to `always`/`never` also maximizes or restores the window then.
+    pub guimaximize: String,
+    /// The `'guiposition'` mode: where the native GUI's window opens. `"remember"`
+    /// (the default: where it was when the GUI last closed) or `"centered"` (centred
+    /// on its screen). Relayed like `'guimaximize'`; `centered` also centres the
+    /// window as it changes to it. Where the platform places windows itself (GTK, Wayland),
+    /// the GUI says so instead.
+    pub guiposition: String,
+    /// The `'guisize'` mode: how large the native GUI's window opens. `"remember"`
+    /// (the default: as it was when the GUI last closed) or `"{W}%x{H}%"`, that
+    /// share of its screen's work area (`"60%x70%"`). Relayed like `'guimaximize'`;
+    /// changing it to a share also resizes the window then.
+    pub guisize: String,
     /// The `'guiopacity'` percentage (`0`–`100`): how opaque a GUI paints the `Normal`
     /// background. Below `100` the window's backdrop shows through — the window's Mica
     /// on Windows, behind-window vibrancy on macOS — while explicit backgrounds (selections, status lines,
@@ -423,6 +441,9 @@ impl Options {
             ("tabline", Str(s)) => self.tabline = s.clone(),
             ("guifont", Str(s)) => self.guifont = s.clone(),
             ("guiglyphoverflow", Str(s)) => self.guiglyphoverflow = s.clone(),
+            ("guimaximize", Str(s)) => self.guimaximize = s.clone(),
+            ("guiposition", Str(s)) => self.guiposition = s.clone(),
+            ("guisize", Str(s)) => self.guisize = s.clone(),
             ("mouse", Str(s)) => self.mouse = s.clone(),
             ("httphost", Str(s)) => self.httphost = s.clone(),
             ("mousemodel", Str(s)) => self.mousemodel = s.clone(),
@@ -482,6 +503,9 @@ impl Options {
             "tabline" => Str(self.tabline.clone()),
             "guifont" => Str(self.guifont.clone()),
             "guiglyphoverflow" => Str(self.guiglyphoverflow.clone()),
+            "guimaximize" => Str(self.guimaximize.clone()),
+            "guiposition" => Str(self.guiposition.clone()),
+            "guisize" => Str(self.guisize.clone()),
             "mouse" => Str(self.mouse.clone()),
             "httphost" => Str(self.httphost.clone()),
             "mousemodel" => Str(self.mousemodel.clone()),
@@ -626,6 +650,11 @@ impl Default for Options {
             // No custom GUI font by default — the client uses its own.
             guifont: String::new(),
             guiglyphoverflow: String::new(),
+            // The window opens as it was when the GUI last closed.
+            guimaximize: "remember".to_string(),
+            // Where, and as large as, it was when the GUI last closed.
+            guiposition: "remember".to_string(),
+            guisize: "remember".to_string(),
             // A solid background until a config asks for the backdrop to show through.
             guiopacity: 100,
             guihlopacity: 100,
@@ -2372,6 +2401,30 @@ static OPTIONS: &[OptionInfo] = {
             scope: Global,
             doc: "When a square one-cell glyph (a Nerd Font icon) may render at full \
                   size over the next cell: never, always, when-followed-by-space.",
+        },
+        OptionInfo {
+            name: "guimaximize",
+            abbrev: None,
+            kind: Str,
+            scope: Global,
+            doc: "Whether the GUI's window opens maximized: remember (as it was when \
+                  the GUI last closed), always, never.",
+        },
+        OptionInfo {
+            name: "guiposition",
+            abbrev: None,
+            kind: Str,
+            scope: Global,
+            doc: "Where the GUI's window opens: remember (where it was when the GUI \
+                  last closed), centered.",
+        },
+        OptionInfo {
+            name: "guisize",
+            abbrev: None,
+            kind: Str,
+            scope: Global,
+            doc: "How large the GUI's window opens: remember (as it was when the GUI \
+                  last closed), or a share of its screen, e.g. 60%x70%.",
         },
         OptionInfo {
             name: "guiopacity",

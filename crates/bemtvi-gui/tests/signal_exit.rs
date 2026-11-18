@@ -80,6 +80,9 @@ fn killing_the_gui_runs_the_exit_sequence() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_bemtvi-gui"))
         .env("BEMTVI_CONFIG", &dir)
+        // Its own state dir: the GUI reads and saves its window's state there, which
+        // must be neither the developer's nor theirs to change.
+        .env("XDG_STATE_HOME", dir.join("state"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

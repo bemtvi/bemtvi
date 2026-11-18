@@ -2662,6 +2662,22 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `btv._gui_window_check(name, value)`: the core's check of a value written to one
+    // of the native GUI's window options (`bemtvi_core::gui_window::check`), so a Lua
+    // write is refused (E474) or canonicalized where it's made, by the same rules as
+    // `:set`. Returns the canonical value, or `nil` and the error; `nil` alone for any
+    // other option.
+    btv.set(
+        "_gui_window_check",
+        lua.create_function(|_, (name, value): (String, String)| {
+            Ok(match bemtvi_core::gui_window::check(&name, &value) {
+                Some(Ok(spec)) => (Some(spec), None),
+                Some(Err(e)) => (None, Some(e)),
+                None => (None, None),
+            })
+        })?,
+    )?;
+
     // `btv._set_workspace_option(name, value)`: queue a [`WorkspaceOptionOp`] for the
     // server to apply to the editor's per-workspace overlay (`btv.wso`). The prelude has
     // canonicalized `name`; a `nil` value clears the override (back to the global value),

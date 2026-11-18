@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use bemtvi_gpu::{
     spawn_session_with, Answer, Client, ClientOptions, Config, Effect, InputEvent, IoThread,
-    KeyCode, Launch, Modifiers, Shada,
+    KeyCode, Launch, Modifiers, Shada, WindowMaximize, WindowPosition, WindowSizing,
 };
 use bemtvi_server::ConfigSource;
 use rmpv::Value;
@@ -525,6 +525,97 @@ async fn a_new_surface_hears_what_the_old_one_was_asked() {
         f.effects.contains(&Effect::InputMethod(false)),
         "the new surface keeps input methods off: {:?}",
         f.effects
+    );
+}
+
+/// `'guimaximize'` reaches the host as it changes, and only then: its first value
+/// (`remember`, the default) once the first frame lands, then each new mode. A frame
+/// that doesn't change it says nothing, so `always` doesn't re-maximize a window the
+/// user has restored since.
+#[tokio::test]
+async fn guimaximize_is_asked_of_the_host_as_it_changes() {
+    let maximize = |f: &Fixture| -> Vec<WindowMaximize> {
+        f.effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::WindowMaximize(mode) => Some(*mode),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut f = start(None, Launch::default());
+    f.framed().await;
+    f.until("the first mode", |f| !maximize(f).is_empty()).await;
+    assert_eq!(maximize(&f), [WindowMaximize::Remember]);
+
+    f.effects.clear();
+    f.lua("btv.o.guimaximize = 'always'").await;
+    f.until("always", |f| !maximize(f).is_empty()).await;
+    assert_eq!(maximize(&f), [WindowMaximize::Always]);
+
+    // Other frames, the mode unchanged: nothing more.
+    f.effects.clear();
+    f.lua("btv.o.guimaximize = 'always'; btv.cmd('normal! ihello')")
+        .await;
+    f.until("the edit's frame", |f| {
+        f.client
+            .view()
+            .windows
+            .iter()
+            .any(|w| w.lines.iter().any(|l| l.contains("hello")))
+    })
+    .await;
+    f.idle(Duration::from_millis(200)).await;
+    assert_eq!(maximize(&f), []);
+
+    f.cmdline("set guimaximize=never").await;
+    f.key(KeyCode::Enter, None, NONE);
+    f.until("never", |f| !maximize(f).is_empty()).await;
+    assert_eq!(maximize(&f), [WindowMaximize::Never]);
+}
+
+/// `'guiposition'` and `'guisize'` reach the host as they change, as `'guimaximize'`
+/// does: their first value once the first frame lands, then each new mode.
+#[tokio::test]
+async fn guiposition_and_guisize_are_asked_of_the_host_as_they_change() {
+    let asked = |f: &Fixture| -> Vec<Effect> {
+        f.effects
+            .iter()
+            .filter(|e| matches!(e, Effect::WindowPosition(_) | Effect::WindowSizing(_)))
+            .cloned()
+            .collect()
+    };
+    let mut f = start(None, Launch::default());
+    f.framed().await;
+    f.until("the first modes", |f| asked(f).len() == 2).await;
+    assert_eq!(
+        asked(&f),
+        [
+            Effect::WindowPosition(WindowPosition::Remember),
+            Effect::WindowSizing(WindowSizing::Remember)
+        ]
+    );
+
+    f.effects.clear();
+    f.lua("btv.o.guisize = '60%x70%'").await;
+    f.until("a share", |f| !asked(f).is_empty()).await;
+    assert_eq!(
+        asked(&f),
+        [Effect::WindowSizing(WindowSizing::Screen {
+            width: 0.6,
+            height: 0.7
+        })]
+    );
+
+    f.effects.clear();
+    f.lua("btv.o.guisize = '60%x70%'; btv.o.guiposition = 'centered'")
+        .await;
+    f.until("centered", |f| !asked(f).is_empty()).await;
+    f.idle(Duration::from_millis(200)).await;
+    assert_eq!(
+        asked(&f),
+        [Effect::WindowPosition(WindowPosition::Centered)],
+        "the unchanged size says nothing"
     );
 }
 

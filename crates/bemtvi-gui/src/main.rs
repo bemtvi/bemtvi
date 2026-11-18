@@ -29,15 +29,26 @@
 // `bemtvi_core::process::no_console_window`.
 #![windows_subsystem = "windows"]
 
+mod window_state;
+
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use anyhow::Result;
 use bemtvi_gpu::remote::{self, ConnectTarget};
-use bemtvi_gpu::{spawn_session, spawn_stdio_daemon_session, GlyphOverflow, GuiConfig, Session};
+use bemtvi_gpu::{
+    spawn_session, spawn_stdio_daemon_session, GlyphOverflow, GuiConfig, Session, WindowMaximize,
+    WindowPosition, WindowSizing,
+};
 use bemtvi_mitsuami::{Editor, EditorHandle};
 use bemtvi_server::ConfigSource;
 use clap::Parser;
-use mitsuami::prelude::{signal, spawn_local, Column, ElementBuilder, LengthExt, Size, Window};
+use mitsuami::core::{CurrentWindow, UiEvent};
+use mitsuami::prelude::{
+    effect, inject, signal, spawn_local, Column, ElementBuilder, LengthExt, NodeId, Placement,
+    Signal, Size, Ui, Window, WindowFrame, WindowSize,
+};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// bemtvi-gui's command line. clap derives the parser, validates flags, errors on unknown
@@ -312,8 +323,18 @@ fn run(
     Ok(())
 }
 
-/// The window: titled `bemtvi`, 960×640 points, its whole content the editor, focused so
-/// keys go to it from the start. Built in mitsuami's app scope.
+/// A first window's content size, before anything was saved.
+const FIRST_SIZE: Size = Size::new(960.0, 640.0);
+
+/// The window: titled `bemtvi`, its whole content the editor, focused so keys go to it
+/// from the start. Built in mitsuami's app scope.
+///
+/// It opens as it was when the GUI last closed (see [`window_state`]): where, as large,
+/// and maximized or not, or as the `'guiposition'`, `'guisize'` and `'guimaximize'`
+/// modes saved then say (centred, a share of the screen, always maximized). The
+/// editor's options then have their say as its config sets them: a mode other than the
+/// one the window opened by applies at once (centred, resized, maximized or restored),
+/// and the modes current when the editor quits decide how the window opens next time.
 fn window(
     handle: EditorHandle,
     session: Session,
@@ -323,6 +344,39 @@ fn window(
     mut signals: UnboundedReceiver<()>,
 ) -> Window {
     let open = signal(true);
+    let saved = window_state::load();
+    let ui = inject::<Ui>().expect("bemtvi-gui: the window is built in mitsuami's app scope");
+    let (size, at) = opening(&ui, saved);
+    // Set by the user maximizing or restoring it too, the platform's way.
+    let maximized = signal(saved.maximized);
+    let maximize = Rc::new(Cell::new(WindowMaximize::default()));
+    // The modes the window is by: what it opened by, then the editor's.
+    let position = signal(saved.position);
+    let sizing = signal(saved.sizing);
+    // Its restored frame, as the platform reports it (and where it opens, if it was).
+    let frame = signal(at);
+    // Where the platform places windows itself (GTK, Wayland), the window has no
+    // position to centre: say so once, rather than let `centered` do nothing.
+    // The editor's own `'guiposition'`, once its config has run (the saved mode, which
+    // the window opened by, may not be the session's).
+    let relayed_position = signal(None::<WindowPosition>);
+    let told = handle.clone();
+    let said = Cell::new(false);
+    effect(move || {
+        let unplaced = frame.get().is_some_and(|f| f.position.is_none());
+        let centred = relayed_position.get() == Some(WindowPosition::Centered);
+        if unplaced && centred && !said.replace(true) {
+            let note = told.exec_lua(
+                "btv.notify_once(\"guiposition: this platform places windows itself, so the \
+                 window can't be centred\", btv.log.levels.WARN)",
+            );
+            spawn_local(async move {
+                if let Err(e) = note.await {
+                    eprintln!("bemtvi-gui: {e:#}");
+                }
+            });
+        }
+    });
     // Killed: quit the session the way `:qall!` does (see `EditorHandle::quit_now`).
     let killed = handle.clone();
     spawn_local(async move {
@@ -334,8 +388,15 @@ fn window(
     let closing = handle.clone();
     // `content` may be asked for again; the session is only there the first time.
     let session = std::cell::Cell::new(Some(session));
+    let placement = match saved.position {
+        WindowPosition::Centered => Placement::Centred,
+        WindowPosition::Remember => Placement::System,
+    };
     Window::new("bemtvi")
-        .size(Size::new(960.0, 640.0))
+        .size(size)
+        .frame(frame)
+        .placement(placement)
+        .maximized(maximized)
         .open(open)
         // Don't close on the close button directly — that would discard a modified
         // buffer silently. Route through the server's `:qa`, which quits a clean
@@ -353,14 +414,161 @@ fn window(
             let session = session
                 .take()
                 .expect("bemtvi-gui: the window's content is built once");
+            let ui = inject::<Ui>().expect("bemtvi-gui: a window's content has its Ui");
+            let CurrentWindow(window) =
+                inject::<CurrentWindow>().expect("bemtvi-gui: a window's content has its window");
+            let (on_mode, exit_mode) = (maximize.clone(), maximize.clone());
+            let sized = ui.clone();
+            let remembered = saved.frame;
+            // A share of the screen was taken of the display a new window opens on, the
+            // primary one (the window didn't exist yet). Once the platform says where
+            // the window is (its first frame), and that's another display (a
+            // remembered place on it), the share is of that one's work area, once.
+            let fitting = ui.clone();
+            let fitted = Cell::new(false);
+            ui.on_event(window, move |event| {
+                // Maximized, its restored frame isn't reported until it's restored:
+                // the first one it is then is the one to fit.
+                if !matches!(event, UiEvent::FrameChanged(_))
+                    || fitted.get()
+                    || maximized.get_untracked()
+                {
+                    return;
+                }
+                fitted.set(true);
+                let WindowSizing::Screen { width, height } = sizing.get_untracked() else {
+                    return;
+                };
+                let (Some(here), Some(primary)) =
+                    (fitting.work_area(Some(window)), fitting.work_area(None))
+                else {
+                    return;
+                };
+                let differs = |a: f32, b: f32| (a - b).abs() > b * 0.02;
+                if differs(here.width, primary.width) || differs(here.height, primary.height) {
+                    let centred = position.get_untracked() == WindowPosition::Centered;
+                    resize_to_share(&fitting, window, frame, share(here, width, height), centred);
+                }
+            });
             // Closing the last window ends mitsuami's run loop, and `run`'s teardown.
             Column::new().size(100.pct(), 100.pct()).child(
-                Editor::new(session, move || open.set(false))
-                    .handle(handle.clone())
-                    .config(config.clone())
-                    .open_dir(open_dir.clone())
-                    .config_source(config_source)
-                    .autofocus(true),
+                Editor::new(session, move || {
+                    // Every way the editor quits passes here (`:qa`, the close button, a
+                    // kill, its server going away), so the state is saved once, as the
+                    // window still is.
+                    let now = window_state::Saved {
+                        maximized: maximized.get_untracked(),
+                        position: position.get_untracked(),
+                        sizing: sizing.get_untracked(),
+                        // Before the window said where it is (quit at once), the
+                        // frame it opened by, or the one saved last time: kept.
+                        frame: frame.get_untracked().or(remembered),
+                    };
+                    window_state::save(exit_mode.get(), now);
+                    open.set(false);
+                })
+                .on_window_maximize(move |mode| {
+                    on_mode.set(mode);
+                    match mode {
+                        WindowMaximize::Always => maximized.set(true),
+                        WindowMaximize::Never => maximized.set(false),
+                        WindowMaximize::Remember => {}
+                    }
+                })
+                .on_window_position(move |mode| {
+                    relayed_position.set(Some(mode));
+                    if position.get_untracked() == mode {
+                        return;
+                    }
+                    position.set(mode);
+                    // A maximized window keeps the screen; centred is how it opens
+                    // next time.
+                    if mode == WindowPosition::Centered && !maximized.get_untracked() {
+                        ui.centre_window(window);
+                    }
+                })
+                .on_window_sizing(move |mode| {
+                    if sizing.get_untracked() == mode {
+                        return;
+                    }
+                    sizing.set(mode);
+                    // A maximized window keeps the screen; the share is how it opens
+                    // next time.
+                    if let WindowSizing::Screen { width, height } = mode {
+                        if !maximized.get_untracked() {
+                            if let Some(area) = sized.work_area(Some(window)) {
+                                let centred = position.get_untracked() == WindowPosition::Centered;
+                                resize_to_share(
+                                    &sized,
+                                    window,
+                                    frame,
+                                    share(area, width, height),
+                                    centred,
+                                );
+                            }
+                        }
+                    }
+                })
+                .handle(handle.clone())
+                .config(config.clone())
+                .open_dir(open_dir.clone())
+                .config_source(config_source)
+                .autofocus(true),
             )
         })
+}
+
+/// How large the window opens, and the frame that places it, if it's to open where it
+/// was: as large as it was (`remember`; [`FIRST_SIZE`] the first time) or a share of the
+/// screen a new window opens on (mitsuami's `WindowSize::Screen`), and where it was
+/// unless it's to be centred (or the platform couldn't say where it was). A frame needs
+/// its size in points, so there the share is taken here, of the same screen.
+fn opening(ui: &Ui, saved: window_state::Saved) -> (WindowSize, Option<WindowFrame>) {
+    let size = match saved.sizing {
+        WindowSizing::Screen { width, height } => WindowSize::Screen { width, height },
+        WindowSizing::Remember => saved.frame.map_or(FIRST_SIZE, |f| f.size).into(),
+    };
+    let placed = match saved.position {
+        WindowPosition::Remember => saved.frame.filter(|f| f.position.is_some()),
+        WindowPosition::Centered => None,
+    };
+    let frame = placed.map(|f| WindowFrame {
+        position: f.position,
+        size: match size {
+            WindowSize::Screen { width, height } => ui
+                .work_area(None)
+                .map_or(FIRST_SIZE, |area| share(area, width, height)),
+            _ => f.size,
+        },
+    });
+    (size, frame)
+}
+
+/// Gives the window a share of its screen now. Centred, it's resized and centred again
+/// (which keeps it on the screen). Otherwise as its frame (where it is, at that size),
+/// so the platform keeps it on the screen as it restores a frame, rather than letting
+/// it grow from its top left corner past the screen's edges; before the platform has
+/// said where it is, as a size. (Not the frame and then centring: a frame set in an
+/// event handler is sent after the handler, so after the centring.)
+fn resize_to_share(
+    ui: &Ui,
+    window: NodeId,
+    frame: Signal<Option<WindowFrame>>,
+    size: Size,
+    centred: bool,
+) {
+    match frame.get_untracked() {
+        Some(now) if !centred => frame.set(Some(WindowFrame { size, ..now })),
+        _ => {
+            ui.set_window_size(window, size);
+            if centred {
+                ui.centre_window(window);
+            }
+        }
+    }
+}
+
+/// `width` × `height` (fractions) of a work area, in whole points.
+fn share(area: Size, width: f32, height: f32) -> Size {
+    Size::new((area.width * width).round(), (area.height * height).round())
 }

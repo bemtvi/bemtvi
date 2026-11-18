@@ -33,6 +33,9 @@ pub(crate) struct App {
     on_exit: Rc<dyn Fn()>,
     /// What the host does with the editor's events (`btv.host.send`), if it listens.
     on_event: Option<Rc<dyn Fn(editor::EditorEvent)>>,
+    /// What the host does with the window options (`'guimaximize'`, `'guiposition'`,
+    /// `'guisize'`), if it owns a window to act on.
+    window: editor::WindowHooks,
     /// The surface's own state, made in its reactive scope: the pointer's cursor over
     /// the surface (a resize arrow over a split separator), the caret the input
     /// method's candidate window opens by, whether input methods are on (unless
@@ -53,6 +56,7 @@ impl App {
         client: Client,
         on_exit: Rc<dyn Fn()>,
         on_event: Option<Rc<dyn Fn(editor::EditorEvent)>>,
+        window: editor::WindowHooks,
     ) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self {
             client,
@@ -60,6 +64,7 @@ impl App {
             node: None,
             on_exit,
             on_event,
+            window,
             cursor: None,
             caret: None,
             input_method: None,
@@ -176,6 +181,27 @@ impl App {
                 let on_exit = app.on_exit.clone();
                 drop(app);
                 on_exit();
+            }
+            // The window is the host's: only an app that owns one acts on these. In an
+            // editor without a window of its own they have nothing to act on, and are
+            // ignored as the TUI ignores them (a config shared with bemtvi-gui sets them).
+            Effect::WindowMaximize(mode) => {
+                if let Some(on_change) = app.window.maximize.clone() {
+                    drop(app);
+                    on_change(mode);
+                }
+            }
+            Effect::WindowPosition(mode) => {
+                if let Some(on_change) = app.window.position.clone() {
+                    drop(app);
+                    on_change(mode);
+                }
+            }
+            Effect::WindowSizing(mode) => {
+                if let Some(on_change) = app.window.sizing.clone() {
+                    drop(app);
+                    on_change(mode);
+                }
             }
             Effect::Host { name, payload } => match app.on_event.clone() {
                 Some(on_event) => {

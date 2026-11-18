@@ -670,6 +670,15 @@ pub struct View {
     /// right instead of being shrunk into its own. Empty means the client's own setting.
     /// Frontend-agnostic — the TUI ignores it (the terminal draws its own glyphs).
     pub guiglyphoverflow: String,
+    /// `'guimaximize'`, relayed from the server: whether the native GUI's window opens
+    /// maximized (`"remember"` / `"always"` / `"never"`). Empty until a server relays
+    /// it (and from an older server that doesn't). Only the native GUI reads it.
+    pub guimaximize: String,
+    /// `'guiposition'` (`"remember"` / `"centered"`) and `'guisize'` (`"remember"` /
+    /// `"{W}%x{H}%"`), relayed like `guimaximize`: where and how large the native
+    /// GUI's window opens. Empty until a server relays them.
+    pub guiposition: String,
+    pub guisize: String,
     /// `'guiopacity'`, relayed from the server: how opaque (`0`–`100`) the native GUI
     /// paints the `Normal` background, letting the window's backdrop (Windows' Mica,
     /// macOS's vibrancy) show through below `100`. The TUI and the web client ignore it — neither has a
@@ -1112,6 +1121,9 @@ impl View {
         self.guifont = map_str(map, "guifont");
         self.guifont_spec = GuiFontSpec::from_value(map_get(map, "guifont_spec"));
         self.guiglyphoverflow = map_str(map, "guiglyphoverflow");
+        self.guimaximize = map_str(map, "guimaximize");
+        self.guiposition = map_str(map, "guiposition");
+        self.guisize = map_str(map, "guisize");
         self.guiopacity = map_get(map, "guiopacity")
             .and_then(Value::as_u64)
             .map(|v| v.min(100) as u8);

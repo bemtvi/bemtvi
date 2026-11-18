@@ -40,7 +40,10 @@ pub use client::{
     Answer, Client, ClientHandle, ClientOptions, CursorShape, Effect, IoThread, PointRect,
     RequestId,
 };
-pub use config::{caret_blink, view_fonts, GlyphOverflow, GuiConfig, CARET_BLINK};
+pub use config::{
+    caret_blink, view_fonts, GlyphOverflow, GuiConfig, WindowMaximize, WindowPosition,
+    WindowSizing, CARET_BLINK,
+};
 pub use input::{
     button_name, encode_input, is_paste, mouse_modifier, InputEvent, KeyCode, Modifiers,
     MouseButton, Point, ScrollDelta,

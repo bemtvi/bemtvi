@@ -166,3 +166,45 @@ async fn overrides_persist_across_a_workspace_session() {
         );
     }
 }
+
+#[tokio::test]
+async fn an_enumerated_gui_option_rejects_a_bad_value_as_set_does() {
+    // `btv.wso` stored what `:set` refuses: a `'guisize'` share out of range, an unknown
+    // `'guiposition'` or `'guimaximize'` mode, which then reached the GUI to be ignored
+    // there. Each fails loud (E474, raised where it's written, as `btv.o` does) and
+    // leaves the option as it was.
+    let (rpc, _incoming) = start().await;
+    for (name, bad) in [
+        ("guisize", "150%x50%"),
+        ("guiposition", "left"),
+        ("guimaximize", "yes"),
+    ] {
+        let err = exec_lua(
+            &rpc,
+            &format!(
+                "local ok, e = pcall(function() btv.wso.{name} = '{bad}' end); return tostring(e)"
+            ),
+        )
+        .await;
+        let err = err.as_str().unwrap_or_default();
+        assert!(
+            err.contains("E474") && err.contains(&format!("{name}={bad}")),
+            "`btv.wso.{name} = '{bad}'` must fail loud, got {err:?}"
+        );
+        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+        assert_eq!(
+            exec_lua(&rpc, &format!("return btv.o.{name}"))
+                .await
+                .as_str(),
+            Some("remember"),
+            "the rejected override left {name} alone"
+        );
+    }
+    // A good one is taken, canonical.
+    exec_lua(&rpc, "btv.wso.guisize = '60%X70%'").await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    assert_eq!(
+        exec_lua(&rpc, "return btv.o.guisize").await.as_str(),
+        Some("60%x70%")
+    );
+}

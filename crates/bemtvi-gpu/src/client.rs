@@ -29,7 +29,7 @@ use crate::render::{Renderer, ScrollFrame};
 use crate::{
     caret_blink, mouse, spawn_io, GlyphOverflow, GuiConfig, InputEvent, IoParts, KeyCode,
     Modifiers, MouseButton, Point, Proxy, ScrollDelta, Session, SurfaceSize, UserEvent,
-    CARET_BLINK,
+    WindowMaximize, WindowPosition, WindowSizing, CARET_BLINK,
 };
 
 /// How often a held-at-the-edge mouse drag re-sends itself to keep the buffer
@@ -131,6 +131,16 @@ pub enum Effect {
     /// Put the window's backdrop under the surface (an opacity below `100`) or take it
     /// away.
     Transparent(bool),
+    /// The relayed `'guimaximize'` changed (the first server value counts as a change):
+    /// whether the window opens maximized, and with `Always`/`Never`, is now. For the
+    /// host that owns the window.
+    WindowMaximize(WindowMaximize),
+    /// The relayed `'guiposition'` changed (the first value counts): where the window
+    /// opens, and with `Centered`, centre it now.
+    WindowPosition(WindowPosition),
+    /// The relayed `'guisize'` changed (the first value counts): how large the window
+    /// opens, and with a share of the screen, size it so now.
+    WindowSizing(WindowSizing),
     /// Show the open dialog, at `start_dir` if given, and answer with
     /// [`Answer::Path`].
     OpenDialog {
@@ -352,6 +362,15 @@ pub struct Client {
     /// value). Empty is both the initial state and the option's default — which means
     /// "keep what `--glyph-overflow` / the env set".
     applied_glyph_overflow: String,
+    /// The last `'guimaximize'` asked of the host, so it hears only a change. Kept
+    /// across a `:connect`: a new server with the same value doesn't re-maximize a
+    /// window the user has restored since.
+    applied_maximize: Option<WindowMaximize>,
+    /// The same for `'guiposition'` and `'guisize'`.
+    applied_position: Option<WindowPosition>,
+    applied_sizing: Option<WindowSizing>,
+    /// The window options' relayed text as last read, to parse only a change.
+    relayed_window_options: (String, String, String),
     /// The last `(view.guiopacity, view.guihlopacity)` applied to the renderer, so a
     /// redraw only re-applies (and only re-reports a refusal) when one actually
     /// changed. `None` is both the initial state and a view no server has filled in
@@ -450,6 +469,10 @@ impl Client {
             applied_guifont: String::new(),
             reported_missing: Vec::new(),
             applied_glyph_overflow: String::new(),
+            applied_maximize: None,
+            applied_position: None,
+            applied_sizing: None,
+            relayed_window_options: Default::default(),
             applied_opacity: (None, None),
             open_dir: options.open_dir,
             remote,
@@ -750,6 +773,7 @@ impl Client {
                 if self.view.guiglyphoverflow != self.applied_glyph_overflow {
                     self.apply_glyph_overflow();
                 }
+                self.update_window_options();
                 // A changed opacity repaints the backgrounds from this frame on.
                 if (self.view.guiopacity, self.view.guihlopacity) != self.applied_opacity {
                     self.apply_opacity();
@@ -1023,6 +1047,38 @@ impl Client {
                 .notify("btv_input", vec![Value::from(notation.as_str())]);
             self.arm_flush_deadline();
         }
+    }
+
+    /// Tell the host a changed `'guimaximize'`, `'guiposition'` or `'guisize'`. Parsed
+    /// only when the relayed text changed (not every frame). A frame without one (an
+    /// older server) says nothing; a value that doesn't parse (a server with other
+    /// spellings) is reported, not acted on.
+    fn update_window_options(&mut self) {
+        let relayed = (
+            self.view.guimaximize.clone(),
+            self.view.guiposition.clone(),
+            self.view.guisize.clone(),
+        );
+        if relayed == self.relayed_window_options {
+            return;
+        }
+        let (maximize, position, sizing) = &relayed;
+        if let Some(mode) = parsed("guimaximize", maximize, WindowMaximize::parse) {
+            if self.applied_maximize.replace(mode) != Some(mode) {
+                self.effects.push(Effect::WindowMaximize(mode));
+            }
+        }
+        if let Some(mode) = parsed("guiposition", position, WindowPosition::parse) {
+            if self.applied_position.replace(mode) != Some(mode) {
+                self.effects.push(Effect::WindowPosition(mode));
+            }
+        }
+        if let Some(mode) = parsed("guisize", sizing, WindowSizing::parse) {
+            if self.applied_sizing.replace(mode) != Some(mode) {
+                self.effects.push(Effect::WindowSizing(mode));
+            }
+        }
+        self.relayed_window_options = relayed;
     }
 
     /// Turn the platform's input methods off while `'imdisable'` is set, and back on
@@ -1393,4 +1449,18 @@ impl Client {
             }
         }
     }
+}
+
+/// A relayed window option's mode: `None` for an empty value (an older server says
+/// nothing), and for one that doesn't parse, which is reported (on the terminal it was
+/// started from) rather than acted on.
+fn parsed<T>(option: &str, value: &str, parse: impl Fn(&str) -> Option<T>) -> Option<T> {
+    if value.is_empty() {
+        return None;
+    }
+    let mode = parse(value);
+    if mode.is_none() {
+        eprintln!("bemtvi-gpu: ignoring {option}={value:?}");
+    }
+    mode
 }

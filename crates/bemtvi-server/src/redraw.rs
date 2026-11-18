@@ -169,6 +169,11 @@ impl EditHost {
         // client size their off-grid glyphs with it (the TUI has no say — the terminal
         // draws them). Empty (the default) leaves the client on its own setting.
         let guiglyphoverflow = global_opts.guiglyphoverflow;
+        // `'guimaximize'`, relayed for the native GUI, which owns the window.
+        let guimaximize = global_opts.guimaximize;
+        // `'guiposition'` / `'guisize'`, the same.
+        let guiposition = global_opts.guiposition;
+        let guisize = global_opts.guisize;
         // `'guiopacity'`, relayed for the native GUI to paint its `Normal` background
         // that opaque (the window's backdrop shows through the rest).
         let guiopacity = global_opts.guiopacity;
@@ -474,6 +479,15 @@ impl EditHost {
                 Value::from("guiglyphoverflow"),
                 Value::from(guiglyphoverflow.as_str()),
             ),
+            (
+                Value::from("guimaximize"),
+                Value::from(guimaximize.as_str()),
+            ),
+            (
+                Value::from("guiposition"),
+                Value::from(guiposition.as_str()),
+            ),
+            (Value::from("guisize"), Value::from(guisize.as_str())),
             (Value::from("guiopacity"), Value::from(guiopacity)),
             (Value::from("guihlopacity"), Value::from(guihlopacity)),
             (Value::from("imdisable"), Value::from(imdisable)),

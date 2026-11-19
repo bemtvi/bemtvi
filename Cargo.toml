@@ -150,9 +150,9 @@ windows-sys = "0.61.2"
 # re-exports cosmic-text, so the GUI reaches `FontSystem`/`Buffer`/`Attrs`/… through
 # `glyphon::`). glyphon 0.12 builds against wgpu 30 — bump the two together. `pollster`
 # blocks on wgpu's async device/adapter requests while the surface is set up.
-mitsuami = "2.4.0"
+mitsuami = "2.5.0"
 # `bemtvi-mitsuami`'s embed tests; same release as `mitsuami`, so the two can't drift apart.
-mitsuami-test = "2.4.0"
+mitsuami-test = "2.5.0"
 wgpu = "30.0.1"
 # The window handle a host's toolkit gives `bemtvi-gpu`'s renderer: the version wgpu
 # and mitsuami both speak, so a handle from one is a surface target for the other.
@@ -316,21 +316,3 @@ split-debuginfo = "unpacked"
 lto = "thin"
 codegen-units = 1
 strip = true
-
-# TEMPORARY: mitsuami's `main` at an exact commit (the window frames bemtvi-gui
-# remembers, and WinUI windows opening as native ones do), until it's released.
-# Remove this and raise the mitsuami floor then
-# (docs/plans/2026-11-16-gui-window-geometry.md).
-[patch.crates-io]
-mitsuami = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
-mitsuami-appkit = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
-mitsuami-core = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
-mitsuami-gtk = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
-mitsuami-headless = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
-mitsuami-linux = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
-mitsuami-macros = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
-mitsuami-reactive = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
-mitsuami-test = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
-mitsuami-test-macros = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
-mitsuami-widgets = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
-mitsuami-winui = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }

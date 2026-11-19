@@ -160,4 +160,5 @@ Release mitsuami with phase 1 (and the WinUI maximize fix), drop bemtvi's tempor
       skips rather than type into another window. To check by eye.
 - [x] Three rounds of review on both branches, findings fixed; both squash-merged to
       their `main`s (mitsuami `f2a0a86`), bemtvi's `[patch]` pinned to that commit.
-- [ ] Phase 3 — release mitsuami and unpatch.
+- [x] Phase 3 — mitsuami 2.5.0 released (2026-11-19); the `[patch]` is gone and the
+      `mitsuami`/`mitsuami-test` floor is 2.5.0.

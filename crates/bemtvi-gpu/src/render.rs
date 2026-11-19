@@ -837,10 +837,12 @@ impl Renderer {
     }
 
     /// Paint one frame from `view`. When `scroll` is set, the focused window's
-    /// text slides at the interpolated offset (smooth scrolling). Returns `Err`
-    /// only on an unrecoverable surface error; a transient `Lost`/`Outdated`
-    /// reconfigures and skips.
-    pub fn render(&mut self, view: &View, scroll: Option<&ScrollFrame>) -> anyhow::Result<()> {
+    /// text slides at the interpolated offset (smooth scrolling). Returns whether
+    /// the frame was presented: a transient `Lost`/`Outdated` reconfigures and
+    /// skips it, as does a surface with no drawable to give (`Timeout`/`Occluded`:
+    /// a window not on screen yet, or hidden), and the caller paints it again
+    /// later. `Err` only on an unrecoverable surface error.
+    pub fn render(&mut self, view: &View, scroll: Option<&ScrollFrame>) -> anyhow::Result<bool> {
         // wgpu 29 replaced the `Result<SurfaceTexture, SurfaceError>` this used to
         // return with the `CurrentSurfaceTexture` enum. `Suboptimal` still hands back
         // a usable frame (draw it, don't drop it); `Lost`/`Outdated` reconfigure and
@@ -851,10 +853,10 @@ impl Renderer {
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
-                return Ok(());
+                return Ok(false);
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(())
+                return Ok(false)
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 anyhow::bail!("wgpu surface get_current_texture raised a validation error")
@@ -1022,7 +1024,7 @@ impl Renderer {
         self.queue.submit(std::iter::once(encoder.finish()));
         self.queue.present(frame);
         self.atlas.trim();
-        Ok(())
+        Ok(true)
     }
 
     /// Walk the view and append its quads and shaped text rows to the draw lists.

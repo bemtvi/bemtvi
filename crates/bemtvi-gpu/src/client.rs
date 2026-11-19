@@ -39,6 +39,13 @@ use crate::{
 /// the continuous scroll the server does a line at a time per drag event.
 const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(40);
 
+/// How soon a frame the surface skipped (no drawable: the window isn't on screen yet,
+/// or is hidden) is painted again, doubling while it keeps skipping up to
+/// [`SKIPPED_FRAME_RETRY_MAX`]. A window's first frames are painted before it's shown;
+/// without the retry, the editor stayed blank until something else repainted it.
+const SKIPPED_FRAME_RETRY: Duration = Duration::from_millis(16);
+const SKIPPED_FRAME_RETRY_MAX: Duration = Duration::from_millis(500);
+
 /// Whether a drag at grid `cell` (`(col, row)`, global, 0-based) sits in the edge
 /// band that arms continuous auto-scroll, for a grid `size` (`(cols, rows)`) cells.
 /// The top row and the bottom rows (the status line and the command row below the
@@ -328,6 +335,9 @@ pub struct Client {
     blink_key: (bool, u16, u16),
     /// When the caret next flips, while there is one.
     blink_next: Instant,
+    /// The last frame was skipped by the surface: when it's painted again, and the
+    /// wait after that if it's skipped again.
+    repaint: Option<(Instant, Duration)>,
     /// While the left button is held with the pointer in the top/bottom edge band,
     /// the cell to re-issue the drag at so the buffer keeps auto-scrolling without
     /// further pointer motion. `None` when not at an edge or the button is up.
@@ -459,6 +469,7 @@ impl Client {
             focused: true,
             blink_key: (false, 0, 0),
             blink_next: now + CARET_BLINK,
+            repaint: None,
             autoscroll: None,
             autoscroll_next: now,
             wheel_accum: (0.0, 0.0),
@@ -675,7 +686,8 @@ impl Client {
     pub fn next_deadline(&self) -> Option<Instant> {
         let blink = self.caret_blinks().then_some(self.blink_next);
         let autoscroll = self.autoscroll.map(|_| self.autoscroll_next);
-        [self.flush_deadline, autoscroll, blink]
+        let repaint = self.repaint.map(|(at, _)| at);
+        [self.flush_deadline, autoscroll, blink, repaint]
             .into_iter()
             .flatten()
             .min()
@@ -696,6 +708,14 @@ impl Client {
                 self.send_mouse("left", "drag", col, row);
                 self.autoscroll_next = now + AUTOSCROLL_INTERVAL;
             }
+        }
+        // A skipped frame comes due: paint it again (`paint` re-arms this if the
+        // surface skips it again).
+        if let Some((at, wait)) = self.repaint.filter(|(at, _)| now >= *at) {
+            // Not due again before the paint answers (a deadline in the past would
+            // wake the loop at once, over and over).
+            self.repaint = Some((at.max(now) + wait, wait));
+            self.request_redraw();
         }
         // The caret flips: repaint, and wait for the next flip.
         if self.caret_blinks() && now >= self.blink_next {
@@ -718,8 +738,17 @@ impl Client {
         if let Some(r) = self.renderer.as_mut() {
             r.set_caret_hidden(hidden);
             r.set_focused(self.focused);
-            if let Err(e) = r.render(&self.view, frame.as_ref()) {
-                eprintln!("bemtvi-gpu: render error: {e}");
+            match r.render(&self.view, frame.as_ref()) {
+                Ok(true) => self.repaint = None,
+                // Skipped: painted again soon, then less often while it keeps
+                // being skipped (a hidden window).
+                Ok(false) => {
+                    let wait = self.repaint.map_or(SKIPPED_FRAME_RETRY, |(_, wait)| {
+                        (wait * 2).min(SKIPPED_FRAME_RETRY_MAX)
+                    });
+                    self.repaint = Some((Instant::now() + wait, wait));
+                }
+                Err(e) => eprintln!("bemtvi-gpu: render error: {e}"),
             }
         }
         self.update_ime_area();

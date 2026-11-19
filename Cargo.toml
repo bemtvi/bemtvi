@@ -322,15 +322,15 @@ strip = true
 # Remove this and raise the mitsuami floor then
 # (docs/plans/2026-11-16-gui-window-geometry.md).
 [patch.crates-io]
-mitsuami = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "f2a0a8665039d7f06299db1f6db6aa04648fd3b5" }
-mitsuami-appkit = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "f2a0a8665039d7f06299db1f6db6aa04648fd3b5" }
-mitsuami-core = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "f2a0a8665039d7f06299db1f6db6aa04648fd3b5" }
-mitsuami-gtk = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "f2a0a8665039d7f06299db1f6db6aa04648fd3b5" }
-mitsuami-headless = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "f2a0a8665039d7f06299db1f6db6aa04648fd3b5" }
-mitsuami-linux = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "f2a0a8665039d7f06299db1f6db6aa04648fd3b5" }
-mitsuami-macros = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "f2a0a8665039d7f06299db1f6db6aa04648fd3b5" }
-mitsuami-reactive = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "f2a0a8665039d7f06299db1f6db6aa04648fd3b5" }
-mitsuami-test = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "f2a0a8665039d7f06299db1f6db6aa04648fd3b5" }
-mitsuami-test-macros = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "f2a0a8665039d7f06299db1f6db6aa04648fd3b5" }
-mitsuami-widgets = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "f2a0a8665039d7f06299db1f6db6aa04648fd3b5" }
-mitsuami-winui = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "f2a0a8665039d7f06299db1f6db6aa04648fd3b5" }
+mitsuami = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
+mitsuami-appkit = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
+mitsuami-core = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
+mitsuami-gtk = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
+mitsuami-headless = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
+mitsuami-linux = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
+mitsuami-macros = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
+mitsuami-reactive = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
+mitsuami-test = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
+mitsuami-test-macros = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
+mitsuami-widgets = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }
+mitsuami-winui = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "7c2b25c9a2a2e70d1e8fd4b672fa61a2df38b6c7" }

@@ -101,6 +101,15 @@ btv.timer(function() btv.cmd('qa!') end, 2000)
     .expect("write init.lua");
 }
 
+/// A saved window's top edge, 120 points or so below the top of the screen: Windows
+/// measures `y` down from the top of the primary display, AppKit up from its bottom
+/// (so there, a top at 620 leaves a 500-point window room on a 640-point screen).
+const TOP: f32 = if cfg!(target_os = "macos") {
+    620.0
+} else {
+    120.0
+};
+
 fn has_display() -> bool {
     cfg!(not(all(unix, not(target_os = "macos"))))
         || std::env::var_os("WAYLAND_DISPLAY").is_some()
@@ -153,14 +162,7 @@ fn guiposition_and_guisize_decide_where_and_how_large_it_opens() {
     // `remember`: it opens where, and as large as, it was left, and says so again.
     std::fs::write(
         &dir,
-        "maximized=false
-position=remember
-size=remember
-x=100
-y=120
-width=700
-height=500
-",
+        format!("maximized=false\nposition=remember\nsize=remember\nx=100\ny={TOP}\nwidth=700\nheight=500\n"),
     )
     .unwrap();
     init(&config, "");
@@ -174,7 +176,7 @@ height=500
     let placed = cfg!(not(target_os = "linux"));
     if placed {
         assert!(
-            near(num(&state, "x"), 100.0) && near(num(&state, "y"), 120.0),
+            near(num(&state, "x"), 100.0) && near(num(&state, "y"), TOP),
             "{:?}",
             saved(&state)
         );
@@ -186,7 +188,7 @@ height=500
     assert_eq!(saved(&state)["position"], "centered");
     if placed {
         assert!(
-            !near(num(&state, "x"), 100.0) || !near(num(&state, "y"), 120.0),
+            !near(num(&state, "x"), 100.0) || !near(num(&state, "y"), TOP),
             "it moved to the centre: {:?}",
             saved(&state)
         );
@@ -454,5 +456,88 @@ fn a_window_left_flush_against_the_screens_edge_opens_there() {
         "flush at {flush} (outer {outer} wide, first opened at {x0}): {:?}",
         saved(&state)
     );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Left maximized, it opens maximized, and its restored frame is still where and as
+/// large as it was: the size the window is made at, applied after it was maximized
+/// (still hidden), un-maximized it on macOS, at the screen's top left corner, and that
+/// was saved.
+#[test]
+#[ignore = "spawns a real GPU window; needs a display. Run with --ignored."]
+fn a_window_left_maximized_opens_maximized_keeping_its_restored_frame() {
+    if !has_display() {
+        eprintln!("skip: no WAYLAND_DISPLAY / DISPLAY to open a window on");
+        return;
+    }
+    let (root, config, state) = scratch("remember");
+    let file = state_file(&state);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &file,
+        format!("maximized=true\nposition=remember\nsize=remember\nx=100\ny={TOP}\nwidth=700\nheight=500\n"),
+    )
+    .unwrap();
+    init(&config, "");
+    run(&config, &state);
+    assert_eq!(saved(&state)["maximized"], "true", "{:?}", saved(&state));
+    let near = |a: f32, b: f32| (a - b).abs() <= 1.0;
+    assert!(
+        near(num(&state, "width"), 700.0) && near(num(&state, "height"), 500.0),
+        "{:?}",
+        saved(&state)
+    );
+    if cfg!(not(target_os = "linux")) {
+        assert!(
+            near(num(&state, "x"), 100.0) && near(num(&state, "y"), TOP),
+            "{:?}",
+            saved(&state)
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Maximized once it's up, its restored frame is the one it had. On macOS the zoom is
+/// animated when the app is frontmost (as it is when the user zooms it), and each step
+/// was taken for the restored frame: the last one short of the screen, nearly as large
+/// as it, was saved, and reopened with a gap to the screen's right and bottom edges.
+/// (A test run whose window isn't frontmost zooms it in one step, and passes either
+/// way.)
+#[test]
+#[ignore = "spawns a real GPU window; needs a display. Run with --ignored."]
+fn maximizing_a_shown_window_keeps_its_restored_frame() {
+    if !has_display() {
+        eprintln!("skip: no WAYLAND_DISPLAY / DISPLAY to open a window on");
+        return;
+    }
+    let (root, config, state) = scratch("remember");
+    let file = state_file(&state);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &file,
+        format!("maximized=false\nposition=remember\nsize=remember\nx=100\ny={TOP}\nwidth=700\nheight=500\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        config.join("init.lua"),
+        "btv.timer(function() btv.o.guimaximize = 'always' end, 1000)\n\
+         btv.timer(function() btv.cmd('qa!') end, 2500)\n",
+    )
+    .unwrap();
+    run(&config, &state);
+    assert_eq!(saved(&state)["maximized"], "true", "{:?}", saved(&state));
+    let near = |a: f32, b: f32| (a - b).abs() <= 1.0;
+    assert!(
+        near(num(&state, "width"), 700.0) && near(num(&state, "height"), 500.0),
+        "{:?}",
+        saved(&state)
+    );
+    if cfg!(not(target_os = "linux")) {
+        assert!(
+            near(num(&state, "x"), 100.0) && near(num(&state, "y"), TOP),
+            "{:?}",
+            saved(&state)
+        );
+    }
     let _ = std::fs::remove_dir_all(root);
 }

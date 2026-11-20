@@ -223,6 +223,9 @@ jobs:
       # ── macOS TUI: sign → installer .pkg → notarize → staple ──────────────
       - name: Build, sign, notarize & staple installer .pkg (macOS, TUI)
         if: matrix.os == 'macos' && matrix.kind == 'tui'
+        # notarytool's own `--timeout` bounds the wait for Apple's verdict, not the
+        # upload: a stalled upload once held a job for GitHub's six-hour limit.
+        timeout-minutes: 45
         shell: bash
         env:
           AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
@@ -334,6 +337,9 @@ jobs:
 
       - name: Package, notarize & staple .dmg (macOS, GUI)
         if: matrix.os == 'macos' && matrix.kind == 'gui'
+        # notarytool's own `--timeout` bounds the wait for Apple's verdict, not the
+        # upload: a stalled upload once held a job for GitHub's six-hour limit.
+        timeout-minutes: 45
         shell: bash
         env:
           AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}

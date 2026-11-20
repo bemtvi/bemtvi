@@ -1,0 +1,17 @@
+Rust crates
+===========
+
+The Rust crates compiled into bemtvi, grouped by license. Each license text
+is given once, followed by the crates it covers.
+{{#each licenses}}
+
+--------------------------------------------------------------------------------
+{{{name}}} ({{{id}}})
+
+Used by:
+{{#each used_by}}
+  - {{{crate.name}}} {{{crate.version}}}{{#if crate.repository}} <{{{crate.repository}}}>{{/if}}
+{{/each}}
+
+{{{text}}}
+{{/each}}

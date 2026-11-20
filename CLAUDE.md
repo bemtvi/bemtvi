@@ -47,6 +47,8 @@ Release notes are written by hand, one file per release, and nothing generates t
 4. Validate: `gh workflow run test.yml --ref main` (fmt, clippy, `cargo test --workspace` and every example's spec, on Linux) and `gh workflow run edge.yml`, which builds every release artifact. Tag only once both are green.
 5. `git tag -s vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`. The workflow refuses a tag that doesn't match both versions, isn't a signed annotated tag GitHub verifies, or has no notes file; runs `test.yml` again on the tagged commit; then builds every target, checksums and attests the artifacts, and creates the GitHub release from the notes.
 
+Every archive ships bemtvi's `LICENSE` and a `THIRD-PARTY-LICENSES.txt` that `scripts/gen-licenses.sh` writes at build time: the Rust crates through cargo-about (`licenses/about.toml`, where a new dependency's license must be accepted), plus the code that isn't a crate, listed in the script by hand. Vendoring C, a JS module, a grammar or a ported file means adding it there; a grammar the web build bundles without a license entry fails the build.
+
 To fix a release's text afterwards, edit the notes file and `gh release edit vX.Y.Z --notes-file …` with the same text, site link and footer included. If the build or publish fails after tagging, rerun the failed jobs of that workflow run; don't move the tag.
 
 ## Design principles (how to decide what to build)

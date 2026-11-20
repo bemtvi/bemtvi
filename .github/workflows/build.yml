@@ -154,6 +154,22 @@ jobs:
         shell: bash
         run: cargo zigbuild --locked --release -p "$CRATE" --target ${{ matrix.target }}.2.17
 
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.3
+
+      # bemtvi's own LICENSE and THIRD-PARTY-LICENSES.txt go in every archive
+      # below (scripts/gen-licenses.sh says what the second one covers).
+      - name: Collect licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/licenses"
+          cp LICENSE "$RUNNER_TEMP/licenses/LICENSE"
+          scripts/gen-licenses.sh native "$RUNNER_TEMP/licenses/THIRD-PARTY-LICENSES.txt"
+          echo "LICENSES_DIR=$RUNNER_TEMP/licenses" >> "$GITHUB_ENV"
+
       - name: Import signing certificates (macOS)
         if: matrix.os == 'macos'
         shell: bash
@@ -224,15 +240,17 @@ jobs:
             --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" "$BIN"
           codesign --verify --strict --verbose=2 "$BIN"
 
-          # 2. Build the installer package (Developer ID Installer), → /usr/local/bin.
+          # 2. Build the installer package (Developer ID Installer): the binary to
+          #    /usr/local/bin, the licenses to /usr/local/share/doc/bemtvi.
           ROOT="$RUNNER_TEMP/pkgroot"
-          mkdir -p "$ROOT"
-          cp "$BIN" "$ROOT/bemtvi"
+          mkdir -p "$ROOT/bin" "$ROOT/share/doc/bemtvi"
+          cp "$BIN" "$ROOT/bin/bemtvi"
+          cp "$LICENSES_DIR"/* "$ROOT/share/doc/bemtvi/"
           mkdir -p dist
           pkgbuild --root "$ROOT" \
             --identifier io.bemtvi.bemtvi \
             --version "$PKG_VERSION" \
-            --install-location /usr/local/bin \
+            --install-location /usr/local \
             --keychain "$SIGN_KEYCHAIN" \
             --sign "$INSTALLER_IDENTITY" \
             "dist/$ASSET"
@@ -281,6 +299,8 @@ jobs:
           put 512  icon_512x512.png
           put 1024 icon_512x512@2x.png
           iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/bemtvi.icns"
+          # The licenses, sealed into the bundle with the rest of Resources.
+          cp "$LICENSES_DIR"/* "$APP/Contents/Resources/"
 
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
@@ -352,7 +372,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          tar -czf "dist/$ASSET" -C "target/${{ matrix.target }}/release" "$BIN"
+          STAGE="$RUNNER_TEMP/tarball"
+          mkdir -p "$STAGE"
+          cp "target/${{ matrix.target }}/release/$BIN" "$LICENSES_DIR"/* "$STAGE/"
+          tar -czf "dist/$ASSET" -C "$STAGE" .
 
       # ── Linux GUI: single-file, desktop-integrated AppImage ──────────────
       - name: Build AppImage (Linux, GUI)
@@ -417,15 +440,37 @@ jobs:
           # (stem must match the .desktop Icon= key).
           cp crates/bemtvi-gui/assets/icons/bemtvi-256.png bemtvi.png
 
+          # Two passes: the first deploys the app and the libraries it needs into
+          # AppDir, the second packs AppDir. In between go the licenses: bemtvi's,
+          # and the Debian copyright file of every library the first pass
+          # bundled (GTK, libadwaita and their dependencies, mostly LGPL).
+          "./linuxdeploy-${ARCH}.AppImage" \
+            --appdir AppDir \
+            --executable "target/${{ matrix.target }}/release/bemtvi-gui" \
+            --desktop-file crates/bemtvi-gui/assets/bemtvi.desktop \
+            --icon-file bemtvi.png \
+            --plugin gtk
+
+          mkdir -p AppDir/usr/share/doc/bemtvi
+          cp "$LICENSES_DIR"/* AppDir/usr/share/doc/bemtvi/
+          # Every bundled shared object comes from a Debian package; a file
+          # without one fails the build rather than ship unaccounted for.
+          find AppDir/usr/lib -type f -name '*.so*' | while read -r lib; do
+            pkg=$(dpkg -S "*/$(basename "$lib")" 2>/dev/null | head -1 | cut -d: -f1) || true
+            if [ -z "$pkg" ]; then
+              echo "::error::no Debian package owns the bundled $(basename "$lib"); its license can't be shipped"
+              exit 1
+            fi
+            if [ ! -f "AppDir/usr/share/doc/$pkg/copyright" ]; then
+              mkdir -p "AppDir/usr/share/doc/$pkg"
+              cp "/usr/share/doc/$pkg/copyright" "AppDir/usr/share/doc/$pkg/copyright"
+            fi
+          done
+          ls AppDir/usr/share/doc
+
           mkdir -p dist
           OUTPUT="dist/$APPIMAGE_ASSET" VERSION="$PKG_VERSION" \
-            "./linuxdeploy-${ARCH}.AppImage" \
-              --appdir AppDir \
-              --executable "target/${{ matrix.target }}/release/bemtvi-gui" \
-              --desktop-file crates/bemtvi-gui/assets/bemtvi.desktop \
-              --icon-file bemtvi.png \
-              --plugin gtk \
-              --output appimage
+            "./linuxdeploy-${ARCH}.AppImage" --appdir AppDir --output appimage
           test -f "dist/$APPIMAGE_ASSET"
 
       - name: Package (Windows)
@@ -445,7 +490,8 @@ jobs:
             throw "$exe has PE subsystem $subsystem, expected $want"
           }
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path $exe -DestinationPath "dist/${env:ASSET}"
+          $licenses = Get-ChildItem -Path $env:LICENSES_DIR -File | ForEach-Object { $_.FullName }
+          Compress-Archive -Path (@($exe) + $licenses) -DestinationPath "dist/${env:ASSET}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -522,10 +568,20 @@ jobs:
       # Assemble the static publish root (web/ + dist/ siblings, _headers, serve.mjs, a
       # serving README), then tar it. The asset name matches the `bemtvi-*` glob the
       # edge/release publish jobs download, so it joins the GitHub release automatically.
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.3
+
+      # The site carries bemtvi's LICENSE and THIRD-PARTY-LICENSES.txt at its
+      # root: the crates, vendored C and emscripten runtime in the wasm, and the
+      # JS, grammars and queries under web/vendor.
       - name: Package site tarball
         run: |
           set -euo pipefail
           ./package-site.sh _site
+          cp ../../LICENSE _site/LICENSE
+          ../../scripts/gen-licenses.sh edithost _site/THIRD-PARTY-LICENSES.txt
           mkdir -p dist
           tar -czf "dist/bemtvi-edithost-${{ inputs.version }}.tar.gz" -C _site .
 

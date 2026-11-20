@@ -82,6 +82,11 @@ fn egit(context: &str, e: impl std::fmt::Display) -> GitError {
 /// buffer `:edit`ed for a file not on disk, still inside the repo) — we discover from its
 /// parent. This keeps `btv.git.show`/`diff_file` reporting `ENOENT` ("no HEAD version") for
 /// an uncommitted new file rather than `ENOREPO`.
+///
+/// Moving HEAD (a checkout, a pull) writes a reflog entry signed with the committer
+/// identity, and gix refuses one when none is configured, so with no `user.name` /
+/// `user.email` anywhere every checkout failed. Plain git makes one up for the reflog;
+/// so does this, in memory and only when nothing is configured.
 fn open(path: &str) -> Result<gix::Repository, GitError> {
     let p = Path::new(path);
     let from = if p.is_dir() {
@@ -91,7 +96,11 @@ fn open(path: &str) -> Result<gix::Repository, GitError> {
             .filter(|par| !par.as_os_str().is_empty())
             .unwrap_or(p)
     };
-    gix::discover(from).map_err(|e| err("ENOREPO", format!("not a git repository ({path}): {e}")))
+    let mut repo = gix::discover(from)
+        .map_err(|e| err("ENOREPO", format!("not a git repository ({path}): {e}")))?;
+    repo.committer_or_set_generic_fallback()
+        .map_err(|e| egit("committer identity", e))?;
+    Ok(repo)
 }
 
 /// The worktree root (toplevel) of `repo`, or `EGIT` for a bare repo (no worktree).

@@ -37,6 +37,18 @@ A pre-commit hook (`.pre-commit-config.yaml`) runs `cargo fmt --check` + `cargo 
 
   What is still forbidden is a **Rust** test that loads an `examples/` config (no `include_str!` / `config_dir` pointed at `examples/`) — use a throwaway for that and delete it before committing. The `examples/` dirs stay; feature behavior is covered by the normal (non-example) suites.
 
+## Releasing
+
+Release notes are written by hand, one file per release, and nothing generates them. A release is a signed tag the maintainer pushes; `.github/workflows/release.yml` does the rest.
+
+1. Bump the version: `[workspace.package]`'s `version` in the root `Cargo.toml`, and `version` in `crates/bemtvi-edithost/Cargo.toml` (outside the workspace, so it's bumped on its own). Any cargo command then updates `Cargo.lock`; refresh the edit-host's lock too (`cargo metadata --manifest-path crates/bemtvi-edithost/Cargo.toml`).
+2. Write `docs/release-notes/vX.Y.Z.md`: a one-line summary ("bemtvi 0.2.0 adds …"), then a section per area (`## Editing`, `## LSP`, `## GUI`, `## Plugins API`, …) with a bullet per change: a bold sentence saying what users get, then why. Name every `btv.*` break under its own `## Breaking changes`. Leave out the site link, the verify-a-download block and the Full Changelog line, which the workflow adds.
+3. Commit both as `chore(release): vX.Y.Z` and push `main`.
+4. Validate: `gh workflow run test.yml --ref main` (fmt, clippy, `cargo test --workspace` and every example's spec, on Linux) and `gh workflow run edge.yml`, which builds every release artifact. Tag only once both are green.
+5. `git tag -s vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`. The workflow refuses a tag that doesn't match both versions, isn't a signed annotated tag GitHub verifies, or has no notes file; runs `test.yml` again on the tagged commit; then builds every target, checksums and attests the artifacts, and creates the GitHub release from the notes.
+
+To fix a release's text afterwards, edit the notes file and `gh release edit vX.Y.Z --notes-file …` with the same text, site link and footer included. If the build or publish fails after tagging, rerun the failed jobs of that workflow run; don't move the tag.
+
 ## Design principles (how to decide what to build)
 
 - **Dogfood the `btv.*` plugin API — prime directive.** Everything that can reasonably be an `btv.*` Lua plugin *is* one; the editor's own first-party features (fuzzy picker, completion, statusline, snippets, tree docks, and behavior layered on them) ship as bundled `btv` plugins, not bespoke Rust. Rust keeps only what a plugin *cannot* be: the pure synchronous core, the frame/renderer, and the native engines (treesitter, LSP, regex). The server exposes a native *provider registry* (the seam); the feature driving it is a plugin. If a feature can't be expressed against `btv.*`, that's a gap to close in the API, not a reason to reach behind it — only drop to Rust for a genuine engine/frame/core constraint, and say which. (architecture.md guiding principle #3; ADR 0002 decision #5.)

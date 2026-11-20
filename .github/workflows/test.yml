@@ -1,0 +1,73 @@
+name: test
+
+# The checks a release must pass: formatting, clippy, the integration suites
+# and every example's spec. release.yml calls it on each `v*` tag, before it
+# builds anything; run it by hand on `main` before tagging
+# (`gh workflow run test.yml --ref main`).
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: fmt, clippy, tests and example specs (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # The workspace includes the GUI, which links mitsuami's GTK backend
+      # (GTK 4.10+, libadwaita 1.4+) and the wgpu graphics stack: the same
+      # packages build.yml installs for the Linux GUI.
+      - name: Install GUI build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev libadwaita-1-dev \
+            libwayland-dev libxkbcommon-dev libxcb1-dev \
+            libx11-dev libxrandr-dev libxi-dev libxcursor-dev \
+            libgl1-mesa-dev libegl1-mesa-dev
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-linux
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked --workspace
+
+      # `cargo test` doesn't run the examples' own specs: each runs in the
+      # real editor through `bemtvi --test-plugin`. All of them run, and the
+      # step fails at the end naming every example that failed.
+      - name: Example specs
+        shell: bash
+        run: |
+          set -uo pipefail
+          cargo build --locked -p bemtvi
+          failed=()
+          for dir in examples/*/; do
+            [ -d "${dir}test" ] || continue
+            echo "::group::${dir}"
+            if ! timeout 300 target/debug/bemtvi --test-plugin "$dir"; then
+              failed+=("$dir")
+            fi
+            echo "::endgroup::"
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            printf '::error::example spec failed: %s\n' "${failed[@]}"
+            exit 1
+          fi

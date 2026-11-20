@@ -1,7 +1,10 @@
 # GitHub Release Pipeline — Design
 
 **Date:** 2026-05-31
-**Status:** Approved (pending spec review)
+**Status:** Partly superseded (2026-11-20): stable releases are now a signed tag the
+maintainer pushes, with hand-written notes in `docs/release-notes/`. The release-prep PR,
+the CI-created tag and git-cliff are gone (CLAUDE.md → Releasing). The build matrix, edge
+channel and attestations below still hold.
 **Scope:** CI/CD that builds and publishes `bemtvi` binaries for all major OSes, with a
 rolling bleeding-edge channel, build provenance attestation, and a git-cliff changelog.
 

@@ -1,45 +1,86 @@
 name: release
 
+# A release is a signed tag pushed by the maintainer (`git tag -s vX.Y.Z`):
+# CLAUDE.md → Releasing. The notes are written by hand in
+# docs/release-notes/vX.Y.Z.md; nothing here generates them.
+
 on:
-  pull_request:
-    types: [closed]
+  push:
+    tags: ["v*"]
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
-  tag:
-    if: >-
-      github.event.pull_request.merged == true &&
-      contains(github.event.pull_request.labels.*.name, 'release')
+  check:
+    name: Check the tag, the version and the notes
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.read.outputs.version }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
-          fetch-depth: 0
 
-      - name: Read version from Cargo.toml
-        id: read
+      - name: The tag matches the workspace version
+        id: version
         shell: bash
         run: |
-          VERSION=$(grep -m1 -E '^version = ' Cargo.toml | sed -E 's/version = "([^"]*)"/\1/')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "bemtvi") | .version')
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match the workspace version $version"
+            exit 1
+          fi
+          # The edit-host is outside the workspace and keeps its own version.
+          edithost=$(cargo metadata --no-deps --format-version 1 \
+            --manifest-path crates/bemtvi-edithost/Cargo.toml \
+            | jq -r '.packages[] | select(.name == "bemtvi-edithost") | .version')
+          if [ "$edithost" != "$version" ]; then
+            echo "::error::bemtvi-edithost is at $edithost, the workspace at $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Create and push tag
+      # Releases come from signed, annotated tags only. GitHub checks the
+      # signature against the keys on the tagger's account; a lightweight tag
+      # has no tag object to sign and fails here too.
+      - name: The tag is signed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git tag "v${{ steps.read.outputs.version }}"
-          git push origin "v${{ steps.read.outputs.version }}"
+          set -euo pipefail
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME")
+          if [ "$(jq -r .object.type <<<"$ref")" != "tag" ]; then
+            echo "::error::$GITHUB_REF_NAME is a lightweight tag; tag with \`git tag -s\`"
+            exit 1
+          fi
+          verification=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$(jq -r .object.sha <<<"$ref")" --jq .verification)
+          if [ "$(jq -r .verified <<<"$verification")" != "true" ]; then
+            echo "::error::$GITHUB_REF_NAME isn't a verified signed tag ($(jq -r .reason <<<"$verification"))"
+            exit 1
+          fi
+
+      - name: The release has its notes
+        shell: bash
+        run: |
+          notes="docs/release-notes/$GITHUB_REF_NAME.md"
+          if [ ! -s "$notes" ]; then
+            echo "::error::$notes is missing or empty; write the release notes before tagging"
+            exit 1
+          fi
+
+  # fmt, clippy, the integration suites and the example specs. Nothing is
+  # built for release until they pass.
+  test:
+    needs: check
+    uses: ./.github/workflows/test.yml
 
   build:
-    needs: tag
+    needs: [check, test]
     uses: ./.github/workflows/build.yml
     with:
-      version: ${{ needs.tag.outputs.version }}
+      version: ${{ needs.check.outputs.version }}
     # Forward only the macOS signing/notarization secrets build.yml declares —
     # not `inherit` (which would expose every repo secret to the build, within
     # one careless `${{ secrets.* }}` of the third-party tooling the Linux GUI
@@ -54,18 +95,17 @@ jobs:
       AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
 
   publish:
-    needs: [tag, build]
+    needs: [check, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
+      # Full history, for the previous tag the Full Changelog line compares to.
       - uses: actions/checkout@v7
         with:
-          ref: v${{ needs.tag.outputs.version }}
           fetch-depth: 0
-
-      - name: Install git-cliff
-        uses: taiki-e/install-action@v2
-        with:
-          tool: git-cliff
 
       - name: Download artifacts
         uses: actions/download-artifact@v8
@@ -85,23 +125,39 @@ jobs:
         with:
           subject-path: "dist/bemtvi-*"
 
+      # The site link, the hand-written notes, how to verify a download, and
+      # the Full Changelog line (from the previous release, when there is one).
       - name: Build release notes
         shell: bash
         run: |
+          set -euo pipefail
+          previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$GITHUB_REF_NAME^" 2>/dev/null || true)
           {
-            git cliff --current --strip header
+            echo "[bemtvi.github.io/bemtvi](https://bemtvi.github.io/bemtvi/)"
+            echo
+            cat "docs/release-notes/$GITHUB_REF_NAME.md"
             echo
             echo "---"
-            echo "Verify a download's provenance:"
+            echo
+            echo "Verify a download ([docs/verifying-downloads.md](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/docs/verifying-downloads.md)):"
+            echo
+            echo '```sh'
+            echo "sha256sum --ignore-missing -c SHA256SUMS"
+            echo "gh attestation verify <file> --repo $GITHUB_REPOSITORY"
             echo '```'
-            echo "gh attestation verify <file> --repo bemtvi/bemtvi"
-            echo '```'
+            echo
+            if [ -n "$previous" ]; then
+              echo "**Full Changelog**: https://github.com/$GITHUB_REPOSITORY/compare/$previous...$GITHUB_REF_NAME"
+            else
+              echo "**Full Changelog**: https://github.com/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME"
+            fi
           } > RELEASE_NOTES.md
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v${{ needs.tag.outputs.version }}" dist/* \
-            --title "v${{ needs.tag.outputs.version }}" \
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
             --notes-file RELEASE_NOTES.md

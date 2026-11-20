@@ -154,10 +154,12 @@ jobs:
         shell: bash
         run: cargo zigbuild --locked --release -p "$CRATE" --target ${{ matrix.target }}.2.17
 
+      # From source, with the `cli` feature its binary needs: install-action has no
+      # 0.9.3 build for every runner, and its from-source fallback leaves `cli` off
+      # and installs nothing.
       - name: Install cargo-about
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-about@0.9.3
+        shell: bash
+        run: cargo install --locked --features cli cargo-about@0.9.3
 
       # bemtvi's own LICENSE and THIRD-PARTY-LICENSES.txt go in every archive
       # below (scripts/gen-licenses.sh says what the second one covers).
@@ -455,8 +457,11 @@ jobs:
           cp "$LICENSES_DIR"/* AppDir/usr/share/doc/bemtvi/
           # Every bundled shared object comes from a Debian package; a file
           # without one fails the build rather than ship unaccounted for.
+          # Only a package that installs it under /lib or /usr/lib counts: the
+          # runner has applications (Edge, under /opt) carrying their own copies.
           find AppDir/usr/lib -type f -name '*.so*' | while read -r lib; do
-            pkg=$(dpkg -S "*/$(basename "$lib")" 2>/dev/null | head -1 | cut -d: -f1) || true
+            pkg=$(dpkg -S "*/$(basename "$lib")" 2>/dev/null \
+              | awk -F': ' '$2 ~ /^\/(usr\/)?lib\// { print $1; exit }' | cut -d: -f1 | cut -d, -f1) || true
             if [ -z "$pkg" ]; then
               echo "::error::no Debian package owns the bundled $(basename "$lib"); its license can't be shipped"
               exit 1
@@ -568,10 +573,12 @@ jobs:
       # Assemble the static publish root (web/ + dist/ siblings, _headers, serve.mjs, a
       # serving README), then tar it. The asset name matches the `bemtvi-*` glob the
       # edge/release publish jobs download, so it joins the GitHub release automatically.
+      # From source, with the `cli` feature its binary needs: install-action has no
+      # 0.9.3 build for every runner, and its from-source fallback leaves `cli` off
+      # and installs nothing.
       - name: Install cargo-about
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-about@0.9.3
+        shell: bash
+        run: cargo install --locked --features cli cargo-about@0.9.3
 
       # The site carries bemtvi's LICENSE and THIRD-PARTY-LICENSES.txt at its
       # root: the crates, vendored C and emscripten runtime in the wasm, and the

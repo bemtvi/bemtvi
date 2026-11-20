@@ -79,6 +79,11 @@ async fn an_editor_started_with_no_file_shows_the_intro() {
     assert!(row_with(&rows, "version 0.1.0").is_some(), "{rows:#?}");
     assert!(row_with(&rows, ":q<Enter>").is_some(), "{rows:#?}");
     assert!(row_with(&rows, ":Plugins<Enter>").is_some(), "{rows:#?}");
+    // The Vim license asks a build with modified Vim code to say so on the intro screen.
+    assert!(
+        row_with(&rows, "modified Vim regex engine").is_some(),
+        "{rows:#?}"
+    );
     // `:help` is only advertised when the help plugin provides it.
     assert!(row_with(&rows, ":help").is_none(), "{rows:#?}");
     // The buffer itself is untouched: one empty, unmodified line.

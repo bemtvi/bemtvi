@@ -385,6 +385,9 @@ const LSP_MOCK_FLAG: &str = "--__lsp-mock";
 #[command(
     name = "bemtvi",
     version,
+    // `--version` adds the notices the build must show (the Vim license's, for the
+    // vendored regex engine); `-V` stays the bare number.
+    long_version = bemtvi_core::version::LONG,
     about = "A modal, vim-style editor: a headless editor server plus a terminal UI client.",
     long_about = "A modal, vim-style editor: a headless editor server plus a terminal UI \
         client, both run from this one binary. With no role flag, bemtvi opens the given \

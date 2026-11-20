@@ -123,6 +123,15 @@ local function text_lines()
       false,
     }
   end
+  -- The notices the build must show beside its version (the Vim license asks for one
+  -- on the intro screen when the vim regex engine is built in), after a blank row.
+  local notices = btv._version_notices or {}
+  if #notices > 0 then
+    lines[#lines + 1] = { 0, {}, true }
+    for _, notice in ipairs(notices) do
+      lines[#lines + 1] = { #notice, { { notice, "BtvIntroText" } }, true }
+    end
+  end
   return lines
 end
 
@@ -224,7 +233,10 @@ local function draw(buf, win)
     virt[#virt + 1] = box_row(0, 0, {})
   end
   for _, row in ipairs(rows) do
-    local offset = row[3] and math.floor((content_width - row[1]) / 2) or text_indent
+    -- A centred row is centred in the window itself, not in the box: centring it in
+    -- the box, which is itself centred, rounds down twice and can land it a column
+    -- further off.
+    local offset = row[3] and (math.floor((width - row[1]) / 2) - left - MARGIN) or text_indent
     virt[#virt + 1] = box_row(offset, row[1], row[2])
   end
   for _ = 1, MARGIN do

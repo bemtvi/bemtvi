@@ -411,7 +411,7 @@ If you know vim, your muscle memory transfers. Concretely, what's wired today:
   `g i I n c` flags), `:g`/`:v`, `:d :m :t`, `:normal`, `:put`, `:undo`/`:redo`,
   the undo-travel family (`:undolist`, `:earlier`/`:later`),
   `:set`/`:setlocal`/`:setglobal`, the listings (`:marks :registers :jumps
-  :changes :messages`), and `:vimgrep`/`:lvimgrep`.
+  :changes :messages :version`), and `:vimgrep`/`:lvimgrep`.
 
 Not yet wired (see the [roadmap](#not-yet-implemented-roadmap)): `%` match-pair,
 the paragraph/sentence motions (`{ } ( )`), the screen motions (`H M L`), the

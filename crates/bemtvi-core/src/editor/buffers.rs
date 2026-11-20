@@ -3102,6 +3102,18 @@ impl Editor {
     /// column, `^J` for embedded newlines). An argument filters to the named
     /// registers (`:reg ab0`). The read-only specials `"%` / `"/` / `":` are
     /// projected from live editor state.
+    /// `:ve[rsion]` — the version, then the notices this build must show beside it
+    /// ([`crate::version::NOTICES`]: the Vim license's, for the vendored regex engine),
+    /// in a listing panel.
+    pub(crate) fn ex_version(&mut self) {
+        let mut lines = vec![crate::version::VERSION.to_string()];
+        if !crate::version::NOTICES.is_empty() {
+            lines.push(String::new());
+            lines.extend(crate::version::NOTICES.iter().map(|n| n.to_string()));
+        }
+        self.open_named_panel("[Version]", lines, 0, "btvlisting", LISTING_HEIGHT);
+    }
+
     pub(crate) fn ex_registers(&mut self, args: &str) {
         let filter: Vec<char> = args.chars().filter(|c| !c.is_whitespace()).collect();
         let wanted = |name: char| filter.is_empty() || filter.contains(&name);

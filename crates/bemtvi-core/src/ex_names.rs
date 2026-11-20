@@ -168,6 +168,7 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("lua", &["lua"]),
     ("sleep", &["sleep", "sl"]),
     ("messages", &["mes", "messages", "message"]),
+    ("version", &["ve", "vers", "versi", "versio", "version"]),
     ("echo", &["ec", "ech", "echo"]),
     ("echomsg", &["echom", "echoms", "echomsg"]),
     ("echoerr", &["echoe", "echoer", "echoerr"]),

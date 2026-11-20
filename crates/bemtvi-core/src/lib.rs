@@ -38,6 +38,7 @@ pub mod statusline;
 pub mod stdpath;
 pub mod syntax;
 pub mod unicode;
+pub mod version;
 pub mod view;
 
 pub use buffer::{dir_listing, Buffer, BufferEdit, BufferKind, DiskChange, EditBatch};

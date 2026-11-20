@@ -35,6 +35,30 @@ async fn messages_command_opens_a_panel_with_the_history() {
     );
 }
 
+// `:ve[rsion]` shows the version and the notice the Vim license asks a build with modified
+// Vim code to show there.
+#[tokio::test]
+async fn version_command_shows_the_version_and_the_vim_notice() {
+    let (rpc, _incoming) = start(None).await;
+    for cmd in [":version<CR>", ":ve<CR>"] {
+        feed(&rpc, cmd);
+        assert!(panel_is_open(&rpc).await, "`{cmd}` opens a panel");
+        let shown = lines(&rpc).await;
+        assert_eq!(
+            shown.first().map(String::as_str),
+            Some(concat!("bemtvi ", env!("CARGO_PKG_VERSION"))),
+            "{shown:?}"
+        );
+        assert!(
+            shown
+                .iter()
+                .any(|l| l.contains("modified Vim regex engine")),
+            "{shown:?}"
+        );
+        feed(&rpc, "q");
+    }
+}
+
 // `:={expr}` — neovim's shorthand for `:lua vim.print({expr})`. It evaluates the
 // Lua expression, pretty-prints the result onto the message history, *and* (bemtvi's
 // own touch) opens the `:messages` panel so the value is visible even when it spans

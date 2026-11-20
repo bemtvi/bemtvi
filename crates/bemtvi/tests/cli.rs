@@ -95,6 +95,23 @@ fn run_io(mut cmd: Command, timeout: Duration) -> (ExitStatus, String, String, D
 /// A `--lua` script's `print(...)` must reach the process's real **stdout** — the
 /// headless one-shot has no UI, so output routed only to the message line would vanish.
 /// A shell/CI running `bemtvi --lua '...print(x)...'` must be able to read it back.
+/// `--version` carries the notice the Vim license asks a build with modified Vim code
+/// to show (the vendored regular expression engine); `-V` stays the bare version.
+#[test]
+fn version_flag_says_the_build_contains_modified_vim_code() {
+    let cfg = fresh_dir("cfg");
+    let mut cmd = bemtvi(&cfg);
+    cmd.arg("--version");
+    let (status, stdout, stderr, _) = run_io(cmd, Duration::from_secs(45));
+    assert!(status.success(), "{status:?} (stderr: {stderr})");
+    assert!(
+        stdout.starts_with(concat!("bemtvi ", env!("CARGO_PKG_VERSION"))),
+        "{stdout:?}"
+    );
+    assert!(stdout.contains("modified Vim regex engine"), "{stdout:?}");
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
 #[test]
 fn lua_oneshot_print_goes_to_stdout() {
     let cfg = fresh_dir("cfg");

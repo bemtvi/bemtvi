@@ -634,7 +634,12 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
         })?,
     )?;
 
-    vim.set("version", "bemtvi 0.1.0")?;
+    vim.set("version", bemtvi_core::version::VERSION)?;
+    // The notices the build must show beside its version, for the intro screen.
+    btv.set(
+        "_version_notices",
+        lua.create_sequence_from(bemtvi_core::version::NOTICES.iter().copied())?,
+    )?;
 
     // An empty `vim.api` namespace; the prelude fills it with `nvim_*` aliases onto
     // the `btv.*` natives (the canonical surface) seeded here and across the prelude.

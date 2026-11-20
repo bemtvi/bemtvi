@@ -1216,6 +1216,7 @@ impl Editor {
             "echo" => self.ex_echo(args, EchoKind::Transient),
             "echomsg" => self.ex_echo(args, EchoKind::Message),
             "echoerr" => self.ex_echo(args, EchoKind::Error),
+            "version" => self.ex_version(),
             "registers" => self.ex_registers(args),
             "marks" => self.ex_marks(args),
             "jumps" => self.ex_jumps(args),

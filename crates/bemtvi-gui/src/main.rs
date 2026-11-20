@@ -63,6 +63,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 #[command(
     name = "bemtvi-gui",
     version,
+    // `--version` adds the notices the build must show (see bemtvi_core::version).
+    long_version = bemtvi_core::version::LONG,
     about = "A modal, vim-style editor: the native (mitsuami + wgpu) GUI client.",
     long_about = "A modal, vim-style editor: the native (mitsuami + wgpu) GUI client. With no \
         role flag, bemtvi-gui opens the given file (or an empty buffer) in a window onto a \

@@ -15,7 +15,7 @@
 //! See `docs/plans/2026-08-07-incremental-buffer-mirror.md`.
 
 use bemtvi_rpc::{Incoming, Rpc};
-use bemtvi_test_harness::{exec_lua, start_with_file, wait_redraw, window0_field};
+use bemtvi_test_harness::{exec_lua, serial_lock, start_with_file, wait_redraw, window0_field};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -295,6 +295,9 @@ async fn marks_do_not_dominate_the_cost_of_typing() {
     // The ratio measured 2.2-2.3x across repeated runs, and reverting either Phase 4
     // fix pushes it to 4.0x+, so 3.2 leaves ~40% headroom while still failing on a
     // regression rather than sitting exactly on the boundary.
+    // Timing ratios: the three in this file take the serial lock, so none is measured
+    // while another is running beside it.
+    let _serial = serial_lock().lock().await;
     let bare = typing_cost(0, "").await;
     let heavy = typing_cost(5_000, HL_MARK).await;
     let ratio = heavy.as_secs_f64() / bare.as_secs_f64();
@@ -493,6 +496,9 @@ async fn gutter_signs_do_not_dominate_the_cost_of_typing() {
     // `byte_to_line` on every frame, which put a buffer full of git signs at ~13.8x a
     // mark-free one (6.5s vs 0.47s) while highlight marks sat at ~2.2x. Pruning to
     // the visible byte range brought it to ~2.0x.
+    // Timing ratios: the three in this file take the serial lock, so none is measured
+    // while another is running beside it.
+    let _serial = serial_lock().lock().await;
     let bare = typing_cost(0, "").await;
     let heavy = typing_cost(5_000, SIGN_MARK).await;
     let ratio = heavy.as_secs_f64() / bare.as_secs_f64();
@@ -927,8 +933,20 @@ async fn many_namespaces_do_not_dominate_the_cost_of_typing() {
     // the case where a per-namespace query does real work. Measured: `main` (one
     // index) ~2.2x; querying each namespace's index and merging per call ~3.2x; one
     // combined index merged from the namespaces' runs ~2.3x.
-    let bare = many_namespaces_typing_cost(0).await;
-    let heavy = many_namespaces_typing_cost(1_000).await;
+    //
+    // The two are run alternately, three times, and the fastest of each compared: one
+    // pair measured once swung from 1.7x to 2.5x under load (the other tests in this
+    // binary run beside it), and read 3.0x once on CI. The fastest run is the least
+    // disturbed one, while a per-namespace cost slows every run, so it still shows.
+    // Timing ratios: the three in this file take the serial lock, so none is measured
+    // while another is running beside it.
+    let _serial = serial_lock().lock().await;
+    let mut bare = std::time::Duration::MAX;
+    let mut heavy = std::time::Duration::MAX;
+    for _ in 0..3 {
+        bare = bare.min(many_namespaces_typing_cost(0).await);
+        heavy = heavy.min(many_namespaces_typing_cost(1_000).await);
+    }
     let ratio = heavy.as_secs_f64() / bare.as_secs_f64();
     assert!(
         ratio < 2.8,

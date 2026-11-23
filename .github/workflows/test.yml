@@ -51,7 +51,15 @@ jobs:
 
       # `--no-fail-fast`: every test binary runs, so one run reports every failure
       # rather than stopping at the first failing binary.
+      #
+      # One test at a time in each binary. About twenty tests time the editor
+      # against a baseline (typing with and without folds, extmarks, diagnostics…)
+      # and fail on the ratio; on a four-core runner, the other tests of the same
+      # binary running beside them threw a different one over its limit on each
+      # run. Run alone, each measures what it means to.
       - name: Tests
+        env:
+          RUST_TEST_THREADS: "1"
         run: cargo test --locked --workspace --no-fail-fast
 
       # `cargo test` doesn't run the examples' own specs: each runs in the

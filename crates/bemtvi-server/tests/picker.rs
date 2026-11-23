@@ -3618,6 +3618,11 @@ async fn live_grep_clips_a_pathologically_long_line_around_the_hit() {
 /// clipped around and highlighting *that* hit.
 #[tokio::test]
 async fn live_grep_reads_a_long_many_hit_line_once_not_once_per_hit() {
+    // `rg --vimgrep` reports a row per hit; the `grep` fallback, one per line.
+    if !have_rg() {
+        eprintln!("skip: rg not installed");
+        return;
+    }
     let _serial = serial_lock().lock().await;
 
     let dir = temp_dir("picker_grep_flood_cfg");
@@ -5790,11 +5795,7 @@ async fn shipped_files_and_live_grep_list_vendored_paths_last() {
 /// `grep` leg is one pass by design).
 #[tokio::test]
 async fn a_capped_live_grep_still_finds_the_normal_hit_under_a_flood_of_low_ones() {
-    if std::process::Command::new("rg")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
+    if !have_rg() {
         eprintln!("skip: rg not installed");
         return;
     }
@@ -5839,6 +5840,16 @@ async fn a_capped_live_grep_still_finds_the_normal_hit_under_a_flood_of_low_ones
 /// Whether `git` can run here; the `_git` fixtures need a real work tree.
 fn have_git() -> bool {
     std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+/// Whether `rg` is on PATH. A test of the `rg` leg skips without it: the `grep`
+/// fallback is a different leg (one row per matching line, one pass), so it would fail
+/// for a reason that isn't the one it tests.
+fn have_rg() -> bool {
+    std::process::Command::new("rg")
         .arg("--version")
         .output()
         .is_ok()
@@ -6209,14 +6220,24 @@ async fn without_rg_a_repo_git_refuses_still_honours_gitignore() {
     let (rpc, mut incoming) = start(&dir, "").await;
     command(&rpc, &format!("cd {}", proj.display())).await;
     let _path = PathWithout::install("picker_git_dubious_path", &["rg"]);
-    struct Unset;
+    // git's test hook makes it see another owner; the machine's own config must not
+    // then trust the repo anyway (GitHub's runner images set `safe.directory = *`
+    // system-wide), so the system and global configs are kept out for the test.
+    struct Unset(Option<std::ffi::OsString>);
     impl Drop for Unset {
         fn drop(&mut self) {
             std::env::remove_var("GIT_TEST_ASSUME_DIFFERENT_OWNER");
+            std::env::remove_var("GIT_CONFIG_NOSYSTEM");
+            match self.0.take() {
+                Some(v) => std::env::set_var("GIT_CONFIG_GLOBAL", v),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
         }
     }
+    let _unset = Unset(std::env::var_os("GIT_CONFIG_GLOBAL"));
     std::env::set_var("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1");
-    let _unset = Unset;
+    std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+    std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
     let refused = std::process::Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(&proj)
@@ -6496,6 +6517,10 @@ async fn without_rg_files_git_reports_git_ls_files_failing() {
 async fn live_grep_git_reports_a_low_chunk_that_cannot_spawn() {
     if !have_git() {
         eprintln!("skip: git not installed");
+        return;
+    }
+    if !have_rg() {
+        eprintln!("skip: rg not installed");
         return;
     }
     // Serial: it needs rg on PATH, which the `PathWithout` tests mask process-wide.

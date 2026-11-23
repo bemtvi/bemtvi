@@ -27,10 +27,12 @@ jobs:
       # The workspace includes the GUI, which links mitsuami's GTK backend
       # (GTK 4.10+, libadwaita 1.4+) and the wgpu graphics stack: the same
       # packages build.yml installs for the Linux GUI.
-      - name: Install GUI build deps
+      # ripgrep: the pickers' searches are built on `rg`, and the tests of that leg
+      # skip without it (the runner image doesn't ship it).
+      - name: Install GUI build deps and ripgrep
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y ripgrep \
             libgtk-4-dev libadwaita-1-dev \
             libwayland-dev libxkbcommon-dev libxcb1-dev \
             libx11-dev libxrandr-dev libxi-dev libxcursor-dev \
@@ -47,8 +49,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      # `--no-fail-fast`: every test binary runs, so one run reports every failure
+      # rather than stopping at the first failing binary.
       - name: Tests
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --no-fail-fast
 
       # `cargo test` doesn't run the examples' own specs: each runs in the
       # real editor through `bemtvi --test-plugin`. All of them run, and the

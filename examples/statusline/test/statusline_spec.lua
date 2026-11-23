@@ -10,8 +10,12 @@ local DIR = btv.utils.dirname(btv.utils.dirname(debug.getinfo(1, "S").source:sub
 
 dofile(DIR .. "/init.lua")
 
+-- Opened from the example's own directory, so the bar names `sample.txt` rather than
+-- its full path: a long checkout path would otherwise crowd the right-hand blocks
+-- off the end of the bar (the encoding, the ruler) and fail cases that read them.
 local function open(t)
-  t:cmd("e " .. DIR .. "/sample.txt")
+  t:cmd("cd " .. DIR)
+  t:cmd("e sample.txt")
   t:cmd("e!")
   t:cmd("set laststatus=2")
   t:feed("gg")

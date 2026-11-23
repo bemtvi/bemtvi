@@ -1087,10 +1087,14 @@ btv.decor.provider {
         "the editor kept answering while the provider re-asked ({:?})",
         t.elapsed()
     );
-    // Bounded: the opening dispatch plus the one invalidation the pass serves.
+    // Bounded: each pass serves the ask once, so the count is the passes run so far. That
+    // is usually 4 here, but how many there are depends on how the `:e` keys and these
+    // RPCs are batched, which a loaded machine (CI) splits more finely — 5 was seen
+    // there. A loop served on demand would be in the thousands; the idle windows below
+    // are what prove there is none.
     let settled = lua_u64(&rpc, "return _G.runs").await.unwrap();
     assert!(
-        (1..=4).contains(&settled),
+        (1..=8).contains(&settled),
         "the pass serves the ask once, it does not loop: {settled}"
     );
     // …and it is not free-running: sitting idle for a while adds nothing beyond the

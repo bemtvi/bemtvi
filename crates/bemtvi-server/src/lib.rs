@@ -1827,6 +1827,16 @@ pub struct EditHost {
     /// [`Editor::load_bytes_into_enc`](bemtvi_core::Editor), so `++enc` decodes a remote
     /// file exactly as it does a local one. Empty for ordinary opens and local sessions.
     forced_fetch_enc: HashMap<BufferId, String>,
+    /// Buffers whose **off-tick** open is in flight: the drain fired the fetch, the bytes
+    /// haven't landed. The drain takes the open off the editor's pending list as it
+    /// fires the fetch, so without this a lifecycle pass in between (any key or RPC)
+    /// saw a named, empty buffer with nothing pending and announced it — `BufNewFile` /
+    /// `FileType` over no content, then the whole chain again when the bytes landed.
+    /// [`emit_lifecycle_events`](Self::emit_lifecycle_events) counts these as pending.
+    /// Inserted in [`drain_pending_opens`](Self::drain_pending_opens); removed by every
+    /// landing — [`apply_open`](Self::apply_open) natively, the wasm
+    /// `complete_fs_read` / `complete_fs_read_dir` — whatever the outcome.
+    fetching: HashSet<BufferId>,
     /// Per-terminal-buffer vt100 emulators, keyed by buffer id. Created when a
     /// `:terminal` opens, fed the child's raw PTY bytes (decoding escape sequences
     /// into a screen grid), and projected back into the buffer's mirrored lines +
@@ -2286,6 +2296,7 @@ impl EditHost {
             remote_watches: HashSet::new(),
             reload_posts: HashMap::new(),
             forced_fetch_enc: HashMap::new(),
+            fetching: HashSet::new(),
             terminals: HashMap::new(),
             terminal_frozen: HashMap::new(),
             dirs: cwd::DirState::new(std::env::current_dir().unwrap_or_default()),
@@ -3140,6 +3151,8 @@ impl EditHost {
             self.redraw();
             return;
         }
+        // The fetch landed, whatever its outcome: the buffer's lifecycle is no longer held.
+        self.fetching.remove(&buffer);
         match kind {
             // kind 0 = an existing file (real bytes); kind 1 = a new file that wasn't on
             // disk. The flag stamps the read-from-disk baseline for the former so it fires
@@ -3189,6 +3202,7 @@ impl EditHost {
             self.redraw();
             return;
         }
+        self.fetching.remove(&buffer);
         self.load_dir_listing(buffer, dir, entries);
         self.redraw();
     }

@@ -417,6 +417,71 @@ async fn edit_existing_remote_file_fires_bufreadpost_not_bufnewfile() {
 /// The gated read chain works identically over the wire — the tier-1 rule applied to the
 /// async event model (`docs/plans/2026-07-26-async-event-model.md`, phases 4–5).
 ///
+/// While a remote open's fetch is in flight the buffer is named but empty, and its read
+/// lifecycle must wait for the bytes. The open leaves the editor's pending list the moment
+/// the fetch is dispatched, so any lifecycle pass in between — another key, another RPC —
+/// used to announce the empty buffer: `FileType` fired with no `BufReadPost` before it,
+/// and the real read later fired the chain a second time. On a quiet machine the bytes
+/// usually landed first, so this only showed under load; parking the read makes it certain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_remote_open_announces_nothing_until_its_bytes_land() {
+    let fake = DaemonFs::default();
+    fake.set("/virtual/note.txt", "alpha\n")
+        .set("/virtual/late.rs", "fn landed() {}\n");
+    let (rpc, _incoming) = spawn_with_daemon_fs(fake.clone(), "/virtual/note.txt").await;
+    await_lines(&rpc, &["alpha"]).await;
+
+    exec_lua(
+        &rpc,
+        r#"
+        _G.log = {}
+        -- Scoped to the file being opened: a handler registered now is also replayed
+        -- the startup buffer's events, which are not what this test is about.
+        for _, ev in ipairs({ "BufReadPost", "BufNewFile", "BufWinEnter" }) do
+          btv.autocmd.create(ev, { pattern = "*late.rs", callback = function(a)
+            _G.log[#_G.log + 1] = ev .. ":" .. (btv.buf.lines(a.buf, 0, 1)[1] or "")
+          end })
+        end
+        btv.autocmd.create("FileType", { pattern = "rust", callback = function(a)
+          _G.log[#_G.log + 1] = "FileType:" .. (btv.buf.lines(a.buf, 0, 1)[1] or "")
+        end })
+        return 1
+        "#,
+    )
+    .await;
+
+    let hold = fake.hold_reads();
+    feed(&rpc, ":edit /virtual/late.rs<CR>");
+    hold.await_parked().await;
+    // A lifecycle pass while the fetch is parked: a key in Normal mode.
+    feed(&rpc, "<Esc>");
+    let early = exec_lua(&rpc, "return table.concat(_G.log, ',')").await;
+    assert_eq!(
+        early.as_str(),
+        Some(""),
+        "nothing may be announced while the buffer's bytes are still in flight"
+    );
+
+    hold.release();
+    await_lines(&rpc, &["fn landed() {}"]).await;
+    let mut log = String::new();
+    for _ in 0..100 {
+        log = exec_lua(&rpc, "return table.concat(_G.log, ',')")
+            .await
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if log.contains("FileType") && log.contains("BufWinEnter") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        log, "BufReadPost:fn landed() {},FileType:fn landed() {},BufWinEnter:fn landed() {}",
+        "the read chain and the window's BufWinEnter fire once, over the landed content"
+    );
+}
+
 /// A remote open takes the off-tick path: the buffer is created empty, the bytes land a
 /// tick or more later, and only *then* is the buffer announced. Both halves of the model
 /// must survive that split — the chain's ordering (`FileType` waits for an async

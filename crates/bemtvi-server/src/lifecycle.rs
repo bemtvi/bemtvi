@@ -46,6 +46,8 @@ impl EditHost {
             self.apply_preview(path, lines, ok);
             return;
         }
+        // The fetch landed, whatever its outcome: the buffer's lifecycle is no longer held.
+        self.fetching.remove(&buffer);
         match result {
             // Decode through the shared seam (latin1/utf-16/BOM detection +
             // invalid-UTF-8 resilience), exactly as the local `Buffer::from_file`
@@ -353,6 +355,8 @@ impl EditHost {
             if let Some(enc) = open.force_encoding {
                 self.forced_fetch_enc.insert(open.buffer, enc);
             }
+            // Hold the buffer's read lifecycle until the bytes land (see `fetching`).
+            self.fetching.insert(open.buffer);
             self.fx.fs_fetch(open.buffer, path);
         }
     }
@@ -439,7 +443,7 @@ impl EditHost {
         // read lifecycle (`BufReadPost`/`FileType`/`BufEnter`) until then, so those fire
         // once over the filled buffer rather than prematurely on the empty one (which
         // would double the `FileType`). `BufLeave` for the buffer being left is unaffected.
-        let pending_open = self.editor.has_pending_open(buf);
+        let pending_open = self.open_pending(buf);
 
         let unannounced = !self.announced.contains(&buf);
         // FileType fires on the buffer's first announce *and* whenever its filetype
@@ -921,7 +925,7 @@ impl EditHost {
                 // *current* buffer's pending state; here every displayed buffer is
                 // checked, so a background window filled by a session restore is covered
                 // too).
-                if self.editor.has_pending_open(b) {
+                if self.open_pending(b) {
                     if let Some(prev) = self.known_window_buffers.get(&w).copied() {
                         new_map.insert(w, prev);
                     }
@@ -1968,7 +1972,7 @@ impl EditHost {
             // off-tick/daemon open) is named but empty: announcing it now would fire
             // against the pre-load filetype. It announces on the diff its content lands,
             // exactly as the current-buffer path holds for `pending_open`.
-            if seen.insert(b) && !self.announced.contains(&b) && !self.editor.has_pending_open(b) {
+            if seen.insert(b) && !self.announced.contains(&b) && !self.open_pending(b) {
                 todo.push(b);
             }
         }
@@ -1980,6 +1984,15 @@ impl EditHost {
             // walk, and a chain in flight implies the buffer is already announced.)
             self.begin_read_chain(b);
         }
+    }
+
+    /// Whether `buf`'s open hasn't finished: still on the editor's pending list, or an
+    /// off-tick fetch the drain fired whose bytes haven't landed. The drain takes the open
+    /// off the pending list as it fires the fetch, so the pending list alone goes false
+    /// while the buffer is still empty (see [`fetching`](Self::fetching)). Both announce
+    /// paths and the `BufWinEnter` walk hold a buffer's events while this is true.
+    fn open_pending(&self, buf: BufferId) -> bool {
+        self.editor.has_pending_open(buf) || self.fetching.contains(&buf)
     }
 
     /// Start `buf`'s read chain at [`ReadStage::ReadPost`] and drive it as far as it

@@ -11,6 +11,10 @@ pixel edges. The upscaled art is centred on its canvas (see `upscale`). Outputs:
 - `icons/bemtvi-<N>.png`: the per-size PNGs that CI packs into the AppImage and
   the macOS `.icns`.
 - `bemtvi.ico`: the Windows icon that `build.rs` embeds into `bemtvi-gui.exe`.
+- `bemtvi-file.ico`: the Windows document icon, for files opened with bemtvi,
+  from the hand-drawn `fileicon<N>.png` sources. `build.rs` embeds it as the
+  exe's second icon. Its upscales keep the source's own placement (see
+  `upscale_in_place`).
 - `crates/bemtvi-lua/src/prelude/intro_logo.lua`: `icon24.png`'s pixels as Lua
   data, which the intro screen draws in the terminal with half-block characters.
 
@@ -32,6 +36,10 @@ INTRO_LOGO = HERE.parent.parent / "bemtvi-lua" / "src" / "prelude" / "intro_logo
 # fractional scale would blur or distort the pixel grid).
 UPSCALES = [48, 64, 128, 256, 512, 1024]
 ICO_SIZES = [16, 24, 32, 48, 64, 128, 256]
+# The document icon has only a 32px drawing, so every size is 32 or a whole
+# multiple of it. Windows samples the 32 down for the 16 to 24px views; a
+# hand-drawn `fileicon16.png` / `fileicon24.png` would let 16, 24 and 48 join.
+FILE_ICO_SIZES = [32, 64, 96, 128, 256]
 
 
 def load(name, size):
@@ -53,6 +61,50 @@ def upscale(src, size):
     out = Image.new("RGBA", (size, size))
     out.paste(art, ((size - art.width) // 2, (size - art.height) // 2))
     return out
+
+
+def upscale_in_place(src, size):
+    """Scale the whole of `src` to `size` by a whole factor, nearest-neighbour,
+    keeping the art where the source draws it. `fileicon32.png` leaves 5px empty
+    on the left and 1px on top; re-centring it the way `upscale` does would move
+    the art in every size but the 32."""
+    return src.resize((size, size), Image.Resampling.NEAREST)
+
+
+def load_sources(prefix):
+    """Every hand-drawn `<prefix><N>.png` next to this script, keyed by N."""
+    out = {}
+    for path in HERE.glob(f"{prefix}*.png"):
+        m = re.fullmatch(rf"{prefix}(\d+)\.png", path.name)
+        if m:
+            size = int(m.group(1))
+            out[size] = load(path.name, size)
+    return out
+
+
+def scaled(sources, size, scale):
+    """`size` as a source when one is drawn at it, else an integer upscale of the
+    largest source that divides it."""
+    if size in sources:
+        return sources[size]
+    bases = [b for b in sources if size % b == 0]
+    if not bases:
+        sys.exit(f"no source divides {size}: it cannot be an integer upscale")
+    return scale(sources[max(bases)], size)
+
+
+def write_ico(path, renders, sizes):
+    """An ICO with PNG-compressed entries (Vista+), smallest first."""
+    imgs = [(s, png_bytes(renders[s])) for s in sizes]
+    off = 6 + 16 * len(imgs)
+    entries = data = b""
+    for s, png in imgs:
+        d = 0 if s >= 256 else s  # 0 encodes 256 in the ICO dir entry
+        entries += struct.pack("<BBBBHHII", d, d, 0, 0, 1, 32, len(png), off)
+        data += png
+        off += len(png)
+    path.write_bytes(struct.pack("<HHH", 0, 1, len(imgs)) + entries + data)
+    return len(imgs)
 
 
 def write_intro_logo(src):
@@ -105,18 +157,10 @@ def png_bytes(img):
 
 
 def main():
-    renders = {}
-    for path in HERE.glob("icon*.png"):
-        m = re.fullmatch(r"icon(\d+)\.png", path.name)
-        if m:
-            size = int(m.group(1))
-            renders[size] = load(path.name, size)
-    sources = dict(renders)
+    sources = load_sources("icon")
+    renders = dict(sources)
     for s in UPSCALES:
-        bases = [b for b in sources if s % b == 0]
-        if not bases:
-            sys.exit(f"no icon<N>.png divides {s}: it cannot be an integer upscale")
-        renders[s] = upscale(sources[max(bases)], s)
+        renders[s] = scaled(sources, s, upscale)
     missing = [s for s in ICO_SIZES if s not in renders]
     if missing:
         sys.exit(f"no source for .ico size(s) {missing}: draw icon<N>.png for each")
@@ -127,19 +171,17 @@ def main():
     for s, img in sorted(renders.items()):
         img.save(OUT / f"bemtvi-{s}.png", "PNG", optimize=True)
 
-    # ICO with PNG-compressed entries (Vista+), smallest first.
-    imgs = [(s, png_bytes(renders[s])) for s in ICO_SIZES]
-    off = 6 + 16 * len(imgs)
-    entries = data = b""
-    for s, png in imgs:
-        d = 0 if s >= 256 else s  # 0 encodes 256 in the ICO dir entry
-        entries += struct.pack("<BBBBHHII", d, d, 0, 0, 1, 32, len(png), off)
-        data += png
-        off += len(png)
-    (HERE / "bemtvi.ico").write_bytes(struct.pack("<HHH", 0, 1, len(imgs)) + entries + data)
+    n_app = write_ico(HERE / "bemtvi.ico", renders, ICO_SIZES)
+
+    file_sources = load_sources("fileicon")
+    file_renders = {s: scaled(file_sources, s, upscale_in_place) for s in FILE_ICO_SIZES}
+    n_file = write_ico(HERE / "bemtvi-file.ico", file_renders, FILE_ICO_SIZES)
 
     write_intro_logo(renders[24])
-    print(f"wrote {len(renders)} PNGs to {OUT} and a {len(imgs)}-entry bemtvi.ico")
+    print(
+        f"wrote {len(renders)} PNGs to {OUT}, a {n_app}-entry bemtvi.ico"
+        f" and a {n_file}-entry bemtvi-file.ico"
+    )
 
 
 if __name__ == "__main__":

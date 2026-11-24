@@ -59,6 +59,7 @@ pub use ops::{
 };
 pub use runtime::{
     extract_prelude, BoGlobalMirror, BoMirror, BufBytesEdit, BufMirror, CmdlineComplete,
-    ExtmarkMirror, ExtmarkPatch, FloatMirror, GoMirror, HlDefMirror, JumpMirror, LinesDelta,
-    LuaRuntime, OptionCatalogRow, QfMirror, TabMirror, UiMirror, WindowMirror, WoGlobalMirror,
+    DecorQueryResult, ExtmarkMirror, ExtmarkPatch, FloatMirror, GoMirror, HlDefMirror, JumpMirror,
+    LinesDelta, LuaRuntime, OptionCatalogRow, QfMirror, TabMirror, UiMirror, WindowMirror,
+    WoGlobalMirror,
 };

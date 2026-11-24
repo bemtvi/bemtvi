@@ -98,6 +98,21 @@ try {
     iaBuf,
   );
 
+  // Multi-byte text before the cursor: text objects travel as (row, byte column), so a
+  // line holding `名前` (3 bytes per character) must still select the right argument.
+  await feed(page, "ggdG");
+  await feed(page, "idef add(名前, beta):<CR>return 名前 + beta<Esc>");
+  await sleep(300);
+  await feed(page, "gg/beta<CR>"); // the signature's `beta`, after the multi-byte argument
+  await feed(page, "dia");
+  const mbBuf = String(await lines(page));
+  const mbSig = mbBuf.split("\n")[0];
+  check(
+    "python: `dia` after multi-byte text deletes just that argument",
+    /def add\(/.test(mbSig) && /名前/.test(mbSig) && !/beta/.test(mbSig),
+    mbBuf,
+  );
+
   // JavaScript: its textobjects.scm is inherits-only (`; inherits: ecma,jsx`), so this
   // ONLY works if the inherit chain was merged (ecma supplies the actual @function
   // patterns) — the regression guard for inherit merging on the web bundle.

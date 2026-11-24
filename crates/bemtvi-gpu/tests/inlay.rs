@@ -7,7 +7,9 @@
 //! it depends on, and mirror the TUI's inline splice (whose paint *is* black-box
 //! tested over RPC).
 
-use bemtvi_gpu::{inlay_shift, splice_inlay, virt_inline_shift, Seg, DEFAULT_INLAY};
+use bemtvi_gpu::{
+    cursor_virt_shift, inlay_shift, splice_inlay, virt_inline_shift, Seg, DEFAULT_INLAY,
+};
 use bemtvi_view::{InlayHint, Style, VirtPlacement};
 
 /// A hint at `col` with `text` and no resolved style (the dim-fallback case).
@@ -106,6 +108,20 @@ fn virt_shift_boundary_matches_the_inlay_convention() {
     assert_eq!(virt_inline_shift(&v, 0, 4, true), 2);
     assert_eq!(virt_inline_shift(&v, 0, 4, false), 0);
     assert_eq!(virt_inline_shift(&v, 0, 5, false), 2);
+}
+
+#[test]
+fn the_cursor_paints_before_the_inline_cells_the_server_says_it_precedes() {
+    // `ab|cd` with `LL` (left gravity) and `RRR` (right gravity) at column 2, and the
+    // cursor at column 2. In Insert mode the server says it precedes `RRR`'s 3 cells:
+    // the cursor lands after `LL`, between them, where a typed character goes.
+    let v = [ivirt(2, "LL"), ivirt(2, "RRR")];
+    assert_eq!(cursor_virt_shift(&v, 0, 2, 3), 2);
+    // In Normal mode (`before` 0) it is on the `|`, past both.
+    assert_eq!(cursor_virt_shift(&v, 0, 2, 0), 5);
+    // Placements before the cursor's column are never taken back.
+    let v = [ivirt(1, "LL"), ivirt(2, "RRR")];
+    assert_eq!(cursor_virt_shift(&v, 0, 2, 3), 2);
 }
 
 #[test]

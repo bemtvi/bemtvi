@@ -4745,6 +4745,33 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `btv._ts_query(buf, query, first, last, cb_id)`: the native call behind the
+    // promise `btv.treesitter.query`. `first`/`last` are both nil (whole buffer) or
+    // both 0-based rows, `last` exclusive; the prelude wrapper has validated them.
+    let sh = shared.clone();
+    btv.set(
+        "_ts_query",
+        lua.create_function(
+            move |_,
+                  (buf, query, first, last, cb_id): (
+                u64,
+                String,
+                Option<usize>,
+                Option<usize>,
+                u64,
+            )| {
+                let rows = first.zip(last);
+                sh.borrow_mut().ts_ops.push(TsOp::Query {
+                    buf,
+                    query,
+                    rows,
+                    cb_id,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+
     // `btv._ts_reload(lang)`: the native call behind `btv.treesitter.reload`.
     let sh = shared.clone();
     btv.set(

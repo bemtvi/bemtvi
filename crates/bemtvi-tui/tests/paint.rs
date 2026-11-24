@@ -2663,3 +2663,40 @@ fn a_slide_clips_a_placement_at_its_interpolated_column() {
     assert_eq!(pan_frame(10), "cdefghijklmn");
     assert_eq!(pan_frame(0), "12345678abcd");
 }
+
+/// `ab|cd` with `LL` and `RRR` inline at column 2 and the cursor at column 2, carrying
+/// the server's `cursor_inline_before`: where the terminal cursor lands.
+fn cursor_at_inline(before: u64) -> (String, Option<(u16, u16)>) {
+    let place = |text: &str| {
+        Value::Array(vec![
+            Value::from(1u64), // inline
+            Value::from(2u64),
+            Value::from(0u64),
+            Value::Array(vec![Value::Array(vec![Value::from(text), Value::Nil])]),
+        ])
+    };
+    let v = view(vec![
+        ("lines", lines(&["ab|cd"])),
+        ("mode_label", Value::from("INSERT")),
+        ("cursor_screen_col", Value::from(2u64)),
+        ("cursor_inline_before", Value::from(before)),
+        (
+            "virt_text",
+            Value::Array(vec![Value::Array(vec![place("LL"), place("RRR")])]),
+        ),
+    ]);
+    let (buf, cursor) = paint_with_cursor(&v, 20, 3);
+    (row_text(&buf, 0).trim_end().to_string(), cursor)
+}
+
+#[test]
+fn the_cursor_paints_before_the_inline_text_the_server_says_it_precedes() {
+    // Insert at a right-gravity mark: the server says the cursor precedes its 3
+    // cells, so the bar sits between `LL` and `RRR`, where a typed character lands.
+    let (row, cursor) = cursor_at_inline(3);
+    assert_eq!(row, "abLLRRR|cd");
+    assert_eq!(cursor, Some((4, 0)), "the bar sits after LL, before RRR");
+    // Without it (Normal mode), the cursor is on the `|`, past all the inline text.
+    let (_, cursor) = cursor_at_inline(0);
+    assert_eq!(cursor, Some((7, 0)), "the block sits on the real character");
+}

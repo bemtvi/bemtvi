@@ -154,6 +154,7 @@ impl EditHost {
         let mut had_real = false;
         let mut shada_due = false;
         let mut resume_due = false;
+        let mut limit_due = false;
         let mut preview_hl_due = false;
         let mut diag_due = false;
         let mut spin_due = false;
@@ -175,6 +176,10 @@ impl EditHost {
                 // is the editor's own timer, not a Lua callback.
                 self.preview_hl_due = true;
                 preview_hl_due = true;
+            } else if crate::is_ts_query_limit_timer(&event) {
+                // The parked-query give-up wake: re-run the parked asks, which rejects
+                // the ones past their limit (and re-arms for any still waiting).
+                limit_due = true;
             } else if crate::is_picker_spin_timer(&event) {
                 // The picker's animation wake: advance the spinner frame. Like the two
                 // above it is the editor's own timer, not a Lua callback — and like
@@ -231,6 +236,14 @@ impl EditHost {
         // diagnostics the debounce just applied, painting the spinner's next frame,
         // extracting the settled preview's spans. A shada-only wake, by contrast,
         // touches nothing visible, so it never forces a frame.
+        // The parse-resume wake also retries the `btv.treesitter.query` asks parked on
+        // an unfinished parse: each retry resumes that parse a budget further.
+        if resume_due || limit_due {
+            if limit_due {
+                self.ts_query_limit_armed = false;
+            }
+            self.run_parked_ts_queries();
+        }
         if had_real || resume_due || diag_due || spin_due || preview_hl_due {
             self.settle_events(true);
         }

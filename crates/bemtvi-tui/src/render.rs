@@ -1442,9 +1442,13 @@ fn render_window(
             .copied()
             .unwrap_or(leftcol)
     };
-    let cursor_shift =
-        inlay_cursor_shift(frame_inlay, cursor_row, win.cursor_screen_col, leftcol).saturating_add(
-            virt_cursor_shift(frame_virt_text, cursor_row, win.cursor_screen_col, leftcol),
+    // Inline `virt_text` at or before the cursor's column pushes it right, less the
+    // cells at its own column it paints before (Insert mode at a right-gravity mark,
+    // where a typed character lands: the server's `cursor_inline_before`).
+    let cursor_shift = inlay_cursor_shift(frame_inlay, cursor_row, win.cursor_screen_col, leftcol)
+        .saturating_add(
+            virt_cursor_shift(frame_virt_text, cursor_row, win.cursor_screen_col, leftcol)
+                .saturating_sub(win.cursor_inline_before),
         );
     (text_inner, cursor_row, cursor_shift, leftcol)
 }

@@ -89,6 +89,190 @@ mod shada;
 #[cfg(feature = "native")]
 mod treesitter;
 
+/// The time budget of a `btv.treesitter.query` walking the tree, in milliseconds. Large
+/// because a plugin may legitimately ask about a whole file; it bounds a pathological
+/// query (one that would otherwise hold the tick indefinitely), not an ordinary one.
+pub(crate) const TS_QUERY_DEADLINE_MS: u64 = 1000;
+
+/// The time budget of a decor provider's `query`, in milliseconds. It runs on every
+/// viewport change over just the visible rows, so a query that needs longer is one the
+/// provider should narrow.
+pub(crate) const DECOR_QUERY_DEADLINE_MS: u64 = 50;
+
+/// One `btv.treesitter.query` ask ([`bemtvi_lua::TsOp::Query`]), kept whole so a
+/// native ask that can't be answered yet can be parked and re-run as is.
+pub(crate) struct TsQueryAsk {
+    pub(crate) buf: BufferId,
+    pub(crate) query: String,
+    pub(crate) rows: Option<(usize, usize)>,
+    pub(crate) cb_id: u64,
+    /// When it was first asked: a parked ask gives up after
+    /// [`treesitter::TS_QUERY_PARK_LIMIT`].
+    #[cfg(feature = "native")]
+    pub(crate) since: std::time::Instant,
+}
+
+impl EditHost {
+    /// Run one `btv.treesitter.query` ask against the editor: the matches with the
+    /// `changedtick` they reflect, or why there are none. A buffer that doesn't exist
+    /// is an error here rather than "no language".
+    pub(crate) fn run_ts_query(
+        &mut self,
+        ask: &TsQueryAsk,
+    ) -> Result<(u64, Vec<bemtvi_core::QueryMatch>), bemtvi_core::QueryError> {
+        let tick = self.editor.changedtick_of(ask.buf).unwrap_or(0);
+        // A `btv.treesitter.query` may be for a buffer no window paints, so it advances
+        // an unfinished parse itself. It may also legitimately walk a whole file, so it
+        // gets a generous time budget; a pathological query still fails loud.
+        let opts = bemtvi_core::QueryOptions {
+            rows: ask.rows,
+            resume_parse: true,
+            deadline_ms: TS_QUERY_DEADLINE_MS,
+        };
+        self.query_buffer(ask.buf, &ask.query, opts)
+            .map(|matches| (tick, matches))
+    }
+
+    /// Run a treesitter query on `buf` through the editor. When this call is the one
+    /// that finished the buffer's parse, the highlight memo for it is dropped: the memo
+    /// is keyed on `(changedtick, viewport)`, neither of which a finished parse changes,
+    /// so the next frame would otherwise keep the spans of the half-parsed tree.
+    pub(crate) fn query_buffer(
+        &mut self,
+        buf: BufferId,
+        query: &str,
+        opts: bemtvi_core::QueryOptions,
+    ) -> Result<Vec<bemtvi_core::QueryMatch>, bemtvi_core::QueryError> {
+        #[cfg(feature = "native")]
+        let was_pending = self.editor.ts_parse_pending(buf);
+        let result = self.editor.ts_query(buf, query, opts);
+        #[cfg(feature = "native")]
+        if was_pending && !self.editor.ts_parse_pending(buf) {
+            self.syntax_states.remove(&buf);
+        }
+        result
+    }
+
+    /// Settle a `btv.treesitter.query` promise, then run what its handlers queued.
+    pub(crate) fn finish_ts_query(
+        &mut self,
+        cb_id: u64,
+        result: Result<(u64, Vec<bemtvi_core::QueryMatch>), String>,
+    ) {
+        if let Err(e) =
+            self.lua
+                .run_callback(cb_id, false, bemtvi_lua::CallbackArgs::TsQuery { result })
+        {
+            self.editor
+                .echo(format!("E: btv.treesitter.query callback: {e}"));
+        }
+        // What the promise goes on to is queued past where this pass of the effects
+        // took its queue (or, off a grammar load, with no pass to come at all).
+        self.apply_lua_effects();
+    }
+
+    /// Answer one `btv.treesitter.query`. An ask the engine can't answer *yet* (the
+    /// grammar is loading, or a large file's parse is unfinished) is parked and re-run
+    /// later ([`run_parked_ts_queries`](Self::run_parked_ts_queries)) rather than
+    /// rejected, because "not yet" is not an answer the caller can act on. Everything
+    /// else settles now: the matches, or a rejection naming why there are none.
+    ///
+    /// Shared by both builds. Natively a parked ask is retried when a grammar lands and
+    /// on the parse-resume wake, and gives up after
+    /// [`treesitter::TS_QUERY_PARK_LIMIT`]. In the browser the grammar loads in the
+    /// worker, which reports it — and the end of a sliced parse — through
+    /// [`ts_grammar_ready`](Self::ts_grammar_ready).
+    ///
+    /// Returns whether the ask was parked on an unfinished parse.
+    pub(crate) fn settle_ts_query(&mut self, ask: TsQueryAsk) -> bool {
+        if self.editor.buffer_of(ask.buf).is_none() {
+            let msg = format!("invalid buffer id {}", ask.buf.0);
+            self.finish_ts_query(ask.cb_id, Err(msg));
+            return false;
+        }
+        match self.run_ts_query(&ask) {
+            Err(e) if e.is_pending() => {
+                #[cfg(feature = "native")]
+                {
+                    let limit = treesitter::TS_QUERY_PARK_LIMIT;
+                    if ask.since.elapsed() >= limit {
+                        let msg = format!("{e} (gave up after {}s)", limit.as_secs());
+                        self.finish_ts_query(ask.cb_id, Err(msg));
+                        return false;
+                    }
+                }
+                let on_parse = matches!(e, bemtvi_core::QueryError::ParseIncomplete);
+                self.parked_ts_queries.push(ask);
+                // Make sure the give-up is checked even if nothing else ever re-runs it.
+                #[cfg(feature = "native")]
+                if !self.ts_query_limit_armed {
+                    self.ts_query_limit_armed = true;
+                    self.fx.loop_command(LoopCommand::TimerStart {
+                        id: TS_QUERY_LIMIT_TIMER_ID,
+                        delay: treesitter::TS_QUERY_PARK_LIMIT,
+                        repeat: std::time::Duration::ZERO,
+                    });
+                }
+                #[cfg(feature = "native")]
+                if on_parse {
+                    // Wake again shortly: the retry is what advances the parse.
+                    self.arm_parse_resume_if_pending();
+                } else {
+                    // The query may have just asked for the grammar.
+                    self.dispatch_grammar_requests();
+                }
+                on_parse
+            }
+            result => {
+                let result = result.map_err(|e| e.to_string());
+                self.finish_ts_query(ask.cb_id, result);
+                false
+            }
+        }
+    }
+
+    /// Re-run every parked `btv.treesitter.query`. One that still can't be answered
+    /// parks again.
+    pub(crate) fn run_parked_ts_queries(&mut self) {
+        // One retry per buffer advances its parse; when it comes back "parse unfinished"
+        // the other asks for that buffer wait for the next wake rather than each
+        // spending another parse budget in this one. Keyed on the retry's own answer,
+        // not on `ts_parse_pending`, which also counts injected layers a query doesn't
+        // need.
+        let mut still_parsing = std::collections::HashSet::new();
+        for ask in std::mem::take(&mut self.parked_ts_queries) {
+            if still_parsing.contains(&ask.buf) {
+                self.parked_ts_queries.push(ask);
+                continue;
+            }
+            let buf = ask.buf;
+            if self.settle_ts_query(ask) {
+                still_parsing.insert(buf);
+            }
+        }
+        // Whatever is still parked on a parse needs the next wake, even with no UI to
+        // redraw (the redraw is the timer's other arming site).
+        #[cfg(feature = "native")]
+        if !self.parked_ts_queries.is_empty() {
+            self.arm_parse_resume_if_pending();
+        }
+    }
+
+    /// The browser worker finished loading a treesitter grammar, so queries that found
+    /// it loading can be answered now: re-run the parked `btv.treesitter.query` asks,
+    /// re-dispatch the decor providers whose `query` was waiting on it, and settle.
+    /// The native build gets the same from its own grammar-load arm
+    /// (`install_grammar`), so only the edit-host calls this.
+    pub fn ts_grammar_ready(&mut self) {
+        for buf in std::mem::take(&mut self.decor_query_grammar_wait) {
+            self.editor
+                .invalidate_decor(bemtvi_core::DecorScope::Buffer(buf));
+        }
+        self.run_parked_ts_queries();
+        self.settle_events(true);
+    }
+}
+
 /// The wasm twin of [`treesitter::EditHost::resolved_preview_highlights`] — the
 /// stateless highlight the picker preview, LSP doc floats and
 /// `btv.treesitter.highlight` go through.
@@ -1693,6 +1877,23 @@ pub struct EditHost {
     /// the browser build's engine loads nothing, so nothing is ever pending.
     #[cfg(feature = "native")]
     parked_ts_highlights: Vec<(String, String, usize, u64)>,
+    /// `btv.treesitter.query` asks the engine can't answer *yet*: the grammar is
+    /// still loading, or the buffer's parse is unfinished. Re-run when a grammar lands
+    /// and on the parse-resume wake ([`EditHost::run_parked_ts_queries`]); in the
+    /// browser build, when the worker reports a grammar ready
+    /// ([`EditHost::ts_grammar_ready`]).
+    parked_ts_queries: Vec<TsQueryAsk>,
+    /// A decor provider's query hit an unfinished parse this pass: the window was
+    /// re-invalidated, and the next frame arms the parse-resume wake so the
+    /// re-dispatch (which advances the parse) happens without waiting for input.
+    #[cfg(feature = "native")]
+    decor_query_parse_wait: bool,
+    /// The parked-query give-up wake ([`TS_QUERY_LIMIT_TIMER_ID`]) is armed.
+    #[cfg(feature = "native")]
+    ts_query_limit_armed: bool,
+    /// Buffers whose decor providers' queries found their grammar still loading:
+    /// re-invalidated when a grammar lands, so the providers get the real answer.
+    decor_query_grammar_wait: std::collections::HashSet<BufferId>,
     /// The picker preview pane's manual scroll offset: a signed line delta added to
     /// the auto-computed window start (which centers a `location` match ~a third down).
     /// `<C-d>`/`<C-u>`/`<C-f>`/`<C-b>` fold into it in [`redraw::project_preview`]; it
@@ -2275,6 +2476,12 @@ impl EditHost {
             preview_hl_due: false,
             #[cfg(feature = "native")]
             parked_ts_highlights: Vec::new(),
+            parked_ts_queries: Vec::new(),
+            #[cfg(feature = "native")]
+            decor_query_parse_wait: false,
+            #[cfg(feature = "native")]
+            ts_query_limit_armed: false,
+            decor_query_grammar_wait: std::collections::HashSet::new(),
             preview_scroll: 0,
             preview_hscroll: 0,
             preview_anchor: None,
@@ -3687,10 +3894,16 @@ impl EditHost {
     /// echo a faithful — but honest — status (only highlighting is wired in the browser;
     /// the cached indents/folds/locals queries have no consumer yet). On failure, echo
     /// the loud reason. Highlighting itself repaints JS-side when the grammar registers,
-    /// independent of this echo (the analogue of native's [`on_install_done`], minus the
-    /// engine reload — the wasm core has no in-process treesitter engine).
+    /// independent of this echo (the analogue of native's [`on_install_done`]).
+    ///
+    /// On success the engine reloads the language too, as natively: on wasm that
+    /// reaches the worker's tree-sitter runners (indent, folds, text objects, queries)
+    /// through `WasmSyntax::reload_grammar`, so they pick the new grammar up instead of
+    /// keeping a cached "no grammar", and it re-runs the decoration providers of that
+    /// language's buffers.
     pub fn complete_ts_install(&mut self, lang: String, ok: bool, msg: String) {
         if ok {
+            self.editor.reload_ts_language(&lang);
             self.ts_installed.insert(lang.clone());
             let detail = if msg.is_empty() {
                 String::new()
@@ -3908,6 +4121,18 @@ pub(crate) fn is_picker_spin_timer(event: &LoopEvent) -> bool {
 /// session.
 pub(crate) const PREVIEW_HL_TIMER_ID: u64 = 1 << 55;
 
+/// The give-up wake for parked `btv.treesitter.query` asks
+/// ([`treesitter::TS_QUERY_PARK_LIMIT`]): armed when an ask parks, it re-runs the parked
+/// asks so one whose wait would otherwise never end (a grammar load that never reports)
+/// is rejected on time instead of only on a retry that may never come.
+pub(crate) const TS_QUERY_LIMIT_TIMER_ID: u64 = 1 << 57;
+
+/// Whether `event` is the parked-query give-up wake ([`TS_QUERY_LIMIT_TIMER_ID`]).
+#[cfg(feature = "native")]
+pub(crate) fn is_ts_query_limit_timer(event: &LoopEvent) -> bool {
+    matches!(event, LoopEvent::Timer { id, .. } if *id == TS_QUERY_LIMIT_TIMER_ID)
+}
+
 /// How long the picker selection must sit still before its preview is highlighted.
 /// Longer than a key-repeat interval, so holding `<C-n>` highlights nothing on the way
 /// through; short enough that stopping on a row reads as immediate.
@@ -4094,7 +4319,11 @@ impl EditHost {
     /// through `fx` like the shada timer, so the wasm Worker could drive it too.
     pub(crate) fn arm_parse_resume_if_pending(&mut self) {
         let buffer = self.editor.current_buffer_id();
-        if self.editor.ts_parse_pending(buffer) {
+        // A `btv.treesitter.query` parked on an unfinished parse needs the wake too:
+        // each retry resumes that parse a budget further, even in a buffer no window
+        // is painting.
+        let decor_wait = std::mem::take(&mut self.decor_query_parse_wait);
+        if self.editor.ts_parse_pending(buffer) || self.has_query_parked_on_parse() || decor_wait {
             self.fx.loop_command(LoopCommand::TimerStart {
                 id: PARSE_RESUME_TIMER_ID,
                 delay: PARSE_RESUME_DELAY,

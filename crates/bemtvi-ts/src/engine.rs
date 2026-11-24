@@ -13,7 +13,7 @@ use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use bemtvi_core::syntax::{GrammarInstall, GrammarRequest};
+use bemtvi_core::syntax::{GrammarInstall, GrammarRequest, QueryCapture, QueryError, QueryOptions};
 use bemtvi_core::{BufferEdit, BufferId, FoldRange, IndentParams, OpenOutcome, Span, SyntaxEngine};
 use ropey::{LineType, Rope};
 use streaming_iterator::StreamingIterator;
@@ -33,6 +33,13 @@ const LINE_TYPE: LineType = LineType::LF_CR;
 /// [`BufferState::reparse`]), so the cost is one frame of stale highlights rather
 /// than a hang. Generous enough that a normal incremental reparse never trips it.
 const PARSE_DEADLINE: Duration = Duration::from_millis(50);
+
+/// How many caller-supplied queries ([`Engine::query`]) stay compiled at once.
+const MAX_COMPILED_QUERIES: usize = 32;
+
+/// The most captured nodes one [`Engine::query`] returns. Past it the query fails loud
+/// ([`QueryError::TooManyCaptures`]) rather than handing back a truncated list.
+const MAX_QUERY_CAPTURES: usize = 100_000;
 
 /// Wall-clock budget for **all** of a buffer's child (injection) work on one
 /// refresh — grammar loads included — the injection analogue of [`PARSE_DEADLINE`].
@@ -343,6 +350,12 @@ pub struct Engine {
     // been unloaded, that call dereferences unmapped memory and segfaults at exit.
     // Rust drops fields in declaration order, so `buffers` is declared first.
     buffers: HashMap<BufferId, BufferState>,
+    /// Caller-supplied queries ([`Engine::query`]) compiled per `(language, source)`,
+    /// so a decoration provider that sends the same query on every scroll compiles it
+    /// once. A compiled `Query` points into its grammar's library, so it is declared
+    /// before `grammars` (dropped first) and evicted wherever a language's grammar slot
+    /// is replaced ([`Engine::forget_compiled_queries`]).
+    compiled_queries: HashMap<(String, String), Result<Query, String>>,
     grammars: HashMap<String, Slot>,
     /// Grammars evicted from `grammars` (a reload, or an install replacing a grammar
     /// a forced synchronous load had produced) whose dlopen'd library must stay
@@ -478,6 +491,7 @@ impl Engine {
             data_dir,
             roots,
             buffers: HashMap::new(),
+            compiled_queries: HashMap::new(),
             grammars: HashMap::new(),
             retired_grammars: Vec::new(),
             query_overrides: QueryOverrides::new(),
@@ -691,6 +705,7 @@ impl Engine {
         // the destroy-after-unload SIGSEGV [`Self::retired_grammars`] exists to
         // prevent — so a loaded old slot is retired instead, staying mapped until
         // the last buffer that references it closes.
+        self.forget_compiled_queries(lang);
         if let Some(old) = self.grammars.remove(lang) {
             // Only a loaded slot owns a library that must stay mapped; a Loading /
             // NotInstalled / Failed slot is simply dropped with the `if let`.
@@ -2487,6 +2502,163 @@ impl Engine {
         out.dedup();
         out
     }
+
+    /// Run a caller-supplied query over `buffer`'s root tree (`language`, the
+    /// buffer's root language), restricted to rows `[first, last)` when `rows` is
+    /// given. See [`SyntaxEngine::query`].
+    ///
+    /// An unfinished parse is resumed one budget first, the same way a redraw's
+    /// highlight pull resumes it, so repeated asks converge even for a buffer no
+    /// window is painting. Answering from a half-parsed tree would be confidently
+    /// wrong, so until it converges the answer is [`QueryError::ParseIncomplete`].
+    pub fn query(
+        &mut self,
+        buffer: BufferId,
+        language: &str,
+        source: &str,
+        opts: QueryOptions,
+    ) -> Result<Vec<bemtvi_core::QueryMatch>, QueryError> {
+        let QueryOptions {
+            rows,
+            resume_parse,
+            deadline_ms,
+        } = opts;
+        let deadline = Duration::from_millis(deadline_ms);
+        let lang = bemtvi_core::resolve_language(language).to_string();
+        match self.grammars.get(&lang) {
+            Some(Slot::Loaded(_)) => {}
+            Some(Slot::Loading) => return Err(QueryError::GrammarLoading(lang)),
+            Some(Slot::Failed(reason)) => {
+                return Err(QueryError::GrammarFailed(lang, reason.clone()))
+            }
+            Some(Slot::NotInstalled) | None => return Err(QueryError::NoGrammar(lang)),
+        }
+        // The editor syncs before asking, so a loaded grammar means the buffer is open
+        // in it. One that isn't (opened in another language) has no tree to query.
+        if self.buffers.get(&buffer).is_none_or(|s| s.language != lang) {
+            return Err(QueryError::NoGrammar(lang));
+        }
+
+        // Only an ask with no other way to progress resumes the parse (a parked
+        // `btv.treesitter.query` on a buffer no window paints). A decor provider's
+        // query leaves it to the redraw's highlight pull, which already advances every
+        // visible buffer each frame: resuming here too would double each frame's parse
+        // budget.
+        if resume_parse {
+            let resumed_to_completion = match self.buffers.get_mut(&buffer) {
+                Some(state) if state.incomplete => {
+                    state.reparse();
+                    !state.incomplete
+                }
+                _ => false,
+            };
+            if resumed_to_completion {
+                self.refresh_injection_layers(buffer);
+            }
+        }
+
+        let key = (lang.clone(), source.to_string());
+        if !self.compiled_queries.contains_key(&key) {
+            let Some(Slot::Loaded(grammar)) = self.grammars.get(&lang) else {
+                return Err(QueryError::NoGrammar(lang));
+            };
+            let compiled = Query::new(&grammar.language, source).map_err(|e| {
+                format!(
+                    "row {}, column {}: {:?} error: {}",
+                    e.row + 1,
+                    e.column + 1,
+                    e.kind,
+                    e.message
+                )
+            });
+            // A small cache: a few providers' worth of queries. Past that, start over
+            // rather than keep every query a plugin ever built.
+            if self.compiled_queries.len() >= MAX_COMPILED_QUERIES {
+                self.compiled_queries.clear();
+            }
+            self.compiled_queries.insert(key.clone(), compiled);
+        }
+        let query = match &self.compiled_queries[&key] {
+            Ok(query) => query,
+            Err(msg) => return Err(QueryError::Compile(msg.clone())),
+        };
+        // An empty row range matches nothing — decided after the grammar and compile
+        // checks, so a broken query still says so. It must not reach the cursor:
+        // tree-sitter reads an end point of (0, 0) as "no limit".
+        if rows.is_some_and(|(first, last)| last <= first) {
+            return Ok(Vec::new());
+        }
+
+        let state = &self.buffers[&buffer];
+        if state.incomplete {
+            return Err(QueryError::ParseIncomplete);
+        }
+        let Some(tree) = state.tree.as_ref() else {
+            return Err(QueryError::ParseIncomplete);
+        };
+        let names = query.capture_names();
+        let mut cursor = QueryCursor::new();
+        if let Some((first, last)) = rows {
+            cursor.set_point_range(Point::new(first, 0)..Point::new(last, 0));
+        }
+        // The walk is bounded in time like the parse is: a query over a huge buffer with
+        // no row range would otherwise run unbounded inside the tick. Cancelling just
+        // ends the match stream, so the callback records that it fired.
+        let timed_out = std::cell::Cell::new(false);
+        let started = Instant::now();
+        let mut budget = |_: &tree_sitter::QueryCursorState| {
+            if started.elapsed() >= deadline {
+                timed_out.set(true);
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        };
+        let options = tree_sitter::QueryCursorOptions::new().progress_callback(&mut budget);
+        let mut out = Vec::new();
+        let mut captured = 0usize;
+        let mut matches = cursor.matches_with_options(
+            query,
+            tree.root_node(),
+            node_text_provider(&state.shadow),
+            options,
+        );
+        while let Some(m) = matches.next() {
+            // Counted in captures, not matches: one quantified capture (`(_)* @c`) can
+            // hold every node in the file in a single match.
+            captured += m.captures.len();
+            if captured > MAX_QUERY_CAPTURES {
+                return Err(QueryError::TooManyCaptures(MAX_QUERY_CAPTURES));
+            }
+            let captures = m
+                .captures
+                .iter()
+                .map(|cap| {
+                    let (start, end) = (cap.node.start_position(), cap.node.end_position());
+                    QueryCapture {
+                        name: names[cap.index as usize].to_string(),
+                        kind: cap.node.kind().to_string(),
+                        start: (start.row, start.column),
+                        end: (end.row, end.column),
+                    }
+                })
+                .collect();
+            out.push(bemtvi_core::QueryMatch {
+                pattern: m.pattern_index,
+                captures,
+            });
+        }
+        if timed_out.get() {
+            return Err(QueryError::TimedOut(deadline_ms));
+        }
+        Ok(out)
+    }
+
+    /// Drop every compiled caller query for `lang`: its grammar slot is about to be
+    /// replaced, and a compiled query points into the old grammar's library.
+    fn forget_compiled_queries(&mut self, lang: &str) {
+        self.compiled_queries.retain(|(l, _), _| l != lang);
+    }
 }
 
 /// One indent capture's `#set!` directives that the algorithm consults.
@@ -2623,6 +2795,16 @@ impl SyntaxEngine for Engine {
         Engine::close(self, buffer);
     }
 
+    fn query(
+        &mut self,
+        buffer: BufferId,
+        language: &str,
+        query: &str,
+        opts: QueryOptions,
+    ) -> Result<Vec<bemtvi_core::QueryMatch>, QueryError> {
+        Engine::query(self, buffer, language, query, opts)
+    }
+
     fn reload_grammar(&mut self, lang: &str) {
         // Evict the cached slot so the next `grammar()` re-resolves it from the
         // search path — picking up a just-installed parser. Buffers already parsed
@@ -2637,6 +2819,7 @@ impl SyntaxEngine for Engine {
         // reload time rather than teardown. Retire it so the library stays mapped for
         // the rest of the session; a not-installed / failed slot owns nothing and is
         // simply dropped.
+        self.forget_compiled_queries(lang);
         if let Some(slot) = self.grammars.remove(lang) {
             if matches!(slot, Slot::Loaded(_)) {
                 self.retired_grammars.push((lang.to_string(), slot));

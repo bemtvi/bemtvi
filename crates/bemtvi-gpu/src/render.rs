@@ -2299,14 +2299,21 @@ impl Renderer {
                         .map(Vec::as_slice)
                         .unwrap_or(&[]);
                     // Inline `virt_text` spliced at or before the cursor pushes it right
-                    // too — the GUI analogue of the TUI's `virt_cursor_shift`.
+                    // too — the GUI analogue of the TUI's `virt_cursor_shift` — less the
+                    // cells at its own column it paints before (`cursor_inline_before`:
+                    // Insert mode at a right-gravity mark, where a typed char lands).
                     let row_vtext = win
                         .virt_text
                         .get(win.cursor_row as usize)
                         .map(Vec::as_slice)
                         .unwrap_or(&[]);
                     inlay_shift(row_inlay, leftcol, win.cursor_screen_col, true)
-                        + virt_inline_shift(row_vtext, leftcol, win.cursor_screen_col, true)
+                        + cursor_virt_shift(
+                            row_vtext,
+                            leftcol,
+                            win.cursor_screen_col,
+                            win.cursor_inline_before,
+                        )
                 }
                 Some(s) => {
                     let idx = s.cursor_row.round() as usize; // cursor's band-row index
@@ -2316,16 +2323,21 @@ impl Renderer {
                         Some(row) => {
                             leftcol = row.left;
                             inlay_shift(&row.inlay, leftcol, win.cursor_screen_col, true)
-                                + virt_inline_shift(
+                                + cursor_virt_shift(
                                     &row.vtext,
                                     leftcol,
                                     win.cursor_screen_col,
-                                    true,
+                                    win.cursor_inline_before,
                                 )
                         }
                         None => {
                             inlay_shift(row_inlay, leftcol, win.cursor_screen_col, true)
-                                + virt_inline_shift(row_vtext, leftcol, win.cursor_screen_col, true)
+                                + cursor_virt_shift(
+                                    row_vtext,
+                                    leftcol,
+                                    win.cursor_screen_col,
+                                    win.cursor_inline_before,
+                                )
                         }
                     }
                 }
@@ -5398,6 +5410,15 @@ pub fn virt_inline_shift(vtext: &[VirtPlacement], leftcol: u16, col: u16, inclus
         .flat_map(|p| p.chunks.iter())
         .map(|(t, _)| cells(t) as u16)
         .sum()
+}
+
+/// How far the inline `virt_text` on the cursor's row pushes a cursor at screen
+/// column `col` right: every placement at or before it ([`virt_inline_shift`],
+/// inclusive), less the `before` cells at its own column that the cursor paints in
+/// front of — the server's `cursor_inline_before`, set in Insert mode at a
+/// right-gravity mark, where a typed character lands.
+pub fn cursor_virt_shift(vtext: &[VirtPlacement], leftcol: u16, col: u16, before: u16) -> u16 {
+    virt_inline_shift(vtext, leftcol, col, true).saturating_sub(before)
 }
 
 /// Splice a column-anchored insertion list into a row's colored `base` segments,

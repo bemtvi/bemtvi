@@ -2526,3 +2526,88 @@ async fn nowrap_blanks_a_wide_char_the_scroll_cuts() {
         (0, vec![(0, " x".to_string())])
     );
 }
+
+/// The `cursor_inline_before` a frame carries: the cells of inline text at the
+/// cursor's own column that the cursor paints before.
+fn cursor_inline_before(map: &[(Value, Value)]) -> u64 {
+    view_get(map, "cursor_inline_before")
+        .and_then(Value::as_u64)
+        .expect("cursor_inline_before")
+}
+
+/// In Insert mode a character typed at a right-gravity inline mark's anchor lands
+/// before the mark's text, so the cursor paints there too, not after the text (as the
+/// client's column shift would put it). Left-gravity text stays before the cursor, and
+/// in Normal mode the cursor is on the real character after all of it (neovim's rule).
+#[tokio::test]
+async fn insert_cursor_paints_before_right_gravity_inline_text() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, ":set nonumber<CR>:set norelativenumber<CR>");
+    feed(&rpc, "iab|cd<Esc>");
+    exec_lua(
+        &rpc,
+        r#"local ns = vim.api.nvim_create_namespace("vt")
+           vim.api.nvim_buf_set_extmark(0, ns, 0, 2, {
+               virt_text = { { "RRR", "Comment" } }, virt_text_pos = "inline",
+           })
+           vim.api.nvim_buf_set_extmark(0, ns, 0, 2, {
+               virt_text = { { "LL", "Comment" } }, virt_text_pos = "inline",
+               right_gravity = false,
+           })"#,
+    )
+    .await;
+
+    // `a` on `b`: the cursor is at byte 2, where both marks anchor.
+    let map = redraw_after(&rpc, &mut incoming, "0la").await;
+    assert_eq!(
+        view_get(&map, "cursor_screen_col").and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        cursor_inline_before(&map),
+        3,
+        "before the right-gravity text only"
+    );
+    // And at the shared anchor the left-gravity text paints first, where it stays once
+    // something is typed (the right-gravity text moves on with the `|`), so the cursor
+    // lands between the two.
+    let texts: Vec<String> = view_get(&map, "virt_text")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.first())
+        .and_then(Value::as_array)
+        .expect("row 0 placements")
+        .iter()
+        .map(|p| {
+            let chunks = p.as_array().expect("placement")[3]
+                .as_array()
+                .expect("chunks");
+            chunks[0].as_array().expect("chunk")[0]
+                .as_str()
+                .expect("text")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["LL", "RRR"],
+        "left-gravity text first at a shared anchor"
+    );
+
+    // A typed character does land there: before `RRR`, which moves right with `|`.
+    let map = redraw_after(&rpc, &mut incoming, "x").await;
+    assert_eq!(lines(&rpc).await, vec!["abx|cd"]);
+    assert_eq!(
+        cursor_inline_before(&map),
+        3,
+        "still at the mark after typing"
+    );
+
+    // Normal mode on the `|` itself: the cursor is on the character, after the text.
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>l").await;
+    assert_eq!(cursor(&rpc).await, (1, 3));
+    assert_eq!(
+        cursor_inline_before(&map),
+        0,
+        "Normal mode paints on the character"
+    );
+}

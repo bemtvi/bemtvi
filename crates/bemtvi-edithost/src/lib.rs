@@ -51,11 +51,17 @@ use rmpv::Value;
 // indenter, web/ts-indent.js) on `globalThis`; with none installed (the Node harness),
 // they degrade to "no ts indent" (-1 / 0) and the core falls back. See [`WasmSyntax`].
 extern "C" {
-    /// Target indent width in columns for 0-indexed `line` of `text` (NUL-terminated
-    /// UTF-8) in `lang`, given the resolved `sw`/`ts`; `-1` to fall back.
+    /// Target indent width in columns for 0-indexed `line` of buffer `buf` (at text
+    /// `version`) in `lang`, given the resolved `sw`/`ts`; `-1` to fall back. The text,
+    /// when given, is `text_len` UTF-8 bytes at `text` (null when not given: the worker's
+    /// shared buffer store keeps its own copy current from [`eh_js_ts_edit`]); `-2` asks
+    /// for the call again with it ([`WasmSyntax::with_text`]).
     fn eh_js_ts_indent(
+        buf: i32,
+        version: u32,
         lang: *const c_char,
-        text: *const c_char,
+        text: *const u8,
+        text_len: i32,
         line: i32,
         sw: i32,
         ts: i32,
@@ -64,30 +70,154 @@ extern "C" {
     fn eh_js_ts_available(lang: *const c_char) -> i32;
     /// Drop `lang`'s cached grammar after a `:TSInstall`, so the next query reloads it.
     fn eh_js_ts_reload(lang: *const c_char);
-    /// Foldable line ranges for `text` in `lang`, written into the `cap`-int `out` buffer
-    /// as flat `[start, end, …]` 0-based inclusive pairs. Returns the total number of i32s
-    /// needed (may exceed `cap` — the caller grows + retries); `-1` if no tree-sitter folds
-    /// are available (no runner / grammar loading / no `folds.scm`).
-    fn eh_js_ts_folds(lang: *const c_char, text: *const c_char, out: *mut i32, cap: i32) -> i32;
+    /// Foldable line ranges for buffer `buf` (at text `version`; the text as for
+    /// [`eh_js_ts_indent`]) in `lang`, written into the `cap`-int `out` buffer as flat
+    /// `[start, end, …]` 0-based inclusive pairs. Returns the total number of i32s needed
+    /// (may exceed `cap` — the caller grows + retries); `-1` if no tree-sitter folds are
+    /// available (no runner / grammar loading / no `folds.scm` / parse unfinished); `-2`
+    /// asks for the text.
+    fn eh_js_ts_folds(
+        buf: i32,
+        version: u32,
+        lang: *const c_char,
+        text: *const u8,
+        text_len: i32,
+        out: *mut i32,
+        cap: i32,
+    ) -> i32;
     /// `1` if a grammar with a `folds.scm` is loaded for `lang`, else `0`.
     fn eh_js_ts_folds_available(lang: *const c_char) -> i32;
-    /// Byte ranges of `text`'s `textobjects.scm` nodes captured as `capture` (e.g.
-    /// `function.inner`) that contain byte offset `byte`, written into the `cap`-int
-    /// `out` buffer as flat `[start, end, …]` **byte** pairs, innermost (smallest
-    /// span) first. Returns the total number of i32s needed (may exceed `cap` — the
-    /// caller grows + retries); `-1` if no tree-sitter text objects are available (no
-    /// runner / grammar loading / no `textobjects.scm`). The JS side converts between
-    /// the core's UTF-8 byte offsets and web-tree-sitter's UTF-16 units.
+    /// Regions of buffer `buf` (at text `version`; the text as for [`eh_js_ts_indent`])
+    /// captured by `textobjects.scm` as `capture` (e.g. `function.inner`) that contain
+    /// the cursor at (`row`, `byte_col`), written into the `cap`-int `out` buffer as flat
+    /// `[start_row, start_byte_col, end_row, end_byte_col, …]` quads, innermost (smallest
+    /// span) first. Returns the total number of i32s needed (may exceed `cap` — the caller
+    /// grows + retries); `-1` if no tree-sitter text objects are available (no runner /
+    /// grammar loading / no `textobjects.scm` / parse unfinished); `-2` asks for the text.
     fn eh_js_ts_textobjects(
+        buf: i32,
+        version: u32,
         lang: *const c_char,
-        text: *const c_char,
+        text: *const u8,
+        text_len: i32,
         capture: *const c_char,
-        byte: i32,
+        row: i32,
+        byte_col: i32,
         out: *mut i32,
         cap: i32,
     ) -> i32;
     /// `1` if a grammar with a `textobjects.scm` is loaded for `lang`, else `0`.
     fn eh_js_ts_textobjects_available(lang: *const c_char) -> i32;
+    /// Run the treesitter `query` over buffer `buf` in `lang`, restricted to rows
+    /// `[first, last)` when `first >= 0`, walking the tree for at most `deadline_ms`;
+    /// with `resume_parse != 0`, an unfinished parse runs one slice first.
+    /// The buffer's text, when given, is `text_len` UTF-8 bytes at `text` (not
+    /// NUL-terminated); `text` is null when it isn't given. The runner keeps its own copy
+    /// of the text and tree, kept current by [`eh_js_ts_edit`]; when its copy isn't
+    /// at `version` and no text was given it returns `-2`, asking for the call again
+    /// with the text. The JSON answer (web/ts-query.js)
+    /// is written as UTF-8 into the `cap`-byte `out` buffer when it fits. Returns the
+    /// byte length the answer needs (may exceed `cap` — the caller grows and asks again,
+    /// and the runner hands back the same answer without re-running), or `-1` when no
+    /// runner is installed.
+    fn eh_js_ts_query(
+        buf: i32,
+        version: u32,
+        lang: *const c_char,
+        text: *const u8,
+        text_len: i32,
+        query: *const c_char,
+        first: i32,
+        last: i32,
+        deadline_ms: i32,
+        resume_parse: i32,
+        out: *mut u8,
+        cap: i32,
+    ) -> i32;
+    /// Drop the text and tree the worker's shared buffer store keeps for buffer `buf`.
+    fn eh_js_ts_forget(buf: i32);
+    /// An edit to buffer `buf`, which took its text from version `prev` to `next`: the
+    /// range from `(start_row, start_col)` to `(old_end_row, old_end_col)` (byte columns,
+    /// before the edit) was replaced by the `text_len` UTF-8 bytes at `text`. The worker's
+    /// shared buffer store applies it to its own copy of the text and tree (used by
+    /// queries, indent, folds and text objects); a copy that isn't at `prev` is dropped
+    /// and re-read on the next ask.
+    fn eh_js_ts_edit(
+        buf: i32,
+        prev: u32,
+        next: u32,
+        start_row: i32,
+        start_col: i32,
+        old_end_row: i32,
+        old_end_col: i32,
+        text: *const u8,
+        text_len: i32,
+    );
+}
+
+/// Decode the query runner's JSON answer ([`eh_js_ts_query`]) for a buffer in `lang`.
+/// Strict: a malformed answer is an error naming the runner, never a match with made-up
+/// coordinates.
+fn decode_ts_query(
+    lang: &str,
+    json: &str,
+) -> Result<Vec<bemtvi_core::QueryMatch>, bemtvi_core::QueryError> {
+    use bemtvi_core::QueryError;
+    let bad = |what: &str| {
+        QueryError::GrammarFailed(lang.to_string(), format!("ts-query runner: {what}"))
+    };
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| bad(&e.to_string()))?;
+    if let Some(err) = v.get("err").and_then(|e| e.as_str()) {
+        let msg = v
+            .get("msg")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_string();
+        let num = v.get("n").and_then(|n| n.as_u64()).unwrap_or(0);
+        return Err(match err {
+            "loading" => QueryError::GrammarLoading(lang.to_string()),
+            "incomplete" => QueryError::ParseIncomplete,
+            "nogrammar" => QueryError::NoGrammar(lang.to_string()),
+            "failed" => QueryError::GrammarFailed(lang.to_string(), msg),
+            "compile" => QueryError::Compile(msg),
+            "toomany" => QueryError::TooManyCaptures(num as usize),
+            "timeout" => QueryError::TimedOut(num),
+            other => bad(&format!("unknown error kind {other:?}")),
+        });
+    }
+    let matches = v
+        .get("ok")
+        .and_then(|m| m.as_array())
+        .ok_or_else(|| bad("no result"))?;
+    let num = |x: Option<&serde_json::Value>| {
+        x.and_then(|n| n.as_u64())
+            .map(|n| n as usize)
+            .ok_or_else(|| bad("a capture position is not a number"))
+    };
+    let text = |x: Option<&serde_json::Value>| {
+        x.and_then(|s| s.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| bad("a capture name or kind is not a string"))
+    };
+    let mut out = Vec::with_capacity(matches.len());
+    for m in matches {
+        let pattern = num(m.get(0))?;
+        let caps = m
+            .get(1)
+            .and_then(|c| c.as_array())
+            .ok_or_else(|| bad("a match has no captures"))?;
+        let mut captures = Vec::with_capacity(caps.len());
+        for c in caps {
+            captures.push(bemtvi_core::QueryCapture {
+                name: text(c.get(0))?,
+                kind: text(c.get(1))?,
+                start: (num(c.get(2))?, num(c.get(3))?),
+                end: (num(c.get(4))?, num(c.get(5))?),
+            });
+        }
+        out.push(bemtvi_core::QueryMatch { pattern, captures });
+    }
+    Ok(out)
 }
 
 /// The outbound effects the wasm edit-host captures for the UI to drain. The
@@ -340,7 +470,21 @@ impl Clipboard for WasmClipboard {
 struct WasmBufState {
     language: String,
     /// Full buffer text (the rope keeps a trailing `\n`, so this does too).
-    shadow: String,
+    shadow: ropey::Rope,
+    /// Changes whenever `shadow` does (open or edit), from [`WasmSyntax::next_version`].
+    /// The query runner keeps its own copy of the text and tree per buffer and only
+    /// re-reads `shadow` across the FFI when this moved, so a query on unchanged text
+    /// (a scroll) costs nothing proportional to the buffer.
+    version: u32,
+}
+
+/// The answer a worker tree-sitter runner gives when it needs the buffer's text (see
+/// [`WasmSyntax::with_text`]).
+const NEEDS_TEXT: i32 = -2;
+
+/// A buffer id as the JS runners key it: an `i32`, saturating (ids never get near it).
+fn js_buf(buffer: BufferId) -> i32 {
+    buffer.0.min(i32::MAX as u64) as i32
 }
 
 /// The wasm [`SyntaxEngine`]: the browser twin of `bemtvi-ts`'s native `Engine`, but it
@@ -358,9 +502,32 @@ struct WasmBufState {
 #[derive(Default)]
 struct WasmSyntax {
     buffers: HashMap<BufferId, WasmBufState>,
+    /// The last text version handed out ([`WasmBufState::version`]); wraps, which is
+    /// fine: the runner only compares a buffer's version for equality.
+    next_version: u32,
 }
 
 impl WasmSyntax {
+    /// Call one of the worker's tree-sitter runners as `f(text, text_len)`, first without
+    /// the text: the worker's shared buffer store keeps its own copy, current from the
+    /// edits `edit` forwards. When the runner answers [`NEEDS_TEXT`] (its copy isn't at
+    /// this buffer's version — the first ask, a re-open, a missed edit), call it again with
+    /// the text, materialized from the rope only then.
+    fn with_text(state: &WasmBufState, mut f: impl FnMut(*const u8, i32) -> i32) -> i32 {
+        let r = f(std::ptr::null(), -1);
+        if r != NEEDS_TEXT {
+            return r;
+        }
+        let text = state.shadow.to_string();
+        f(text.as_ptr(), text.len().min(i32::MAX as usize) as i32)
+    }
+
+    /// A fresh text version for a buffer whose shadow just changed.
+    fn bump_version(&mut self) -> u32 {
+        self.next_version = self.next_version.wrapping_add(1);
+        self.next_version
+    }
+
     /// Borrow a buffer's language as a C string for the FFI bridge (empty on a buffer the
     /// engine never opened — the JS side maps that to "no grammar" → fall back).
     fn lang_cstr(language: &str) -> Option<CString> {
@@ -380,40 +547,64 @@ impl SyntaxEngine for WasmSyntax {
         // Just snapshot the text + language; the parser is JS-side. A grammar that isn't
         // available there is the JS indenter's silent-fallback case, never a load failure
         // surfaced here — so always `Ok` (matches the wasm build's best-effort highlighting).
+        let version = self.bump_version();
         self.buffers.insert(
             buffer,
             WasmBufState {
                 language: language.to_string(),
-                shadow: text.to_string(),
+                shadow: ropey::Rope::from_str(text),
+                version,
             },
         );
         OpenOutcome::Ok
     }
 
     fn edit(&mut self, buffer: BufferId, edits: &[BufferEdit]) {
-        let Some(state) = self.buffers.get_mut(&buffer) else {
-            return;
-        };
-        // Patch the shadow with each byte-range replacement, defending against a malformed
-        // delta (out-of-range / mid-codepoint) so a bad edit degrades to a stale shadow
-        // rather than a panic across the FFI boundary.
         for e in edits {
+            let version = self.bump_version();
+            let Some(state) = self.buffers.get_mut(&buffer) else {
+                return;
+            };
+            let prev = state.version;
+            state.version = version;
+            // Patch the shadow with the byte-range replacement, defending against a
+            // malformed delta (out-of-range / mid-codepoint) so a bad edit degrades to a
+            // stale shadow rather than a panic across the FFI boundary. A rope, so this
+            // costs the edit, not the buffer.
             let len = state.shadow.len();
             if e.start_byte > e.old_end_byte
                 || e.old_end_byte > len
                 || !state.shadow.is_char_boundary(e.start_byte)
                 || !state.shadow.is_char_boundary(e.old_end_byte)
             {
+                // Not forwarded: the query runner sees the version jump without its
+                // edit and re-reads the whole text on its next query.
                 continue;
             }
-            state
-                .shadow
-                .replace_range(e.start_byte..e.old_end_byte, &e.text);
+            state.shadow.remove(e.start_byte..e.old_end_byte);
+            state.shadow.insert(e.start_byte, &e.text);
+            // Hand the edit to the worker's buffer store too, so it keeps its copy of the
+            // text and its tree current from the delta instead of re-reading the buffer.
+            let clamp = |n: usize| n.min(i32::MAX as usize) as i32;
+            unsafe {
+                eh_js_ts_edit(
+                    js_buf(buffer),
+                    prev,
+                    version,
+                    clamp(e.start_point.0),
+                    clamp(e.start_point.1),
+                    clamp(e.old_end_point.0),
+                    clamp(e.old_end_point.1),
+                    e.text.as_ptr(),
+                    clamp(e.text.len()),
+                )
+            };
         }
     }
 
     fn close(&mut self, buffer: BufferId) {
         self.buffers.remove(&buffer);
+        unsafe { eh_js_ts_forget(js_buf(buffer)) };
     }
 
     fn reload_grammar(&mut self, lang: &str) {
@@ -434,18 +625,21 @@ impl SyntaxEngine for WasmSyntax {
     fn indent(&mut self, buffer: BufferId, line: usize, p: &IndentParams) -> Option<usize> {
         let state = self.buffers.get(&buffer)?;
         let lang = Self::lang_cstr(&state.language)?;
-        let text = CString::new(state.shadow.as_str()).ok()?;
-        let width = unsafe {
+        let width = Self::with_text(state, |text, text_len| unsafe {
             eh_js_ts_indent(
+                js_buf(buffer),
+                state.version,
                 lang.as_ptr(),
-                text.as_ptr(),
+                text,
+                text_len,
                 line.min(i32::MAX as usize) as i32,
                 p.shiftwidth as i32,
                 p.tabstop as i32,
             )
-        };
+        });
         // `-1` is the JS side's fallback signal (grammar still loading, no grammar / no
-        // indents.scm, or an inconclusive `@indent.auto` query). A real verdict is `>= 0`.
+        // indents.scm, the parse not finished, or an inconclusive `@indent.auto` query).
+        // A real verdict is `>= 0`.
         (width >= 0).then_some(width as usize)
     }
 
@@ -458,10 +652,7 @@ impl SyntaxEngine for WasmSyntax {
         let Some(state) = self.buffers.get(&buffer) else {
             return Vec::new();
         };
-        let (Some(lang), Ok(text)) = (
-            Self::lang_cstr(&state.language),
-            CString::new(state.shadow.as_str()),
-        ) else {
+        let Some(lang) = Self::lang_cstr(&state.language) else {
             return Vec::new();
         };
         // The worker writes flat `[start, end, …]` i32 pairs into `buf`; it returns the
@@ -473,22 +664,24 @@ impl SyntaxEngine for WasmSyntax {
         // pathologically fold-dense buffer — or a buggy/hostile runner returning an inflated
         // count — can't size a multi-GB `Vec` and abort the whole wasm module (the 32-bit
         // address space tops out at 4 GB). Folds are cosmetic, so we degrade to the ranges
-        // that fit rather than OOM, mirroring this method's existing "return Vec::new() when
-        // unavailable" graceful-fallback shape. `1 << 20` ints = 512K fold ranges (~4 MB) is
-        // far beyond any real file.
+        // that fit rather than OOM. `1 << 20` ints = 512K fold ranges (~4 MB) is far beyond
+        // any real file.
         const MAX_FOLD_INTS: usize = 1 << 20;
         let mut buf = vec![0i32; 1024];
         loop {
-            let needed = unsafe {
+            let needed = Self::with_text(state, |text, text_len| unsafe {
                 eh_js_ts_folds(
+                    js_buf(buffer),
+                    state.version,
                     lang.as_ptr(),
-                    text.as_ptr(),
+                    text,
+                    text_len,
                     buf.as_mut_ptr(),
                     buf.len() as i32,
                 )
-            };
+            });
             if needed < 0 {
-                return Vec::new(); // no tree-sitter folds available
+                return Vec::new(); // no tree-sitter folds available (yet)
             }
             let needed = needed as usize;
             if needed <= buf.len() {
@@ -523,32 +716,40 @@ impl SyntaxEngine for WasmSyntax {
         let Some(state) = self.buffers.get(&buffer) else {
             return Vec::new();
         };
-        let (Some(lang), Ok(text), Ok(capture)) = (
-            Self::lang_cstr(&state.language),
-            CString::new(state.shadow.as_str()),
-            CString::new(capture),
-        ) else {
+        let (Some(lang), Ok(capture)) = (Self::lang_cstr(&state.language), CString::new(capture))
+        else {
             return Vec::new();
         };
-        // Same grow-and-retry protocol as `folds`: the worker writes flat `[start, end,
-        // …]` byte pairs and returns the count needed; grow once past the initial 512
-        // ranges if a query is unusually rich. The `MAX` cap defends against a hostile
-        // runner returning an inflated count sizing a multi-GB `Vec` (32-bit wasm).
+        // The cursor goes over as (row, byte column) and the regions come back the same
+        // way, converted against the rope here in O(log n), so nothing on either side
+        // walks the whole text. Rows are counted the way the core counts them for the
+        // edits it forwards (`LF_CR`), so the two agree.
+        let rope = &state.shadow;
+        let byte = byte.min(rope.len());
+        let row = rope.byte_to_line_idx(byte, ropey::LineType::LF_CR);
+        let col = byte - rope.line_to_byte_idx(row, ropey::LineType::LF_CR);
+        let clamp = |n: usize| n.min(i32::MAX as usize) as i32;
+        // Same grow-and-retry protocol as `folds`, in quads. The `MAX` cap defends
+        // against a hostile runner returning an inflated count sizing a multi-GB `Vec`.
         const MAX_INTS: usize = 1 << 20;
         let mut buf = vec![0i32; 1024];
         loop {
-            let needed = unsafe {
+            let needed = Self::with_text(state, |text, text_len| unsafe {
                 eh_js_ts_textobjects(
+                    js_buf(buffer),
+                    state.version,
                     lang.as_ptr(),
-                    text.as_ptr(),
+                    text,
+                    text_len,
                     capture.as_ptr(),
-                    byte.min(i32::MAX as usize) as i32,
+                    clamp(row),
+                    clamp(col),
                     buf.as_mut_ptr(),
-                    buf.len().min(i32::MAX as usize) as i32,
+                    clamp(buf.len()),
                 )
-            };
+            });
             if needed < 0 {
-                return Vec::new(); // no tree-sitter text objects available
+                return Vec::new(); // no tree-sitter text objects available (yet)
             }
             let needed = needed as usize;
             if needed <= buf.len() {
@@ -560,14 +761,96 @@ impl SyntaxEngine for WasmSyntax {
             }
             buf = vec![0i32; needed.min(MAX_INTS)];
         }
-        buf.chunks_exact(2)
-            .map(|c| (c[0].max(0) as usize, c[1].max(0) as usize))
+        let lines = rope.len_lines(ropey::LineType::LF_CR);
+        let to_byte = |r: i32, c: i32| {
+            let r = (r.max(0) as usize).min(lines.saturating_sub(1));
+            (rope.line_to_byte_idx(r, ropey::LineType::LF_CR) + c.max(0) as usize).min(rope.len())
+        };
+        buf.chunks_exact(4)
+            .map(|q| (to_byte(q[0], q[1]), to_byte(q[2], q[3])))
             .collect()
     }
 
     fn text_objects_available(&self, buffer: BufferId) -> bool {
         self.lang_for(buffer)
             .is_some_and(|lang| unsafe { eh_js_ts_textobjects_available(lang.as_ptr()) != 0 })
+    }
+
+    fn query(
+        &mut self,
+        buffer: BufferId,
+        language: &str,
+        query: &str,
+        opts: bemtvi_core::QueryOptions,
+    ) -> Result<Vec<bemtvi_core::QueryMatch>, bemtvi_core::QueryError> {
+        use bemtvi_core::QueryError;
+        let Some(state) = self.buffers.get(&buffer) else {
+            return Err(QueryError::NoGrammar(language.to_string()));
+        };
+        let Some(lang) = Self::lang_cstr(language) else {
+            return Err(QueryError::NoGrammar(language.to_string()));
+        };
+        let Ok(src) = CString::new(query) else {
+            return Err(QueryError::Compile(
+                "the query contains a NUL byte".to_string(),
+            ));
+        };
+        let clamp = |n: usize| n.min(i32::MAX as usize) as i32;
+        let (first, last) = opts.rows.map_or((-1, -1), |(f, l)| (clamp(f), clamp(l)));
+        // The runner keeps its own copy of the text, kept current by the edits
+        // `edit` forwards, so the text is only handed over when it asks for it (the
+        // first query on a buffer, or after a re-open / a missed edit): it answers
+        // `NEEDS_TEXT` to a call without the text, and the call is repeated with it.
+        const NEEDS_TEXT: i32 = -2;
+        let mut text: Option<String> = None;
+        // Same grow-and-retry protocol as `folds`: the runner returns the bytes its JSON
+        // answer needs; grow once if the first buffer was too small (the bridge holds the
+        // answer, so the second call doesn't re-run the query). The cap keeps a hostile
+        // or buggy count from sizing a multi-GB `Vec` in 32-bit wasm.
+        const MAX_BYTES: usize = 64 << 20;
+        let mut out = vec![0u8; 64 << 10];
+        loop {
+            let (text_ptr, text_len) = match &text {
+                Some(t) => (t.as_ptr(), clamp(t.len())),
+                None => (std::ptr::null(), -1),
+            };
+            let needed = unsafe {
+                eh_js_ts_query(
+                    js_buf(buffer),
+                    state.version,
+                    lang.as_ptr(),
+                    text_ptr,
+                    text_len,
+                    src.as_ptr(),
+                    first,
+                    last,
+                    opts.deadline_ms.min(i32::MAX as u64) as i32,
+                    i32::from(opts.resume_parse),
+                    out.as_mut_ptr(),
+                    clamp(out.len()),
+                )
+            };
+            if needed == NEEDS_TEXT && text.is_none() {
+                text = Some(state.shadow.to_string());
+                continue;
+            }
+            if needed < 0 {
+                return Err(QueryError::Unsupported);
+            }
+            let needed = needed as usize;
+            if needed < out.len() {
+                out.truncate(needed);
+                break;
+            }
+            if needed + 1 > MAX_BYTES {
+                return Err(QueryError::GrammarFailed(
+                    language.to_string(),
+                    "ts-query runner: the answer is larger than 64 MiB".to_string(),
+                ));
+            }
+            out = vec![0u8; needed + 1];
+        }
+        decode_ts_query(language, &String::from_utf8_lossy(&out))
     }
 
     fn set_query(&mut self, _lang: &str, _name: &str, _text: Option<String>) -> Result<(), String> {
@@ -1618,6 +1901,18 @@ pub unsafe extern "C" fn eh_ts_install_complete(
     handle
         .host
         .complete_ts_install(as_str(lang).to_string(), ok != 0, as_str(msg).to_string());
+}
+
+/// The worker's query runner finished loading a grammar a `btv.treesitter.query` or a
+/// decor provider's `query` found loading: re-run what was waiting on it and settle. See
+/// [`EditHost::ts_grammar_ready`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_ts_grammar_ready(h: *mut WasmEditHost) {
+    let handle = host_or!(h);
+    handle.host.ts_grammar_ready();
 }
 
 /// Seed the grammars available to the JS highlighter at boot, from a JSON `["lang", …]`

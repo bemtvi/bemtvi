@@ -68,6 +68,7 @@ dependencies = [
  "bemtvi-lua",
  "bemtvi-server",
  "rmpv",
+ "ropey",
  "serde_json",
 ]
 

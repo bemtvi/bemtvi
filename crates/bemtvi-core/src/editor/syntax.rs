@@ -127,6 +127,19 @@ impl Editor {
         self.syntax_failed.remove(lang);
         self.syntax_opened
             .retain(|_buf, opened| opened.as_str() != lang);
+        // A provider that asked this language's parse tree and was told there is no
+        // grammar has nothing to wait for, so nothing re-runs it — but there may be one
+        // now. Re-run the providers of every buffer in this language.
+        let bufs: Vec<BufferId> = self
+            .buffers
+            .map
+            .keys()
+            .copied()
+            .filter(|b| self.ts_language_for(*b).as_deref() == Some(lang))
+            .collect();
+        for buf in bufs {
+            self.invalidate_decor(crate::editor::DecorScope::Buffer(buf));
+        }
     }
 
     /// The buffer's **filetype** — the *language* noun, independent of whether
@@ -181,16 +194,20 @@ impl Editor {
     pub fn set_filetype(&mut self, buf: BufferId, ft: &str) {
         // The filetype is a `bo` mirror row — see `bump_options_generation`.
         self.bump_options_generation();
+        let before = self.decor_syntax_inputs(buf);
         self.ts_filetype.insert(buf, ft.to_string());
         self.refresh_syntax(buf);
+        self.invalidate_decor_if_changed(buf, before);
     }
 
     /// Reset `buf` to its extension-derived filetype (`:set filetype&`).
     pub fn reset_filetype(&mut self, buf: BufferId) {
         // The filetype is a `bo` mirror row — see `bump_options_generation`.
         self.bump_options_generation();
+        let before = self.decor_syntax_inputs(buf);
         self.ts_filetype.remove(&buf);
         self.refresh_syntax(buf);
+        self.invalidate_decor_if_changed(buf, before);
     }
 
     /// Enable or disable treesitter highlighting for `buf` (the `ts_highlight`
@@ -199,16 +216,20 @@ impl Editor {
     pub fn set_ts_highlight(&mut self, buf: BufferId, on: bool) {
         // `ts_highlight` is a `bo` mirror row — see `bump_options_generation`.
         self.bump_options_generation();
+        let before = self.decor_syntax_inputs(buf);
         self.ts_enabled.insert(buf, on);
         self.refresh_syntax(buf);
+        self.invalidate_decor_if_changed(buf, before);
     }
 
     /// Reset `buf`'s highlight-enable to the default (on).
     pub fn reset_ts_highlight(&mut self, buf: BufferId) {
         // `ts_highlight` is a `bo` mirror row — see `bump_options_generation`.
         self.bump_options_generation();
+        let before = self.decor_syntax_inputs(buf);
         self.ts_enabled.remove(&buf);
         self.refresh_syntax(buf);
+        self.invalidate_decor_if_changed(buf, before);
     }
 
     /// After a filetype/enable change, drop the buffer's "opened in language"
@@ -222,6 +243,32 @@ impl Editor {
             if let Some(engine) = self.syntax.as_mut() {
                 engine.close(buf);
             }
+        }
+    }
+
+    /// What a decoration provider sees of `buf`'s syntax: its filetype (what
+    /// `bufs.filetype` matches) and its treesitter language (what a `query` runs
+    /// against). Compared across a change by
+    /// [`invalidate_decor_if_changed`](Self::invalidate_decor_if_changed).
+    pub(crate) fn decor_syntax_inputs(&self, buf: BufferId) -> (Option<String>, Option<String>) {
+        (self.buffer_filetype(buf), self.ts_language_for(buf))
+    }
+
+    /// Re-run `buf`'s decoration providers when what they see of its syntax changed
+    /// since `before` ([`decor_syntax_inputs`](Self::decor_syntax_inputs)). Neither the
+    /// filetype nor the language is part of the viewport key — a file being opened
+    /// into a reused buffer gets its path a pass before its text, and a dispatch keyed
+    /// on the filetype would run the providers on the empty placeholder in between — so
+    /// the places that change them with no edit call this: the filetype / `ts_highlight`
+    /// setters and the saves that rename a buffer. One that re-states the current value
+    /// (a read chain setting the filetype it already has) re-runs nothing.
+    pub(crate) fn invalidate_decor_if_changed(
+        &mut self,
+        buf: BufferId,
+        before: (Option<String>, Option<String>),
+    ) {
+        if self.decor_syntax_inputs(buf) != before {
+            self.invalidate_decor(crate::editor::DecorScope::Buffer(buf));
         }
     }
 
@@ -499,6 +546,30 @@ impl Editor {
         };
         self.echo_ts_query_errors();
         objects
+    }
+
+    /// Run a caller-supplied treesitter `query` over `buf`'s tree, as `opts` says: the
+    /// engine half of `btv.treesitter.query` and a decor provider's `query`. Syncs the
+    /// engine to the latest edits first, like every other engine query, but never
+    /// forces a deferred grammar load: a grammar still loading is reported as
+    /// [`QueryError::GrammarLoading`] for the caller to retry when it lands, instead of
+    /// stalling the tick on a load.
+    pub fn ts_query(
+        &mut self,
+        buf: BufferId,
+        query: &str,
+        opts: crate::syntax::QueryOptions,
+    ) -> Result<Vec<crate::syntax::QueryMatch>, crate::syntax::QueryError> {
+        let Some(language) = self.ts_language_for(buf) else {
+            return Err(crate::syntax::QueryError::NoLanguage);
+        };
+        self.sync_syntax_engine(buf);
+        let result = match self.syntax.as_mut() {
+            Some(engine) => engine.query(buf, &language, query, opts),
+            None => Err(crate::syntax::QueryError::Unsupported),
+        };
+        self.echo_ts_query_errors();
+        result
     }
 
     /// Whether `language`'s grammar is still loading — asked for, no verdict yet.

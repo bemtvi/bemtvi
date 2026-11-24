@@ -535,7 +535,8 @@ end
 -- shape and modifiability are validated SYNCHRONOUSLY and raise before anything is queued
 -- (a non-table replacement, a non-string / newline-bearing line, an unknown or
 -- `nomodifiable` buffer); the server refuses a read-only KIND (terminal / `btv.view` /
--- quickfix) and an inverted span loudly. Out-of-range coordinates clamp into the buffer.
+-- quickfix) and an inverted span loudly. Out-of-range coordinates clamp into the buffer;
+-- a column inside a multi-byte character is refused loudly, since a character can't be split.
 function btv.buf.set_text(bufnr, start_row, start_col, end_row, end_col, replacement)
   local buf = btv._resolve_bufnr(bufnr)
   local mirror = btv._bufs[buf]

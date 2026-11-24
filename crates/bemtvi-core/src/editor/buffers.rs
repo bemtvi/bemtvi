@@ -783,14 +783,24 @@ impl Editor {
             // (row, col) → byte offset, clamped into the rope (mirrors the server's
             // `byte_of` for extmark positions), so an out-of-range coordinate lands at
             // the nearest valid byte rather than erroring.
-            let byte_at = |row: usize, col: usize| -> usize {
+            //
+            // A column inside a multi-byte character is refused instead: the rope can't
+            // split a character, and inserting there used to panic the editor.
+            let byte_at = |row: usize, col: usize| -> Result<usize, String> {
                 let n = buf.line_count();
                 let row = row.min(n);
                 let line_len = if row < n { buf.line_len(row) } else { 0 };
-                buf.line_start(row) + col.min(line_len)
+                let col = col.min(line_len);
+                if row < n && !buf.line_cow(row).is_char_boundary(col) {
+                    return Err(format!(
+                        "E5555: nvim_buf_set_text: column {col} of line {row} is not on a \
+                         character boundary"
+                    ));
+                }
+                Ok(buf.line_start(row) + col)
             };
-            let from = byte_at(start_row, start_col);
-            let to = byte_at(end_row, end_col);
+            let from = byte_at(start_row, start_col)?;
+            let to = byte_at(end_row, end_col)?;
             if to < from {
                 return Err("E5555: nvim_buf_set_text: 'end' is before 'start'".to_string());
             }
@@ -986,6 +996,8 @@ impl Editor {
     /// happens outside core (in the browser build, via the File System Access API),
     /// so this updates only the in-editor bookkeeping.
     pub fn mark_saved(&mut self, name: Option<String>) {
+        let id = self.cur_buffer();
+        let before = self.decor_syntax_inputs(id);
         let buf = self.buffer_mut();
         if let Some(name) = name {
             buf.set_path(Some(std::path::PathBuf::from(name)));
@@ -995,6 +1007,8 @@ impl Editor {
         // `Buffer::write`/`mark_written` do, so a `save_tick` consumer (LSP
         // `didSave`) sees every save — including a repeat save with no edit.
         buf.save_tick += 1;
+        // A save under a new name can retype the buffer (`.txt` to `.md`).
+        self.invalidate_decor_if_changed(id, before);
     }
 
     /// Turn on **off-tick filesystem mode**: `:w` (and the write half of `:wq` / `:x`)
@@ -1184,10 +1198,13 @@ impl Editor {
         // `mark_written` clears `modified` and re-derives `endofline`, both `bo`
         // mirror rows — see `bump_options_generation`.
         self.bump_options_generation();
+        let before = self.decor_syntax_inputs(buffer);
         self.buffers
             .get_mut(buffer)
             .buffer
             .mark_written(path.clone(), stat);
+        // A save under a new name can retype the buffer (`.txt` to `.md`).
+        self.invalidate_decor_if_changed(buffer, before);
         if moved_on {
             // `mark_written` cleared it for the snapshot; the buffer has since moved past
             // what was written, so it is dirty again — and its current state is *not* the
@@ -1269,8 +1286,11 @@ impl Editor {
             };
         }
         let fs = self.host_fs.clone();
+        let before = self.decor_syntax_inputs(buffer);
         let outcome = match self.buffers.get_mut(buffer).buffer.write(path, &*fs) {
             Ok((bytes, lines)) => {
+                // A save under a new name can retype the buffer (`.txt` to `.md`).
+                self.invalidate_decor_if_changed(buffer, before.clone());
                 // A save clears `modified` and re-derives `endofline`, both `bo`
                 // mirror rows — see `bump_options_generation`.
                 self.bump_options_generation();

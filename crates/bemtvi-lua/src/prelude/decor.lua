@@ -53,6 +53,45 @@ btv._decor = btv._decor or { providers = {} }
 -- carrying no `hl_group`, `virt_text`, `virt_lines`, `sign_text`, `line_hl_group`,
 -- `line_fill` or `gutter_text` — fails loud rather than silently painting nothing, and
 -- so does a mark with an unknown key.
+--
+-- **Asking the parse tree.** `query = "<treesitter query>"` runs that query over the
+-- buffer's root language for the visible rows before each `on_range`, and hands the
+-- answer over as `ctx.query`, in the same call — no second round trip:
+--
+-- ```lua
+-- btv.decor.provider({
+--   name = "tables",
+--   bufs = { filetype = { "markdown" } },
+--   query = "(pipe_table) @table",
+--   on_range = function(ctx, publish)
+--     if not ctx.query.matches then
+--       return -- ctx.query.error says why; ctx.query.pending is true for "not yet"
+--     end
+--     local marks = {}
+--     for _, m in ipairs(ctx.query.matches) do
+--       local row = m.captures.table[1][1]
+--       marks[#marks + 1] = { row, 0, sign_text = "T" }
+--     end
+--     publish(marks)
+--   end,
+-- })
+-- ```
+--
+-- `ctx.query.matches` has the shape `btv.treesitter.query` resolves `matches` with:
+-- each node `{ row, col, end_row, end_col, kind = "..." }`, and a node that
+-- intersects the viewport comes back with its full extent, so a table that starts
+-- above the screen reports its real first row.
+--
+-- Otherwise `ctx.query.error` names why there are no matches. With `pending = true`
+-- the answer is only "not yet" (the grammar is loading, or a large file's parse is
+-- unfinished), and the provider runs again by itself once it is ready: keep what is
+-- drawn rather than clearing it. Without `pending` there is nothing to wait for (no
+-- grammar installed, treesitter off); a query that doesn't compile is also reported on
+-- the message line, once.
+--
+-- With `debounce`, the query runs once per settled burst: while a burst of viewport
+-- changes is coalescing no query runs for the provider, and when it settles the window
+-- is dispatched once more with the query answered.
 function btv.decor.provider(spec)
   if type(spec) ~= "table" or type(spec.name) ~= "string" then
     error("btv.decor.provider: requires a { name = <string>, on_range = <fn> } table", 2)
@@ -69,10 +108,17 @@ function btv.decor.provider(spec)
   if spec.debounce ~= nil and type(spec.debounce) ~= "number" then
     error("btv.decor.provider('" .. spec.name .. "'): debounce must be a number (milliseconds)", 2)
   end
+  -- `query = <string>` (optional): a treesitter query run over the visible rows before
+  -- each `on_range`, answered as `ctx.query`. It compiles against the buffer's grammar,
+  -- which only the dispatch knows, so a query that doesn't compile is reported there.
+  if spec.query ~= nil and (type(spec.query) ~= "string" or not spec.query:find("%S")) then
+    error("btv.decor.provider('" .. spec.name .. "'): query must be a non-empty string", 2)
+  end
   local provider = {
     name = spec.name,
     bufs = spec.bufs,
     debounce = spec.debounce,
+    query = spec.query,
     on_range = spec.on_range,
     -- One namespace per provider: a republish clears it and re-sets, wholesale.
     ns = btv.ns.create("btv.decor:" .. spec.name),
@@ -399,6 +445,47 @@ local function run_provider(p, ctx)
   end
 end
 
+-- `btv._decor_queries(ctx)` -> `{ { name, query }, ... }`: the queries of the providers
+-- a dispatch for `ctx` (`{ win, buf, filetype, buftype }`) will call. The server asks first
+-- and runs only these, so a provider's `bufs` filter keeps its one home here.
+--
+-- A debounced provider's query runs only on the dispatch its debounce released (see
+-- `btv._decor_dispatch`): the runs a burst coalesces away would discard theirs.
+function btv._decor_queries(ctx)
+  local out = {}
+  for _, p in ipairs(btv._decor.providers) do
+    if p.query and not p.disabled and decor_matches(p, ctx) then
+      local debounced = p.debounce and p.debounce > 0
+      if not debounced or (p._fire and p._fire[ctx.win]) then
+        out[#out + 1] = { p.name, p.query }
+      end
+    end
+  end
+  return out
+end
+
+-- The `ctx` a querying provider `p` sees: the shared snapshot plus its own answer as
+-- `ctx.query`. A query that doesn't compile is a bug in the provider, so it is also
+-- reported on the message line, once per message, rather than only sitting in
+-- `ctx.query.error` where a provider that ignores errors would hide it.
+local function ctx_with_query(p, ctx, answers)
+  local answer = answers and answers[p.name]
+  if not answer then
+    answer = { error = "the server ran no query for this provider", pending = false }
+  end
+  if answer.compile and p.query_error ~= answer.error then
+    p.query_error = answer.error
+    btv.notify("E5108: btv.decor provider '" .. p.name .. "': " .. answer.error, "error")
+  end
+  answer.compile = nil
+  local own = {}
+  for k, v in pairs(ctx) do
+    own[k] = v
+  end
+  own.query = answer
+  return own
+end
+
 -- `btv._decor_dispatch(ctx)`: the server calls this off-tick, once per visible-range
 -- change, with `ctx = { win, buf, top, bot, lines, filetype, buftype, gen }`. Runs each matching,
 -- non-disabled provider's `on_range` (via `run_provider`). A provider with a `debounce`
@@ -408,9 +495,32 @@ end
 -- per-window coalescing in core already collapses changes between two drains; this adds
 -- the time delay across a continuous gesture (Decision 2).
 function btv._decor_dispatch(ctx)
+  local answers = ctx._queries
+  ctx._queries = nil
   for _, p in ipairs(btv._decor.providers) do
     if not p.disabled and decor_matches(p, ctx) then
-      if p.debounce and p.debounce > 0 then
+      local debounced = p.debounce and p.debounce > 0
+      if debounced and p.query then
+        -- A debounced provider that queries: its query is skipped while a burst is
+        -- coalescing, and when the debounce fires the window is re-dispatched once,
+        -- with the query answered, and the provider runs straight away.
+        p._fire = p._fire or {}
+        if p._fire[ctx.win] then
+          p._fire[ctx.win] = nil
+          run_provider(p, ctx_with_query(p, ctx, answers))
+        else
+          p._deb = p._deb or {}
+          local d = p._deb[ctx.win]
+          if not d then
+            d = btv.utils.debounce(function(c)
+              p._fire[c.win] = true
+              pcall(btv.decor.invalidate, { win = c.win })
+            end, p.debounce)
+            p._deb[ctx.win] = d
+          end
+          d(ctx)
+        end
+      elseif debounced then
         p._deb = p._deb or {}
         local d = p._deb[ctx.win]
         if not d then
@@ -421,7 +531,7 @@ function btv._decor_dispatch(ctx)
         end
         d(ctx)
       else
-        run_provider(p, ctx)
+        run_provider(p, p.query and ctx_with_query(p, ctx, answers) or ctx)
       end
     end
   end

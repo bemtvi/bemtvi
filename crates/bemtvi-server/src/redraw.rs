@@ -734,6 +734,10 @@ impl EditHost {
                 Value::from(win.cursor_screen_col as u64),
             ),
             (
+                Value::from("cursor_inline_before"),
+                Value::from(win.cursor_inline_before as u64),
+            ),
+            (
                 Value::from("cursor_width"),
                 Value::from(win.cursor_width as u64),
             ),

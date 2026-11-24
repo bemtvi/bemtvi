@@ -20,41 +20,7 @@
 // indices). The leading whitespace and code that drive indentation are ASCII, so a
 // column equals a byte there; the algorithm stays in JS string units throughout.
 
-import { EXT, FT, REGISTRY } from './grammars.js';
-
-// web-tree-sitter is imported *dynamically* (below, inside init) rather than statically:
-// a static import that fails (e.g. the emscripten glue tripping over a worker-vs-window
-// difference) would abort the whole worker module, silently hanging the editor. Loaded
-// lazily and guarded, a failure instead just leaves ts-indent unavailable (the core falls
-// back), and surfaces a real error in the console. Filled in by `createIndenter`'s init.
-let Parser, Language, Query;
-
-// Vendored assets live next to this module (web/vendor/), same as highlight.js.
-const V = new URL('./vendor/', import.meta.url);
-// OPFS path where `:TSInstall` caches grammars: /.bemtvi/treesitter/<lang>/{parser.wasm,indents.scm}.
-const TS_DIR = ['.bemtvi', 'treesitter'];
-
-// --- OPFS (worker thread) -----------------------------------------------------------
-// The async File System Access API works in a Worker too; the grammar cache is small and
-// off the hot path (loaded ahead of the keystroke), so async acquisition is fine.
-async function opfsDir(parts) {
-  let dir = await navigator.storage.getDirectory();
-  for (const p of parts) dir = await dir.getDirectoryHandle(p, { create: false });
-  return dir;
-}
-async function opfsReadBytes(parts) {
-  const dir = await opfsDir(parts.slice(0, -1));
-  const fh = await dir.getFileHandle(parts[parts.length - 1], { create: false });
-  return new Uint8Array(await (await fh.getFile()).arrayBuffer());
-}
-async function opfsReadText(parts) {
-  return new TextDecoder().decode(await opfsReadBytes(parts));
-}
-async function fetchText(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`${r.status} fetching ${url}`);
-  return r.text();
-}
+import { createScmLoader, NEED_TEXT } from './ts-buffers.js';
 
 // One indents.scm capture's `#set!` directives the algorithm consults.
 function beginMeta(props) {
@@ -66,14 +32,21 @@ function beginMeta(props) {
   };
 }
 
-// Captured node ids by indent role, built once per `indent()` by running indents.scm over
-// the whole tree (ancestors anywhere can carry a capture). Mirrors engine.rs's IndentMaps.
-function buildIndentMaps(query, root) {
+// Captured node ids by indent role, built once per `indent()`. Mirrors engine.rs's
+// IndentMaps and its scoping: the algorithm only consults captured nodes that start at
+// or above the target line (the decision node and its ancestors), so the capture pass
+// covers the rows from the top through `line` rather than the whole tree; `lineCount`
+// is the real line count (a `line` at or past it covers everything, which is correct
+// there: every consulted node is above the phantom line).
+function buildIndentMaps(query, root, line, lineCount) {
   const maps = {
     begin: new Map(), end: new Set(), dedent: new Set(), branch: new Set(),
     ignore: new Set(), align: new Set(), auto: new Set(), zero: new Set(),
   };
-  for (const m of query.matches(root)) {
+  const opts = line + 1 < lineCount
+    ? { startPosition: { row: 0, column: 0 }, endPosition: { row: line + 1, column: 0 } }
+    : {};
+  for (const m of query.matches(root, opts)) {
     const props = m.setProperties;
     for (const c of m.captures) {
       const name = c.name;
@@ -214,154 +187,47 @@ function computeIndent(maps, root, lines, line, indentSize) {
   return Math.max(0, indent);
 }
 
-// Build the worker's indenter. Mirrors highlight.js's loader (bundled vendor / OPFS
-// install caches), but loads indents.scm instead of highlights.scm and answers
-// synchronously. The Worker installs the returned `indent`/`available`/`reload` on
-// globalThis for the FFI bridge, and warms grammars via `ensureForFrame` each redraw.
-export function createIndenter() {
-  const bundled = new Set();        // languages with a grammar vendored in ./vendor/
-  const bundledIndents = new Set(); // bundled languages that also vendor an indents.scm
-  const installed = new Set();      // languages cached in OPFS by `:TSInstall`
-  const langs = new Map();          // regName → { parser, query } once loaded, or null if unavailable
-  const loading = new Set();
-
-  let ready = false;
-  let readyResolve;
-  const readyP = new Promise((r) => { readyResolve = r; });
-
-  (async () => {
-    ({ Parser, Language, Query } = await import('./vendor/web-tree-sitter/web-tree-sitter.js'));
-    await Parser.init({ locateFile: (f) => new URL('web-tree-sitter/' + f, V).href });
-    try {
-      const res = await fetch(new URL('manifest.json', V));
-      if (res.ok) for (const l of (await res.json()).languages || []) bundled.add(l);
-    } catch (e) { console.error('[bemtvi] indenter: vendor manifest load failed:', e); }
-    try {
-      const res = await fetch(new URL('indents.json', V));
-      if (res.ok) for (const l of await res.json()) bundledIndents.add(l);
-    } catch { /* no bundled indents */ }
-    await refreshInstalled();
-    ready = true;
-    readyResolve();
-  })().catch((e) => console.error('[bemtvi] indenter: init failed:', e && e.stack ? e.stack : e));
-
-  async function refreshInstalled() {
-    try {
-      for (const l of JSON.parse(await opfsReadText([...TS_DIR, 'manifest.json']))) installed.add(l);
-    } catch { /* nothing installed yet */ }
-  }
-
-  // The core's filetype → a registry grammar name (mirrors highlight.js's FT mapping), or
-  // null when no grammar covers it.
-  function resolveReg(coreLang) {
-    if (!coreLang) return null;
-    const reg = FT[coreLang] || coreLang;
-    return REGISTRY[reg] ? reg : null;
-  }
-
-  // Load `reg`'s grammar + indents.scm into memory (idempotent). An installed copy wins
-  // over the bundle (a `:TSInstall` of a bundled name uses the freshly fetched grammar).
-  // Sets `langs[reg] = null` for any honest "no ts indent here" case (no grammar, no
-  // indents.scm, or a load/compile failure) so the caller falls back rather than retries.
-  async function ensure(reg) {
-    if (langs.has(reg) || loading.has(reg)) return;
-    loading.add(reg);
-    try {
-      if (!ready) await readyP;
-      let parserSrc, indentScm;
-      if (installed.has(reg)) {
-        parserSrc = await opfsReadBytes([...TS_DIR, reg, 'parser.wasm']);
-        try { indentScm = await opfsReadText([...TS_DIR, reg, 'indents.scm']); } catch { indentScm = null; }
-      } else if (bundled.has(reg)) {
-        parserSrc = new URL('grammars/' + reg + '.wasm', V).href;
-        // Prefer an OPFS-cached indents.scm — a `:TSInstall` that supplied the indents the
-        // offline bundle lacks for this grammar — over the vendored one (or none).
-        try { indentScm = await opfsReadText([...TS_DIR, reg, 'indents.scm']); }
-        catch { indentScm = bundledIndents.has(reg) ? await fetchText(new URL('indents/' + reg + '.scm', V).href) : null; }
-      } else {
-        langs.set(reg, null);
-        return;
-      }
-      if (!indentScm || !indentScm.trim()) { langs.set(reg, null); return; } // no indents → fall back
-      const language = await Language.load(parserSrc);
-      const query = new Query(language, indentScm);
-      const parser = new Parser();
-      parser.setLanguage(language);
-      langs.set(reg, { parser, query });
-    } catch (e) {
-      console.error('[bemtvi] indenter: failed to load', reg, e);
-      langs.set(reg, null);
-    } finally {
-      loading.delete(reg);
-    }
-  }
-
+// Build the worker's indenter over the shared buffer store (ts-buffers.js): the
+// buffer's text (as lines) and tree come from the store, kept current from the core's
+// edit deltas, so an indent ask (`o`, `<CR>`, `=`) neither copies nor re-parses the
+// buffer. The Worker installs the returned methods on globalThis for the FFI bridge and
+// warms grammars via `ensureForFrame` each redraw.
+export function createIndenter(store) {
+  const scm = createScmLoader(store, 'indents', 'indenter');
   return {
-    // How much async work is in flight: in-flight grammar loads, plus the one-time init
-    // (web-tree-sitter + manifests) until ready. The worker reads this to keep its run loop
-    // event-loop-live (a non-blocking `Atomics.waitAsync` park) while > 0 — a thread blocked
-    // in `Atomics.wait` can't run the fetch/`Language.load` promises these depend on, so
-    // without this the grammar would never finish loading between keystrokes.
-    pendingLoads() {
-      return loading.size + (ready ? 0 : 1);
-    },
-
-    // Warm the grammars for the languages on screen, so indentation is ready before the
-    // user types. Called from the worker each redraw with the current frame.
-    ensureForFrame(frame) {
-      if (!frame || !Array.isArray(frame.windows)) return;
-      for (const w of frame.windows) {
-        let reg = resolveReg(w.filetype);
-        if (!reg && w.file_name && !w.unnamed) {
-          const base = String(w.file_name).split(/[\\/]/).pop().toLowerCase();
-          const dot = base.lastIndexOf('.');
-          reg = REGISTRY[EXT[dot >= 0 ? base.slice(dot + 1) : '']] ? EXT[base.slice(dot + 1)] : null;
-        }
-        if (reg) ensure(reg);
-      }
-    },
-
+    pendingLoads: () => scm.pendingLoads(),
+    ensureForFrame: (frame) => scm.ensureForFrame(frame),
     // Whether ts-indent is available for `coreLang` (a grammar with an indents.scm is
     // loaded) — the core reads this to tell an inconclusive query (fall back to
     // copy-previous) from no-ts-indent (column 0). Kicks off a load on first miss.
-    available(coreLang) {
-      const reg = resolveReg(coreLang);
-      if (!reg) return false;
-      const entry = langs.get(reg);
-      if (entry === undefined) { ensure(reg); return false; }
-      return !!entry;
-    },
+    available: (coreLang) => scm.available(coreLang),
 
-    // Target indent width in columns for `line` of `text` in `coreLang`, or -1 for the
-    // honest fallback cases (grammar still loading, no grammar/indents, inconclusive
-    // query). `sw` is the resolved shiftwidth. Synchronous: parse + query both are.
-    indent(coreLang, text, line, sw /*, ts */) {
-      const reg = resolveReg(coreLang);
+    // Target indent width in columns for `line` of buffer `buf` (`coreLang`, at the
+    // core's text `version`), `NEED_TEXT` when the store needs the text (`getText()` gave
+    // none), or -1 for the honest fallback cases (grammar still loading, no
+    // grammar/indents, an inconclusive query).
+    // `sw` is the resolved shiftwidth. Synchronous.
+    indent(buf, version, coreLang, getText, line, sw /*, ts */) {
+      const reg = store.resolveReg(coreLang);
       if (!reg) return -1;
-      const entry = langs.get(reg);
-      if (entry === undefined) { ensure(reg); return -1; } // not loaded yet — warm + fall back
-      if (!entry) return -1;
-      const lines = text.split('\n');
-      const tree = entry.parser.parse(text);
+      const e = scm.entry(reg);
+      if (!e) return -1;
+      const b = store.buffer(buf, version, reg, e.language, getText);
+      if (b === NEED_TEXT) return NEED_TEXT;
+      if (b.failed) return -1;
+      if (store.parse(buf, b, { complete: true }) !== 'done') return -1;
       try {
-        const maps = buildIndentMaps(entry.query, tree.rootNode);
-        const r = computeIndent(maps, tree.rootNode, lines, line, sw);
+        const lineCount = Math.max(0, b.lines.length - 1);
+        const maps = buildIndentMaps(e.query, b.tree.rootNode, line, lineCount);
+        const r = computeIndent(maps, b.tree.rootNode, b.lines, line, sw);
         return r == null ? -1 : r;
-      } catch (e) {
-        console.error('[bemtvi] indenter: indent failed for', reg, e);
+      } catch (err) {
+        console.error('[bemtvi] indenter: indent failed for', reg, err);
         return -1;
-      } finally {
-        tree.delete();
       }
     },
 
-    // Evict `coreLang`'s cached grammar after a `:TSInstall` so the next query reloads it
-    // (picking up the freshly cached parser + indents.scm). Re-reads the OPFS install
-    // manifest so a newly-installed language is known.
-    reload(coreLang) {
-      const reg = resolveReg(coreLang) || (coreLang && (FT[coreLang] || coreLang));
-      if (reg) langs.delete(reg);
-      refreshInstalled();
-    },
+    // Evict `coreLang`'s indents.scm after a `:TSInstall` so the next ask reloads it.
+    reload: (coreLang) => scm.reload(coreLang),
   };
 }

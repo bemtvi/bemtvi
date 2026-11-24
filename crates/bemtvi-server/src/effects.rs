@@ -1165,6 +1165,21 @@ impl EditHost {
                     let nlines = text.matches('\n').count();
                     self.settle_ts_highlight(lang, text, nlines, cb_id);
                 }
+                TsOp::Query {
+                    buf,
+                    query,
+                    rows,
+                    cb_id,
+                } => {
+                    self.settle_ts_query(crate::TsQueryAsk {
+                        buf: BufferId(buf),
+                        query,
+                        rows,
+                        cb_id,
+                        #[cfg(feature = "native")]
+                        since: std::time::Instant::now(),
+                    });
+                }
                 // The scan walks the grammar dirs, so it leaves the tick.
                 #[cfg(not(feature = "native"))]
                 TsOp::Reload { .. } => {
@@ -4227,6 +4242,7 @@ impl EditHost {
         };
         let filetype = self.editor.buffer_filetype(vp.buf).unwrap_or_default();
         let buftype = self.editor.buffer_buftype(vp.buf);
+        let queries = self.decor_query_answers(&vp, bot, &filetype, buftype);
         if let Err(e) = self.lua.run_decor_dispatch(
             vp.win.0,
             vp.buf.0,
@@ -4236,10 +4252,100 @@ impl EditHost {
             &filetype,
             buftype,
             &lines,
+            queries,
         ) {
             self.editor
                 .echo(format!("E5108: Error in btv.decor provider: {e}"));
         }
+    }
+
+    /// Run the treesitter queries of the decor providers about to be dispatched for
+    /// `vp` (`query = ...` on `btv.decor.provider`) over its visible rows, one answer
+    /// per provider; an identical query two providers share runs once. Bounded by the
+    /// viewport like `ctx.lines`, so the cost follows the window, not the buffer.
+    ///
+    /// An answer that is only "not yet" schedules the re-dispatch that will carry the
+    /// real one: an unfinished parse re-invalidates the window and wakes the
+    /// parse-resume timer (each run advances the parse), and a grammar still loading
+    /// re-invalidates the buffer's windows when it lands.
+    fn decor_query_answers(
+        &mut self,
+        vp: &DecorViewport,
+        bot: usize,
+        filetype: &str,
+        buftype: &str,
+    ) -> Vec<(String, bemtvi_lua::DecorQueryResult)> {
+        let wanted = match self
+            .lua
+            .decor_queries(vp.win.0, vp.buf.0, filetype, buftype)
+        {
+            Ok(wanted) => wanted,
+            Err(e) => {
+                self.editor
+                    .echo(format!("E5108: Error in btv.decor provider: {e}"));
+                return Vec::new();
+            }
+        };
+        let mut ran: std::collections::HashMap<String, bemtvi_lua::DecorQueryResult> =
+            std::collections::HashMap::new();
+        let mut answers = Vec::with_capacity(wanted.len());
+        for (name, query) in wanted {
+            let answer = match ran.get(&query) {
+                Some(answer) => answer.clone(),
+                // Before a buffer's first highlight, its first parse is being kept off
+                // the opening frame (`first_highlight_deferred`, the "paint now,
+                // highlight after" model). A query now would pay that parse on the
+                // opening frame after all, so it answers "not yet", and the provider
+                // runs again once the deferred parse has happened.
+                #[cfg(feature = "native")]
+                None if self.ui.is_some()
+                    && self.editor.ts_language_for(vp.buf).is_some()
+                    && !self.first_highlight_deferred.contains(&vp.buf) =>
+                {
+                    Err(bemtvi_core::QueryError::ParseIncomplete)
+                }
+                None => {
+                    // The redraw's highlight pull advances a visible buffer's parse every
+                    // frame, so the query leaves it alone. With no UI attached there is
+                    // no redraw, and the query has to advance it.
+                    let opts = bemtvi_core::QueryOptions {
+                        rows: Some((vp.top, bot + 1)),
+                        resume_parse: self.ui.is_none(),
+                        deadline_ms: crate::DECOR_QUERY_DEADLINE_MS,
+                    };
+                    let answer = self.query_buffer(vp.buf, &query, opts);
+                    ran.insert(query, answer.clone());
+                    answer
+                }
+            };
+            match &answer {
+                #[cfg(feature = "native")]
+                Err(bemtvi_core::QueryError::ParseIncomplete) => {
+                    self.editor
+                        .invalidate_decor(bemtvi_core::DecorScope::Window(vp.win));
+                    self.decor_query_parse_wait = true;
+                    // Armed here, not only from the redraw: a session with no UI never
+                    // redraws, and the re-dispatch would otherwise wait for input.
+                    self.arm_parse_resume_if_pending();
+                }
+                #[cfg(not(feature = "native"))]
+                Err(bemtvi_core::QueryError::ParseIncomplete) => {
+                    // The browser runner parses in slices and reports the end of a
+                    // sliced parse like a grammar landing (`ts_grammar_ready`).
+                    self.decor_query_grammar_wait.insert(vp.buf);
+                }
+                Err(bemtvi_core::QueryError::GrammarLoading(_)) => {
+                    self.decor_query_grammar_wait.insert(vp.buf);
+                    // The query may have just asked for the grammar; hand it to the
+                    // loader now rather than at the next redraw (none without a UI).
+                    #[cfg(feature = "native")]
+                    self.dispatch_grammar_requests();
+                }
+                _ => {}
+            }
+            answers.push((name, answer));
+        }
+        answers
     }
 
     /// Push the **`KeyPending`** event to `btv.on_key_pending` listeners when the live

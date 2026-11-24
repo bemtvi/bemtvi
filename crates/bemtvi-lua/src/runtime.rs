@@ -1766,6 +1766,9 @@ fn install_getenv(lua: &Lua) -> mlua::Result<()> {
     lua.globals().get::<Table>("os")?.set("getenv", getenv)
 }
 
+/// One decor provider's query answer ([`LuaRuntime::run_decor_dispatch`]).
+pub type DecorQueryResult = Result<Vec<bemtvi_core::QueryMatch>, bemtvi_core::QueryError>;
+
 impl LuaRuntime {
     /// Build the VM and point `require` at `runtimepath`: each entry's `lua/`
     /// subdirectory is prepended to `package.path` as `<rt>/lua/?.lua` and
@@ -3052,6 +3055,70 @@ impl LuaRuntime {
         run.call::<()>(ctx)
     }
 
+    /// Treesitter query matches as the Lua shape `btv.treesitter.query` and a decor
+    /// provider's `ctx.query` share: `{ { pattern, captures = { name = { node, ... } } } }`
+    /// with each node `{ row, col, end_row, end_col, kind = "..." }` (0-based rows, byte
+    /// columns, the end exclusive; `pattern` 1-based).
+    fn query_matches_to_lua(
+        &self,
+        matches: Vec<bemtvi_core::QueryMatch>,
+    ) -> mlua::Result<mlua::Table> {
+        let arr = self.lua.create_table()?;
+        for (i, m) in matches.into_iter().enumerate() {
+            let entry = self.lua.create_table()?;
+            entry.set("pattern", m.pattern + 1)?;
+            let captures = self.lua.create_table()?;
+            for cap in m.captures {
+                let nodes = match captures.get::<Option<mlua::Table>>(cap.name.as_str())? {
+                    Some(nodes) => nodes,
+                    None => {
+                        let nodes = self.lua.create_table()?;
+                        captures.set(cap.name.as_str(), nodes.clone())?;
+                        nodes
+                    }
+                };
+                let node = self.lua.create_table()?;
+                node.set(1, cap.start.0)?;
+                node.set(2, cap.start.1)?;
+                node.set(3, cap.end.0)?;
+                node.set(4, cap.end.1)?;
+                node.set("kind", cap.kind)?;
+                nodes.push(node)?;
+            }
+            entry.set("captures", captures)?;
+            arr.set(i + 1, entry)?;
+        }
+        Ok(arr)
+    }
+
+    /// The treesitter queries the decor providers matching this buffer declared
+    /// (`query = ...` on `btv.decor.provider`), as `(provider name, query)` pairs —
+    /// asked before [`run_decor_dispatch`](Self::run_decor_dispatch) so the server runs
+    /// only the queries of the providers that will actually be called. The provider's
+    /// `bufs` filter stays in Lua (`btv._decor_queries`), its one home.
+    pub fn decor_queries(
+        &self,
+        win: u64,
+        buf: u64,
+        filetype: &str,
+        buftype: &str,
+    ) -> mlua::Result<Vec<(String, String)>> {
+        let btv = self.btv()?;
+        let wanted: mlua::Function = btv.get("_decor_queries")?;
+        let ctx = self.lua.create_table()?;
+        ctx.set("win", lua_int(win as i64))?;
+        ctx.set("buf", lua_int(buf as i64))?;
+        ctx.set("filetype", self.lua.create_string(filetype)?)?;
+        ctx.set("buftype", self.lua.create_string(buftype)?)?;
+        let list: mlua::Table = wanted.call(ctx)?;
+        let mut out = Vec::new();
+        for pair in list.sequence_values::<mlua::Table>() {
+            let pair = pair?;
+            out.push((pair.get::<String>(1)?, pair.get::<String>(2)?));
+        }
+        Ok(out)
+    }
+
     /// Dispatch the registered `btv.decor` providers for a window whose visible range
     /// changed (`btv._decor_dispatch`). The server stamps the viewport `generation` in
     /// core and passes a snapshot — `win`/`buf` handles, the 0-based inclusive
@@ -3071,6 +3138,7 @@ impl LuaRuntime {
         filetype: &str,
         buftype: &str,
         lines: &[String],
+        queries: Vec<(String, DecorQueryResult)>,
     ) -> mlua::Result<()> {
         let btv = self.btv()?;
         let run: mlua::Function = btv.get("_decor_dispatch")?;
@@ -3087,6 +3155,22 @@ impl LuaRuntime {
             arr.set(i + 1, self.lua.create_string(line)?)?;
         }
         ctx.set("lines", arr)?;
+        // Each querying provider's answer, by provider name: `btv._decor_dispatch`
+        // hands each provider its own as `ctx.query`.
+        let answers = self.lua.create_table()?;
+        for (name, result) in queries {
+            let answer = self.lua.create_table()?;
+            match result {
+                Ok(matches) => answer.set("matches", self.query_matches_to_lua(matches)?)?,
+                Err(e) => {
+                    answer.set("error", self.lua.create_string(e.to_string())?)?;
+                    answer.set("pending", e.is_pending())?;
+                    answer.set("compile", matches!(e, bemtvi_core::QueryError::Compile(_)))?;
+                }
+            }
+            answers.set(name, answer)?;
+        }
+        ctx.set("_queries", answers)?;
         run.call::<()>(ctx)
     }
 
@@ -3382,6 +3466,15 @@ impl LuaRuntime {
                 Ok(langs) => {
                     let arr = self.lua.create_sequence_from(langs)?;
                     run.call::<()>((id, keep, mlua::Value::Nil, mlua::Value::Table(arr)))
+                }
+                Err(e) => run.call::<()>((id, keep, self.lua.create_string(&e)?)),
+            },
+            CallbackArgs::TsQuery { result } => match result {
+                Ok((tick, matches)) => {
+                    let res = self.lua.create_table()?;
+                    res.set("tick", tick)?;
+                    res.set("matches", self.query_matches_to_lua(matches)?)?;
+                    run.call::<()>((id, keep, mlua::Value::Nil, mlua::Value::Table(res)))
                 }
                 Err(e) => run.call::<()>((id, keep, self.lua.create_string(&e)?)),
             },

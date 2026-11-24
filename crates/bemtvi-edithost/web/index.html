@@ -2190,6 +2190,10 @@
       const isFocused = w.focused && !w.cursor_hidden && !view.command_mode && !pickerOpen;
       const cursorCol = w.cursor_screen_col;
       const cursorRow = w.cursor_row;
+      // The inline cells at the cursor's own column it paints before (`cursor_inline_before`:
+      // Insert mode at a right-gravity mark, where a typed character lands). The cursor
+      // then sits on the first of them instead of on its glyph; see virtChunksCursorHtml.
+      const cursorBefore = (isFocused && row === cursorRow && w.cursor_inline_before) || 0;
       const sel = w.selection[row] || null;
       const search = w.search[row] || [];
       const inc = w.incsearch[row] || null;
@@ -2250,8 +2254,13 @@
         // Inline virt_text anchored at this column: flush the pending run and emit the
         // chunks before the glyph; DOM flow shifts the cell (and everything after,
         // including the cursor / selection) right by the inserted width.
-        for (const p of inlineVirt) {
-          if (p[1] === c) { flush(); out += virtChunksHtml(p[3]); }
+        const here = inlineVirt.filter((p) => p[1] === c);
+        const cursorInVirt = cursorBefore > 0 && c === cursorCol && here.length > 0;
+        if (here.length) {
+          flush();
+          out += cursorInVirt
+            ? virtChunksCursorHtml(here, cursorBefore)
+            : here.map((p) => virtChunksHtml(p[3])).join("");
         }
         let cls = "";
         if (search.some((s) => inSpan(s, c))) cls = "search";
@@ -2260,7 +2269,7 @@
         if (secCols.has(c)) cls = "seccur";
         // The cursor lives only in the focused window — an unfocused split draws none,
         // matching the native TUI/GUI clients (and vim's single terminal cursor).
-        if (isFocused && row === cursorRow && c === cursorCol) cls = cursorClass();
+        if (isFocused && row === cursorRow && c === cursorCol && !cursorInVirt) cls = cursorClass();
         // Cursor / selection / search own their colors via their CSS class; the
         // server overlay, control-char colour, and virt_text bg only show on a plain cell.
         const owned = COLOR_OWNED.has(cls);
@@ -2279,7 +2288,7 @@
         }
         // A wide glyph or boxed symbol breaks the run and renders in its own fixed-width
         // box; a wide glyph's empty continuation cell (next column) then adds nothing.
-        const isCursorCell = isFocused && row === cursorRow && c === cursorCol;
+        const isCursorCell = isFocused && row === cursorRow && c === cursorCol && !cursorInVirt;
         if (cellNeedsBox(cells[c].ch)) { flush(); out += cellBoxSpan(cells[c].ch, cls, css, isCursorCell ? CURSOR_ID : null, cells[c + 1]?.ch === " "); continue; }
         // The cursor cell is emitted as its own id-tagged span so the off-screen IME
         // proxy can be parked over it (see positionImeProxy).
@@ -2289,10 +2298,17 @@
       }
       flush();
       // Inline virt_text anchored at or past end-of-text (col beyond the last cell).
-      for (const p of inlineVirt) {
-        if (p[1] >= cells.length) out += virtChunksHtml(p[3]);
+      const tail = inlineVirt.filter((p) => p[1] >= cells.length);
+      const tailAtCursor = tail.filter((p) => p[1] === cursorCol);
+      const cursorInTail = cursorBefore > 0 && cursorCol >= cells.length && tailAtCursor.length > 0;
+      for (const p of tail) {
+        if (cursorInTail && p[1] === cursorCol) {
+          if (p === tailAtCursor[0]) out += virtChunksCursorHtml(tailAtCursor, cursorBefore);
+        } else {
+          out += virtChunksHtml(p[3]);
+        }
       }
-      if (isFocused && row === cursorRow && cursorCol >= cells.length) {
+      if (isFocused && row === cursorRow && cursorCol >= cells.length && !cursorInTail) {
         out += `<span id="${CURSOR_ID}" class="${cursorClass()}"> </span>`;
       }
       // Extmark end-of-line virtual text: a one-cell gap, then each placement's
@@ -2393,6 +2409,39 @@
     }
     // A chunk run as styled spans (full style: fg + bold/italic) — for eol /
     // right_align / virt_lines, which paint past the text where there are no cells.
+    // The inline placements `places` (all anchored at the cursor's column) with the
+    // cursor on the cell `before` cells from their end: in Insert mode the cursor paints
+    // before the right-gravity text there (the server's `cursor_inline_before`), so its
+    // bar sits on the left edge of that text's first cell. The cells are counted the way
+    // the TUI and GUI count them, so all three clients agree.
+    function virtChunksCursorHtml(places, before) {
+      const chunks = places.flatMap((p) => p[3]);
+      const widthOf = (text) => [...clusters(text)].reduce((n, g) => n + (clusterWidth(g) || 0), 0);
+      const total = chunks.reduce((n, [text]) => n + widthOf(text), 0);
+      const at = Math.max(0, total - before);
+      let seen = 0, out = "";
+      for (const [text, id] of chunks) {
+        const css = id != null ? styleToCss(paletteStyle(id)) : "";
+        const attr = css ? ` style="${css}"` : "";
+        const w = widthOf(text);
+        if (at < seen || at >= seen + w) {
+          out += `<span${attr}>${escapeHtml(text)}</span>`;
+          seen += w;
+          continue;
+        }
+        let pre = "", cur = "", post = "", n = seen;
+        for (const g of clusters(text)) {
+          if (cur) post += g;
+          else if (n < at) { pre += g; n += clusterWidth(g) || 0; }
+          else cur = g;
+        }
+        if (pre) out += `<span${attr}>${escapeHtml(pre)}</span>`;
+        out += `<span id="${CURSOR_ID}" class="${cursorClass()}"${attr}>${escapeHtml(cur)}</span>`;
+        if (post) out += `<span${attr}>${escapeHtml(post)}</span>`;
+        seen += w;
+      }
+      return out;
+    }
     function virtChunksHtml(chunks) {
       let out = "";
       for (const [text, id] of chunks) {

@@ -149,6 +149,7 @@ const eh_sock_closed = M.cwrap("eh_sock_closed", null, ["number", "number", "str
 // tells the core, at boot, which grammars are already available (bundle + OPFS cache).
 const eh_take_ts_requests = M.cwrap("eh_take_ts_requests", "number", ["number"]);
 const eh_ts_install_complete = M.cwrap("eh_ts_install_complete", null, ["number", "string", "number", "string"]);
+const eh_ts_grammar_ready = M.cwrap("eh_ts_grammar_ready", null, ["number"]);
 const eh_ts_seed_installed = M.cwrap("eh_ts_seed_installed", null, ["number", "string"]);
 // The page's chord substitutions (`{"<C-w>": "<A-w>"}`), for `btv.ui.caps().key_labels`.
 const eh_set_key_labels = M.cwrap("eh_set_key_labels", null, ["number", "string"]);
@@ -176,79 +177,126 @@ function readStr(ptr) {
   return s;
 }
 
-// Tree-sitter INDENTATION (web/ts-indent.js). Unlike highlighting — a UI-thread paint
-// overlay that may repaint late — the core decides indentation *synchronously, inside the
-// tick* (on `o`/`O`/`<CR>`/`=`), so it must run HERE in the worker. The indenter loads
-// grammars + indents.scm (offline bundle / OPFS install cache) and answers `indent()`
-// synchronously; the Rust tick reaches it through the `eh_js_ts_*` FFI bridge
-// (web/eh-lib.js), which forwards to these globals.
+// The in-tick TREE-SITTER runners: indentation (web/ts-indent.js), folds
+// (web/ts-folds.js), text objects (web/ts-textobjects.js) and queries (web/ts-query.js).
+// Unlike highlighting — a UI-thread paint overlay that may repaint late — the core asks
+// these *synchronously, inside the tick* (`o`/`<CR>`/`=`, `foldmethod=expr`,
+// `vif`/`daf`, a decor provider's `query`), so they answer HERE in the worker, reached
+// through the `eh_js_ts_*` FFI bridge (web/eh-lib.js), which forwards to these globals.
 //
-// Loaded *dynamically and guarded*: the indenter is optional (it pulls in web-tree-sitter),
-// so a load failure must degrade to "no ts indent" (the core falls back to copy-previous /
-// column 0), never abort the worker and hang the editor. The grammar loads are async too, so
-// a keystroke that beats the first load just falls back that once.
+// All four share one buffer store (web/ts-buffers.js): one copy of each buffer's text,
+// one parser and one tree, kept current from the core's edit deltas (`eh_js_ts_edit`),
+// so no ask copies or re-parses the buffer. The store also owns the web-tree-sitter
+// runtime and the grammars.
+//
+// Loaded *dynamically and guarded*: a load failure degrades to the honest fallbacks (no
+// ts indent / folds / text objects; queries answer "failed"), never aborts the worker.
+// Until the modules are in, the placeholders below answer the same fallbacks, and a query
+// asked meanwhile ("loading") is re-run once they are.
+let tsStore = null;
 let indenter = null;
-let indenterSettled = false; // the dynamic import has resolved or rejected (not still loading the module)
-import("./ts-indent.js")
-  .then(({ createIndenter }) => {
-    indenter = createIndenter();
-    globalThis.__bemtviTsIndent = (lang, text, line, sw, ts) => indenter.indent(lang, text, line, sw, ts);
-    globalThis.__bemtviTsAvailable = (lang) => indenter.available(lang);
-  })
-  .catch((e) => postMessage({ type: "config_error", error: "ts-indent unavailable: " + (e && e.stack ? e.stack : e) }))
-  .finally(() => { indenterSettled = true; });
-
-// Tree-sitter FOLDS (web/ts-folds.js) — the same in-tick story as the indenter:
-// `foldmethod=expr` + the tree-sitter foldexpr asks the core for fold ranges while
-// converging a keystroke, so the fold runner answers HERE in the worker, synchronously,
-// reached through the `eh_js_ts_folds*` FFI bridge. Loaded dynamically + guarded the same
-// way: a failure degrades to "no tree-sitter folds" (the core leaves folds empty), never
-// aborts the worker.
 let folder = null;
-let folderSettled = false;
-import("./ts-folds.js")
-  .then(({ createFolder }) => {
-    folder = createFolder();
-    globalThis.__bemtviTsFolds = (lang, text) => folder.folds(lang, text);
-    globalThis.__bemtviTsFoldsAvailable = (lang) => folder.available(lang);
-  })
-  .catch((e) => postMessage({ type: "config_error", error: "ts-folds unavailable: " + (e && e.stack ? e.stack : e) }))
-  .finally(() => { folderSettled = true; });
-
-// Tree-sitter TEXT OBJECTS (web/ts-textobjects.js) — the same in-tick story: `vif`/`daf`/
-// `dia` ask the core for a syntactic range while converging the keystroke, so the runner
-// answers HERE, synchronously, through the `eh_js_ts_textobjects*` FFI bridge. Loaded
-// dynamically + guarded: a failure degrades to "no tree-sitter text objects" (the core
-// falls through to nothing), never aborts the worker.
 let textobjects = null;
-let textobjectsSettled = false;
-import("./ts-textobjects.js")
-  .then(({ createTextObjects }) => {
-    textobjects = createTextObjects();
-    globalThis.__bemtviTsTextObjects = (lang, text, capture, byte) => textobjects.textObjectsAt(lang, text, capture, byte);
+let tsquery = null;
+let tsRunnersSettled = false;
+let tsQueryReady = false; // something an ask waited on settled; the run loop reports it
+// Something an ask was told "not yet" about has settled (a grammar loaded, a sliced parse
+// finished, or the runners themselves arrived). Flag it and wake the run loop, which tells
+// the core (`eh_ts_grammar_ready`) and repaints — the same wake a daemon push uses, so it
+// reaches a loop parked on `Atomics.waitAsync`. In the non-SAB mode there is no parked
+// loop to wake: tell the core and repaint here.
+const tsQuerySettledSomething = () => {
+  tsQueryReady = true;
+  if (sabMode) {
+    if (daemonWaker) { const r = daemonWaker; daemonWaker = null; r(); }
+    if (sabCtrl) { Atomics.add(sabCtrl, SEQ, 1); Atomics.notify(sabCtrl, SEQ, 1); }
+  } else if (tsQueryBootDone) {
+    drainTsQueryReady();
+    postMessage(redrawMsg({ acks: [], results: [] }));
+  }
+  // Otherwise boot is still running: the flag is drained once it finishes.
+};
+// Tell the core about whatever an ask waited on that has settled. Called from a run-loop
+// pass (SAB), from the settle callback itself (the postMessage path, once booted), or
+// right after boot — never from inside a call into the host.
+function drainTsQueryReady() {
+  if (!tsQueryReady) return false;
+  tsQueryReady = false;
+  eh_ts_grammar_ready(h);
+  return true;
+}
+let tsQueryBootDone = false;
+let tsQueryAskedEarly = false;
+globalThis.__bemtviTsQuery = () => { tsQueryAskedEarly = true; return JSON.stringify({ err: "loading" }); };
+globalThis.__bemtviTsIndent = () => -1;
+globalThis.__bemtviTsAvailable = () => false;
+globalThis.__bemtviTsFolds = () => null;
+globalThis.__bemtviTsFoldsAvailable = () => false;
+globalThis.__bemtviTsTextObjects = () => null;
+globalThis.__bemtviTsTextObjectsAvailable = () => false;
+globalThis.__bemtviTsEdit = () => {};
+globalThis.__bemtviTsForget = () => {};
+Promise.all([
+  import("./ts-buffers.js"),
+  import("./ts-indent.js"),
+  import("./ts-folds.js"),
+  import("./ts-textobjects.js"),
+  import("./ts-query.js"),
+])
+  .then(([buffers, ind, fol, tob, qry]) => {
+    tsStore = buffers.createBufferStore({ onReady: tsQuerySettledSomething });
+    indenter = ind.createIndenter(tsStore);
+    folder = fol.createFolder(tsStore);
+    textobjects = tob.createTextObjects(tsStore);
+    tsquery = qry.createQueryRunner(tsStore);
+    globalThis.__bemtviTsIndent = (buf, version, lang, getText, line, sw, ts) =>
+      indenter.indent(buf, version, lang, getText, line, sw, ts);
+    globalThis.__bemtviTsAvailable = (lang) => indenter.available(lang);
+    globalThis.__bemtviTsFolds = (buf, version, lang, getText) => folder.folds(buf, version, lang, getText);
+    globalThis.__bemtviTsFoldsAvailable = (lang) => folder.available(lang);
+    globalThis.__bemtviTsTextObjects = (buf, version, lang, getText, capture, row, col) =>
+      textobjects.textObjectsAt(buf, version, lang, getText, capture, row, col);
     globalThis.__bemtviTsTextObjectsAvailable = (lang) => textobjects.available(lang);
+    globalThis.__bemtviTsQuery = (buf, version, lang, getText, src, first, last, deadline, resume) =>
+      tsquery.query(buf, version, lang, getText, src, first, last, deadline, resume);
+    globalThis.__bemtviTsEdit = (buf, prev, next, sRow, sCol, oRow, oCol, text) =>
+      tsStore.edit(buf, prev, next, sRow, sCol, oRow, oCol, text);
+    globalThis.__bemtviTsForget = (buf) => {
+      globalThis.__bemtviTsQueryHeld = null;
+      tsStore.forget(buf);
+    };
   })
-  .catch((e) => postMessage({ type: "config_error", error: "ts-textobjects unavailable: " + (e && e.stack ? e.stack : e) }))
-  .finally(() => { textobjectsSettled = true; });
+  .catch((e) => {
+    const msg = "tree-sitter runners unavailable: " + (e && e.stack ? e.stack : e);
+    // A terminal answer for queries, not "loading" forever; the others keep falling back.
+    globalThis.__bemtviTsQuery = () => JSON.stringify({ err: "failed", msg });
+    postMessage({ type: "config_error", error: msg });
+  })
+  .finally(() => {
+    tsRunnersSettled = true;
+    if (tsQueryAskedEarly) tsQuerySettledSomething();
+  });
 
-// One `:TSInstall <lang>` evicts ALL tree-sitter runners' caches for that language, so the
-// next indent/fold/text-object query reloads the freshly installed parser + queries. The
+// One `:TSInstall <lang>` evicts every runner's cache for that language (and the store's
+// grammar and trees), so the next ask reloads the freshly installed parser + queries. The
 // single `eh_js_ts_reload` FFI export (lib.rs) forwards here.
 globalThis.__bemtviTsReload = (lang) => {
+  globalThis.__bemtviTsQueryHeld = null;
   if (indenter) indenter.reload(lang);
   if (folder) folder.reload(lang);
   if (textobjects) textobjects.reload(lang);
+  if (tsquery) tsquery.reload(lang);
+  if (tsStore) tsStore.reload(lang);
 };
 
 // Whether the tree-sitter runners have async work the SAB run loop must stay event-loop-live
-// for: each module's import, then its init (web-tree-sitter + manifests) and any in-flight
-// grammar load. A thread blocked in `Atomics.wait` can't run those promises, so the loop parks
-// non-blockingly (`Atomics.waitAsync`) while this is true — the same treatment daemon watches
-// get — and only blocks once both runners are fully idle.
+// for: the modules loading, the runtime starting, grammar and query-file loads, background
+// parse chains, a pending wake. A thread blocked in `Atomics.wait` can't run those, so the
+// loop parks non-blockingly (`Atomics.waitAsync`) while this is true — the same treatment
+// daemon watches get — and only blocks once everything is idle.
 const indenterBusy = () =>
-  !indenterSettled ||
-  !folderSettled ||
-  !textobjectsSettled ||
+  !tsRunnersSettled ||
+  (tsStore !== null && tsStore.pendingLoads() > 0) ||
   (indenter !== null && indenter.pendingLoads() > 0) ||
   (folder !== null && folder.pendingLoads() > 0) ||
   (textobjects !== null && textobjects.pendingLoads() > 0);
@@ -420,6 +468,10 @@ async function bootWithConfig() {
     postMessage({ type: "config_error", error: "treesitter seed: " + e });
   }
   eh_boot_finish(h);
+  // A query that waited during boot (a grammar or the query runner settling meanwhile)
+  // can be told now that the host is up; the frame that follows boot repaints it.
+  tsQueryBootDone = true;
+  drainTsQueryReady();
 }
 // NB: invoked at the very END of the module (see below), not here — the OPFS helpers it
 // reaches (`splitPath` et al.) are `const` arrows still in their temporal dead zone at
@@ -2407,6 +2459,9 @@ async function runLoopSAB(ctrl, data) {
     // not a stale clock that would make it instantly due.
     eh_set_clock(h, nowMs());
     const { acks, results, tsLanded } = drain();
+    // A grammar a `btv.treesitter.query` / decor `query` waited on has settled in the
+    // query runner: let the core re-run what was waiting, and repaint below.
+    const queryReady = drainTsQueryReady();
     // A runtime `:connect bemtvi://…` arrived this pass (`<Esc>` already dismissed the command
     // line in the drain above): dial the daemon now, while the loop is event-loop-live — a
     // blocking `Atomics.wait` park would freeze the WebTransport handshake. This re-points the
@@ -2470,7 +2525,7 @@ async function runLoopSAB(ctrl, data) {
     drainTsRequests();
     // Forward any `"+`/`"*` yanks/deletes to the UI thread to write to navigator.clipboard.
     drainClipboard();
-    if (fired || acks.length || fsWork || fsOpWork || gitOpWork || httpWork || mountWork || notified || tsLanded || termFlushed) {
+    if (fired || acks.length || fsWork || fsOpWork || gitOpWork || httpWork || mountWork || notified || tsLanded || queryReady || termFlushed) {
       postMessage(redrawMsg({ acks, results }));
     }
     // Persistence (shada): any input this pass arms the debounced checkpoint; a requested

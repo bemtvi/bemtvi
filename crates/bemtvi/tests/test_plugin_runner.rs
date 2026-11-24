@@ -62,6 +62,90 @@ fn passing_suite_exits_zero() {
 }
 
 #[test]
+fn a_skipped_test_is_reported_with_its_reason_and_does_not_fail_the_run() {
+    let dir = fixture_dir("skip");
+    std::fs::write(
+        dir.join("test/skip_spec.lua"),
+        r#"
+        _G.cleaned = false
+        btv.test.describe("fixture", function()
+          btv.test.after_each(function() _G.cleaned = true end)
+          btv.test.it("needs a grammar", function(t)
+            t:skip("no markdown grammar installed")
+            error("unreachable: a skip stops the test")
+          end)
+          btv.test.it("checks the cleanup ran for the skipped test", function()
+            btv.test.expect(_G.cleaned).to_be(true)
+          end)
+        end)
+        "#,
+    )
+    .unwrap();
+
+    let (ok, stdout) = run(&dir);
+    assert!(ok, "a skip must not fail the run; stdout:\n{stdout}");
+    assert!(
+        stdout.contains("needs a grammar (skipped: no markdown grammar installed)"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("1 passed, 0 failed, 1 skipped"),
+        "stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_skip_in_before_each_skips_the_test() {
+    let dir = fixture_dir("skip-before");
+    std::fs::write(
+        dir.join("test/skip_spec.lua"),
+        r#"
+        btv.test.describe("fixture", function()
+          btv.test.before_each(function(t) t:skip("needs a grammar") end)
+          btv.test.it("would run", function() error("unreachable") end)
+        end)
+        "#,
+    )
+    .unwrap();
+
+    let (ok, stdout) = run(&dir);
+    assert!(
+        ok,
+        "a skip in before_each must not fail the run; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("would run (skipped: needs a grammar)"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("0 passed, 0 failed, 1 skipped"),
+        "stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_skip_without_a_reason_fails_loud() {
+    let dir = fixture_dir("skip-noreason");
+    std::fs::write(
+        dir.join("test/skip_spec.lua"),
+        r#"
+        btv.test.describe("fixture", function()
+          btv.test.it("skips silently", function(t) t:skip() end)
+        end)
+        "#,
+    )
+    .unwrap();
+
+    let (ok, stdout) = run(&dir);
+    assert!(!ok, "a reasonless skip must fail; stdout:\n{stdout}");
+    assert!(
+        stdout.contains("t:skip: give the reason"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("0 passed, 1 failed"), "stdout:\n{stdout}");
+}
+
+#[test]
 fn failing_assertion_exits_nonzero() {
     let dir = fixture_dir("fail");
     std::fs::write(

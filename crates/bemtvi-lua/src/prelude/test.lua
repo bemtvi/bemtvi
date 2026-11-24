@@ -377,6 +377,34 @@ function Ctx:idle()
   return self
 end
 
+-- `t:skip(reason)` — stop this test here and report it as **skipped**, with `reason`.
+-- For a test that needs something the machine running the suite may not have — a
+-- treesitter grammar, an external binary — so a missing dependency neither fails the
+-- run nor passes as though the test ran. A skip is its own outcome: listed with its
+-- reason, counted apart from passes and failures, and it leaves the run's exit status
+-- alone. `after_each` hooks still run.
+--
+-- ```lua
+-- btv.test.it("aligns a table", function(t)
+--   if not btv.tbl.contains(btv.await(btv.treesitter.installed()), "markdown") then
+--     t:skip("no markdown treesitter grammar installed")
+--   end
+--   -- ...
+-- end)
+-- ```
+--
+-- `reason` is required: a skip that doesn't say why can't be told apart from one
+-- left in by mistake.
+function Ctx:skip(reason)
+  if type(reason) ~= "string" or not reason:find("%S") then
+    error("t:skip: give the reason the test is skipped", 2)
+  end
+  -- Bound to a local first, as the failure path does, so selene's string-typed view
+  -- of `error` doesn't flag the table.
+  local e = { __btvtest_skip = true, message = reason }
+  error(e, 0)
+end
+
 -- t:sleep(ms) — await a wall-clock delay (for genuinely time-based behavior).
 function Ctx:sleep(ms)
   btv.await(btv.promise.delay(ms))
@@ -1265,12 +1293,18 @@ function M._run()
 
         fresh_slate()
 
-        -- before_each (outer→inner). A hook failure errors the test without running it.
+        -- before_each (outer→inner). A hook failure errors the test without running it;
+        -- a `t:skip` there skips it (the natural place to skip a whole block that needs
+        -- something the machine lacks).
         for _, hook in ipairs(case.befores) do
           local ok, err = run_protected(hook, ctx)
           if not ok then
-            status = "error"
-            message = "before_each: " .. (type(err) == "table" and err.message or tostring(err))
+            if type(err) == "table" and err.__btvtest_skip then
+              status, message = "skip", err.message
+            else
+              status = "error"
+              message = "before_each: " .. (type(err) == "table" and err.message or tostring(err))
+            end
             break
           end
         end
@@ -1278,7 +1312,9 @@ function M._run()
         if status == "pass" then
           local ok, err = run_protected(case.fn, ctx)
           if not ok then
-            if type(err) == "table" and err.__btvtest_fail then
+            if type(err) == "table" and err.__btvtest_skip then
+              status, message = "skip", err.message
+            elseif type(err) == "table" and err.__btvtest_fail then
               status, message = "fail", err.message
             else
               status, message = "error", (type(err) == "table" and err.message or tostring(err))
@@ -1286,11 +1322,12 @@ function M._run()
           end
         end
 
-        -- after_each always runs (inner→outer), even after a failure. A cleanup
-        -- failure downgrades a pass to error but never overwrites a real failure.
+        -- after_each always runs (inner→outer), even after a failure or a skip. A
+        -- cleanup failure downgrades a pass or a skip to error but never overwrites a
+        -- real failure.
         for _, hook in ipairs(case.afters) do
           local ok, err = run_protected(hook, ctx)
-          if not ok and status == "pass" then
+          if not ok and (status == "pass" or status == "skip") then
             status = "error"
             message = "after_each: " .. (type(err) == "table" and err.message or tostring(err))
           end

@@ -1662,6 +1662,17 @@ pub enum TsOp {
         text: String,
         cb_id: u64,
     },
+    /// `btv.treesitter.query(buf, query, { rows })`: run `query` over buffer `buf`'s
+    /// tree, restricted to the 0-based rows `[first, last)` when `rows` is given, and
+    /// settle `cb_id` with the matches ([`CallbackArgs::TsQuery`]). An ask the engine
+    /// can't answer *yet* (grammar loading, parse unfinished) is parked by the server
+    /// and settled when it can be.
+    Query {
+        buf: u64,
+        query: String,
+        rows: Option<(usize, usize)>,
+        cb_id: u64,
+    },
     /// `btv.treesitter.reload(lang)`: look for `lang`'s grammar again.
     Reload { lang: String },
     /// `btv.treesitter.installed()`: settle `cb_id` with the languages that have a grammar
@@ -1974,6 +1985,12 @@ pub enum CallbackArgs {
     },
     /// A `btv.treesitter.installed` settle: the languages, or why there's no answer.
     TsInstalled { result: Result<Vec<String>, String> },
+    /// A [`TsOp::Query`] settle (`btv.treesitter.query`): `Ok((tick, matches))` resolves
+    /// the promise with `{ tick, matches }`, where `tick` is the buffer's `changedtick`
+    /// the tree reflects; `Err(message)` rejects it with the reason there is no answer.
+    TsQuery {
+        result: Result<(u64, Vec<bemtvi_core::QueryMatch>), String>,
+    },
 }
 
 /// One diagnostic mirrored into the Lua `btv._diagnostics[bufnr]` table so the

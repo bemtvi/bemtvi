@@ -731,6 +731,35 @@ async fn buftype_scopes_a_provider_to_buffer_kind() {
     );
 }
 
+#[tokio::test]
+async fn a_filetype_change_runs_the_providers_without_a_scroll() {
+    // A provider's `bufs.filetype` filter matches on the filetype, which no viewport
+    // change reports: setting it on a buffer already on screen must dispatch the
+    // providers it now matches (and leave the rest), without waiting for a scroll.
+    let dir = temp_dir("decor_filetype_change");
+    let (rpc, _incoming) = start(&dir, PROBE_INIT).await;
+    let path = dir.join("notes.txt");
+    std::fs::write(&path, "return 1\n").expect("write notes.txt");
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+    assert!(
+        exec_lua(&rpc, "return _G.probe").await.is_nil(),
+        "the lua-scoped probe does not run on a text buffer"
+    );
+
+    feed(&rpc, ":set filetype=lua<CR>");
+    let ft = exec_lua(&rpc, "return _G.probe and _G.probe.ft").await;
+    assert_eq!(
+        ft.as_str(),
+        Some("lua"),
+        "the probe ran once the buffer became lua"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.rust_ran").await.as_bool(),
+        Some(false),
+        "a provider the new filetype doesn't match still doesn't run"
+    );
+}
+
 /// window 0's `line_bg` layer as `(row, style_id)` pairs — the full-width line
 /// backgrounds (neovim's `line_hl_group`) painted under the text.
 fn window0_line_bg(map: &[(Value, Value)]) -> Vec<(u64, Option<u64>)> {

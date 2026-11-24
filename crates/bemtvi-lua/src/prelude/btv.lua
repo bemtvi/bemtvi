@@ -386,6 +386,102 @@ function btv.treesitter.highlight(lang, text)
   end)
 end
 
+-- `btv.treesitter.query(buf, query[, opts])` -> promise of the nodes treesitter query
+-- `query` captures in buffer `buf` (`0` = the current buffer). Lets a plugin read the
+-- structure the grammar already knows — where the tables, fences or functions are —
+-- instead of re-deriving it from the text.
+--
+-- The query runs over the buffer's **root** language, the one its filetype names; the
+-- languages it injects (a code fence's contents) are not searched. `opts.rows` restricts
+-- it to the 0-based rows `{ first, last }`, `last` exclusive. A node that **intersects**
+-- those rows is returned with its full extent, even where it runs past them.
+--
+-- Resolves with:
+--
+-- ```lua
+-- {
+--   tick = 42,          -- the buffer's changedtick the tree reflects
+--   matches = {
+--     { pattern = 1,    -- 1-based index of the pattern that matched
+--       captures = {    -- each capture name (no `@`) -> the nodes it captured
+--         table = { { 4, 0, 9, 0, kind = "pipe_table" } },
+--       } },
+--   },
+-- }
+-- ```
+--
+-- Each node is `{ row, col, end_row, end_col, kind = "<node type>" }`: 0-based rows,
+-- byte columns, the end exclusive — what `btv.buf.set_extmark` takes. Matches are in
+-- tree order. Compare `tick` with `btv.buf.changedtick(buf)` to drop a result the
+-- buffer has already moved past.
+--
+-- ```lua
+-- btv.treesitter.query(0, "(pipe_table) @table"):next(function(res)
+--   for _, m in ipairs(res.matches) do
+--     local row, _, end_row = table.unpack(m.captures.table[1])
+--     print(("table on rows %d-%d"):format(row, end_row))
+--   end
+-- end)
+-- ```
+--
+-- An empty row range (`last == first`) matches nothing.
+--
+-- When the grammar is still loading, or a large file's parse is not finished, the
+-- promise waits and settles once it can (natively, it gives up after 30 seconds). It
+-- **rejects**, with a message naming the cause, when there is no answer: no such
+-- buffer, no filetype or `ts_highlight` off, no grammar installed, a grammar that
+-- failed to load, a query that doesn't compile, more than 100000 captured nodes, or a
+-- walk of the tree longer than its time budget (narrow the query, or pass `rows`). An
+-- empty `matches` therefore always means the query matched nothing.
+function btv.treesitter.query(buf, query, opts)
+  if type(buf) ~= "number" then
+    error("btv.treesitter.query: buf must be a buffer number (0 = the current buffer)", 2)
+  end
+  if type(query) ~= "string" then
+    error("btv.treesitter.query: query must be a string of treesitter query source", 2)
+  end
+  if opts ~= nil and type(opts) ~= "table" then
+    error("btv.treesitter.query: opts must be a table", 2)
+  end
+  local first, last
+  for k in pairs(opts or {}) do
+    if k ~= "rows" then
+      error("btv.treesitter.query: unknown option '" .. tostring(k) .. "' (accepts rows)", 2)
+    end
+  end
+  if opts and opts.rows ~= nil then
+    local rows = opts.rows
+    if
+      type(rows) ~= "table"
+      or type(rows[1]) ~= "number"
+      or type(rows[2]) ~= "number"
+      or rows[1] % 1 ~= 0
+      or rows[2] % 1 ~= 0
+      or rows[1] < 0
+      or rows[2] < rows[1]
+    then
+      error("btv.treesitter.query: rows must be { first, last }, 0-based with last >= first", 2)
+    end
+    first, last = rows[1], rows[2]
+  end
+  if buf == 0 then
+    buf = btv.buf.current()
+  end
+  return btv.promise.new(function(resolve, reject)
+    local id = btv._next_cb_id()
+    btv._cb_fns[id] = function(err, res)
+      if err then
+        reject(err)
+      else
+        resolve(res)
+      end
+    end
+    btv._bridge(id, function()
+      btv._ts_query(buf, query, first, last, id)
+    end)
+  end)
+end
+
 -- `btv.treesitter.reload(lang)`: look for `lang`'s grammar again, and repaint what's open in
 -- it. An editor remembers that a language has no grammar, and `:TSInstall` only tells the
 -- editor that ran it (`TSInstalled`), so this is for another editor that installed one: an app

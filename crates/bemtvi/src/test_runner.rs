@@ -331,6 +331,7 @@ fn report(results: &Value, load_errors: &[(PathBuf, String)]) -> bool {
     let cases = parse(results);
     let mut passed = 0;
     let mut failed = 0;
+    let mut skipped = 0;
 
     println!();
     let mut last_group = String::new();
@@ -344,6 +345,13 @@ fn report(results: &Value, load_errors: &[(PathBuf, String)]) -> bool {
             "pass" => {
                 passed += 1;
                 println!("  \x1b[32m✓\x1b[0m {} ({}ms)", case.name, case.ms);
+            }
+            // A skip is neither a pass nor a failure: shown with its reason, counted
+            // apart, and it leaves the exit status alone.
+            "skip" => {
+                skipped += 1;
+                let reason = case.message.as_deref().unwrap_or("no reason given");
+                println!("  \x1b[33m○\x1b[0m {} (skipped: {reason})", case.name);
             }
             _ => {
                 failed += 1;
@@ -366,7 +374,10 @@ fn report(results: &Value, load_errors: &[(PathBuf, String)]) -> bool {
     }
 
     println!();
-    let summary = format!("{passed} passed, {failed} failed");
+    let mut summary = format!("{passed} passed, {failed} failed");
+    if skipped > 0 {
+        summary.push_str(&format!(", {skipped} skipped"));
+    }
     if failed == 0 {
         println!("\x1b[32m{summary}\x1b[0m");
     } else {

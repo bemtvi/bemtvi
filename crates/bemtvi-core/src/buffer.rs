@@ -706,6 +706,22 @@ impl Buffer {
             .collect()
     }
 
+    /// The cells of `line`'s inline `virt_text` anchored exactly at byte column `byte`
+    /// whose marks have right gravity. Text typed at `byte` lands before them (the
+    /// marks slide right with it), so an Insert-mode cursor there paints before them,
+    /// while left-gravity text stays before it (neovim's rule).
+    pub fn inline_cells_after_insert_at(&self, line: usize, byte: usize) -> usize {
+        use crate::extmark::VirtTextPos;
+        let at = self.line_start(line) + byte;
+        self.extmarks
+            .starting_in(at, at + 1)
+            .filter_map(|(_, m)| m.decor.as_deref().filter(|_| m.right_gravity))
+            .filter(|d| d.virt_text_pos == VirtTextPos::Inline)
+            .flat_map(|d| d.virt_text.iter())
+            .map(|c| crate::unicode::grapheme_cells(&c.text))
+            .sum()
+    }
+
     /// The total cells spliced into `line`, which needs none of its text.
     pub fn inline_width(&self, line: usize) -> usize {
         self.inline_bytes(line).iter().map(|s| s.1).sum()

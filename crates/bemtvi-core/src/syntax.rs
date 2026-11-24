@@ -54,6 +54,118 @@ pub struct FoldRange {
     pub end: usize,
 }
 
+/// How a caller-supplied treesitter query ([`SyntaxEngine::query`]) runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryOptions {
+    /// Restrict the query to rows `[first, last)`; `None` is the whole buffer. An empty
+    /// range matches nothing.
+    pub rows: Option<(usize, usize)>,
+    /// Advance an unfinished parse one budget before answering. Only an ask nothing
+    /// else will make progress for should; without it the answer is
+    /// [`QueryError::ParseIncomplete`] until the parse finishes elsewhere.
+    pub resume_parse: bool,
+    /// How long walking the tree may take, in milliseconds, before the query fails
+    /// with [`QueryError::TimedOut`]. Bounds the time a query holds the editor's tick.
+    pub deadline_ms: u64,
+}
+
+/// One match of a caller-supplied treesitter query over a buffer
+/// ([`SyntaxEngine::query`]): the index of the pattern that matched and the nodes it
+/// captured, in capture order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryMatch {
+    /// 0-based index of the matching pattern in the query source.
+    pub pattern: usize,
+    pub captures: Vec<QueryCapture>,
+}
+
+/// One captured node: its capture name (without the `@`), its node kind, and its
+/// **full** extent, even where it reaches past the queried row range. Positions are
+/// `(row, byte column)`, 0-based, the end exclusive: what an extmark anchors on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryCapture {
+    pub name: String,
+    pub kind: String,
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+}
+
+/// Why [`SyntaxEngine::query`] has no matches to give. Every case is distinct from
+/// "the query matched nothing" (an empty `Ok`), so a caller can never mistake a
+/// missing tree for an absence of nodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryError {
+    /// The buffer has no treesitter language: no filetype, or `ts_highlight` is off.
+    NoLanguage,
+    /// No grammar is installed for this language.
+    NoGrammar(String),
+    /// The grammar is installed but failed to load; the reason.
+    GrammarFailed(String, String),
+    /// The grammar is still loading off the editor thread. Ask again when it lands.
+    GrammarLoading(String),
+    /// The buffer's parse is unfinished (a large file parsed across frames). Asking
+    /// again advances it, so a retry converges.
+    ParseIncomplete,
+    /// The query didn't compile; treesitter's message.
+    Compile(String),
+    /// The query captured more than this many nodes. Narrow it or give it a row range.
+    TooManyCaptures(usize),
+    /// Walking the tree took longer than this many milliseconds. Narrow the query or
+    /// give it a row range.
+    TimedOut(u64),
+    /// This engine can't run queries (the browser build, for now).
+    Unsupported,
+}
+
+impl QueryError {
+    /// Whether asking again later can succeed without anything else changing: the
+    /// grammar is loading or the parse is unfinished.
+    pub fn is_pending(&self) -> bool {
+        matches!(
+            self,
+            QueryError::GrammarLoading(_) | QueryError::ParseIncomplete
+        )
+    }
+}
+
+impl std::fmt::Display for QueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueryError::NoLanguage => {
+                write!(
+                    f,
+                    "the buffer has no treesitter language (no filetype, or ts_highlight is off)"
+                )
+            }
+            QueryError::NoGrammar(lang) => {
+                write!(f, "no treesitter grammar installed for '{lang}'")
+            }
+            QueryError::GrammarFailed(lang, reason) => {
+                write!(
+                    f,
+                    "the treesitter grammar for '{lang}' failed to load: {reason}"
+                )
+            }
+            QueryError::GrammarLoading(lang) => {
+                write!(f, "the treesitter grammar for '{lang}' is still loading")
+            }
+            QueryError::ParseIncomplete => write!(f, "the buffer's parse is not finished yet"),
+            QueryError::Compile(msg) => write!(f, "invalid query: {msg}"),
+            QueryError::TooManyCaptures(max) => write!(
+                f,
+                "the query captured more than {max} nodes; narrow it or pass a row range"
+            ),
+            QueryError::TimedOut(ms) => write!(
+                f,
+                "the query ran longer than {ms} ms; narrow it or pass a row range"
+            ),
+            QueryError::Unsupported => {
+                write!(f, "treesitter queries are not available in this build yet")
+            }
+        }
+    }
+}
+
 /// The editor's effective indent settings, passed to [`SyntaxEngine::indent`] so
 /// the engine can turn an indent *level* into a target column width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,6 +420,24 @@ pub trait SyntaxEngine {
     /// default is `false`.
     fn text_objects_available(&self, _buffer: BufferId) -> bool {
         false
+    }
+
+    /// Run `query` (treesitter query source) over `buffer`'s tree in `language`, the
+    /// buffer's root language, as `opts` says (row range, parse resumption, time
+    /// budget). Matches come back in tree order; a node that intersects the row range
+    /// is reported with its full extent.
+    ///
+    /// The default can't answer and says so (`Unsupported`) rather than reporting no
+    /// matches: an engine without query support must not look like a query that
+    /// found nothing.
+    fn query(
+        &mut self,
+        _buffer: BufferId,
+        _language: &str,
+        _query: &str,
+        _opts: QueryOptions,
+    ) -> Result<Vec<QueryMatch>, QueryError> {
+        Err(QueryError::Unsupported)
     }
 
     /// Install (or, with `text = None`, clear) a resolved query override for

@@ -75,6 +75,8 @@ impl Editor {
             let bot = top.saturating_add(height.saturating_sub(1)).min(last_line);
             // `changedtick` is in the key so an on-screen edit that leaves top/bot
             // unchanged (typing within the viewport) still re-dispatches the provider.
+            // (A change of filetype or treesitter language with no edit re-dispatches
+            // through `invalidate_decor`, from the setters and the renaming saves.)
             let key = (buf, top, bot, tick);
             let moved = self.decor_viewports.get(&win) != Some(&key);
             // An outstanding `btv.decor.invalidate` re-dispatches this window even

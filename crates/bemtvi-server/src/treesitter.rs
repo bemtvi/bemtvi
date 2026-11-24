@@ -21,6 +21,11 @@ use bemtvi_core::{unicode, view::WindowView, BufferId, WinHl};
 use rmpv::Value;
 use std::collections::HashMap;
 
+/// How long a parked `btv.treesitter.query` waits for its grammar or parse before it
+/// rejects. Both normally settle in well under a second; this only bounds a wait that
+/// would otherwise never end.
+pub(crate) const TS_QUERY_PARK_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A cached highlight span in buffer coordinates: a byte range within a line.
 #[derive(Clone)]
 pub(crate) struct ByteSpan {
@@ -142,6 +147,14 @@ impl EditHost {
         self.apply_lua_effects();
     }
 
+    /// Whether a parked `btv.treesitter.query` is waiting on an unfinished parse
+    /// (rather than on a grammar load, which has its own wake).
+    pub(crate) fn has_query_parked_on_parse(&self) -> bool {
+        self.parked_ts_queries
+            .iter()
+            .any(|ask| self.editor.ts_parse_pending(ask.buf))
+    }
+
     /// Re-run the `btv.treesitter.highlight` asks parked on a grammar that has now
     /// landed. One that is *still* pending (a different language) parks again.
     fn run_parked_ts_highlights(&mut self) {
@@ -192,13 +205,21 @@ impl EditHost {
     /// opened before its grammar was ready stays plain until the next edit or scroll.
     fn install_grammar(&mut self, outcome: crate::GrammarOutcome) -> bool {
         let (lang, loaded) = outcome;
-        if !self.editor.install_ts_grammar(&lang, loaded) {
+        let installed = self.editor.install_ts_grammar(&lang, loaded);
+        // Decor providers whose query found this grammar loading get re-dispatched
+        // with the real answer (matches, or "no grammar") on the settle that follows.
+        for buf in std::mem::take(&mut self.decor_query_grammar_wait) {
+            self.editor
+                .invalidate_decor(bemtvi_core::DecorScope::Buffer(buf));
+        }
+        if !installed {
             // `Missing` — no parser installed. The engine still replaced its
             // `Loading` slot with a terminal `NotInstalled` verdict, so the settle's
             // re-check resolves a parked `btv.treesitter.highlight` ask (empty spans)
             // instead of parking it forever — the promise must not hang the whole
             // session because no other grammar ever lands.
             self.run_parked_ts_highlights();
+            self.run_parked_ts_queries();
             return false;
         }
         self.syntax_states.clear();
@@ -209,6 +230,7 @@ impl EditHost {
         // `install_ts_grammar` — their styling lives in core.)
         self.rehighlight_preview();
         self.run_parked_ts_highlights();
+        self.run_parked_ts_queries();
         true
     }
 

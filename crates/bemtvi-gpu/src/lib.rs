@@ -68,8 +68,8 @@ pub use bemtvi_view::images::{DecodeReq, ImageFetch};
 pub use fontchain::runs_by;
 pub use render::{block_element_rects, split_block_elements};
 pub use render::{
-    inlay_shift, run_columns, seg_bg_spans, segment_columns, splice_inlay, split_at_char,
-    virt_inline_shift, with_preedit, Seg, DEFAULT_BG, DEFAULT_ERROR_MSG, DEFAULT_FG,
+    cursor_virt_shift, inlay_shift, run_columns, seg_bg_spans, segment_columns, splice_inlay,
+    split_at_char, virt_inline_shift, with_preedit, Seg, DEFAULT_BG, DEFAULT_ERROR_MSG, DEFAULT_FG,
     DEFAULT_INCSEARCH_BG, DEFAULT_INLAY, DEFAULT_LINE_NR, DEFAULT_SEARCH_BG, DEFAULT_STATUS_BG,
     DEFAULT_VISUAL_BG, DEFAULT_WIN_SEPARATOR, DIAG_ERROR, DIAG_HINT, DIAG_INFO, DIAG_WARN,
     MULTICURSOR_ACCENT,

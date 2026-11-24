@@ -200,6 +200,12 @@ pub struct WindowView {
     pub lines: Vec<String>,
     pub cursor_row: u16,
     pub cursor_screen_col: u16,
+    /// Cells of inline `virt_text` at the cursor's own column that the cursor paints
+    /// before (in Insert mode, the right-gravity text a typed character lands in front
+    /// of). A renderer shifts the cursor right past every inline placement at or
+    /// before `cursor_screen_col`, then takes this many cells back off. `0` from an
+    /// older server that omits the key.
+    pub cursor_inline_before: u16,
     /// Display width (screen cells) of the grapheme under the cursor. `1` for an
     /// ordinary char or end-of-line; wider for a tab, a wide CJK/emoji glyph, or a
     /// `^X` / `<xx>` control-char token. The renderer's block cursor envelops this
@@ -1476,6 +1482,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         lines: map_str_array(m, "lines"),
         cursor_row: map_u16(m, "cursor_row"),
         cursor_screen_col: map_u16(m, "cursor_screen_col"),
+        cursor_inline_before: map_u16(m, "cursor_inline_before"),
         // Default 1 so an older server (no key) gives an ordinary one-cell cursor.
         cursor_width: map_get(m, "cursor_width")
             .and_then(Value::as_u64)

@@ -435,7 +435,18 @@ impl EditHost {
                 // visual selection, a mark that opted into hiding draws nothing.
                 let row_selected = selection.get(row).copied().flatten().is_some();
                 let mut marks = marks.clone();
-                marks.sort_by_key(|m| (m.start, m.priority, m.id));
+                // At a shared anchor, inline left-gravity text paints before right-gravity
+                // text: that's where each stays once something is typed there (the
+                // right-gravity marks move on with it), and where an Insert cursor sits
+                // between them (see `WindowView::cursor_inline_before`). Other positions
+                // keep pure priority order, which decides what an overlay covers.
+                marks.sort_by_key(|m| {
+                    let inline = m
+                        .decor
+                        .as_deref()
+                        .is_some_and(|d| d.virt_text_pos == VirtTextPos::Inline);
+                    (m.start, inline && m.right_gravity, m.priority, m.id)
+                });
                 // Inline placements need the line text + its start byte to map the
                 // mark's byte anchor to a screen column (the same tab/wide-char
                 // `virtcol` the inlay hints and hl spans use). Computed once per row.

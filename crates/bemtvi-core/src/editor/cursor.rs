@@ -200,16 +200,24 @@ impl Editor {
 
     /// Where the cursor's character sits under `nowrap`, in the space `leftcol` counts:
     /// the column its cells start at, its own inline text included, and the column the
-    /// character itself paints at.
+    /// character itself paints at. In Insert mode the cursor paints before the
+    /// right-gravity inline text at its column (see
+    /// [`Buffer::inline_cells_after_insert_at`]), so those cells come back off.
     pub(crate) fn cursor_painted_span(&self) -> (usize, usize) {
         let tab = self.tabstop();
         let splices = self
             .buffer()
             .inline_splices_upto(self.cursor.line, tab, self.cursor.col);
         let vc = self.cursor_virtcol();
+        let before = if self.mode.is_insert() {
+            self.buffer()
+                .inline_cells_after_insert_at(self.cursor.line, self.cursor.col)
+        } else {
+            0
+        };
         (
             unicode::painted_start(vc, &splices),
-            unicode::painted_col(vc, &splices),
+            unicode::painted_col(vc, &splices) - before,
         )
     }
 

@@ -507,6 +507,12 @@ pub struct WindowView {
     /// Cursor's screen-cell column on its line (wide-char and tab aware), for
     /// placing the terminal cursor.
     pub cursor_screen_col: usize,
+    /// Cells of inline `virt_text` anchored at the cursor's own column that the cursor
+    /// paints *before*: in Insert mode, the text of right-gravity marks there, which a
+    /// typed character lands in front of. A client shifts the cursor right past every
+    /// inline placement at or before [`cursor_screen_col`](Self::cursor_screen_col)
+    /// and takes this many cells back off. `0` outside Insert mode.
+    pub cursor_inline_before: usize,
     /// Display width (screen cells) of the grapheme under the cursor — `1` for an
     /// ordinary char or at end-of-line, `2` for a wide CJK/emoji glyph or a `^X`
     /// caret token, `4` for a `<xx>` hex token, a tab's width for a tab. A block
@@ -1263,6 +1269,15 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
             unicode::cursor_cell_width(&line, cur_col, tab),
         )
     };
+    // The inline cells at the cursor's own column that it paints before: in Insert
+    // mode, the right-gravity text a typed character lands in front of. The clients
+    // shift the cursor past every inline placement at or before its column and take
+    // these back off.
+    let cursor_inline_before = if w.focused && ed.mode.is_insert() && !cursor_folded {
+        buf.inline_cells_after_insert_at(cur_line, cur_col)
+    } else {
+        0
+    };
 
     // The cursor is off screen when its row isn't laid out (a closed fold shows on
     // its first line's row), or, under `nowrap`, its column is scrolled off a side.
@@ -1276,7 +1291,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 let painted = unicode::painted_col(
                     cursor_screen_col,
                     &buf.inline_splices_upto(cur_line, buf.options.effective_tabstop(), cur_col),
-                );
+                ) - cursor_inline_before;
                 painted < w.leftcol || painted >= w.leftcol + width
             })
     };
@@ -1427,6 +1442,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         leftcol: w.leftcol,
         cursor_col: w.cursor.col,
         cursor_screen_col,
+        cursor_inline_before,
         cursor_width,
         secondary_cursors,
         text_pointer: ed.text_pointer_over(w.buffer),

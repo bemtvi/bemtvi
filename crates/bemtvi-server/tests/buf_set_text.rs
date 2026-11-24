@@ -150,3 +150,25 @@ async fn a_newline_bearing_line_fails_loud() {
     .await;
     assert_eq!(ok.as_bool(), Some(false));
 }
+
+/// A column inside a multi-byte character can't be split: the edit is refused with a
+/// message naming the position, the text is left alone, and the editor keeps running.
+/// (It used to panic in the rope insert: "byte index is not on a char boundary".)
+#[tokio::test]
+async fn a_column_inside_a_multibyte_character_is_refused_not_a_crash() {
+    let (rpc, mut inc) = open("名x\n").await;
+    // `名` is bytes [0,3); byte column 1 falls inside it.
+    let msg = bemtvi_test_harness::message_after(
+        &rpc,
+        &mut inc,
+        r#":lua btv.buf.set_text(0, 0, 1, 0, 1, { "Y" })<CR>"#,
+    )
+    .await;
+    assert_eq!(lines(&rpc).await, "名x", "the text is unchanged");
+    assert!(
+        msg.contains("not on a character boundary"),
+        "message: {msg:?}"
+    );
+    // The editor is still up and editable: a valid edit at the boundary still lands.
+    assert_eq!(set_and_read(&rpc, r#"0, 3, 0, 3, { "Y" }"#).await, "名Yx");
+}

@@ -380,8 +380,17 @@ fn an_injection_query_does_not_cost_a_walk_of_the_whole_tree() {
         started.elapsed()
     };
 
-    let baseline = elapsed(None);
-    let injected = elapsed(Some(MARKDOWN_IN_HTML_MACRO));
+    // A timing guard: the two halves run alternately, three times, and the fastest of
+    // each is compared. One sample of each is taken at two moments, and whatever else
+    // runs between them (this binary's other tests) can push the ratio past its limit;
+    // the fastest run is the least disturbed one, and a real regression slows every
+    // run, so it still shows. (The editor crates share this as
+    // `bemtvi_test_harness::fastest_pair`.)
+    let (mut baseline, mut injected) = (std::time::Duration::MAX, std::time::Duration::MAX);
+    for _ in 0..3 {
+        baseline = baseline.min(elapsed(None));
+        injected = injected.min(elapsed(Some(MARKDOWN_IN_HTML_MACRO)));
+    }
     let ratio = injected.as_secs_f64() / baseline.as_secs_f64().max(0.000_001);
     assert!(
         ratio < 3.0,

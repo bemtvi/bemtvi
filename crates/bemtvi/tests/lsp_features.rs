@@ -5964,8 +5964,13 @@ async fn time_semantic_tokens(len: usize) -> Duration {
 #[tokio::test]
 async fn semantic_tokens_on_a_long_ascii_line_do_not_scale_with_its_length() {
     let _guard = serial_lock().lock().await;
-    let short = time_semantic_tokens(10_000).await;
-    let long = time_semantic_tokens(400_000).await;
+    // A timing guard: see `fastest_pair`.
+    let (short, long) = bemtvi_test_harness::fastest_pair(
+        bemtvi_test_harness::TIMING_ROUNDS,
+        || time_semantic_tokens(10_000),
+        || time_semantic_tokens(400_000),
+    )
+    .await;
     std::env::remove_var("BEMTVI_LSP_CMD");
     let ratio = long.as_secs_f64() / short.as_secs_f64().max(0.001);
     assert!(
@@ -6013,8 +6018,13 @@ async fn time_inlay_hints(len: usize) -> Duration {
 #[tokio::test]
 async fn inlay_hints_on_a_long_line_do_not_scale_with_its_length() {
     let _guard = serial_lock().lock().await;
-    let short = time_inlay_hints(10_000).await;
-    let long = time_inlay_hints(400_000).await;
+    // A timing guard: see `fastest_pair`.
+    let (short, long) = bemtvi_test_harness::fastest_pair(
+        bemtvi_test_harness::TIMING_ROUNDS,
+        || time_inlay_hints(10_000),
+        || time_inlay_hints(400_000),
+    )
+    .await;
     std::env::remove_var("BEMTVI_LSP_CMD");
     let ratio = long.as_secs_f64() / short.as_secs_f64().max(0.001);
     assert!(

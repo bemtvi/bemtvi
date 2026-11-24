@@ -2187,8 +2187,14 @@ async fn time_frames_over_long_lines(len: usize, frames: usize) -> std::time::Du
 /// only the line length grows 100x; a ratio, so both halves share the machine load.
 #[tokio::test]
 async fn a_frame_does_not_scale_with_the_length_of_its_lines() {
-    let short = time_frames_over_long_lines(10_000, 20).await;
-    let long = time_frames_over_long_lines(1_000_000, 20).await;
+    // A timing guard: see `fastest_pair`.
+    let _serial = bemtvi_test_harness::serial_lock().lock().await;
+    let (short, long) = bemtvi_test_harness::fastest_pair(
+        bemtvi_test_harness::TIMING_ROUNDS,
+        || time_frames_over_long_lines(10_000, 20),
+        || time_frames_over_long_lines(1_000_000, 20),
+    )
+    .await;
     let ratio = long.as_secs_f64() / short.as_secs_f64().max(0.001);
     assert!(
         ratio < 8.0,
@@ -2226,8 +2232,14 @@ async fn time_word_motion(filler: usize) -> std::time::Duration {
 /// grows; a ratio, so both halves share the machine load.
 #[tokio::test]
 async fn a_word_motion_does_not_scale_with_the_rest_of_the_line() {
-    let short = time_word_motion(1).await;
-    let long = time_word_motion(2_000_000).await;
+    // A timing guard: see `fastest_pair`.
+    let _serial = bemtvi_test_harness::serial_lock().lock().await;
+    let (short, long) = bemtvi_test_harness::fastest_pair(
+        bemtvi_test_harness::TIMING_ROUNDS,
+        || time_word_motion(1),
+        || time_word_motion(2_000_000),
+    )
+    .await;
     let ratio = long.as_secs_f64() / short.as_secs_f64().max(0.001);
     assert!(
         ratio < 5.0,

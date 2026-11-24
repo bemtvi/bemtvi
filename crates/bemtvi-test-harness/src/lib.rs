@@ -1631,6 +1631,55 @@ pub fn serial_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+// ===== timing guards =========================================================
+//
+// A perf guard times the editor with and without the thing under test and fails on
+// the ratio, so both halves share the machine's load. One sample of each is not
+// enough: the two are taken at different moments, and whatever else runs in between
+// (the binary's other tests, the rest of the machine) swung single-sample ratios
+// well past their limits. These take the fastest of several runs — the least
+// disturbed one — while a real regression slows every run, so it still shows. Hold
+// [`serial_lock`] around the measurement too, so two guards never time each other.
+
+/// How many times a timing guard repeats each measurement.
+pub const TIMING_ROUNDS: usize = 3;
+
+/// The fastest of `rounds` runs of `measure`. For a guard whose two halves can't be
+/// interleaved, such as a baseline and then the same session after a state change:
+/// each half takes its own fastest.
+pub async fn fastest_of<F, Fut>(rounds: usize, mut measure: F) -> std::time::Duration
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::time::Duration>,
+{
+    let mut best = std::time::Duration::MAX;
+    for _ in 0..rounds.max(1) {
+        best = best.min(measure().await);
+    }
+    best
+}
+
+/// The fastest of `rounds` runs of each of `a` and `b`, run alternately so both see
+/// the same stretches of load. Returns `(fastest a, fastest b)`.
+pub async fn fastest_pair<A, FA, B, FB>(
+    rounds: usize,
+    mut a: A,
+    mut b: B,
+) -> (std::time::Duration, std::time::Duration)
+where
+    A: FnMut() -> FA,
+    FA: std::future::Future<Output = std::time::Duration>,
+    B: FnMut() -> FB,
+    FB: std::future::Future<Output = std::time::Duration>,
+{
+    let (mut best_a, mut best_b) = (std::time::Duration::MAX, std::time::Duration::MAX);
+    for _ in 0..rounds.max(1) {
+        best_a = best_a.min(a().await);
+        best_b = best_b.min(b().await);
+    }
+    (best_a, best_b)
+}
+
 // ===== clipboard =============================================================
 
 /// An in-memory stand-in for the host clipboard, injected via

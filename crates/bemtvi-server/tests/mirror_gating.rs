@@ -305,9 +305,10 @@ async fn an_idle_keystroke_does_not_republish_the_loclist_mirror() {
 
 // ------------------------------------------------------------------ perf guards
 
-/// Time `keys` keystrokes of insert-mode typing in the middle of the buffer.
+/// Time `keys` keystrokes of insert-mode typing in the middle of the buffer. Leaves
+/// Insert first, so it can be repeated on one session.
 async fn time_typing(rpc: &Rpc, keys: usize) -> std::time::Duration {
-    feed(rpc, "500GI");
+    feed(rpc, "<Esc>500GI");
     let _ = lines(rpc).await; // the setup has landed before the clock starts
     let started = std::time::Instant::now();
     for _ in 0..keys {
@@ -324,9 +325,9 @@ async fn typing_does_not_scale_with_the_quickfix_list() {
     // the two are indistinguishable. A **ratio** rather than a wall-clock bound so
     // both halves see the same machine load under a loaded `cargo test
     // --workspace` — the convention the extmark guards established.
+    let _serial = bemtvi_test_harness::serial_lock().lock().await;
     let (plain, _i1) = open(&sample(1_000)).await;
     push_every_key(&plain).await;
-    let baseline = time_typing(&plain, 300).await;
 
     let (heavy, _i2) = open(&sample(1_000)).await;
     push_every_key(&heavy).await;
@@ -336,7 +337,13 @@ async fn typing_does_not_scale_with_the_quickfix_list() {
         5_000,
         "the benchmark must not pass by having built no list",
     );
-    let loaded = time_typing(&heavy, 300).await;
+    // A timing guard: see `fastest_pair`.
+    let (baseline, loaded) = bemtvi_test_harness::fastest_pair(
+        bemtvi_test_harness::TIMING_ROUNDS,
+        || time_typing(&plain, 300),
+        || time_typing(&heavy, 300),
+    )
+    .await;
 
     let ratio = loaded.as_secs_f64() / baseline.as_secs_f64().max(0.001);
     assert!(
@@ -348,9 +355,9 @@ async fn typing_does_not_scale_with_the_quickfix_list() {
 
 #[tokio::test]
 async fn typing_does_not_scale_with_the_register_contents() {
+    let _serial = bemtvi_test_harness::serial_lock().lock().await;
     let (plain, _i1) = open(&sample(1_000)).await;
     push_every_key(&plain).await;
-    let baseline = time_typing(&plain, 300).await;
 
     let (heavy, _i2) = open(&sample(1_000)).await;
     push_every_key(&heavy).await;
@@ -368,7 +375,13 @@ async fn typing_does_not_scale_with_the_register_contents() {
         as_int(&exec_lua(&heavy, r#"return #vim.fn.getreg('a')"#).await) == 32 * 1024 * 1024,
         "the benchmark must not pass by having stored nothing",
     );
-    let loaded = time_typing(&heavy, 300).await;
+    // A timing guard: see `fastest_pair`.
+    let (baseline, loaded) = bemtvi_test_harness::fastest_pair(
+        bemtvi_test_harness::TIMING_ROUNDS,
+        || time_typing(&plain, 300),
+        || time_typing(&heavy, 300),
+    )
+    .await;
 
     let ratio = loaded.as_secs_f64() / baseline.as_secs_f64().max(0.001);
     assert!(

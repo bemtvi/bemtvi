@@ -11,7 +11,10 @@
 //! lives in `editing/folds.rs`; this file only pins the cost.
 
 use bemtvi_rpc::Rpc;
-use bemtvi_test_harness::{command, exec_lua, feed, lines, start_with_file as open};
+use bemtvi_test_harness::{
+    command, exec_lua, fastest_of, fastest_pair, feed, lines, serial_lock, start_with_file as open,
+    TIMING_ROUNDS,
+};
 
 const LINES: usize = 5_000;
 const KEYS: usize = 300;
@@ -30,8 +33,9 @@ fn sample(n: usize) -> String {
         .collect()
 }
 
+/// Leaves Insert first, so it can be repeated on one session.
 async fn time_typing(rpc: &Rpc) -> std::time::Duration {
-    feed(rpc, "2500GA");
+    feed(rpc, "<Esc>2500GA");
     let _ = lines(rpc).await;
     let started = std::time::Instant::now();
     for _ in 0..KEYS {
@@ -55,8 +59,14 @@ async fn typing_under(foldmethod: &str) -> std::time::Duration {
 async fn typing_does_not_scale_with_indent_folds() {
     // 13.0 s against a 0.49 s `manual` baseline before (27x): every keystroke read
     // all 5000 lines back through indexed rope access to re-derive their levels.
-    let baseline = typing_under("manual").await;
-    let folded = typing_under("indent").await;
+    // A timing guard: see `fastest_pair`.
+    let _serial = serial_lock().lock().await;
+    let (baseline, folded) = fastest_pair(
+        TIMING_ROUNDS,
+        || typing_under("manual"),
+        || typing_under("indent"),
+    )
+    .await;
     let ratio = folded.as_secs_f64() / baseline.as_secs_f64().max(0.001);
     assert!(
         ratio < 3.0,
@@ -68,8 +78,14 @@ async fn typing_does_not_scale_with_indent_folds() {
 
 #[tokio::test]
 async fn typing_does_not_scale_with_marker_folds() {
-    let baseline = typing_under("manual").await;
-    let folded = typing_under("marker").await;
+    // A timing guard: see `fastest_pair`.
+    let _serial = serial_lock().lock().await;
+    let (baseline, folded) = fastest_pair(
+        TIMING_ROUNDS,
+        || typing_under("manual"),
+        || typing_under("marker"),
+    )
+    .await;
     let ratio = folded.as_secs_f64() / baseline.as_secs_f64().max(0.001);
     assert!(
         ratio < 3.0,
@@ -90,18 +106,15 @@ async fn a_lua_foldexpr_is_not_evaluated_for_every_line_on_every_keystroke() {
     // the cost is measured — against a **baseline of the same typing with no
     // foldexpr at all**, which is what isolates the foldexpr from the rest of the
     // per-keystroke frame cost (redraw over 5000 lines dominates otherwise).
+    //
+    // A timing guard (see `fastest_of`): the two halves share one session, so each is
+    // the fastest of its own `TIMING_ROUNDS` runs.
+    let _serial = serial_lock().lock().await;
     let (rpc, _i) = open(&sample(LINES)).await;
     exec_lua(&rpc, "btv.on('CursorMoved', function() end)").await;
 
     // Baseline: the same typing, no computed fold source.
-    feed(&rpc, "2500GA");
-    let _ = lines(&rpc).await;
-    let base_start = std::time::Instant::now();
-    for _ in 0..KEYS {
-        feed(&rpc, "z");
-    }
-    let _ = lines(&rpc).await;
-    let baseline = base_start.elapsed();
+    let baseline = fastest_of(TIMING_ROUNDS, || time_typing(&rpc)).await;
 
     // Now with a foldexpr whose value genuinely depends on the line, so a full
     // re-evaluation really would touch every row.
@@ -113,12 +126,7 @@ async fn a_lua_foldexpr_is_not_evaluated_for_every_line_on_every_keystroke() {
     command(&rpc, "set foldmethod=expr").await;
     let _ = lines(&rpc).await;
 
-    let expr_start = std::time::Instant::now();
-    for _ in 0..KEYS {
-        feed(&rpc, "z");
-    }
-    let _ = lines(&rpc).await;
-    let with_expr = expr_start.elapsed();
+    let with_expr = fastest_of(TIMING_ROUNDS, || time_typing(&rpc)).await;
 
     // Re-running the whole buffer per keystroke would add KEYS × (a full 5000-line
     // pass) — seconds — on top of the baseline. The incremental splice adds a

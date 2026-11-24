@@ -879,8 +879,14 @@ async fn republishing_one_namespace_does_not_pay_for_the_others() {
     // namespace, with the frame still re-sorting one store-wide position index after
     // each structural change, ~3.1x; with an index per namespace, ~1.0x. 2.0 leaves
     // room for a loaded machine and still fails either regression.
-    let bare = republish_cost(0).await;
-    let heavy = republish_cost(20_000).await;
+    // A timing guard: see `fastest_pair`.
+    let _serial = bemtvi_test_harness::serial_lock().lock().await;
+    let (bare, heavy) = bemtvi_test_harness::fastest_pair(
+        bemtvi_test_harness::TIMING_ROUNDS,
+        || republish_cost(0),
+        || republish_cost(20_000),
+    )
+    .await;
     let ratio = heavy.as_secs_f64() / bare.as_secs_f64();
     assert!(
         ratio < 2.0,

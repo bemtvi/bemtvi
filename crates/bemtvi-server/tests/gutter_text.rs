@@ -485,8 +485,14 @@ async fn the_column_costs_a_frame_no_more_than_signs_do() {
     // the column's own cost against the sign layer's at the same mark count, while
     // typing (each keystroke an edit); the off-screen cost of every layer is pinned in
     // `extmark_render.rs`.
-    let signs = typing_cost(20_000, "sign_text = '>>'").await;
-    let gutter = typing_cost(20_000, "gutter_text = { { tostring(i) } }").await;
+    // A timing guard: see `fastest_pair`.
+    let _serial = bemtvi_test_harness::serial_lock().lock().await;
+    let (signs, gutter) = bemtvi_test_harness::fastest_pair(
+        bemtvi_test_harness::TIMING_ROUNDS,
+        || typing_cost(20_000, "sign_text = '>>'"),
+        || typing_cost(20_000, "gutter_text = { { tostring(i) } }"),
+    )
+    .await;
     let ratio = gutter.as_secs_f64() / signs.as_secs_f64();
     assert!(
         ratio < 1.5,

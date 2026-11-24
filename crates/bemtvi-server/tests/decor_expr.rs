@@ -714,28 +714,40 @@ async fn a_steady_screen_does_not_re_evaluate_the_paint() {
       return {}
     ]])"#;
     let content: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    // 30 in-viewport motions on `rpc`'s session, timed.
+    async fn motions(rpc: &bemtvi_rpc::Rpc) -> std::time::Duration {
+        let started = std::time::Instant::now();
+        for _ in 0..30 {
+            feed_sync(rpc, "0$").await;
+        }
+        started.elapsed()
+    }
+    // A timing guard: each half is the fastest of its own `TIMING_ROUNDS` runs (see
+    // `fastest_of`), and the serial lock keeps it from being timed beside another.
+    let _serial = bemtvi_test_harness::serial_lock().lock().await;
 
     // Baseline: the same keystrokes with nothing installed.
     let (rpc, _inc) = start("paint_perf_base", &content, "").await;
-    let started = std::time::Instant::now();
-    for _ in 0..30 {
-        feed_sync(&rpc, "0$").await;
-    }
-    let baseline = started.elapsed();
+    let baseline =
+        bemtvi_test_harness::fastest_of(bemtvi_test_harness::TIMING_ROUNDS, || motions(&rpc)).await;
 
     let (rpc, _inc) = start("paint_perf", &content, slow).await;
     // One pass is paid up front (and proves the block really is slow).
     let first = std::time::Instant::now();
     feed_sync(&rpc, "j").await;
     let one_pass = first.elapsed();
-    let started = std::time::Instant::now();
-    for _ in 0..30 {
-        feed_sync(&rpc, "0$").await;
-    }
-    let steady = started.elapsed();
+    let steady =
+        bemtvi_test_harness::fastest_of(bemtvi_test_harness::TIMING_ROUNDS, || motions(&rpc)).await;
 
+    // Healthy, the two are equal idle; on a saturated CPU the painted session pays
+    // about a scheduler slice per motion more (one more wake-up a frame), which
+    // doubles a baseline this light and ate a bare 5-pass allowance whole — hence the
+    // doubled baseline. A lost memo re-runs the paint on every one of the 30 motions,
+    // and the measured pass itself grows then, so 10 passes on top stays far below
+    // it: breaking the memo reads 5.2s against a 1.9s limit idle, 7.7s against 4.9s
+    // saturated.
     assert!(
-        steady < baseline + one_pass * 5,
+        steady < baseline * 2 + one_pass * 10,
         "in-viewport motion must not re-run the paint: {steady:?} against a \
          {baseline:?} baseline, one pass costing {one_pass:?}"
     );

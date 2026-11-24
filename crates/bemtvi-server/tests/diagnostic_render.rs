@@ -268,8 +268,9 @@ async fn the_statusline_count_sees_every_diagnostic_not_just_the_visible_ones() 
 
 // ------------------------------------------------------------------ perf guard
 
+/// Leaves Insert first, so it can be repeated on one session.
 async fn time_typing(rpc: &Rpc, keys: usize) -> std::time::Duration {
-    feed(rpc, "2500GI");
+    feed(rpc, "<Esc>2500GI");
     let _ = lines(rpc).await;
     let started = std::time::Instant::now();
     for _ in 0..keys {
@@ -286,9 +287,9 @@ async fn typing_does_not_scale_with_the_diagnostic_count() {
     // 5000 diagnostics take 17.5 s against a 0.49 s baseline (36x), scaling cleanly
     // with the count. A **ratio** rather than a wall-clock bound so both halves see
     // the same machine load under a loaded `cargo test --workspace`.
+    let _serial = bemtvi_test_harness::serial_lock().lock().await;
     let (plain, _i1) = start_with_file(&sample(5_000)).await;
     exec_lua(&plain, "btv.on('CursorMoved', function() end)").await;
-    let baseline = time_typing(&plain, 300).await;
 
     let (heavy, _i2) = start_with_file(&sample(5_000)).await;
     exec_lua(&heavy, "btv.on('CursorMoved', function() end)").await;
@@ -312,7 +313,13 @@ async fn typing_does_not_scale_with_the_diagnostic_count() {
         Some(5_000),
         "the benchmark must not pass by having set no diagnostics",
     );
-    let loaded = time_typing(&heavy, 300).await;
+    // A timing guard: see `fastest_pair`.
+    let (baseline, loaded) = bemtvi_test_harness::fastest_pair(
+        bemtvi_test_harness::TIMING_ROUNDS,
+        || time_typing(&plain, 300),
+        || time_typing(&heavy, 300),
+    )
+    .await;
 
     let ratio = loaded.as_secs_f64() / baseline.as_secs_f64().max(0.001);
     assert!(
@@ -375,8 +382,14 @@ async fn diagnostics_on_a_long_line_do_not_scale_with_its_length() {
     // diagnostics x line length: a minified file's one line froze the editor. The
     // diagnostic count and the viewport are fixed here and only the line grows 20x;
     // a ratio, so both halves see the same machine load.
-    let short = time_diagnosed_long_line(10_000).await;
-    let long = time_diagnosed_long_line(200_000).await;
+    // A timing guard: see `fastest_pair`.
+    let _serial = bemtvi_test_harness::serial_lock().lock().await;
+    let (short, long) = bemtvi_test_harness::fastest_pair(
+        bemtvi_test_harness::TIMING_ROUNDS,
+        || time_diagnosed_long_line(10_000),
+        || time_diagnosed_long_line(200_000),
+    )
+    .await;
     let ratio = long.as_secs_f64() / short.as_secs_f64().max(0.001);
     assert!(
         ratio < 4.0,

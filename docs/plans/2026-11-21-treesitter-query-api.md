@@ -1,6 +1,8 @@
 # A treesitter query API for plugins
 
-**Status:** proposal (2026-11-21), decisions settled. Not started.
+**Status:** done. Phases 1–4 landed in the editor in `adfa41db` (2026-11-24); phase 5
+landed in bemtvi-md-table in `7cf8fee` (2026-11-24). What was left on purpose is under
+*Known limitations*.
 
 **Decisions** (David, 2026-11-21):
 
@@ -227,7 +229,8 @@ side keep one tree per buffer, updated with `tree.edit` from the `BufferEdit` de
 `WasmSyntax::edit` already receives. That keeps the web path incremental like the
 native one. The same cache then serves indent and text objects too.
 
-*As built:* the query runner keeps each buffer's text as lines, with a Fenwick tree of
+*As built:* the per-buffer store (`web/ts-buffers.js`, shared by queries, indent, folds
+and text objects) keeps each buffer's text as lines, with a Fenwick tree of
 line lengths, plus its own parser and tree. `WasmSyntax::edit` (whose shadow text is now
 a rope) forwards every edit delta to it, and the runner converts the delta's byte columns
 to UTF-16 within the touched lines only, edits its tree and re-parses incrementally,
@@ -249,6 +252,8 @@ Each phase lands, with tests, and pauses for review before the next. Phase 4 doe
 depend on 1–3 and can land first.
 
 ### Phase 1: native engine method and `btv.treesitter.query`
+
+**Done** (adfa41db).
 
 - `SyntaxEngine::query`, `QueryMatch`/`QueryCapture`/`QueryError` in `bemtvi-core`;
   the default returns `Unsupported`.
@@ -276,6 +281,8 @@ depend on 1–3 and can land first.
 
 ### Phase 2: `query` on decor providers
 
+**Done** (adfa41db).
+
 - `query` key on `btv.decor.provider` (validated at registration, compiled at
   dispatch; see the design above).
 - `dispatch_decor` fills `ctx.query`; `run_decor_dispatch` carries it into Lua.
@@ -290,17 +297,21 @@ depend on 1–3 and can land first.
 
 ### Phase 3: web parity
 
+**Done** (adfa41db).
+
 - `eh_js_ts_query` FFI (an import, from `web/eh-lib.js`), `web/ts-query.js`, and
   `WasmSyntax::query`; `eh_ts_grammar_ready` (in `EXPORTED_FUNCTIONS`) for the
   grammar-loaded wake. Parking moved into code both builds share.
-- Incremental per-buffer trees in the query runner (see *As built* above; not yet
-  shared with indent and text objects).
+- Incremental per-buffer trees (see *As built* above), in one store that indent,
+  folds and text objects share too (`web/ts-buffers.js`).
 - `web/verify-treesitter-query.mjs`: the queries and a decor provider in the browser
   build, an incremental-vs-fresh-parse equivalence check after structural edits, and a
   large buffer. The tree reuse was measured in the worker; a page-side timing check
   can't see it under the `execLua` round trips.
 
 ### Phase 4: skipped tests in `btv.test` (editor repo)
+
+**Done** (adfa41db).
 
 The `--test-plugin` runner keeps the user's config out, but its syntax engine reads
 grammars from the real data dir (`bemtvi_ts::data_dir()`: `$BEMTVI_DATA_DIR`, else
@@ -324,6 +335,8 @@ returning early would count as a pass, which is a silent skip.
   ```
 
 ### Phase 5: port bemtvi-md-table (in the plugin repo)
+
+**Done** (bemtvi-md-table `7cf8fee`).
 
 - Declare `query = "(pipe_table) @table"` on the provider. The table extent comes from
   the grammar. The fence scan and `layout.table_at` are deleted. Cell splitting stays

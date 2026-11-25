@@ -2093,8 +2093,9 @@ pub struct EditHost {
     /// (a daemon / web one): the LSP position, keyed by the replica buffer whose fetch is
     /// in flight. The `character`→byte-column conversion needs the target line's text, so
     /// off-tick it can only happen when the bytes land — see
-    /// [`EditHost::settle_pending_goto`]. Empty in a local session, which reads
-    /// synchronously and converts inline.
+    /// [`EditHost::settle_pending_goto`]. A local session reads synchronously and
+    /// converts inline, except where it defers an open too (a `BufReadCmd` handler is
+    /// registered), which settles at its own landing (`load_pending_open`).
     pending_goto_cols: HashMap<BufferId, lsp::PendingGoto>,
     /// The **file** operations a workspace edit asked for (`rename` / `delete`
     /// resource operations) that are still in flight, keyed by the off-tick job id

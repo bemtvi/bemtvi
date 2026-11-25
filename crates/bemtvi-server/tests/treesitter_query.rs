@@ -738,3 +738,35 @@ async fn a_provider_reads_the_edit_a_query_continuation_made() {
         "a provider read a buffer older than the viewport it was dispatched for"
     );
 }
+
+#[tokio::test]
+async fn query_rows_agree_with_buffer_rows_past_a_lone_carriage_return() {
+    // Tree-sitter counts rows by `\n` alone. The editor's rows once also broke at a
+    // lone `\r`, so past one every captured row was a line above the text it named (a
+    // table reported over the line before its header). A `\r` is a character of its
+    // line now, and the two agree.
+    let doc = "x\na\rb\n\n| a | b |\n|---|---|\n| c | d |\n";
+    let (rpc, _incoming, _guard, _keep) = open_file!("tsq-cr", "md", doc);
+    let (nodes, _) = query(&rpc, r#"0, "(pipe_table) @table""#).await.unwrap();
+    assert_eq!(nodes, "table:3,0-6,0 pipe_table");
+    let header = exec_lua(&rpc, "return btv.buf.lines(0, 3, 4)[1]").await;
+    assert_eq!(header.as_str(), Some("| a | b |"));
+}
+
+#[tokio::test]
+async fn query_rows_stay_right_across_edits_around_a_carriage_return() {
+    // The incremental re-parse is fed each edit's points in the editor's rows, and
+    // tree-sitter applies them in its own: the two must count alike for the tree to
+    // stay where the text is.
+    let doc = "x\na\rb\n\n| a | b |\n|---|---|\n| c | d |\n";
+    let (rpc, _incoming, _guard, _keep) = open_file!("tsq-cr-edit", "md", doc);
+    query(&rpc, r#"0, "(pipe_table) @table""#).await.unwrap();
+    // A line above, then typing into the line holding the `\r`.
+    exec_lua(&rpc, "btv.buf.set_lines(0, 0, 0, true, { 'new' })").await;
+    feed(&rpc, "3GA more<Esc>");
+    assert_eq!(lines(&rpc).await[2], "a\rb more");
+    let (nodes, _) = query(&rpc, r#"0, "(pipe_table) @table""#).await.unwrap();
+    assert_eq!(nodes, "table:4,0-7,0 pipe_table");
+    let header = exec_lua(&rpc, "return btv.buf.lines(0, 4, 5)[1]").await;
+    assert_eq!(header.as_str(), Some("| a | b |"));
+}

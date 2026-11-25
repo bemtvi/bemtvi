@@ -6033,3 +6033,355 @@ async fn inlay_hints_on_a_long_line_do_not_scale_with_its_length() {
          line ({long:?} vs {short:?}) — hint columns are walking the line again",
     );
 }
+
+// ----- a lone `\r`: the protocol's lines are not the editor's rows -------------------
+//
+// The editor holds a lone `\r` as a character of its line (it paints `^M`); the LSP
+// protocol counts it as a line end. In `CR_DOC` the editor has three rows and the server
+// four lines, so every position past the `\r` converts between the two. (The last row is
+// there so a position left unconverted can't land right by being clamped to the end.)
+
+const CR_DOC: &str = "a\rb\nlet x = 1\nlast\n";
+
+/// The params of the last `method` request the mock recorded.
+fn last_recorded(record: &Path, method: &str) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(record).ok()?;
+    text.lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["method"] == method)
+        .map(|v| v["params"].clone())
+}
+
+#[tokio::test]
+async fn a_request_past_a_lone_cr_sends_the_servers_line() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_cr_hover");
+    let record = dir.join("record.jsonl");
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+    let (rpc, _incoming) = open_with_server(&dir, CR_DOC).await;
+    assert!(await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await);
+    // Row 1, column 4 (`x`) is the server's line 2.
+    feed(&rpc, "2G5|");
+    exec_lua(&rpc, "btv.lsp.hover()").await;
+    let mut sent = None;
+    for _ in 0..200 {
+        sent = last_recorded(&record, "textDocument/hover");
+        if sent.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let sent = sent.expect("the hover was sent");
+    assert_eq!(
+        sent["position"],
+        serde_json::json!({ "line": 2, "character": 4 })
+    );
+    // And on the first row, past the `\r`: `b`, byte 2, is line 1, character 0.
+    feed(&rpc, "gg$");
+    exec_lua(&rpc, "btv.lsp.hover()").await;
+    let mut sent = None;
+    for _ in 0..200 {
+        sent = last_recorded(&record, "textDocument/hover").filter(|p| p["position"]["line"] != 2);
+        if sent.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        sent.expect("the second hover was sent")["position"],
+        serde_json::json!({ "line": 1, "character": 0 })
+    );
+    std::env::remove_var("BEMTVI_LSP_CMD");
+}
+
+#[tokio::test]
+async fn a_diagnostic_past_a_lone_cr_paints_on_its_row() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_cr_diag");
+    arm_mock(
+        &dir,
+        r#"{
+            "diagnostics": [
+                { "range": { "start": { "line": 2, "character": 4 },
+                             "end":   { "line": 2, "character": 5 } },
+                  "severity": 1, "message": "x" }
+            ]
+        }"#,
+    );
+    let (rpc, mut incoming) = open_with_server(&dir, CR_DOC).await;
+    assert_eq!(await_painted_rows(&rpc, &mut incoming, &[1]).await, vec![1]);
+    // The Lua mirror reports the editor's row too.
+    assert!(
+        await_lua_eq(&rpc, "(btv.diagnostic.get(0)[1] or {}).lnum", "1").await,
+        "btv.diagnostic.get reports the editor's row"
+    );
+    std::env::remove_var("BEMTVI_LSP_CMD");
+}
+
+#[tokio::test]
+async fn a_definition_past_a_lone_cr_jumps_to_its_row() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_cr_def");
+    let uri = file_uri(&dir, "a.rs");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "definition": {{ "uri": "{uri}", "range": {{ "start": {{ "line": 2, "character": 4 }}, "end": {{ "line": 2, "character": 5 }} }} }}
+            }}"#
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, CR_DOC).await;
+    assert!(await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await);
+    let mut at = (0, 0);
+    for _ in 0..80 {
+        exec_lua(&rpc, "btv.lsp.definition()").await;
+        bemtvi_test_harness::barrier(&rpc).await;
+        at = cursor(&rpc).await;
+        if at == (2, 4) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        at,
+        (2, 4),
+        "the jump lands on `x`, row 2 (1-based), column 4"
+    );
+    std::env::remove_var("BEMTVI_LSP_CMD");
+}
+
+#[tokio::test]
+async fn a_formatting_edit_past_a_lone_cr_lands_on_its_row() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_cr_fmt");
+    arm_mock(
+        &dir,
+        r#"{
+            "formatting": [
+                { "range": { "start": { "line": 2, "character": 8 }, "end": { "line": 2, "character": 9 } },
+                  "newText": "2" }
+            ]
+        }"#,
+    );
+    let (rpc, _incoming) = open_with_server(&dir, CR_DOC).await;
+    assert!(await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await);
+    let mut got = Vec::new();
+    for _ in 0..80 {
+        exec_lua(&rpc, "btv.lsp.format()").await;
+        bemtvi_test_harness::barrier(&rpc).await;
+        got = lines(&rpc).await;
+        if got.get(1).map(String::as_str) == Some("let x = 2") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(got, vec!["a\rb", "let x = 2", "last"]);
+    std::env::remove_var("BEMTVI_LSP_CMD");
+}
+
+#[tokio::test]
+async fn an_inlay_hint_past_a_lone_cr_sits_on_its_row() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_cr_inlay");
+    arm_mock(
+        &dir,
+        r#"{ "inlay_hints": [ { "position": { "line": 2, "character": 5 }, "label": ": i32", "kind": 1 } ] }"#,
+    );
+    let (rpc, _incoming) = open_with_server(&dir, CR_DOC).await;
+    exec_lua(&rpc, "vim.lsp.inlay_hint.enable(true)").await;
+    assert!(
+        await_lua_eq(
+            &rpc,
+            "(function() local h = (btv.lsp.inlay_hint.get({ bufnr = 0 })[1] or {}).inlay_hint or {} return tostring(h.line) .. ':' .. tostring(h.col) end)()",
+            "1:5"
+        )
+        .await,
+        "the hint after `let x` sits on row 1, byte 5"
+    );
+    std::env::remove_var("BEMTVI_LSP_CMD");
+}
+
+#[tokio::test]
+async fn semantic_tokens_on_either_side_of_a_lone_cr_land_on_their_rows() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_cr_sem");
+    // Line 1 (`b`, after the `\r` in row 0), character 0; then line 2, character 4 (`x`).
+    arm_mock(
+        &dir,
+        r#"{
+            "semantic_tokens": {
+                "legend": { "tokenTypes": ["keyword", "variable"], "tokenModifiers": [] },
+                "data": [1, 0, 1, 1, 0, 1, 4, 1, 0, 0]
+            }
+        }"#,
+    );
+    let (rpc, _incoming) = open_with_server(&dir, CR_DOC).await;
+    assert!(
+        await_lua_eq(
+            &rpc,
+            "(btv.lsp.semantic_tokens.get_at_pos(0, 0, 2)[1] or {}).type",
+            "variable"
+        )
+        .await,
+        "`b`, byte 2 of row 0, carries the line-1 token"
+    );
+    assert!(
+        await_lua_eq(
+            &rpc,
+            "(btv.lsp.semantic_tokens.get_at_pos(0, 1, 4)[1] or {}).type",
+            "keyword"
+        )
+        .await,
+        "`x` on row 1 carries the line-2 token"
+    );
+    std::env::remove_var("BEMTVI_LSP_CMD");
+}
+
+#[tokio::test]
+async fn a_folding_range_past_a_lone_cr_folds_its_rows() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_cr_fold");
+    // The server's lines 2..4 are rows 1..3 (`L2`..`L4`).
+    arm_mock(
+        &dir,
+        r#"{ "folding_ranges": [ { "startLine": 2, "endLine": 4 } ] }"#,
+    );
+    let (rpc, mut incoming) = open_with_server(&dir, "a\rb\nL2\nL3\nL4\nL5\n").await;
+    feed(&rpc, ":set foldmethod=expr<CR>");
+    feed(&rpc, ":set foldexpr=v:lua.btv.lsp.foldexpr()<CR>");
+    let numbers = poll_visible_numbers(&rpc, &mut incoming, |n| n == [1, 2, 5]).await;
+    assert_eq!(numbers, Some(vec![1, 2, 5]), "rows 2-3 fold under row 1");
+    std::env::remove_var("BEMTVI_LSP_CMD");
+}
+
+#[tokio::test]
+async fn lua_position_helpers_convert_past_a_lone_cr() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_cr_lua");
+    arm_mock(&dir, "{}");
+    let (rpc, _incoming) = open_with_server(&dir, CR_DOC).await;
+    assert!(await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await);
+    feed(&rpc, "2G5|");
+    let got = exec_lua(
+        &rpc,
+        "local p = btv.lsp.position_params({ encoding = 'utf-8' }).position \
+         return p.line .. ':' .. p.character",
+    )
+    .await;
+    assert_eq!(got.as_str(), Some("2:4"));
+
+    // A location into the open buffer, and into a file on disk holding a `\r` too.
+    let other = dir.join("b.rs");
+    std::fs::write(&other, "x\ry\nfn z() {}\n").expect("write b.rs");
+    // And a classic-Mac file, every line ended by a `\r`: the editor opens it as rows
+    // (`'fileformat'` mac), so the server's line N is row N there.
+    std::fs::write(dir.join("c.rs"), "a\rb\rc\r").expect("write c.rs");
+    let uri_a = file_uri(&dir, "a.rs");
+    let uri_b = file_uri(&dir, "b.rs");
+    let uri_c = file_uri(&dir, "c.rs");
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"_G.items = nil
+            btv.lsp.locations_to_items({{
+              {{ uri = "{uri_a}", range = {{ start = {{ line = 2, character = 4 }}, ["end"] = {{ line = 2, character = 5 }} }} }},
+              {{ uri = "{uri_b}", range = {{ start = {{ line = 2, character = 3 }}, ["end"] = {{ line = 2, character = 4 }} }} }},
+              {{ uri = "{uri_c}", range = {{ start = {{ line = 2, character = 0 }}, ["end"] = {{ line = 2, character = 1 }} }} }},
+            }}, {{ encoding = "utf-8" }}):next(function(items) _G.items = items end)"#
+        ),
+    )
+    .await;
+    assert!(await_lua_eq(&rpc, "_G.items ~= nil", "true").await);
+    let got = exec_lua(
+        &rpc,
+        "local out = {} for _, it in ipairs(_G.items) do \
+           out[#out + 1] = it.lnum .. ':' .. it.col .. '-' .. it.end_lnum .. ':' .. it.end_col \
+         end return table.concat(out, ' ')",
+    )
+    .await;
+    assert_eq!(got.as_str(), Some("2:5-2:6 2:4-2:5 3:1-3:2"));
+    std::env::remove_var("BEMTVI_LSP_CMD");
+}
+
+#[tokio::test]
+async fn a_client_set_diagnostic_in_a_buffer_with_a_lone_cr_stays_on_its_row() {
+    // A `vim.diagnostic.set` entry is already in the editor's rows (no server counted
+    // them), so it must not be converted as the protocol's lines are.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_cr_client_diag");
+    arm_mock(&dir, "{}");
+    let (rpc, mut incoming) = open_with_server(&dir, CR_DOC).await;
+    exec_lua(
+        &rpc,
+        "vim.diagnostic.set(7, 0, { { lnum = 2, col = 0, end_lnum = 2, end_col = 4, severity = 1, message = 'm' } })",
+    )
+    .await;
+    assert_eq!(await_painted_rows(&rpc, &mut incoming, &[2]).await, vec![2]);
+    std::env::remove_var("BEMTVI_LSP_CMD");
+}
+
+#[tokio::test]
+async fn a_range_past_the_end_of_a_buffer_with_a_lone_cr_is_clamped() {
+    // A Lua `opts.range` has no upper bound; resolving it into the server's lines in a
+    // buffer whose lines differ indexed the rope past its end and killed the server.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_cr_clamp");
+    arm_mock(&dir, "{}");
+    let (rpc, _incoming) = open_with_server(&dir, CR_DOC).await;
+    assert!(await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await);
+    exec_lua(
+        &rpc,
+        "btv.lsp.code_action({ range = { start_row = 50, start_col = 0, end_row = 50, end_col = 2^40 } })",
+    )
+    .await;
+    bemtvi_test_harness::barrier(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["a\rb", "let x = 1", "last"],
+        "the server is alive"
+    );
+    std::env::remove_var("BEMTVI_LSP_CMD");
+}
+
+#[tokio::test]
+async fn a_jump_past_a_lone_cr_into_an_unopened_file_is_one_jump() {
+    // The jump lands on the server's line, then the position converts to the editor's
+    // row once the file is read: a refinement of the same jump, not a second one, so
+    // `<C-o>` goes straight back to where it was made.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_cr_jumplist");
+    std::fs::write(dir.join("b.rs"), CR_DOC).expect("write b.rs");
+    let uri_b = file_uri(&dir, "b.rs");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "definition": {{ "uri": "{uri_b}", "range": {{ "start": {{ "line": 2, "character": 4 }}, "end": {{ "line": 2, "character": 5 }} }} }}
+            }}"#
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "fn main() {}\n").await;
+    assert!(await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await);
+    exec_lua(&rpc, "btv.lsp.definition()").await;
+    assert!(
+        await_lua_eq(&rpc, "btv.utils.basename(btv.buf.name(0))", "b.rs").await,
+        "the jump opened b.rs"
+    );
+    let mut at = (0, 0);
+    for _ in 0..80 {
+        at = cursor(&rpc).await;
+        if at == (2, 4) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(at, (2, 4), "on `x`, row 2 (1-based)");
+    feed(&rpc, "<C-o>");
+    assert!(
+        await_lua_eq(&rpc, "btv.utils.basename(btv.buf.name(0))", "a.rs").await,
+        "<C-o> goes straight back to a.rs"
+    );
+    std::env::remove_var("BEMTVI_LSP_CMD");
+}

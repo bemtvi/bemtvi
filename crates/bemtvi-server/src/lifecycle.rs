@@ -327,7 +327,11 @@ impl EditHost {
                 // read it now through `host_fs` and drive the lifecycle events the read
                 // implies, the synchronous counterpart of the off-tick `apply_open`
                 // landing below.
+                let buffer = open.buffer;
                 self.editor.load_pending_open(open);
+                // A goto whose target this open was reading converts its position now
+                // that the text is here, as the off-tick landing does (`load_replica_bytes`).
+                self.settle_pending_goto(buffer);
                 self.push_buf_mirror();
                 self.emit_lifecycle_events();
                 self.run_pending();

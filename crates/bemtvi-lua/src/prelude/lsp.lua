@@ -1859,6 +1859,73 @@ local function encoded_col_to_byte(line, character, encoding)
   return ok and byte or math.min(character, #line)
 end
 
+-- Lines, as the protocol counts them, differ from the editor's rows in one case: the
+-- protocol ends a line at a lone `\r` as well as at `\n`, while the editor holds a lone
+-- `\r` as a character of its row (it paints `^M`). The helpers below convert between the
+-- two over a document's rows; they are only reached for a document holding such a `\r`
+-- (the buffer mirror's `lsp_lines_differ`, or a scan of a file's rows), so everywhere
+-- else a position stays the identity it always was.
+
+-- The pieces of the editor's row `text` that the protocol counts as lines, each
+-- `{ start = <0-based byte in the row>, text = <the piece> }`. Every `\r` ends one,
+-- except a `\r` that is the row's last character: that is half of the `\r\n` that ends
+-- the row, one line end, not two.
+local function protocol_pieces(text)
+  local body = text:sub(-1) == "\r" and text:sub(1, -2) or text
+  local pieces, from = {}, 1
+  while true do
+    local cr = body:find("\r", from, true)
+    if not cr then
+      pieces[#pieces + 1] = { start = from - 1, text = body:sub(from) }
+      return pieces
+    end
+    pieces[#pieces + 1] = { start = from - 1, text = body:sub(from, cr - 1) }
+    from = cr + 1
+  end
+end
+
+-- Whether any of `rows` holds a `\r` before its last character, making the protocol's
+-- lines differ from the rows.
+local function rows_differ(rows)
+  for _, row in ipairs(rows) do
+    local cr = row:find("\r", 1, true)
+    if cr and cr < #row then
+      return true
+    end
+  end
+  return false
+end
+
+-- The editor's `(row, col)` (0-based row, byte column) in the document `rows` as the
+-- protocol's line: `line, piece_text, col_in_piece`.
+local function protocol_point(rows, row, col)
+  local line = 0
+  for r = 1, row do
+    line = line + #protocol_pieces(rows[r] or "")
+  end
+  local pieces = protocol_pieces(rows[row + 1] or "")
+  local k = 1
+  while pieces[k + 1] and pieces[k + 1].start <= col do
+    k = k + 1
+  end
+  return line + k - 1, pieces[k].text, math.max(0, col - pieces[k].start)
+end
+
+-- The protocol's `line` of the document `rows` as the editor's row (0-based) and the
+-- piece of it the line is: `row, { start, text }`. Past the last line, a row past the
+-- last with an empty piece, as reading the rows by the line itself would give.
+local function editor_point(rows, line)
+  local seen = 0
+  for r, text in ipairs(rows) do
+    local pieces = protocol_pieces(text)
+    if line < seen + #pieces then
+      return r - 1, pieces[line - seen + 1]
+    end
+    seen = seen + #pieces
+  end
+  return #rows + (line - seen), { start = 0, text = "" }
+end
+
 -- The position encoding to count a buffer's columns in: the one the buffer's own
 -- server negotiated. With several servers attached the first is taken — a caller who
 -- means a specific server passes `opts.encoding = client.offset_encoding`, which is
@@ -1898,12 +1965,22 @@ function btv.lsp.position_params(opts)
     cur_bufnr(btv._refuse_pending_buffer(opts.bufnr, "btv.lsp.position_params") or btv.win.buf(win))
   local pos = btv.cursor.get(win)
   local row, col = pos[1], pos[2]
+  local encoding = opts.encoding or buffer_encoding(bufnr)
+  local mirror = btv._bufs[bufnr]
+  if mirror and mirror.lsp_lines_differ then
+    -- A lone `\r` somewhere: the server's line is not the row (see `protocol_pieces`).
+    local line, text, at = protocol_point(btv.buf.lines(bufnr, 0, -1, false), row - 1, col)
+    return {
+      textDocument = { uri = btv.utils.uri_from_buf(bufnr) },
+      position = { line = line, character = byte_to_encoded_col(text, at, encoding) },
+    }
+  end
   local line = btv.buf.lines(bufnr, row - 1, row, false)[1] or ""
   return {
     textDocument = { uri = btv.utils.uri_from_buf(bufnr) },
     position = {
       line = row - 1,
-      character = byte_to_encoded_col(line, col, opts.encoding or buffer_encoding(bufnr)),
+      character = byte_to_encoded_col(line, col, encoding),
     },
   }
 end
@@ -1921,7 +1998,20 @@ local location_lines = btv.async(function(path)
   local text = btv.await(btv.fs.read_text(path):catch(function()
     return nil
   end))
-  return type(text) == "string" and btv.str.split(text, "\n") or {}
+  if type(text) ~= "string" then
+    return {}
+  end
+  -- Split as the editor reads the file (`normalize_eol`): Dos when every `\n` follows a
+  -- `\r`, classic Mac when there is no `\n` but a `\r`. Otherwise a Mac file would read
+  -- as one row, its `\r`s taken for characters, though the editor opens it as rows.
+  if text:find("\n", 1, true) then
+    if not text:find("^\n") and not text:find("[^\r]\n") then
+      text = text:gsub("\r\n", "\n")
+    end
+  elseif text:find("\r", 1, true) then
+    text = text:gsub("\r", "\n")
+  end
+  return btv.str.split(text, "\n")
 end)
 
 -- `btv.lsp.locations_to_items(locations[, opts])` -> a PROMISE of quickfix items,
@@ -1968,8 +2058,18 @@ btv.lsp.locations_to_items = btv.async(function(locations, opts)
   end
   table.sort(order)
   local items = {}
+  -- A server position's `(row, byte col)` in the document `lines`: the server's line is
+  -- the row, unless a lone `\r` makes the two differ (see `protocol_pieces`).
+  local function point(lines, differ, pos)
+    if differ then
+      local row, piece = editor_point(lines, pos.line)
+      return row, piece.start + encoded_col_to_byte(piece.text, pos.character, encoding)
+    end
+    return pos.line, encoded_col_to_byte(lines[pos.line + 1] or "", pos.character, encoding)
+  end
   for _, path in ipairs(order) do
     local lines = btv.await(location_lines(path))
+    local differ = rows_differ(lines)
     local ranges = by_path[path]
     table.sort(ranges, function(a, b)
       if a.start.line ~= b.start.line then
@@ -1978,20 +2078,15 @@ btv.lsp.locations_to_items = btv.async(function(locations, opts)
       return a.start.character < b.start.character
     end)
     for _, range in ipairs(ranges) do
-      local row = range.start.line
-      local text = lines[row + 1] or ""
-      local end_row = (range["end"] or range.start).line
+      local row, col = point(lines, differ, range.start)
+      local end_row, end_col = point(lines, differ, range["end"] or range.start)
       items[#items + 1] = {
         filename = path,
         lnum = row + 1,
-        col = encoded_col_to_byte(text, range.start.character, encoding) + 1,
+        col = col + 1,
         end_lnum = end_row + 1,
-        end_col = encoded_col_to_byte(
-          lines[end_row + 1] or "",
-          (range["end"] or range.start).character,
-          encoding
-        ) + 1,
-        text = text,
+        end_col = end_col + 1,
+        text = lines[row + 1] or "",
       }
     end
   end

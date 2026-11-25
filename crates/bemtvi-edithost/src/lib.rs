@@ -724,11 +724,12 @@ impl SyntaxEngine for WasmSyntax {
         // The cursor goes over as (row, byte column) and the regions come back the same
         // way, converted against the rope here in O(log n), so nothing on either side
         // walks the whole text. Rows are counted the way the core counts them for the
-        // edits it forwards (`LF_CR`), so the two agree.
+        // edits it forwards (`bemtvi_core::buffer::LINE_TYPE`, `\n` alone, which is also
+        // how tree-sitter counts them), so the three agree.
         let rope = &state.shadow;
         let byte = byte.min(rope.len());
-        let row = rope.byte_to_line_idx(byte, ropey::LineType::LF_CR);
-        let col = byte - rope.line_to_byte_idx(row, ropey::LineType::LF_CR);
+        let row = rope.byte_to_line_idx(byte, bemtvi_core::buffer::LINE_TYPE);
+        let col = byte - rope.line_to_byte_idx(row, bemtvi_core::buffer::LINE_TYPE);
         let clamp = |n: usize| n.min(i32::MAX as usize) as i32;
         // Same grow-and-retry protocol as `folds`, in quads. The `MAX` cap defends
         // against a hostile runner returning an inflated count sizing a multi-GB `Vec`.
@@ -762,10 +763,10 @@ impl SyntaxEngine for WasmSyntax {
             }
             buf = vec![0i32; needed.min(MAX_INTS)];
         }
-        let lines = rope.len_lines(ropey::LineType::LF_CR);
+        let lines = rope.len_lines(bemtvi_core::buffer::LINE_TYPE);
         let to_byte = |r: i32, c: i32| {
             let r = (r.max(0) as usize).min(lines.saturating_sub(1));
-            (rope.line_to_byte_idx(r, ropey::LineType::LF_CR) + c.max(0) as usize).min(rope.len())
+            (rope.line_to_byte_idx(r, bemtvi_core::buffer::LINE_TYPE) + c.max(0) as usize).min(rope.len())
         };
         buf.chunks_exact(4)
             .map(|q| (to_byte(q[0], q[1]), to_byte(q[2], q[3])))

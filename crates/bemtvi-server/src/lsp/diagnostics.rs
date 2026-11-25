@@ -171,11 +171,19 @@ impl EditHost {
         let Some(state) = self.lsp_states.get(&buffer) else {
             return;
         };
+        let Some(buf) = self.editor.buffer_of(buffer) else {
+            return;
+        };
         let all: Vec<DiagnosticData> = state
             .servers()
             .flat_map(|(k, d)| {
-                let client_id = self.lsp_servers.get(k).map(|rt| rt.client_id);
-                diagnostic_mirror_data(&d.diagnostics, client_id)
+                // A server whose runtime is gone has no encoding to read its columns
+                // by; its set is dropped from the mirror rather than guessed at (the
+                // painted surfaces skip it the same way, see `lsp_diagnostics_of`).
+                let Some(rt) = self.lsp_servers.get(k) else {
+                    return Vec::new();
+                };
+                diagnostic_mirror_data(&d.diagnostics, Some(rt.client_id), buf, rt.encoding)
             })
             .collect();
         self.lsp_dirty = true;
@@ -435,7 +443,12 @@ impl EditHost {
                     .flatten()
                     .map(|m| (m.start, m.end.unwrap_or(m.start)))
                     .unwrap_or_else(|| {
-                        let r = resolver.range(&d.range, encoding);
+                        // A client-set diagnostic (no server) is in the editor's own
+                        // rows; a server's in the protocol's lines.
+                        let r = match server {
+                            Some(_) => resolver.range(&d.range, encoding),
+                            None => resolver.editor_range(&d.range),
+                        };
                         (r.start, r.end)
                     });
                 let (start, end) = (span.0, span.1.max(span.0));
@@ -528,8 +541,12 @@ impl EditHost {
             };
             let mut resolver = super::LspPosResolver::new(buf);
             self.merged_sources(buffer)
-                .map(|(d, _, encoding)| {
-                    let r = resolver.range(&d.range, encoding);
+                .map(|(d, server, encoding)| {
+                    // A client-set diagnostic is in the editor's rows (see above).
+                    let r = match server {
+                        Some(_) => resolver.range(&d.range, encoding),
+                        None => resolver.editor_range(&d.range),
+                    };
                     (r.start, r.end.max(r.start))
                 })
                 .collect()

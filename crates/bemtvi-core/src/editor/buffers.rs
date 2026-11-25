@@ -1698,7 +1698,7 @@ impl Editor {
             // Whether the landed bytes terminated their last line (`'endofline'`) — the
             // off-tick twin of the detection in `Buffer::from_file`, so a remote or wasm
             // read round-trips a no-eol file exactly like a local one.
-            ob.buffer.options.endofline = crate::buffer::ends_with_line_break(&text);
+            ob.buffer.options.endofline = crate::buffer::ends_with_line_break(&text, fileformat);
         }
         // The off-tick twin of the `'indentdetect'` pass every synchronous read makes, so
         // a file opened over a daemon or in the browser indents exactly like a local one.
@@ -2652,6 +2652,16 @@ impl Editor {
             return;
         }
 
+        self.land_cursor(line, col);
+    }
+
+    /// Move the cursor of the current buffer to the 0-based `(line, byte col)` target of
+    /// a jump [`jump_to`](Self::jump_to) already made, refined: the position a goto into
+    /// a file that wasn't open first landed on (the server's raw line and character) and
+    /// can only convert once the file's text is here. The jump was recorded then; this is
+    /// the same jump, so it records nothing, and `<C-o>` still returns to where it was
+    /// made.
+    pub fn refine_jump_target(&mut self, line: usize, col: usize) {
         self.land_cursor(line, col);
     }
 

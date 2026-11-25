@@ -50,7 +50,7 @@ serde_json = "=1.0.154"
 # The shadow copy of each buffer's text the syntax engine keeps (a rope, as the core's
 # own text is), so applying an edit costs the edit, not the buffer. Pinned to the
 # workspace version.
-ropey = "=2.0.0-beta.1"
+ropey = { version = "=2.0.0-beta.1", features = ["metric_lines_lf"] }
 
 # Small-ish artifact. LTO is OFF on purpose: Rust LTO emits LLVM bitcode objects into
 # the staticlib, which the `emcc` final link would then need `-flto` to read — an

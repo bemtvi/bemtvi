@@ -24,7 +24,9 @@ use tree_sitter::{
 
 use crate::loader::{compile_query, query_path, Grammar, LazyQuery, LoadError, QueryOverrides};
 
-const LINE_TYPE: LineType = LineType::LF_CR;
+/// The editor's rows: `\n` alone, the same rows tree-sitter's points count (see
+/// [`bemtvi_core::buffer::LINE_TYPE`]).
+const LINE_TYPE: LineType = bemtvi_core::buffer::LINE_TYPE;
 
 /// Wall-clock budget for a single (incremental) parse. In-process, a runaway or
 /// pathological grammar would otherwise stall the editor on the frame that
@@ -3450,15 +3452,15 @@ fn extract_spans(
     for line in first_line..last_line {
         let line_start = shadow.line_to_byte_idx(line, LINE_TYPE);
         let line_end = shadow.line_to_byte_idx(line + 1, LINE_TYPE);
-        // Trim the trailing `\n` / `\r` terminator bytes off the content length
-        // by inspecting the last byte(s) in place — this used to materialize each
-        // visible line into a fresh `String` every frame just to `trim_end` it.
+        // Trim the line's `\n` terminator off the content length by inspecting the last
+        // byte in place — this used to materialize each visible line into a fresh
+        // `String` every frame just to `trim_end` it. Only the `\n`: a `\r` before it is a
+        // character of the line (it paints `^M`), and a capture over it paints it.
         let mut content_len = line_end - line_start;
-        while content_len > 0 {
-            match read_chunk(shadow, line_start + content_len - 1).first() {
-                Some(&(b'\n' | b'\r')) => content_len -= 1,
-                _ => break,
-            }
+        if content_len > 0
+            && read_chunk(shadow, line_start + content_len - 1).first() == Some(&b'\n')
+        {
+            content_len -= 1;
         }
         line_geom.push((line_start, content_len));
     }

@@ -927,7 +927,8 @@ pub(crate) fn lsp_range_to_bytes_in(
 /// were O(diagnostics x line length).
 pub(crate) struct LspPosResolver<'b> {
     buffer: &'b Buffer,
-    line: Option<(usize, semantic::LineCols)>,
+    /// The line last converted against: `(line, in the protocol's lines?, its columns)`.
+    line: Option<(usize, bool, semantic::LineCols)>,
 }
 
 impl<'b> LspPosResolver<'b> {
@@ -951,6 +952,24 @@ impl<'b> LspPosResolver<'b> {
     /// read without a final newline it is bemtvi bookkeeping the server has never been told
     /// about, and a position resolved onto it would land one byte past the document's end.
     pub(crate) fn pos(&mut self, pos: Position, encoding: PositionEncoding) -> usize {
+        self.resolve(pos, encoding, true)
+    }
+
+    /// [`pos`](Self::pos) for a position already in the editor's coordinates (a row
+    /// and a byte column), such as a `vim.diagnostic.set` entry: no server counted its
+    /// rows, so none of the protocol's line ends apply.
+    pub(crate) fn editor_pos(&mut self, pos: Position) -> usize {
+        self.resolve(pos, PositionEncoding::Utf8, false)
+    }
+
+    /// [`range`](Self::range) in the editor's coordinates, as [`editor_pos`](Self::editor_pos).
+    pub(crate) fn editor_range(&mut self, range: &Range) -> std::ops::Range<usize> {
+        let start = self.editor_pos(range.start);
+        let end = self.editor_pos(range.end);
+        start..end.max(start)
+    }
+
+    fn resolve(&mut self, pos: Position, encoding: PositionEncoding, protocol: bool) -> usize {
         let buffer = self.buffer;
         // `line_count` is the number of editable lines; a valid line index is
         // `0..=line_count` (the count itself addresses the phantom row, i.e. the end of
@@ -967,19 +986,58 @@ impl<'b> LspPosResolver<'b> {
         // `{ line: <line count>, character: 0 }` — past the last row of a file with no
         // trailing newline — so `:LspFormat` on such a file replaced only its *first* line
         // with the whole formatted document and left the rest appended to it.
+        //
+        // `pos.line` counts the protocol's lines, which also end at a lone `\r`; in a
+        // buffer holding one (rare: `lsp_lines_differ`) they are not the editor's rows,
+        // and the line's start and text come from the protocol's count instead.
+        let differ = protocol && buffer.lsp_lines_differ();
+        let last_row = if differ {
+            buffer
+                .lsp_line_count()
+                .saturating_sub(usize::from(!buffer.options.endofline))
+        } else {
+            last_row
+        };
         if pos.line as usize > last_row {
             return buffer.document_len_bytes();
         }
         let row = pos.line as usize;
         let cols = match &mut self.line {
-            Some((at, cols)) if *at == row => cols,
+            Some((at, mode, cols)) if *at == row && *mode == differ => cols,
             slot => {
-                &mut slot
-                    .insert((row, semantic::LineCols::new(buffer.line(row))))
-                    .1
+                let text = if differ {
+                    buffer.lsp_line_text(row).into_owned()
+                } else {
+                    buffer.line(row)
+                };
+                &mut slot.insert((row, differ, semantic::LineCols::new(text))).2
             }
         };
-        buffer.line_start(row) + cols.byte(encoding, pos.character as usize)
+        let start = if differ {
+            buffer.lsp_line_start(row)
+        } else {
+            buffer.line_start(row)
+        };
+        start + cols.byte(encoding, pos.character as usize)
+    }
+
+    /// An LSP [`Position`] as the editor's `(row, byte column)`: [`pos`](Self::pos), then
+    /// the row and column that byte sits at. What a server's position becomes wherever
+    /// the editor keeps rows (diagnostics, hints, tokens, folds, jump targets).
+    pub(crate) fn point(&mut self, pos: Position, encoding: PositionEncoding) -> (usize, usize) {
+        let byte = self.pos(pos, encoding);
+        let row = self.buffer.byte_to_line(byte);
+        (row, byte - self.buffer.line_start(row))
+    }
+
+    /// The editor's row an LSP line starts on: the row holding that line's first byte.
+    /// The identity in a buffer whose lines don't differ.
+    pub(crate) fn row_of_lsp_line(&self, line: u32) -> usize {
+        let buffer = self.buffer;
+        if !buffer.lsp_lines_differ() {
+            return line as usize;
+        }
+        buffer.byte_to_line(buffer.lsp_line_start(line as usize))
     }
 
     /// Absolute byte range of `range`, exactly as [`lsp_range_to_bytes_in`] documents.
@@ -1070,6 +1128,29 @@ pub(crate) fn lsp_position_in(
     row: usize,
     byte_col: usize,
 ) -> Position {
+    // In a buffer holding a lone `\r` the protocol's lines are not the editor's rows
+    // (it ends a line there): find the point's byte, then the protocol line holding it.
+    if buffer.lsp_lines_differ() {
+        // The point is untrusted (a Lua `opts.range` has no upper bound): a row past the
+        // last addresses the end, and the byte stays inside the buffer.
+        let row = row.min(buffer.line_count());
+        let byte = buffer
+            .line_start(row)
+            .saturating_add(byte_col)
+            .min(buffer.len_bytes());
+        let line = buffer.lsp_line_of_byte(byte);
+        let text = buffer.lsp_line_text(line);
+        let col = (byte - buffer.lsp_line_start(line)).min(text.len());
+        let character = match encoding {
+            PositionEncoding::Utf8 => col,
+            PositionEncoding::Utf16 => unicode::byte_to_utf16(&text, col),
+            PositionEncoding::Utf32 => text.get(..col).map_or(0, |t| t.chars().count()),
+        };
+        return Position {
+            line: line as u32,
+            character: character as u32,
+        };
+    }
     let character = match encoding {
         PositionEncoding::Utf8 => byte_col,
         PositionEncoding::Utf16 => {
@@ -1334,10 +1415,10 @@ pub(crate) fn provider_caps_to_lua(p: &ProviderCaps) -> LspServerCapabilities {
 }
 
 /// Project a buffer's cached diagnostics into the plain [`DiagnosticData`] the
-/// Lua mirror (`btv._diagnostics`) holds for `vim.diagnostic.get`. Positions are
-/// the raw 0-based LSP coordinates; `col`/`end_col` are byte offsets under the
-/// UTF-8 encoding bemtvi advertises first (the negotiated default), matching
-/// neovim's byte-column `get` shape for the common case.
+/// Lua mirror (`btv._diagnostics`) holds for `vim.diagnostic.get`: 0-based rows of the
+/// editor and byte columns, neovim's `get` shape, converted from the publisher's
+/// protocol lines and `encoding` against `buffer` (they differ past a lone `\r`, and a
+/// UTF-16 server's columns are not bytes).
 ///
 /// `client_id` tags every entry with the server that published it — the mirror is
 /// one flat list per buffer merged across servers, so the caller projects each
@@ -1345,18 +1426,25 @@ pub(crate) fn provider_caps_to_lua(p: &ProviderCaps) -> LspServerCapabilities {
 pub(crate) fn diagnostic_mirror_data(
     diags: &[Diagnostic],
     client_id: Option<u64>,
+    buffer: &Buffer,
+    encoding: PositionEncoding,
 ) -> Vec<DiagnosticData> {
+    let mut resolver = LspPosResolver::new(buffer);
     diags
         .iter()
-        .map(|d| DiagnosticData {
-            client_id,
-            lnum: d.range.start.line as i64,
-            col: d.range.start.character as i64,
-            end_lnum: d.range.end.line as i64,
-            end_col: d.range.end.character as i64,
-            severity: severity_code(d.severity),
-            message: d.message.clone(),
-            source: d.source.clone(),
+        .map(|d| {
+            let (lnum, col) = resolver.point(d.range.start, encoding);
+            let (end_lnum, end_col) = resolver.point(d.range.end, encoding);
+            DiagnosticData {
+                client_id,
+                lnum: lnum as i64,
+                col: col as i64,
+                end_lnum: end_lnum as i64,
+                end_col: end_col as i64,
+                severity: severity_code(d.severity),
+                message: d.message.clone(),
+                source: d.source.clone(),
+            }
         })
         .collect()
 }

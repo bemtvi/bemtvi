@@ -1329,9 +1329,7 @@ impl EditHost {
             let Some(path) = self.uri_path(&loc.uri) else {
                 continue;
             };
-            let row = loc.range.start.line as usize;
-            let character = loc.range.start.character as usize;
-            let byte = self.location_byte_col(&path, row, character, *encoding);
+            let (row, byte) = self.location_point(&path, loc.range.start, *encoding);
             if !seen.insert((path.clone(), row, byte)) {
                 continue; // the same place, reported by another server too
             }
@@ -1409,9 +1407,7 @@ impl EditHost {
             let Some(path) = self.uri_path(&sym.location.uri) else {
                 continue;
             };
-            let row = sym.location.range.start.line as usize;
-            let character = sym.location.range.start.character as usize;
-            let byte = self.location_byte_col(&path, row, character, *encoding);
+            let (row, byte) = self.location_point(&path, sym.location.range.start, *encoding);
             if !seen.insert((sym.name.clone(), path.clone(), row, byte)) {
                 continue; // the same symbol, reported by another server too
             }
@@ -1464,6 +1460,12 @@ impl EditHost {
         let Some(path) = self.uri_path(&loc.uri) else {
             return;
         };
+        // A file already loaded converts exactly, before the jump.
+        if self.location_is_loaded(&path) {
+            let (row, byte) = self.location_point(&path, loc.range.start, encoding);
+            self.editor.jump_to(&path, row, byte);
+            return;
+        }
         let line = loc.range.start.line as usize;
         let character = loc.range.start.character as usize;
         self.editor.jump_to(&path, line, character);
@@ -1484,12 +1486,10 @@ impl EditHost {
             );
             return;
         }
-        // Loaded: the exact conversion, against the line we actually landed on.
-        if self.editor.cursor.line == line {
-            let text = self.editor.buffer().line(line);
-            let byte = byte_col(encoding, &text, character);
-            self.editor.jump_to(&path, line, byte);
-        }
+        // Opened now: the exact conversion, against the text just read, refining the
+        // jump just made rather than making another.
+        let (row, byte) = self.location_point(&path, loc.range.start, encoding);
+        self.editor.refine_jump_target(row, byte);
     }
 
     /// Refine a deferred goto's column once its file's bytes have landed — the off-tick
@@ -1506,34 +1506,54 @@ impl EditHost {
         let Some(goto) = self.pending_goto_cols.remove(&buffer) else {
             return;
         };
-        if self.editor.current_buffer_id() != buffer || self.editor.cursor.line != goto.line {
+        // The landing put the cursor on the raw line (clamped to the file): anywhere else,
+        // the user has moved on and the refinement would yank them back.
+        let landed = goto
+            .line
+            .min(self.editor.buffer().line_count().saturating_sub(1));
+        if self.editor.current_buffer_id() != buffer || self.editor.cursor.line != landed {
             return;
         }
-        let Some(path) = self.editor.buffer_of(buffer).and_then(|b| b.path.clone()) else {
-            return;
+        let pos = Position {
+            line: goto.line as u32,
+            character: goto.character as u32,
         };
-        let text = self.editor.buffer().line(goto.line);
-        let byte = byte_col(goto.encoding, &text, goto.character);
-        self.editor.jump_to(&path, goto.line, byte);
+        let (row, byte) =
+            super::LspPosResolver::new(self.editor.buffer()).point(pos, goto.encoding);
+        // The same jump, refined (it was recorded when it was made).
+        self.editor.refine_jump_target(row, byte);
     }
 
-    /// Best-effort LSP char→byte column for a target location: exact when the
-    /// target is the current buffer (its line text is in hand); otherwise the raw
-    /// character, which is already the byte offset under the UTF-8 encoding the
-    /// goto path negotiates. `jump_to` clamps to the line, so an over-long value
-    /// lands at end-of-line rather than panicking.
-    pub(crate) fn location_byte_col(
+    /// Whether `path` is loaded in a buffer whose text is here (not still crossing the
+    /// wire), so a location in it converts exactly.
+    fn location_is_loaded(&self, path: &Path) -> bool {
+        self.editor.find_buffer_by_path(path).is_some_and(|id| {
+            !self.editor.has_pending_open(id) && self.editor.buffer_of(id).is_some()
+        })
+    }
+
+    /// A server's location `pos` in `path` as the editor's `(row, byte column)`: exact
+    /// when the file is loaded in a buffer (its protocol lines, which part at a lone
+    /// `\r` too, and `encoding`'s columns, converted against its text). For a file not
+    /// open, the raw `(line, character)`: right for nearly every file (a lone `\r` is
+    /// rare, and the character is the byte under the UTF-8 encoding offered first), and
+    /// a jump there refines it against the text once the file is read.
+    pub(crate) fn location_point(
         &self,
         path: &Path,
-        row: usize,
-        character: usize,
+        pos: Position,
         encoding: PositionEncoding,
-    ) -> usize {
-        if self.editor.buffer().path.as_deref() == Some(path) {
-            byte_col(encoding, &self.editor.buffer().line(row), character)
-        } else {
-            character
+    ) -> (usize, usize) {
+        if self.location_is_loaded(path) {
+            if let Some(buf) = self
+                .editor
+                .find_buffer_by_path(path)
+                .and_then(|id| self.editor.buffer_of(id))
+            {
+                return super::LspPosResolver::new(buf).point(pos, encoding);
+            }
         }
+        (pos.line as usize, pos.character as usize)
     }
 
     /// The Lua `client_id` assigned to `key`'s server (the reverse of the id handed

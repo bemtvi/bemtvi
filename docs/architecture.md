@@ -460,8 +460,17 @@ draws the border around. (See [*Windows*](#windows).)
 
 Buffers are backed by a [ropey](https://docs.rs/ropey) 2.0 rope (`bemtvi-core`'s
 `Buffer`). Indices are **byte offsets** — ropey 2.0's native metric, and the
-same column model vim uses — with lines tracked via ropey's `LineType::LF_CR`
-(so both Unix `\n` and DOS `\r\n` files split correctly). Editing operations
+same column model vim uses — with lines broken at `\n` alone (ropey's
+`LineType::LF`, the one constant `bemtvi_core::buffer::LINE_TYPE` that the core, undo,
+the treesitter engine and the browser edit host all count rows by). A file's line
+endings are normalized on read (a Dos `\r\n` or an old-Mac `\r` becomes `\n`; vim's
+`'fileformat'` detection decides which, Dos only when every `\n` follows a `\r`) and
+converted back on write, so a `\r` left in the rope is a character of its line and
+paints as `^M`, as in vim. Tree-sitter counts rows the same way, so its points are the
+editor's rows. LSP is the exception: the protocol also ends a line at a lone `\r`, so
+positions crossing to a server convert through byte offsets
+(`bemtvi_core::buffer::LSP_LINE_TYPE`, ropey's `LF_CR`), which is the identity in any
+buffer without a lone `\r` (see `docs/plans/2026-11-25-lf-only-line-model.md`). Editing operations
 snap byte ranges to char boundaries (`floor`/`ceil_char_boundary`) so a
 multi-byte character can never be split; for ASCII this is all a no-op. The key
 invariant: **the rope always ends with a trailing `\n`**, so an empty buffer is

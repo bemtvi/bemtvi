@@ -393,6 +393,12 @@ pub struct BufMirror {
     /// placeholder. Always carried — one integer, and the buffer whose line a caller
     /// wants is usually one whose text did *not* change this tick.
     pub lnum: u64,
+    /// Whether the LSP protocol's lines differ from the buffer's rows: whether it holds
+    /// a lone `\r`, a line end to the protocol and a character to the editor
+    /// ([`Buffer::lsp_lines_differ`](bemtvi_core::Buffer::lsp_lines_differ)). Lets the
+    /// Lua LSP helpers convert positions only in such a buffer, and keep the identity
+    /// (no scan of the lines) everywhere else. One flag, O(1) to compute.
+    pub lsp_lines_differ: bool,
 }
 
 /// One buffer's wired buffer-local options (`btv._bo_mirror[bufnr]`) read by

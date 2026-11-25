@@ -11,10 +11,20 @@ use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
 
 use crate::host::{FileStat, HostFs};
 
-/// The line-break convention bemtvi tracks. `LF_CR` recognizes both Unix (`\n`)
-/// and DOS (`\r\n`) breaks, so files of either `fileformat` split into lines
-/// correctly. (Available via ropey's default `metric_lines_lf_cr` feature.)
-const LINE_TYPE: LineType = LineType::LF_CR;
+/// The line-break convention bemtvi counts rows by: `\n` alone, as tree-sitter does.
+/// The rope only ever holds `\n` breaks — a file is normalized on read (a Dos `\r\n` or
+/// a Mac `\r` becomes `\n`, see [`normalize_eol`]) and converted back on write — so a
+/// `\r` in it is a character of its line, which paints as `^M`, as in vim. Everything that
+/// counts the editor's rows (undo, the treesitter engine, the browser edit host) uses this
+/// one constant. LSP is the exception: its protocol counts a lone `\r` as a line end too,
+/// so LSP positions convert through byte offsets. (ropey's `metric_lines_lf` feature.)
+pub const LINE_TYPE: LineType = LineType::LF;
+
+/// The line ends the LSP protocol counts: `\n`, `\r\n`, and a lone `\r`, which the
+/// editor holds as a character of its line ([`LINE_TYPE`]). Language servers count rows
+/// this way, so an LSP position converts to and from the editor's rows through byte
+/// offsets (the `lsp_line_*` methods on [`Buffer`]). (ropey's `metric_lines_lf_cr`.)
+pub const LSP_LINE_TYPE: LineType = LineType::LF_CR;
 
 /// A single content mutation, recorded so out-of-process consumers (the
 /// treesitter syntax worker) can reparse **incrementally**. The byte offsets and
@@ -478,7 +488,7 @@ impl Buffer {
             // to make it end in `\n` either way. An empty file has no final newline,
             // so it reads as `false` and its document stays empty (a 0-byte file
             // survives a `:w` at 0 bytes).
-            options.endofline = ends_with_line_break(&decoded);
+            options.endofline = ends_with_line_break(&decoded, options.fileformat);
             Rope::from_str(&normalize_eol(&decoded, options.fileformat))
         } else {
             Rope::new()
@@ -607,11 +617,9 @@ impl Buffer {
         }
         let sl = self.text.line(idx, LINE_TYPE);
         let mut n = sl.len();
+        // Only the `\n` ends the line (see `LINE_TYPE`); a `\r` before it is text.
         if n > 0 && matches!(sl.get_char(n - 1), Ok('\n')) {
             n -= 1;
-            if n > 0 && matches!(sl.get_char(n - 1), Ok('\r')) {
-                n -= 1;
-            }
         }
         n
     }
@@ -645,6 +653,57 @@ impl Buffer {
     /// Editable line containing byte offset `byte_idx`.
     pub fn byte_to_line(&self, byte_idx: usize) -> usize {
         self.text.byte_to_line_idx(byte_idx, LINE_TYPE)
+    }
+
+    /// Whether the LSP protocol's lines differ from the editor's rows in this buffer:
+    /// whether it holds a lone `\r`, which the protocol counts as a line end and the
+    /// editor as a character (see [`LSP_LINE_TYPE`]). O(1). When it doesn't, LSP line `n`
+    /// *is* row `n`, with the same text, and positions need no conversion.
+    pub fn lsp_lines_differ(&self) -> bool {
+        self.text.len_lines(LSP_LINE_TYPE) != self.text.len_lines(LINE_TYPE)
+    }
+
+    /// The number of lines the LSP protocol counts in the buffer, the counterpart of
+    /// [`line_count`](Self::line_count) (the rope's phantom final line excluded).
+    pub fn lsp_line_count(&self) -> usize {
+        self.text.len_lines(LSP_LINE_TYPE).saturating_sub(1)
+    }
+
+    /// The LSP line holding byte offset `byte` (clamped to the end of the buffer).
+    pub fn lsp_line_of_byte(&self, byte: usize) -> usize {
+        self.text
+            .byte_to_line_idx(byte.min(self.text.len()), LSP_LINE_TYPE)
+    }
+
+    /// The byte offset LSP line `line` starts at; a line past the last is clamped to it.
+    pub fn lsp_line_start(&self, line: usize) -> usize {
+        let last = self.text.len_lines(LSP_LINE_TYPE).saturating_sub(1);
+        self.text.line_to_byte_idx(line.min(last), LSP_LINE_TYPE)
+    }
+
+    /// The text of LSP line `line`, without the line end (`\n`, `\r\n` or a lone `\r`)
+    /// that closes it; empty past the last line.
+    pub fn lsp_line_text(&self, line: usize) -> Cow<'_, str> {
+        if line >= self.text.len_lines(LSP_LINE_TYPE) {
+            return Cow::Borrowed("");
+        }
+        let sl = self.text.line(line, LSP_LINE_TYPE);
+        let text: Cow<'_, str> = match sl.as_str() {
+            Some(s) => Cow::Borrowed(s),
+            None => Cow::Owned(sl.to_string()),
+        };
+        let trim = |s: &str| -> usize {
+            let s2 = s.strip_suffix('\n').unwrap_or(s);
+            let s2 = s2.strip_suffix('\r').unwrap_or(s2);
+            s2.len()
+        };
+        match text {
+            Cow::Borrowed(s) => Cow::Borrowed(&s[..trim(s)]),
+            Cow::Owned(mut s) => {
+                s.truncate(trim(&s));
+                Cow::Owned(s)
+            }
+        }
     }
 
     /// Replace the LSP inlay hints [`inline_splices`](Self::inline_splices) counts.
@@ -1368,27 +1427,31 @@ pub enum DiskChange {
     Vanished,
 }
 
-/// Detect the line-ending convention from a file's decoded text: the FIRST line break
-/// decides (`\r\n` → Dos, lone `\r` → Mac, `\n` → Unix), matching how vim picks
-/// `'fileformat'` for a consistently-formatted file. No line break at all → Unix.
+/// Detect the line-ending convention from a file's decoded text, as vim does with
+/// `'fileformats'` of `unix,dos,mac`: Dos when every `\n` follows a `\r`, Mac when there
+/// is no `\n` at all but a `\r`, else Unix (no line break at all is Unix too). A file
+/// mixing the two is Unix, its `\r`s kept as characters of their lines (`^M`), so nothing
+/// a write puts back differs from what was read.
 pub(crate) fn detect_fileformat(s: &str) -> crate::options::FileFormat {
     use crate::options::FileFormat;
     let b = s.as_bytes();
+    let mut saw_lf = false;
     let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'\r' => {
-                return if b.get(i + 1) == Some(&b'\n') {
-                    FileFormat::Dos
-                } else {
-                    FileFormat::Mac
-                };
-            }
-            b'\n' => return FileFormat::Unix,
-            _ => i += 1,
+    while let Some(off) = b[i..].iter().position(|&c| c == b'\n') {
+        let at = i + off;
+        if at == 0 || b[at - 1] != b'\r' {
+            return FileFormat::Unix;
         }
+        saw_lf = true;
+        i = at + 1;
     }
-    FileFormat::Unix
+    if saw_lf {
+        FileFormat::Dos
+    } else if b.contains(&b'\r') {
+        FileFormat::Mac
+    } else {
+        FileFormat::Unix
+    }
 }
 
 /// Normalize a decoded file's line endings to `\n` for the rope (the inverse of
@@ -1483,21 +1546,23 @@ fn prev_boundary_slice(sl: ropey::RopeSlice<'_>, byte: usize) -> usize {
     }
 }
 
-/// Strip a single trailing line break (`\n` or `\r\n`) from `s`, leaving any
-/// other characters — including interior or leading `\r` — untouched.
+/// Strip a single trailing line break from `s`: the `\n` that ends a rope line (see
+/// [`LINE_TYPE`]). A `\r` before it is a character of the line, kept.
 fn strip_eol(s: &str) -> &str {
-    match s.strip_suffix('\n') {
-        Some(rest) => rest.strip_suffix('\r').unwrap_or(rest),
-        None => s,
-    }
+    s.strip_suffix('\n').unwrap_or(s)
 }
 
-/// Whether a decoded file's text ends with a line break in *any* `'fileformat'`
-/// convention — the read-side detection for `'endofline'`. Runs on the text before
-/// [`normalize_eol`], so a Dos file's `\r\n` and a classic-Mac `\r` count too. An
-/// empty file has no final line break, and so opens as a genuinely empty document.
-pub(crate) fn ends_with_line_break(s: &str) -> bool {
-    s.ends_with('\n') || s.ends_with('\r')
+/// Whether a decoded file's text ends with a line break in its `'fileformat'` `ff` —
+/// the read-side detection for `'endofline'`. Runs on the text before
+/// [`normalize_eol`]: a Dos file's `\r\n` (detection guarantees the `\r` before every
+/// `\n`) and a Mac file's `\r` count. In a Unix file a final lone `\r` is a character of
+/// the last line, not a line end, so that file has no final newline (vim's `'noeol'`).
+/// An empty file has no final line break, and so opens as a genuinely empty document.
+pub(crate) fn ends_with_line_break(s: &str, ff: crate::options::FileFormat) -> bool {
+    match ff {
+        crate::options::FileFormat::Mac => s.ends_with('\r'),
+        _ => s.ends_with('\n'),
+    }
 }
 
 fn ensure_trailing_newline(text: &mut Rope) {

@@ -185,6 +185,37 @@ try {
   }
   check("the incremental tree matches a fresh parse after structural edits", agree, detail);
 
+  // 5c. A lone `\r` is a character of its line, to the editor and to tree-sitter alike
+  //     (which counts rows by `\n` alone), so rows past one agree: a table below a `\r`
+  //     is reported on the rows it is on, and stays there across edits around the `\r`
+  //     (the worker's incremental tree is fed the core's edit points).
+  await page.evaluate(() => window.__bemtvi.feed(":new<CR>"));
+  await lua(page, `btv.bo.filetype = "markdown"
+    btv.buf.set_lines(0, 0, -1, false, { "x", "a\\rb", "", "| a | b |", "|---|---|", "| c | d |" })
+    return ""`);
+  const crRows = await query(page, `0, "(pipe_table) @table"`);
+  const crHeader = await lua(page, `return btv.buf.lines(0, 3, 4)[1]`);
+  check(
+    "query rows agree with buffer rows past a lone \\r",
+    crRows === "table:3,0-6,0 pipe_table" && crHeader === "| a | b |",
+    `${crRows} / row 3 = ${crHeader}`,
+  );
+  await lua(page, `btv.buf.set_lines(0, 0, 0, false, { "new" })
+    btv.buf.set_text(0, 2, 3, 2, 3, { " more" })
+    return ""`);
+  const crEdited = await until(
+    page,
+    `local l = btv.buf.lines(0, 2, 3)[1] return l == "a\\rb more" and "y" or ""`,
+    (v) => v === "y",
+  );
+  const crAfter = await query(page, `0, "(pipe_table) @table"`);
+  check(
+    "and across edits around the \\r",
+    crEdited === "y" && crAfter === "table:4,0-7,0 pipe_table",
+    `${crEdited} ${crAfter}`,
+  );
+  await page.evaluate(() => window.__bemtvi.feed(":bd!<CR>"));
+
   // 6. A decor provider's `query` reaches it as ctx.query (on the sample text again).
   // `:bd!` leaves the splits `:new` opened, so go back to one full-height window.
   await page.evaluate(() => window.__bemtvi.feed(":b /q.md<CR>:only!<CR>"));

@@ -357,7 +357,16 @@ fn decode_tokens(
     let mut line: u32 = 0;
     let mut start_char: u32 = 0;
     // The current line's column converter, reused by every token on it.
-    let mut cols: Option<(usize, LineCols)> = None;
+    // `(protocol line, the editor row it starts on, the byte it starts at in that row,
+    // its columns)`. Past a lone `\r` a protocol line can start mid-row (the server ends
+    // a line there, the editor doesn't), so its tokens land on that row, offset.
+    let differ = buffer.lsp_lines_differ();
+    let line_limit = if differ {
+        buffer.lsp_line_count()
+    } else {
+        buffer.line_count()
+    };
+    let mut cols: Option<(usize, usize, usize, LineCols)> = None;
     for tok in tokens {
         // Absolute position: a non-zero deltaLine moves down and resets the
         // column to deltaStart; a zero deltaLine advances the column on the line.
@@ -376,26 +385,33 @@ fn decode_tokens(
             continue;
         }
         let line_idx = line as usize;
-        if line_idx >= buffer.line_count() {
+        if line_idx >= line_limit {
             continue;
         }
-        let cols = match &mut cols {
-            Some((at, cols)) if *at == line_idx => cols,
+        let (row, base, cols) = match &mut cols {
+            Some((at, row, base, cols)) if *at == line_idx => (*row, *base, cols),
             slot => {
-                &mut slot
-                    .insert((line_idx, LineCols::new(buffer.line(line_idx))))
-                    .1
+                let (row, base, text) = if differ {
+                    let start = buffer.lsp_line_start(line_idx);
+                    let row = buffer.byte_to_line(start);
+                    let text = buffer.lsp_line_text(line_idx).into_owned();
+                    (row, start - buffer.line_start(row), text)
+                } else {
+                    (line_idx, 0, buffer.line(line_idx))
+                };
+                let entry = slot.insert((line_idx, row, base, LineCols::new(text)));
+                (row, base, &mut entry.3)
             }
         };
-        let start = cols.byte(encoding, start_char as usize);
-        let end = cols.byte(encoding, start_char.saturating_add(tok.length) as usize);
+        let start = base + cols.byte(encoding, start_char as usize);
+        let end = base + cols.byte(encoding, start_char.saturating_add(tok.length) as usize);
         if end <= start {
             continue;
         }
         let Some((ty, mods, groups)) = classify(tok, legend) else {
             continue;
         };
-        spans.entry(line_idx).or_default().push(SemanticSpan {
+        spans.entry(row).or_default().push(SemanticSpan {
             start,
             end,
             groups,

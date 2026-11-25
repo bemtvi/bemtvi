@@ -778,7 +778,7 @@ impl Editor {
     fn undo_landing(&self, id: BufferId, node: NodeIdx, snap: &mut Snapshot) {
         let (mut cursor, in_insert) = self.buffers.get(id).undo.landing_cursor(node);
         if in_insert && !self.mode.is_insert() && cursor.col > 0 {
-            use ropey::LineType::LF_CR as LT;
+            use crate::buffer::LINE_TYPE as LT;
             if cursor.line < snap.text.len_lines(LT) {
                 let line = snap.text.line(cursor.line, LT).to_string();
                 if let Some(before) = line.get(..cursor.col) {
@@ -1425,7 +1425,7 @@ impl Editor {
 /// head through the last line before their common tail. A span that put back no
 /// line at all (lines were only removed) is the line after the removal.
 fn changed_line_span(old: &ropey::Rope, new: &ropey::Rope) -> (usize, usize) {
-    use ropey::LineType::LF_CR as LT;
+    use crate::buffer::LINE_TYPE as LT;
     let (on, nn) = (old.len_lines(LT), new.len_lines(LT));
     let mut head = 0;
     while head < on && head < nn && old.line(head, LT) == new.line(head, LT) {

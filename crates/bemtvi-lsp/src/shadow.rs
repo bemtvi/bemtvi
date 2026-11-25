@@ -17,9 +17,11 @@ use ropey::{LineType, Rope};
 
 use crate::PositionEncoding;
 
-/// Line breaks as the editor's own buffer counts them (and as the LSP base
-/// protocol does): `\n`, `\r\n` and a lone `\r`.
-const LINE_TYPE: LineType = LineType::LF_CR;
+/// Line breaks as the LSP base protocol counts them: `\n`, `\r\n` and a lone `\r`. Not
+/// the editor's rows, which break at `\n` alone (a lone `\r` is a character of its line):
+/// positions the server sees are counted here, from byte offsets, so they are the
+/// protocol's whatever the editor makes of the text.
+const LINE_TYPE: LineType = bemtvi_core::buffer::LSP_LINE_TYPE;
 
 /// One server's copy of one document. See the module docs.
 #[derive(Clone, Debug, Default)]

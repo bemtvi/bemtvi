@@ -2706,6 +2706,10 @@ impl EditHost {
                 focused: focused_bufs.contains(&id),
                 // 1-based, the `:ls` convention (and neovim's `getbufinfo().lnum`).
                 lnum: self.editor.buffer_last_line(id).unwrap_or(0) as u64 + 1,
+                lsp_lines_differ: self
+                    .editor
+                    .buffer_of(id)
+                    .is_some_and(|b| b.lsp_lines_differ()),
             });
         }
         // Drop tick entries for buffers that no longer exist, so the map can't grow

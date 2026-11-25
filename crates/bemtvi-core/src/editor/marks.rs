@@ -116,7 +116,7 @@ impl Editor {
         if line >= b.line_count() {
             return Err(format!("E19: Mark has invalid line number: {}", line + 1));
         }
-        let len = b.line(line).trim_end_matches(['\n', '\r']).len();
+        let len = b.line(line).trim_end_matches('\n').len();
         let cursor = Cursor {
             line,
             col: col.min(len.saturating_sub(1)),
@@ -371,7 +371,7 @@ impl Editor {
                 Some(VisualMarkEnd::Start) => 0,
                 Some(VisualMarkEnd::End) => {
                     let text = self.buffer().line(line.min(self.last_line()));
-                    let text = text.trim_end_matches(['\n', '\r']);
+                    let text = text.trim_end_matches('\n');
                     text.char_indices().last().map_or(0, |(i, _)| i)
                 }
                 None => col,
@@ -574,7 +574,8 @@ pub struct MarkMirrorEntry {
 /// grapheme boundary, so a stale column can neither spill into a later line nor
 /// split a multibyte character.
 fn clamp_mark_col(line: &str, col: usize) -> usize {
-    let text = line.trim_end_matches('\r');
+    // (A `\r` at its end is a character of the line, not part of a break.)
+    let text = line.trim_end_matches('\n');
     crate::unicode::floor_grapheme(text, col.min(text.len()))
 }
 

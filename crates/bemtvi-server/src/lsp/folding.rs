@@ -88,11 +88,14 @@ impl EditHost {
             return; // computed against superseded text; the newer request wins.
         }
         let last = buf.line_count().saturating_sub(1);
+        // The range names the server's lines; each converts to the editor's row it
+        // starts on (they differ past a lone `\r`, which ends a line only for the server).
+        let resolver = super::LspPosResolver::new(buf);
         let ranges: Vec<(usize, usize)> = folds
             .iter()
             .filter_map(|f| {
-                let start = f.start as usize;
-                let end = (f.end as usize).min(last);
+                let start = resolver.row_of_lsp_line(f.start).min(last);
+                let end = resolver.row_of_lsp_line(f.end).min(last);
                 (end > start).then_some((start, end))
             })
             .collect();

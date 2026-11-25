@@ -70,9 +70,13 @@ impl EditHost {
         let Some(uri) = state.uri.clone() else {
             return;
         };
-        // Whole-buffer range: `(0,0)` .. `(line_count, 0)`. A viewport-scoped range
-        // is a Phase-2 follow-up (recorded as an approximation).
-        let line_count = self.editor.buffer_of(buffer).map_or(0, |b| b.line_count());
+        // Whole-buffer range: `(0,0)` .. `(line_count, 0)`, in the protocol's lines
+        // (which also end at a lone `\r`). A viewport-scoped range is a Phase-2
+        // follow-up (recorded as an approximation).
+        let line_count = self
+            .editor
+            .buffer_of(buffer)
+            .map_or(0, |b| b.lsp_line_count());
         let range = Range {
             start: Position {
                 line: 0,
@@ -132,9 +136,18 @@ impl EditHost {
         // which froze the tick on a minified file's one long line.
         let mut cols: std::collections::HashMap<usize, super::semantic::LineCols> =
             std::collections::HashMap::new();
+        // Past a lone `\r` the server's lines are not the editor's rows: those hints
+        // convert through the buffer's text instead (rare, so no per-line cache).
+        let differ = buf.lsp_lines_differ();
+        let mut resolver = super::LspPosResolver::new(buf);
         for hint in hints {
-            let line_idx = hint.line as usize;
-            if line_idx >= buf.line_count() {
+            if hint.line as usize
+                >= if differ {
+                    buf.lsp_line_count()
+                } else {
+                    buf.line_count()
+                }
+            {
                 continue; // a hint past the buffer's editable lines: drop it.
             }
             // An eager hint paints its label; a *lazy* one (empty label but
@@ -143,10 +156,20 @@ impl EditHost {
             if hint.label.is_empty() && hint.resolve_data.is_none() {
                 continue;
             }
-            let byte = cols
-                .entry(line_idx)
-                .or_insert_with(|| super::semantic::LineCols::new(buf.line(line_idx)))
-                .byte(encoding, hint.character as usize);
+            let (line_idx, byte) = if differ {
+                let pos = Position {
+                    line: hint.line,
+                    character: hint.character,
+                };
+                resolver.point(pos, encoding)
+            } else {
+                let line_idx = hint.line as usize;
+                let byte = cols
+                    .entry(line_idx)
+                    .or_insert_with(|| super::semantic::LineCols::new(buf.line(line_idx)))
+                    .byte(encoding, hint.character as usize);
+                (line_idx, byte)
+            };
             by_line.entry(line_idx).or_default().push(InlayHintSpan {
                 byte_col: byte,
                 text: sanitize_label(&hint.label),

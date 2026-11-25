@@ -424,7 +424,7 @@ function btv.complete.choice(items, opts)
   opts = opts or {}
   local r = opts.range
   if r == nil then
-    local pos = btv.win.cursor(0) -- { row (1-based), col (0-based byte) }
+    local pos = btv.cursor.get() -- { row (1-based), col (0-based byte) }
     r = { pos[1] - 1, pos[2], pos[1] - 1, pos[2] }
   end
   btv._choice_menu(items, r[1], r[2], r[3], r[4])

@@ -1076,6 +1076,31 @@ async fn choice_api_opens_nongrabbing_popup_and_replaces_the_range() {
     assert_eq!(lines(&rpc).await, vec!["x = b"]);
 }
 
+/// Without `opts.range`, `btv.complete.choice` inserts the pick at the cursor (the empty
+/// span there). That default once called a `btv.win.cursor` that doesn't exist, so the
+/// call raised instead of opening the popup.
+#[tokio::test]
+async fn choice_api_without_a_range_inserts_at_the_cursor() {
+    let dir = temp_dir("complete_choice_default_range");
+    let (rpc, mut incoming) = start(&dir, "btv.complete.setup{}").await;
+
+    feed(&rpc, "ix = ");
+    exec_lua(&rpc, "btv.complete.choice({ 'a', 'b' })").await;
+    let menu = menu_of(
+        &poll_menu(&rpc, &mut incoming)
+            .await
+            .expect("choice popup opens"),
+    );
+    assert_eq!(menu_items(&menu), vec!["a", "b"]);
+    feed(&rpc, "<C-n><C-y>");
+    // The first row starts highlighted; <C-n> moves to `b`.
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["x = b"],
+        "the pick lands at the cursor"
+    );
+}
+
 /// The menu's per-row kind labels (the `kinds` array), parallel to [`menu_items`];
 /// empty when the key is absent (no row carries a kind).
 fn menu_kinds(menu: &[(Value, Value)]) -> Vec<Option<String>> {

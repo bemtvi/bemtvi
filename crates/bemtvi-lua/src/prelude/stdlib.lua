@@ -918,8 +918,11 @@ vim.fn.strchars = btv.str.chars
 -- cells `s` occupies, measured as the window paints it: tabs expand to the next tab stop,
 -- wide characters count as two, combining marks as none, and a control character as its
 -- `^X` / `<xx>` substitution (`"\0"` is drawn `^@`, two cells). `col` is the starting
--- screen column used for tab-stop math (default 0); the return value is the width of `s`
--- itself (cells consumed beyond `col`). A byte that isn't UTF-8 counts as one cell.
+-- screen column used for tab-stop math (default 0; a negative one counts as 0, a
+-- fractional one is floored); the return value is the width of `s` itself (cells
+-- consumed beyond `col`). Text that isn't UTF-8 is read as the U+FFFD replacement
+-- character, one cell, for each malformed sequence (a stray byte, or a truncated
+-- multi-byte character).
 --
 -- Tab stops are the current buffer's `'tabstop'`, as in vim. `tabstop` names another
 -- (a bemtvi extension), for text bound for a buffer that isn't current, such as the one
@@ -927,15 +930,13 @@ vim.fn.strchars = btv.str.chars
 function btv.str.displaywidth(s, col, tabstop)
   local ts = tabstop
   if ts == nil then
-    -- The current buffer's options, from the mirror the server refreshes before each
-    -- Lua entry (`btv._cur_buf`, `btv._bo_mirror`); 8 before there is one.
-    local cur = btv._cur_buf and btv._cur_buf.bufnr
-    local bo = cur and btv._bo_mirror and btv._bo_mirror[cur]
-    ts = bo and bo.tabstop or 8
+    -- The current buffer's `'tabstop'`, which reads the option's default before any
+    -- buffer is mirrored, as every other reader of it does.
+    ts = btv.bo.tabstop
   elseif type(ts) ~= "number" or ts < 1 or ts % 1 ~= 0 then
     error("btv.str.displaywidth: tabstop must be a positive integer", 2)
   end
-  return btv._displaywidth(tostring(s or ""), col or 0, ts)
+  return btv._displaywidth(tostring(s or ""), math.max(0, math.floor(tonumber(col) or 0)), ts)
 end
 vim.fn.strdisplaywidth = btv.str.displaywidth
 

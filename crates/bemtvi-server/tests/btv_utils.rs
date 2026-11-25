@@ -354,6 +354,16 @@ async fn displaywidth_measures_as_the_screen_paints() {
         eval_str(&rpc, r#"btv.str.displaywidth("日e\u{301}")"#).await,
         "3"
     );
+    // A negative or fractional starting column is clamped and floored, as vim does,
+    // rather than raising.
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.displaywidth("\t", -3)"#).await,
+        "4"
+    );
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.displaywidth("\t", 2.5)"#).await,
+        "2"
+    );
     // Another buffer's tab stops, named.
     assert_eq!(
         eval_str(&rpc, r#"btv.str.displaywidth("a\tb", 0, 2)"#).await,

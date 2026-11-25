@@ -41,9 +41,18 @@ const NVIM_TS_REF: &str = "52773f0d13a0c11d0c3ef33c14ab6ecc1c17148b";
 /// core repo's `runtime/queries/`. Pinned; override with `$BEMTVI_TS_TEXTOBJECTS_REF`.
 const NVIM_TS_TEXTOBJECTS_REF: &str = "5c7b0263797dfd1bd6202f2b219f3b53a80b2187";
 
-/// Zig version fetched to build every grammar (unless `$BEMTVI_CC` is set). The per-target archive
-/// + SHA-256 are pinned in [`zig_target`]; bump all three together.
-const ZIG_VERSION: &str = "0.15.2";
+/// Zig version fetched to build every grammar (unless `$BEMTVI_CC` is set), as a
+/// macro so the per-target archive names in [`zig_target`] are spelled from it.
+/// Bump it together with the SHA-256s there (from `ziglang.org`'s
+/// `download/index.json`), then run the live install test on each target.
+macro_rules! zig_version {
+    () => {
+        "0.17.1"
+    };
+}
+
+/// [`zig_version!`] as a constant — public so tests can find the unpacked toolchain.
+pub const ZIG_VERSION: &str = zig_version!();
 
 /// The standard nvim-treesitter query files, in the order we copy them. Missing
 /// ones (a 404) are simply skipped — not every grammar ships every query.
@@ -904,34 +913,34 @@ fn tree_sitter_cli() -> Option<String> {
 
 /// Pinned Zig archive name + SHA-256 for the host target, or `Err` on an
 /// unsupported platform. macOS/Linux ship a `.tar.xz`, Windows a `.zip`;
-/// [`ensure_zig`] dispatches the extractor on the extension. Bump all the names +
-/// shas together with [`ZIG_VERSION`] (they come from `ziglang.org`'s
+/// [`ensure_zig`] dispatches the extractor on the extension. Bump the shas
+/// together with [`zig_version!`] (they come from `ziglang.org`'s
 /// `download/index.json`).
 fn zig_target() -> Result<(&'static str, &'static str)> {
     let t = match (std::env::consts::ARCH, std::env::consts::OS) {
         ("aarch64", "macos") => (
-            "zig-aarch64-macos-0.15.2.tar.xz",
-            "3cc2bab367e185cdfb27501c4b30b1b0653c28d9f73df8dc91488e66ece5fa6b",
+            concat!("zig-aarch64-macos-", zig_version!(), ".tar.xz"),
+            "75f1bc7a1e9852f17ec9a0c1895f767c4ec56d46bc8a834920eece1d0359dd8d",
         ),
         ("x86_64", "macos") => (
-            "zig-x86_64-macos-0.15.2.tar.xz",
-            "375b6909fc1495d16fc2c7db9538f707456bfc3373b14ee83fdd3e22b3d43f7f",
+            concat!("zig-x86_64-macos-", zig_version!(), ".tar.xz"),
+            "9af07b20319fbd0c92ee46ad23e81d6a782b1aaea2cfb8dcbff35f1d2c7ddbb7",
         ),
         ("x86_64", "linux") => (
-            "zig-x86_64-linux-0.15.2.tar.xz",
-            "02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239",
+            concat!("zig-x86_64-linux-", zig_version!(), ".tar.xz"),
+            "3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a",
         ),
         ("aarch64", "linux") => (
-            "zig-aarch64-linux-0.15.2.tar.xz",
-            "958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f",
+            concat!("zig-aarch64-linux-", zig_version!(), ".tar.xz"),
+            "a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795",
         ),
         ("x86_64", "windows") => (
-            "zig-x86_64-windows-0.15.2.zip",
-            "3a0ed1e8799a2f8ce2a6e6290a9ff22e6906f8227865911fb7ddedc3cc14cb0c",
+            concat!("zig-x86_64-windows-", zig_version!(), ".zip"),
+            "b03f477a1943673e02aca0f570e8030dffd536ce1f45cbc4d3326ec31159562e",
         ),
         ("aarch64", "windows") => (
-            "zig-aarch64-windows-0.15.2.zip",
-            "b926465f8872bf983422257cd9ec248bb2b270996fbe8d57872cca13b56fc370",
+            concat!("zig-aarch64-windows-", zig_version!(), ".zip"),
+            "4789895bdb1e312a2ea73b2a7c0a0cc8d2ab62ba6976e834a7c54cf443377c15",
         ),
         (arch, os) => bail!(
             "no pinned Zig for {arch}-{os}; set $BEMTVI_CC to a C compiler \

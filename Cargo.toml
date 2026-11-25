@@ -83,11 +83,11 @@ bemtvi-test-harness = { path = "crates/bemtvi-test-harness" }
 # yieldable `pcall`, and a generational GC over the old 5.1 baseline. `lua54` is
 # selected here so every crate that links mlua shares it; there is no backend
 # toggle to thread anymore.
-anyhow = "1.0.104"
+anyhow = "1.0.105"
 # CLI argument parsing for the `bemtvi` binary (the only consumer): the `derive`
 # feature gives a struct-driven parser that validates flags, errors on unknown
 # options, and auto-generates `--help`/`--version`.
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.9", features = ["derive"] }
 ropey = "=2.0.0-beta.1"
 # Fuzzy matcher (nucleo-class) shared by every static-source widget consumer —
 # completion, `btv.ui.select`, and static pickers. The matcher-only sub-crate:
@@ -100,13 +100,13 @@ nucleo-matcher = "0.3.1"
 # emscripten for the wasm edit-host. `simd-accel` is left OFF (it needs nightly);
 # the default `alloc` build is stable and portable. See
 # docs/plans/2026-06-14-encoding-and-invalid-utf8.md.
-encoding_rs = "0.8.42"
+encoding_rs = "0.8.44"
 # URL query-string + component percent-encoding for `btv.http` (the `query`/`form` opts
 # and `btv.http.encode_query` / `encode_uri_component`). The canonical `rust-url`
 # (servo) crates — pure Rust, wasm-safe, and already in the tree via `url`/`ureq`, so
 # no bespoke encoder. `form_urlencoded` builds `application/x-www-form-urlencoded`
 # query/body strings; `percent-encoding` does single-component `encodeURIComponent`.
-form_urlencoded = "1.2.2"
+form_urlencoded = "1.2.3"
 percent-encoding = "2.3.2"
 # CommonMark + GFM parser backing the markdown renderer for read-only doc popups
 # (LSP hover / completion docs / picker preview): a pull parser that emits an event
@@ -114,7 +114,7 @@ percent-encoding = "2.3.2"
 # `default-features = false` drops its `html`/`getopts` bits — we only want the
 # parser. Pure Rust, no C, no async/IO ⇒ lives inside the synchronous `bemtvi-core`
 # and compiles under emscripten for the wasm edit-host.
-pulldown-cmark = { version = "0.13.4", default-features = false }
+pulldown-cmark = { version = "0.13.6", default-features = false }
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 ratatui = "0.30.2"
 # In-terminal image rendering for the TUI client's `'imagepreview'` (Phase 2): a
@@ -135,7 +135,7 @@ image = "0.25.10"
 # `bemtvi-tui/src/images.rs::terminal_answers_status_query`): it must wait for a
 # reply *without consuming stdin*, which `std::io` can't express. Already in the
 # tree transitively; pinned to the resolved version.
-libc = "0.2.190"
+libc = "0.2.191"
 # OSC 52 clipboard payloads (`crates/bemtvi-server/src/clipboard.rs`) — the escape
 # carries its text base64-encoded.
 base64 = "0.23.1"
@@ -153,7 +153,7 @@ windows-sys = "0.61.2"
 mitsuami = "2.5.1"
 # `bemtvi-mitsuami`'s embed tests; same release as `mitsuami`, so the two can't drift apart.
 mitsuami-test = "2.5.1"
-wgpu = "30.0.1"
+wgpu = "30.0.2"
 # The window handle a host's toolkit gives `bemtvi-gpu`'s renderer: the version wgpu
 # and mitsuami both speak, so a handle from one is a surface target for the other.
 raw-window-handle = "0.6.2"
@@ -166,16 +166,16 @@ glyphon = "0.12.0"
 cosmic-text = { version = "0.19.0", features = ["monospace_fallback"] }
 # The type in cosmic-text's `Fallback` trait, which it doesn't re-export. Same instance
 # cosmic-text uses.
-unicode-script = "0.5.8"
-pollster = "1.0.1"
+unicode-script = "0.5.9"
+pollster = "1.0.3"
 # Build-dependency (Windows host only): embeds the app icon + version info into
 # the bemtvi-gui.exe via the Windows SDK's rc.exe. See crates/bemtvi-gui/build.rs.
 winresource = "0.1.34"
 # Build-dependency of bemtvi-regex: compiles the vendored vim/neovim regexp
 # engine (csrc/) into the crate. Plain C99; also builds for
 # wasm32-unknown-emscripten (the bemtvi-edithost target).
-cc = "1.8.0"
-tokio = { version = "1.53.2", features = ["rt", "macros", "io-util", "io-std", "net", "sync", "time", "process"] }
+cc = "1.11.3"
+tokio = { version = "1.54.1", features = ["rt", "macros", "io-util", "io-std", "net", "sync", "time", "process"] }
 # Cross-platform filesystem notification backing `vim.uv.fs_event` in the server's
 # event-loop actor. `macos_kqueue` selects the kqueue backend on macOS instead of
 # the default FSEvents one: FSEvents' `watch()` talks to the `fseventsd` daemon and
@@ -184,23 +184,23 @@ tokio = { version = "1.53.2", features = ["rt", "macros", "io-util", "io-std", "
 # plain syscall (sub-ms) and needs no daemon. Linux still uses inotify, Windows
 # ReadDirectoryChangesW (both already non-blocking). bemtvi watches only a handful of
 # paths (e.g. lualine's `.git/HEAD`), so kqueue's one-fd-per-watch cost is moot.
-notify = { version = "8.2.0", features = ["macos_kqueue"] }
+notify = { version = "8.2.2", features = ["macos_kqueue"] }
 futures = "0.3.34"
 rmpv = "1.3.1"
-mlua = { version = "0.12.2", features = ["vendored", "serde", "lua54"] }
+mlua = { version = "0.12.3", features = ["vendored", "serde", "lua54"] }
 serde = { version = "1.0.229", features = ["derive"] }
 # Persistence (shada). `redb` is the pure-Rust, ACID, single-file embedded store
 # each daemon's per-instance shada file lives in; `rmp-serde` encodes the table
 # values as msgpack. Both server-only (the wasm core never links them). See
 # docs/plans/2026-06-11-shada-persistence.md.
-redb = "4.4.0"
+redb = "4.6.0"
 rmp-serde = "1.3.1"
-unicode-width = "0.2.2"
+unicode-width = "0.2.3"
 unicode-segmentation = "1.13.3"
 # The GUI reads a font's character map with it (its font list resolves each
 # character to the first font that has it). Pinned to the version fontdb uses.
 ttf-parser = { version = "0.25.1", default-features = false, features = ["std"] }
-regex = "1.13.1"
+regex = "1.13.2"
 # The glob parser behind `bemtvi_core::glob` (and so `btv.glob`). Used purely as the
 # glob->regex TRANSLATOR — `Glob::regex()` hands back regex source that we compile
 # and match ourselves with the `regex` crate above, rather than going through
@@ -209,12 +209,12 @@ regex = "1.13.1"
 # "this candidate is a Windows path" — and the daemon/remote session can hand a
 # Unix-hosted client Windows paths. Owning the regex makes path style an explicit
 # option. Pure Rust and wasm-safe (aho-corasick / bstr / regex-automata).
-globset = { version = "0.4.20", default-features = false }
+globset = { version = "0.4.22", default-features = false }
 # `.gitignore` semantics for the `btv.fs` walk (`btv.fs.gitignore`): ripgrep's own
 # matcher, so negation, anchoring and `**` behave exactly as in `rg`. Only its
 # `gitignore` module is used — the walker stays the Lua one over `btv.fs`, which is
 # what reaches a daemon and OPFS. Same project as globset.
-ignore = { version = "0.4.33", default-features = false }
+ignore = { version = "0.4.35", default-features = false }
 portable-pty = "0.9.0"
 vt100 = "0.16.2"
 tree-sitter = "0.26.13"
@@ -225,7 +225,7 @@ tree-sitter = "0.26.13"
 tree-sitter-generate = { version = "0.26.13", default-features = false, features = ["load"] }
 rquickjs = { version = "0.14.0", features = ["loader"] }
 streaming-iterator = "0.1.9"
-libloading = "0.9.0"
+libloading = "0.9.1"
 # In-process git (bemtvi-git, native-only). Feature set is chosen per crate;
 # default-features off keeps the network/tls tree opt-in.
 gix = { version = "0.89.0", default-features = false }
@@ -242,7 +242,7 @@ gix-worktree-state = { version = "0.36.0", default-features = false }
 # injection tests can exercise cross-language + nested injections, not just
 # rust-in-rust self-injection.
 tree-sitter-rust = "0.24.2"
-tree-sitter-md = "0.5.3"
+tree-sitter-md = "0.5.4"
 
 # `:TSInstall` grammar fetch + compile (bemtvi-ts `install` module). All in-process
 # so a *prebuilt* bemtvi needs no external curl/git/tar at runtime. `ureq` is the
@@ -254,7 +254,7 @@ tree-sitter-md = "0.5.3"
 # on macOS/Linux (`xz2`) and a `.zip` on Windows (`zip`, reusing `flate2` for
 # deflate via its `deflate-flate2` feature so we don't pull a second inflate
 # stack). `sha2` verifies the pinned Zig checksum before we execute it.
-ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
 # The `btv.http.mount` listener (`bemtvi-server`'s `httpmount` module) — the INBOUND
 # twin of `ureq` above, which is outbound-only. One editor-owned origin serves every
 # plugin's mounted subroute (`/plugin/<name>/*`); see
@@ -269,9 +269,9 @@ ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
 # contract through a Service Worker instead.
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 tar = "0.4.46"
-flate2 = "1.1.10"
+flate2 = "1.1.11"
 xz2 = "0.1.7"
-zip = { version = "9.0.2", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.8.2", default-features = false, features = ["deflate-flate2"] }
 sha2 = "0.11.1"
 # Hash digests for the `btv.hash.*` Lua utilities (alongside `sha2`, which doubles
 # as the zig-checksum verifier above). All RustCrypto, pure Rust and wasm-safe;

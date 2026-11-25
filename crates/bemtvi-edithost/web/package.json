@@ -33,9 +33,9 @@
   },
   "devDependencies": {
     "@msgpack/msgpack": "3.1.3",
-    "playwright": "1.60.0"
+    "playwright": "1.65.1"
   },
   "dependencies": {
-    "pyodide": "314.0.0"
+    "pyodide": "314.0.8"
   }
 }

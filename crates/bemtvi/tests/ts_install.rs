@@ -639,12 +639,14 @@ async fn ts_install_never_uses_a_compiler_from_path() {
     let (data_dir, _mirror) = fixture("nopathcc");
     std::env::remove_var("BEMTVI_CC");
     let stem = format!(
-        "zig-{}-{}-0.15.2",
+        "zig-{}-{}-{}",
         std::env::consts::ARCH,
-        std::env::consts::OS
+        std::env::consts::OS,
+        bemtvi_test_harness::ZIG_VERSION
     );
     let fake_zig = data_dir
-        .join("zig/0.15.2")
+        .join("zig")
+        .join(bemtvi_test_harness::ZIG_VERSION)
         .join(&stem)
         .join(format!("zig{}", std::env::consts::EXE_SUFFIX));
     write_under(&fake_zig, b"not a zig binary");

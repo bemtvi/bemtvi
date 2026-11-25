@@ -114,6 +114,8 @@ jobs:
       # Zig is the cross-linker cargo-zigbuild drives to pin an ancient glibc
       # floor (see the Linux build step). Every Linux build — TUI and GUI — goes
       # through it so the dynamically-linked binaries run on very old distros.
+      # Held on 0.13.0 on purpose for that glibc floor: dependency sweeps leave it
+      # alone (it is not the `:TSInstall` Zig, which bemtvi-ts pins separately).
       - name: Install Zig (Linux)
         if: matrix.os == 'linux'
         uses: mlugg/setup-zig@v2
@@ -553,7 +555,7 @@ jobs:
           actions-cache-folder: emsdk-cache
 
       - name: Install Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 24
 

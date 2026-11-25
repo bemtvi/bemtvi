@@ -1128,6 +1128,10 @@ pub fn c_compiler() -> Vec<String> {
     }
 }
 
+/// The Zig version `:TSInstall` fetches, for tests that locate its unpacked tree
+/// under `<data>/zig/<version>/`.
+pub const ZIG_VERSION: &str = bemtvi_ts::install::ZIG_VERSION;
+
 /// [`c_compiler`] as one whitespace-separated string — the `$BEMTVI_CC` spelling.
 pub fn c_compiler_cmd() -> String {
     c_compiler().join(" ")

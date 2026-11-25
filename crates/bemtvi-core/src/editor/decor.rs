@@ -69,15 +69,21 @@ impl Editor {
             };
             let top = self.window_top(win);
             let height = self.window_text_area(win).map_or(0, |(_, h)| h);
-            let (last_line, tick) = self.buffer_of(buf).map_or((0, 0), |b| {
-                (b.line_count().saturating_sub(1), b.changedtick)
+            let (last_line, tick, tabstop) = self.buffer_of(buf).map_or((0, 0, 0), |b| {
+                (
+                    b.line_count().saturating_sub(1),
+                    b.changedtick,
+                    b.options.effective_tabstop(),
+                )
             });
             let bot = top.saturating_add(height.saturating_sub(1)).min(last_line);
             // `changedtick` is in the key so an on-screen edit that leaves top/bot
             // unchanged (typing within the viewport) still re-dispatches the provider.
             // (A change of filetype or treesitter language with no edit re-dispatches
             // through `invalidate_decor`, from the setters and the renaming saves.)
-            let key = (buf, top, bot, tick);
+            // `'tabstop'` too: a provider lining text up by display width measures tabs on
+            // it, so a change re-runs it, however it was set (`:set`, `btv.bo`, a modeline).
+            let key = (buf, top, bot, tick, tabstop);
             let moved = self.decor_viewports.get(&win) != Some(&key);
             // An outstanding `btv.decor.invalidate` re-dispatches this window even
             // though the viewport itself is unchanged — but at most ONCE per pass.

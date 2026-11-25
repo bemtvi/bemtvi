@@ -970,6 +970,45 @@ btv.decor.provider {
 }
 
 #[tokio::test]
+async fn a_tabstop_change_runs_the_providers_without_a_scroll() {
+    // A provider measuring text by display width (tabs included) lays out against the
+    // buffer's 'tabstop'; a change to it must re-run the provider, as an edit does, or
+    // what it drew stays measured on the old tab stops until the next scroll.
+    let dir = temp_dir("decor_tabstop");
+    let init = r#"
+_G.runs = 0
+btv.decor.provider {
+  name = "ts",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    _G.runs = _G.runs + 1
+    publish({})
+  end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, init).await;
+    let path = dir.join("t.lua");
+    std::fs::write(&path, "return\tx\n").expect("write t.lua");
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+    wait_redraw(&mut incoming, |m| window0_field(m, "lines").is_some()).await;
+    let before = lua_u64(&rpc, "return _G.runs").await.unwrap_or(0);
+    assert!(before > 0, "the provider ran on open");
+    exec_lua(&rpc, "btv.bo.tabstop = 8").await;
+    let mut after = before;
+    for _ in 0..100 {
+        after = lua_u64(&rpc, "return _G.runs").await.unwrap_or(0);
+        if after > before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        after > before,
+        "a 'tabstop' change re-ran the provider ({before} -> {after})"
+    );
+}
+
+#[tokio::test]
 async fn invalidate_scopes_to_a_buffer_and_to_a_window() {
     // The scope selects *windows*: `buf` wakes every window showing that buffer (a
     // buffer can be in several splits, each with its own viewport), `win` wakes exactly

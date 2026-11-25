@@ -677,6 +677,22 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
         "_strwidth",
         lua.create_function(|_, s: String| Ok(UnicodeWidthStr::width(s.as_str())))?,
     )?;
+    // `btv._displaywidth(s, col, tabstop)` (behind `btv.str.displaywidth`): the cells `s`
+    // takes from screen column `col`, measured exactly as the window paints it — tabs on
+    // `tabstop`, control characters as their `^X` substitution — through the core's own
+    // `unicode::str_display_width`. A byte that isn't UTF-8 counts as one cell (the
+    // U+FFFD it is read as), the prelude's documented treatment of malformed text.
+    btv.set(
+        "_displaywidth",
+        lua.create_function(|_, (s, col, tabstop): (mlua::LuaString, usize, usize)| {
+            let bytes = s.as_bytes();
+            Ok(bemtvi_core::unicode::str_display_width(
+                &String::from_utf8_lossy(&bytes),
+                col,
+                tabstop,
+            ))
+        })?,
+    )?;
     // `btv._replace_termcodes(s)` (exposed by the prelude as `btv.replace_termcodes` /
     // `vim.api.nvim_replace_termcodes`): translate vim key-notation into the
     // terminal-byte encoding neovim emits — Ctrl-chords (`<C-o>` → `\x0f`), the

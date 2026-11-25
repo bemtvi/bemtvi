@@ -626,10 +626,11 @@ async fn string_width_and_character_builtins() {
         exec_lua(&rpc, "return vim.fn.strchars('h\\195\\169llo')").await,
         Value::from(5u64)
     );
-    // strdisplaywidth: a tab from column 0 expands to the next tabstop (8).
+    // strdisplaywidth: a tab from column 0 expands to the next stop of the current
+    // buffer's 'tabstop' (bemtvi's default is 4).
     assert_eq!(
         exec_lua(&rpc, "return vim.fn.strdisplaywidth('\\t')").await,
-        Value::from(8u64)
+        Value::from(4u64)
     );
     // A wide (CJK) character counts as two cells (U+4E2D = e4 b8 ad).
     assert_eq!(

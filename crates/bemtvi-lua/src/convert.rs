@@ -437,26 +437,36 @@ fn lua_to_json_at(value: &mlua::Value, depth: usize) -> mlua::Result<serde_json:
             // table's contents. Dropping the entries here would silently lose whatever
             // a caller added to it.
             Some("object") => {
-                let mut map = serde_json::Map::new();
+                let mut entries = Vec::new();
                 for pair in t.clone().pairs::<mlua::Value, mlua::Value>() {
                     let (k, v) = pair?;
-                    map.insert(json_key(&k)?, lua_to_json_at(&v, depth + 1)?);
+                    entries.push((json_key(&k)?, lua_to_json_at(&v, depth + 1)?));
                 }
-                serde_json::Value::Object(map)
+                sorted_object(entries)
             }
             _ => match classify_table(t, |v| lua_to_json_at(v, depth + 1))? {
                 LuaTable::Array(items) => serde_json::Value::Array(items),
                 LuaTable::Map(pairs) => {
-                    let mut map = serde_json::Map::new();
+                    let mut entries = Vec::with_capacity(pairs.len());
                     for (k, v) in pairs {
-                        map.insert(json_key(&k)?, v);
+                        entries.push((json_key(&k)?, v));
                     }
-                    serde_json::Value::Object(map)
+                    sorted_object(entries)
                 }
             },
         },
         _ => serde_json::Value::Null,
     })
+}
+
+/// A JSON object of `entries`, its keys in sorted order. A Lua table has no order of
+/// its own (`pairs` walks its hash, which differs between VMs), and `serde_json::Map`
+/// keeps whatever order it is filled in once any crate in the build turns on its
+/// `preserve_order` feature: sorting here keeps the output the same from run to run,
+/// whatever the features, so a file a plugin writes diffs cleanly.
+fn sorted_object(mut entries: Vec<(String, serde_json::Value)>) -> serde_json::Value {
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    serde_json::Value::Object(entries.into_iter().collect())
 }
 
 /// Coerce a Lua table key to the JSON object key string `vim.json.encode` uses.

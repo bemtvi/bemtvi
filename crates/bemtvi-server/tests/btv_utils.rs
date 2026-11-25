@@ -327,3 +327,74 @@ async fn uri_from_path_resolves_a_relative_path_against_the_cwd() {
         "file:///abs/x.rs"
     );
 }
+
+// `btv.str.displaywidth` measures as the screen paints: tabs on the current buffer's
+// `'tabstop'` (vim's `strdisplaywidth`), and a control character at the width of the
+// `^X` it is drawn as. It used to assume a tabstop of 8 and count a control character
+// as one cell, so a plugin lining text up around either drew it misaligned.
+#[tokio::test]
+async fn displaywidth_measures_as_the_screen_paints() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, "btv.cmd('set tabstop=4')").await;
+    assert_eq!(eval_str(&rpc, r#"btv.str.displaywidth("a\tb")"#).await, "5");
+    // A tab from column 2 runs to the next stop, 4.
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.displaywidth("\t", 2)"#).await,
+        "2"
+    );
+    // NUL paints as `^@`, DEL as `^?`, a C1 control as `<xx>`.
+    assert_eq!(eval_str(&rpc, r#"btv.str.displaywidth("a\0b")"#).await, "4");
+    assert_eq!(eval_str(&rpc, r#"btv.str.displaywidth("\127")"#).await, "2");
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.displaywidth("\u{85}")"#).await,
+        "4"
+    );
+    // Wide and combining characters are unchanged.
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.displaywidth("日e\u{301}")"#).await,
+        "3"
+    );
+    // Another buffer's tab stops, named.
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.displaywidth("a\tb", 0, 2)"#).await,
+        "3"
+    );
+    exec_lua(&rpc, "btv.cmd('set tabstop=8')").await;
+    assert_eq!(eval_str(&rpc, r#"btv.str.displaywidth("a\tb")"#).await, "9");
+}
+
+// `btv.json.encode` writes an object's keys sorted, so a file a plugin keeps (the
+// `btv.plugins` lockfile) diffs cleanly. A dependency turning on serde_json's
+// `preserve_order` made objects keep insertion order, which for a Lua table is its hash
+// order, different from one VM to the next: the lockfile came out shuffled.
+#[tokio::test]
+async fn json_encode_sorts_object_keys() {
+    let (rpc, _incoming) = start().await;
+    let got = eval_str(
+        &rpc,
+        r#"(function()
+          local t = {}
+          for i = 50, 1, -1 do t[("k%02d"):format(i)] = i end
+          local keys = {}
+          for k in btv.json.encode(t):gmatch('"(k%d%d)"') do keys[#keys + 1] = k end
+          for i = 2, #keys do
+            if keys[i - 1] > keys[i] then return "unsorted at " .. keys[i] end
+          end
+          local marked = btv.json.encode(btv.json.empty_object())
+          return #keys .. " " .. marked
+        end)()"#,
+    )
+    .await;
+    assert_eq!(got, "50 {}");
+    // Pretty output too, and nested objects.
+    let nested = eval_str(
+        &rpc,
+        r#"btv.json.encode({ z = { b = 1, a = 2 }, a = 1 }, { pretty = true })"#,
+    )
+    .await;
+    assert!(
+        nested.find("\"a\": 1") < nested.find("\"z\"")
+            && nested.find("\"a\": 2") < nested.find("\"b\""),
+        "{nested}"
+    );
+}

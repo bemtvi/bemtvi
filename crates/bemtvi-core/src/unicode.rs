@@ -222,6 +222,23 @@ pub fn virtcol(line: &str, byte: usize, tabstop: usize) -> usize {
     col
 }
 
+/// Display cells `s` takes when it starts at screen column `start_col`: what the
+/// window paints for it, tabs expanding to the next multiple of `tabstop` (counted from
+/// `start_col`), wide characters as two, combining marks as none, and control
+/// characters at the width of their `^X` / `<xx>` substitution. The width of `s`
+/// itself, not the column it ends at. vim's `strdisplaywidth`.
+pub fn str_display_width(s: &str, start_col: usize, tabstop: usize) -> usize {
+    if all_printable_ascii(s.as_bytes()) {
+        return s.len();
+    }
+    let tabstop = tabstop.max(1);
+    let mut col = start_col;
+    for g in s.graphemes(true) {
+        col += grapheme_width(g, col, tabstop);
+    }
+    col - start_col
+}
+
 /// Display width of the grapheme the cursor sits on at byte offset `byte` — how
 /// many screen cells a block cursor should cover. A tab, a wide (CJK / emoji)
 /// grapheme, and the `^X` / `<xx>` control-char substitutions all report their

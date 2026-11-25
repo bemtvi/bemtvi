@@ -843,31 +843,6 @@ local function utf8_decode(s, i)
   return b, 1 -- ASCII control, stray continuation, or truncated lead byte
 end
 
--- Display cells one codepoint occupies: 2 for the common East-Asian-wide and
--- emoji ranges, else 1. INCOMPLETE: a pragmatic range check, not the full
--- Unicode east-asian-width / emoji tables, and combining marks (which should be
--- width 0) count as 1 — close enough for popup grid layout, wrong for dense CJK
--- with combining marks. A real impl would consult a generated width table.
-local function char_width(cp)
-  if
-    cp >= 0x1100
-    and (
-      cp <= 0x115F -- Hangul Jamo
-      or (cp >= 0x2E80 and cp <= 0xA4CF and cp ~= 0x303F) -- CJK … Yi
-      or (cp >= 0xAC00 and cp <= 0xD7A3) -- Hangul Syllables
-      or (cp >= 0xF900 and cp <= 0xFAFF) -- CJK Compat Ideographs
-      or (cp >= 0xFE30 and cp <= 0xFE4F) -- CJK Compat Forms
-      or (cp >= 0xFF00 and cp <= 0xFF60) -- Fullwidth Forms
-      or (cp >= 0xFFE0 and cp <= 0xFFE6) -- Fullwidth signs
-      or (cp >= 0x1F300 and cp <= 0x1FAFF) -- emoji & pictographs
-      or (cp >= 0x20000 and cp <= 0x3FFFD) -- CJK Ext B+
-    )
-  then
-    return 2
-  end
-  return 1
-end
-
 -- Encode codepoint `cp` to its UTF-8 byte string. The inverse of `utf8_decode`,
 -- backing `vim.fn.nr2char`. An out-of-range / negative value is clamped to U+FFFD
 -- (the replacement char) so it always yields a valid string.
@@ -939,28 +914,28 @@ function btv.str.chars(s, _skipcc)
 end
 vim.fn.strchars = btv.str.chars
 
--- `btv.str.displaywidth(s[, col])` [alias `vim.fn.strdisplaywidth`]: the display cells `s`
--- occupies, expanding tabs to the next tabstop boundary and counting wide chars as
--- two. `col` is the starting screen column used for tab-stop math (default 0); the
--- return value is the width of `s` itself (cells consumed beyond `col`). INCOMPLETE:
--- tabs expand on a fixed tabstop of 8, not the current buffer's `'tabstop'`.
-function btv.str.displaywidth(s, col)
-  s = tostring(s or "")
-  local ts, base = 8, col or 0
-  local w, i = base, 1
-  while i <= #s do
-    local cp, len = utf8_decode(s, i)
-    if len == 0 then
-      break
-    end
-    if cp == 9 then
-      w = w + (ts - (w % ts)) -- tab advances to the next tabstop
-    else
-      w = w + char_width(cp)
-    end
-    i = i + len
+-- `btv.str.displaywidth(s[, col[, tabstop]])` [alias `vim.fn.strdisplaywidth`]: the display
+-- cells `s` occupies, measured as the window paints it: tabs expand to the next tab stop,
+-- wide characters count as two, combining marks as none, and a control character as its
+-- `^X` / `<xx>` substitution (`"\0"` is drawn `^@`, two cells). `col` is the starting
+-- screen column used for tab-stop math (default 0); the return value is the width of `s`
+-- itself (cells consumed beyond `col`). A byte that isn't UTF-8 counts as one cell.
+--
+-- Tab stops are the current buffer's `'tabstop'`, as in vim. `tabstop` names another
+-- (a bemtvi extension), for text bound for a buffer that isn't current, such as the one
+-- a decoration provider is painting: `btv.str.displaywidth(s, 0, btv.bo[buf].tabstop)`.
+function btv.str.displaywidth(s, col, tabstop)
+  local ts = tabstop
+  if ts == nil then
+    -- The current buffer's options, from the mirror the server refreshes before each
+    -- Lua entry (`btv._cur_buf`, `btv._bo_mirror`); 8 before there is one.
+    local cur = btv._cur_buf and btv._cur_buf.bufnr
+    local bo = cur and btv._bo_mirror and btv._bo_mirror[cur]
+    ts = bo and bo.tabstop or 8
+  elseif type(ts) ~= "number" or ts < 1 or ts % 1 ~= 0 then
+    error("btv.str.displaywidth: tabstop must be a positive integer", 2)
   end
-  return w - base
+  return btv._displaywidth(tostring(s or ""), col or 0, ts)
 end
 vim.fn.strdisplaywidth = btv.str.displaywidth
 

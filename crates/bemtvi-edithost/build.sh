@@ -47,6 +47,10 @@ command -v em++ >/dev/null 2>&1 || {
 #    its messages as JSON (`build-script-executed` names each script's `out_dir`,
 #    `compiler-artifact` the staticlib's path), for cached units too, and the paths come
 #    from there.
+command -v node >/dev/null 2>&1 || {
+  echo "error: node not found — it reads cargo's build messages, and runs the web tooling" >&2
+  exit 1
+}
 MSGS="$(mktemp)"
 trap 'rm -f "$MSGS"' EXIT
 EMCC_CFLAGS="-fwasm-exceptions" \
@@ -63,8 +67,11 @@ cargo_path() {
     const want = process.argv[1];
     const msgs = readFileSync(process.argv[2], "utf8").split("\n").filter(Boolean)
       .map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    // The run for the wasm target: should the package ever also be a build-dependency,
+    // its host build script reports an out_dir too, and that archive must not be linked.
     const outDir = (pkg) => msgs.filter((m) => m.reason === "build-script-executed"
-      && new RegExp(`[/#]${pkg}[@#]`).test(m.package_id)).map((m) => m.out_dir).pop();
+      && new RegExp(`[/#]${pkg}[@#]`).test(m.package_id)
+      && /[\\/]wasm32-unknown-emscripten[\\/]/.test(m.out_dir)).map((m) => m.out_dir).pop();
     let path;
     if (want === "lib") {
       path = msgs.filter((m) => m.reason === "compiler-artifact" && m.target.name === "bemtvi_edithost")

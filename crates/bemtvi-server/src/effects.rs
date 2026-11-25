@@ -2487,6 +2487,20 @@ impl EditHost {
         })
     }
 
+    /// [`push_buf_mirror`](Self::push_buf_mirror), but only when some buffer's text
+    /// changed since the last push (or a buffer appeared that was never pushed) — a
+    /// changedtick comparison per buffer, so a drain can call it before each Lua entry
+    /// without re-serializing the window and cursor state every time.
+    pub(crate) fn push_buf_mirror_if_behind(&mut self) {
+        let behind = self.editor.buffer_ids().into_iter().any(|id| {
+            let tick = self.editor.buffer_of(id).map(|b| b.changedtick);
+            tick.is_some() && self.buf_mirror_ticks.get(&id).copied() != tick
+        });
+        if behind {
+            self.push_buf_mirror();
+        }
+    }
+
     /// Refresh the Rust→Lua buffer mirror (`btv._bufs` + `btv._cur_cursor` +
     /// current window) the buffer-read API resolves against (Phase 6). Pushed
     /// before any Lua entry that can read buffer/cursor state. The per-buffer line
@@ -4751,8 +4765,10 @@ impl EditHost {
         let mut rounds = 0;
         // Refresh the buffer mirror before draining: everything that flows through
         // `run_pending` (user commands, scheduled / select callbacks, queued `:lua`)
-        // can read buffer/cursor state. The Lua API exposes no buffer-text write, so
-        // the mirror can't go stale mid-batch from Lua — once-at-entry is enough.
+        // can read buffer/cursor state. Lua's own text writes (`btv.buf.set_lines` /
+        // `set_text`) are queued and land *inside* the drain, so this entry push isn't
+        // the last word: each round, and the decor dispatch, catch up on them through
+        // `push_buf_mirror_if_behind`.
         self.push_buf_mirror();
         // …and the current-buffer snapshot, so a command body reading `expand("%")` (a
         // `:BtvDiffGit`-style command right after `:edit`) sees the current buffer's name.
@@ -4764,6 +4780,9 @@ impl EditHost {
         #[cfg(feature = "native")]
         let mut reconciled = false;
         loop {
+            // An edit a previous round's Lua queued has landed since the mirror was
+            // pushed: catch up before this round's handlers read it.
+            self.push_buf_mirror_if_behind();
             // File-change reconciles core deferred (`:checktime`, or the per-buffer
             // file watch): fire the `FileChangedShell` round-trip and apply the
             // choice. Inside the fixpoint so a handler's queued `vim.cmd`/`:lua`
@@ -5066,6 +5085,12 @@ impl EditHost {
                 // `recompute_decor_dirty` itself.
                 self.editor.recompute_decor_dirty();
                 for vp in self.editor.take_decor_dirty() {
+                    // A viewport dirtied by an edit this round's Lua made (a command's
+                    // promise continuation) is read by the provider through
+                    // `btv.buf.*`, so the mirror has to hold that edit. A provider
+                    // caching its work per `changedtick` would otherwise serve the
+                    // pre-edit result and, the viewport now clean, never run again.
+                    self.push_buf_mirror_if_behind();
                     self.dispatch_decor(vp);
                     self.apply_lua_effects();
                 }

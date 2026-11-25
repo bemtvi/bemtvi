@@ -660,3 +660,81 @@ async fn a_provider_told_no_grammar_reruns_once_one_is_installed() {
     );
     drop(guard);
 }
+
+#[tokio::test]
+async fn a_provider_reads_the_edit_a_query_continuation_made() {
+    // A `btv.treesitter.query` asked from a command settles inside the effects drain,
+    // so an edit its continuation queues lands mid-drain, after the mirror push at the
+    // drain's entry. The chained `:next` keeps the drain going another round, whose
+    // decor step dispatches the provider for the edited viewport — and the provider
+    // must read that edit through `btv.buf.*`. A provider caching its work per
+    // `changedtick` (the md-table aligner) otherwise serves the pre-edit result and is
+    // never asked again.
+    let (rpc, _incoming, _guard, _keep) = open_file!("tsq-edit", "md", SAMPLE);
+    exec_lua(
+        &rpc,
+        r#"
+        _G.seen = {}
+        btv.decor.provider({
+          name = "reader",
+          bufs = { filetype = { "markdown" } },
+          query = "(pipe_table) @t",
+          on_range = function(ctx, publish)
+            table.insert(_G.seen, {
+              ctx = table.concat(ctx.lines, "\n"),
+              mirror = table.concat(btv.buf.lines(ctx.buf, ctx.top, ctx.bot + 1), "\n"),
+            })
+            publish({})
+          end,
+        })
+        btv.decor.invalidate()
+        "#,
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return #_G.seen > 0").await,
+        "the provider never ran"
+    );
+    // From a user command, as a plugin's `:Command` makes it.
+    exec_lua(
+        &rpc,
+        r#"btv.command("EditViaQuery", function()
+          btv.treesitter.query(0, "(pipe_table) @t"):next(function(res)
+            local n = res.matches[1].captures.t[1]
+            btv.buf.set_lines(0, n[1], n[3], true, {
+              "Edited | Upstream |",
+              "|------|----------|",
+              "| a    | b        |",
+              "| c    | d        |",
+            })
+          end):next(function() end)
+        end)"#,
+    )
+    .await;
+    feed(&rpc, ":EditViaQuery<CR>");
+    assert!(
+        poll_true(
+            &rpc,
+            r#"for _, s in ipairs(_G.seen) do if s.ctx:find("Edited", 1, true) then return true end end
+            return false"#,
+        )
+        .await,
+        "the provider never ran on the edited viewport"
+    );
+    let stale = exec_lua(
+        &rpc,
+        r#"local out = {}
+        for _, s in ipairs(_G.seen) do
+          if s.ctx ~= s.mirror then
+            out[#out + 1] = ("viewport %q, mirror %q"):format(s.ctx, tostring(s.mirror))
+          end
+        end
+        return table.concat(out, "; ")"#,
+    )
+    .await;
+    assert_eq!(
+        stale.as_str(),
+        Some(""),
+        "a provider read a buffer older than the viewport it was dispatched for"
+    );
+}

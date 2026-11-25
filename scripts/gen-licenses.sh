@@ -53,6 +53,16 @@ if command -v cygpath >/dev/null; then lua_src=$(cygpath -u "$lua_src"); fi
 lua_h=$(ls "$(dirname "$lua_src")"/lua-5.4*/lua.h | tail -1)
 need "$lua_h"
 
+# QuickJS, which rquickjs-sys vendors (native only: :TSInstall's grammar generator).
+if [ "$mode" = native ]; then
+  rquickjs_sys=$(cargo metadata --format-version 1 --manifest-path "$manifest" \
+    | jq -r '.packages[] | select(.name == "rquickjs-sys") | .manifest_path' | head -1)
+  [ -n "$rquickjs_sys" ] || { echo "error: rquickjs-sys isn't in the dependency tree" >&2; exit 1; }
+  if command -v cygpath >/dev/null; then rquickjs_sys=$(cygpath -u "$rquickjs_sys"); fi
+  quickjs_license="$(dirname "$rquickjs_sys")/quickjs/LICENSE"
+  need "$quickjs_license"
+fi
+
 regex="$root/crates/bemtvi-regex"
 colors="$root/crates/bemtvi-server/runtime/colors"
 
@@ -85,6 +95,13 @@ EOF
   need "$regex/csrc/klib/kvec.h"
   sed -n '1,/^$/p' "$regex/csrc/klib/kvec.h" | sed 's|^// \{0,1\}||' \
     | component "klib (kvec.h)" "A vector macro library used by the vim regular expression engines." -
+
+  if [ "$mode" = native ]; then
+    component "QuickJS" "The JavaScript engine that evaluates a grammar's grammar.js when :TSInstall generates a parser (vendored by the rquickjs-sys crate)." \
+      "$quickjs_license"
+    component "tree-sitter grammar DSL" "The grammar DSL that :TSInstall evaluates grammar.js with (crates/bemtvi-ts/src/generate/dsl.js), from the tree-sitter-generate crate." \
+      "$root/crates/bemtvi-ts/src/generate/LICENSE"
+  fi
 
   if [ "$mode" = edithost ]; then
     emcc_path=$(command -v emcc) || { echo "error: emcc isn't on PATH" >&2; exit 1; }

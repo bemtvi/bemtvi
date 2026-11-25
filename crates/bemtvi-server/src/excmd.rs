@@ -272,7 +272,7 @@ impl EditHost {
             // one and it registered `:TSInstall`, this arm is skipped and the
             // user-command arm below runs the plugin's instead (no silent shadow).
             "TSInstall" | "TSUpdate" if !self.lua.has_user_command(name, cur_buf) => {
-                self.ts_install(args)
+                self.ts_install(args, name == "TSUpdate")
             }
             // `:TSInstallInfo` — list the installed grammars (native: the on-disk
             // parser scan; browser: what the JS highlighter can load). Same
@@ -543,7 +543,7 @@ impl EditHost {
     /// grammar and its queries from a CDN, caches in OPFS, and registers it —
     /// landing later via [`EditHost::complete_ts_install`]. One command body;
     /// the divergence lives behind `fx.ts_install`.
-    fn ts_install(&mut self, args: &str) {
+    fn ts_install(&mut self, args: &str, update: bool) {
         let langs = self.ts_install_langs(args);
         if langs.is_empty() {
             self.editor.echo(
@@ -557,8 +557,10 @@ impl EditHost {
         // Native `install()` dispatches repo specs itself, so they pass straight through.
         #[cfg(not(feature = "native"))]
         let langs = {
-            let (repos, langs): (Vec<String>, Vec<String>) =
-                langs.into_iter().partition(|l| l.contains('/'));
+            let (repos, langs): (Vec<String>, Vec<String>) = langs.into_iter().partition(|l| {
+                // `owner/repo[@ref]`; a `/` after the `@` is part of a version.
+                l.split('@').next().is_some_and(|name| name.contains('/'))
+            });
             if !repos.is_empty() {
                 self.editor.echo(format!(
                     "TSInstall: installing from a GitHub repo ({}) needs a C compiler and \
@@ -574,7 +576,7 @@ impl EditHost {
         self.editor
             .echo(format!("TSInstall: installing {}…", langs.join(", ")));
         for lang in langs {
-            self.fx.ts_install(lang);
+            self.fx.ts_install(lang, update);
         }
     }
 
@@ -594,7 +596,12 @@ impl EditHost {
             lines.push(format!("Available treesitter grammars ({}):", langs.len()));
             lines.push(String::new());
             for lang in &langs {
-                lines.push(lang.clone());
+                match self.ts_followed(lang) {
+                    Some(v) => lines.push(format!(
+                        "{lang:<14} following {v} (:TSUpdate fetches it again)"
+                    )),
+                    None => lines.push(lang.clone()),
+                }
             }
         }
         self.editor
@@ -641,6 +648,16 @@ impl EditHost {
                 };
                 lines.push(format!("{:<14} {}", p.lang, queries));
                 lines.push(format!("{:<14} {}", "", p.root.display()));
+                if let Some((git_ref, commit)) = &p.follows {
+                    let at = commit
+                        .as_deref()
+                        .map(|c| format!(" @ {}", c.chars().take(9).collect::<String>()))
+                        .unwrap_or_default();
+                    lines.push(format!(
+                        "{:<14} following {git_ref}{at} (:TSUpdate rebuilds it)",
+                        ""
+                    ));
+                }
             }
         }
         self.editor
@@ -652,10 +669,18 @@ impl EditHost {
     /// parser without a manual `:e`; on failure, echo the (loud) reason.
     #[cfg(feature = "native")]
     pub(crate) fn on_install_done(&mut self, outcome: crate::InstallOutcome) {
-        let (lang, result) = outcome;
+        let (spec, result) = outcome;
+        // `TSInstalled`'s pattern is the language: for a `lang@ref` spec that's
+        // `lang`, not the spec (a repo spec keeps its name until the build says which
+        // language it declares).
+        let mut lang = match spec.split_once('@') {
+            Some((l, _)) if !l.contains('/') => l.to_string(),
+            _ => spec.clone(),
+        };
         let mut error = None;
         match result {
             Ok(report) => {
+                lang = report.lang.clone();
                 self.editor.reload_ts_language(&report.lang);
                 // `reload_ts_language` re-opens open buffers in the *engine*, but the
                 // server's own highlight memo is keyed on (changedtick, viewport) —
@@ -663,7 +688,9 @@ impl EditHost {
                 // the next redraw re-queries the engine; otherwise a buffer opened
                 // before the grammar existed stays blank until the next edit/scroll.
                 self.syntax_states.clear();
-                let short = &report.revision[..report.revision.len().min(9)];
+                // By chars: a `lang@ref` whose archive names no commit reports the ref,
+                // which needn't be ASCII.
+                let short: String = report.revision.chars().take(9).collect();
                 let queries = if report.queries.is_empty() {
                     "no queries".to_string()
                 } else {
@@ -681,14 +708,23 @@ impl EditHost {
                 } else {
                     format!(" file-types[{}]", report.file_types.join(", "))
                 };
+                // A `lang@ref` install builds the grammar at the ref but keeps the
+                // pinned nvim-treesitter queries, which can lag a newer grammar.
+                let follows = match &report.follows {
+                    Some(r) => format!(
+                        " following {r} (queries are nvim-treesitter's pinned set and may \
+                         not match)"
+                    ),
+                    None => String::new(),
+                };
                 self.editor.echo(format!(
-                    "TSInstall: installed {} @ {short} [{}] (queries: {queries}{inherited}){file_types}",
+                    "TSInstall: installed {} @ {short}{follows} [{}] (queries: {queries}{inherited}){file_types}",
                     report.lang, report.compiler
                 ));
             }
             Err(e) => {
                 let why = format!("{e:#}");
-                self.editor.echo(format!("TSInstall: {lang} failed: {why}"));
+                self.editor.echo(format!("TSInstall: {spec} failed: {why}"));
                 error = Some(why);
             }
         }

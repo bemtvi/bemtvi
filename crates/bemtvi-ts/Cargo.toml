@@ -23,6 +23,9 @@ flate2.workspace = true
 xz2.workspace = true
 zip.workspace = true
 sha2.workspace = true
+# Generating a parser from `grammar.js` in-process (src/generate.rs).
+tree-sitter-generate.workspace = true
+rquickjs.workspace = true
 
 [dev-dependencies]
 # Grammar fixtures for the hermetic engine tests (`tests/fixture/`): the crates'

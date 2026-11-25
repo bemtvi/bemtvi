@@ -412,8 +412,10 @@ pub trait HostEffects {
     /// finished [`InstallReport`](bemtvi_ts::install::InstallReport) (or a loud error)
     /// returns *inbound* on the run loop's install arm, where the editor reloads the
     /// grammar and echoes. The native impl runs the work on a `spawn_blocking` worker;
-    /// the wasm build (Phase 5) supplies its own grammar-fetch path.
-    fn ts_install(&mut self, lang: String);
+    /// the wasm build supplies its own grammar-fetch path. `update` is `:TSUpdate`: a
+    /// language installed earlier at a ref (`lua@HEAD`) is built at that ref again,
+    /// where a `:TSInstall lua` goes back to the pinned revision.
+    fn ts_install(&mut self, lang: String, update: bool);
 
     /// Load a treesitter grammar off the editor thread. Compiling a language's
     /// queries is what a grammar load costs — hundreds of ms for a big one, none of
@@ -661,7 +663,7 @@ impl HostEffects for NativeEffects {
         });
     }
 
-    fn ts_install(&mut self, lang: String) {
+    fn ts_install(&mut self, lang: String, update: bool) {
         let tx = self.install_tx.clone();
         let Some(dir) = bemtvi_ts::data_dir() else {
             let _ = tx.send((
@@ -674,7 +676,11 @@ impl HostEffects for NativeEffects {
             return;
         };
         tokio::task::spawn_blocking(move || {
-            let result = bemtvi_ts::install::install(&dir, &lang);
+            let result = if update {
+                bemtvi_ts::install::update(&dir, &lang)
+            } else {
+                bemtvi_ts::install::install(&dir, &lang)
+            };
             // The receiver only drops at shutdown; a send error means we're exiting, so
             // there's nothing to report to.
             let _ = tx.send((lang, result));

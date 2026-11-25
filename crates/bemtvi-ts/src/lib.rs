@@ -13,6 +13,7 @@
 //! drop-in usable.
 
 pub mod engine;
+mod generate;
 pub mod install;
 pub mod loader;
 pub mod lua_pattern;
@@ -50,6 +51,9 @@ pub struct InstalledParser {
     /// `highlights`, `indents`), sorted. Empty means the parser loads but has no
     /// queries (no highlighting / ts-indent).
     pub queries: Vec<String>,
+    /// For a grammar installed as `lang@ref`: the ref it follows and, when the
+    /// archive said, the commit that was built. `None` at the pinned revision.
+    pub follows: Option<(String, Option<String>)>,
 }
 
 /// Enumerate installed parsers across the data-dir search path
@@ -74,10 +78,12 @@ pub fn installed_parsers() -> std::io::Result<Vec<InstalledParser>> {
                 continue; // an earlier (higher-precedence) root already has it
             }
             let queries = query_names_in(root, &lang)?;
+            let follows = install::followed_ref(root, &lang);
             out.push(InstalledParser {
                 lang,
                 root: root.clone(),
                 queries,
+                follows,
             });
         }
     }

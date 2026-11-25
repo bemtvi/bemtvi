@@ -1,0 +1,98 @@
+% A sample LaTeX document for trying the treesitter LaTeX grammar.
+% Its repository commits only grammar.js, so :TSInstall latex generates
+% the parser in-process before compiling it.
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+
+\title{Notes on Gradient Descent}
+\author{A. Sample}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+  We recall the gradient descent method for minimising a smooth function
+  $f \colon \R^n \to \R$ and state its convergence rate.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+Many problems in machine learning reduce to finding
+\[
+  x^\star = \operatorname*{arg\,min}_{x \in \R^n} f(x).
+\]
+When $f$ is differentiable, the gradient $\nabla f(x)$ points in the
+direction of steepest ascent, so we step the other way. See
+Section~\ref{sec:method} for the algorithm and \cite{nesterov2004} for
+the theory.
+
+\section{The method}
+\label{sec:method}
+
+Starting from $x_0$, gradient descent iterates
+\begin{equation}
+  x_{k+1} = x_k - \eta \, \nabla f(x_k),
+  \label{eq:update}
+\end{equation}
+where $\eta > 0$ is the \emph{step size}.
+
+\subsection{Assumptions}
+
+We assume $f$ is \textbf{convex} and $L$-smooth:
+\begin{align}
+  f(y) &\ge f(x) + \langle \nabla f(x), y - x \rangle, \\
+  \norm{\nabla f(x) - \nabla f(y)} &\le L \norm{x - y}.
+\end{align}
+
+\subsection{Convergence}
+
+\begin{itemize}
+  \item With $\eta = 1/L$, the error after $k$ steps is $O(1/k)$.
+  \item If $f$ is also $\mu$-strongly convex, it shrinks like
+        $\left(1 - \mu / L\right)^k$.
+\end{itemize}
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{lcc}
+    \hline
+    Setting         & Step size  & Rate              \\
+    \hline
+    Convex          & $1/L$      & $O(1/k)$          \\
+    Strongly convex & $1/L$      & $O((1-\mu/L)^k)$  \\
+    \hline
+  \end{tabular}
+  \caption{Convergence of gradient descent.}
+  \label{tab:rates}
+\end{table}
+
+\section{An implementation}
+
+\begin{lstlisting}[language=Python]
+def gradient_descent(grad, x, eta=0.1, steps=100):
+    for _ in range(steps):
+        x = x - eta * grad(x)
+    return x
+\end{lstlisting}
+
+% TODO: add a figure of the iterates.
+% \includegraphics[width=0.6\textwidth]{iterates.pdf}
+
+\begin{thebibliography}{9}
+  \bibitem{nesterov2004}
+    Y.~Nesterov, \textit{Introductory Lectures on Convex Optimization},
+    Springer, 2004.
+\end{thebibliography}
+
+\end{document}

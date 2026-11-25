@@ -25,7 +25,13 @@
 // the renderer already does).
 
 import { Parser, Language, Query } from './vendor/web-tree-sitter/web-tree-sitter.js';
-import { EXT, FT, REGISTRY, QUERY_KINDS, highlightSources, fetchQueryMerged, versionOf, resolveName } from './grammars.js';
+import { EXT, FT, REGISTRY, QUERY_KINDS, highlightSources, fetchQueryMerged, queriesFromNvimTs, versionOf, resolveName } from './grammars.js';
+// The commit build.sh stamps for fetching the committed `prebuilt` parsers (markdown's).
+// Imported dynamically: a vendor/ tree built before build.sh wrote it would otherwise fail
+// this whole module's import and take all highlighting down with it. Missing, it's empty,
+// which `:TSInstall markdown` already handles.
+const PREBUILT_COMMIT = await import('./vendor/build-info.js')
+  .then((m) => m.PREBUILT_COMMIT || '', () => '');
 import { sanitize } from './ts-sanitize.js';
 
 // Resolve vendored assets relative to THIS module, not the page, so the demo still
@@ -305,126 +311,81 @@ export function createHighlighter({ onReady } = {}) {
   }
 
   // Fetch the standard NON-highlights query set (indents/injections/folds/locals) for a
-  // grammar from the CDN. `indents` is special — the grammar packages don't ship a usable
-  // one, so it comes from nvim-treesitter (the worker indenter consumes it), falling back
-  // to the grammar package. The rest are best-effort (a grammar that doesn't ship one is
-  // skipped, not an error). Returns `{ kind: text, … }` for whatever was found.
-  async function fetchQuerySet(name, cfg) {
-    const ver = versionOf(cfg.pkg);
-    const extras = {};
-    for (const kind of QUERY_KINDS) {
-      if (kind === 'highlights') continue;
-      // Indents come from nvim-treesitter (the grammar packages don't ship a usable one),
-      // with the `; inherits:` chain merged (so `javascript` picks up `ecma`/`jsx`); fall
-      // back to the grammar package's own if nvim-treesitter has none.
-      if (kind === 'indents') {
-        const merged = await fetchQueryMerged(name, 'indents', fetchText, GH_BASE);
-        if (merged.trim()) { extras.indents = merged; continue; }
-        try { extras.indents = await fetchText(`${CDN_BASE}/${cfg.pkg}@${ver}/queries/indents.scm`); }
-        catch { /* no indents from either source */ }
-        continue;
+  // grammar. `indents`, `folds` and `textobjects` come from nvim-treesitter (inherit-merged;
+  // the grammar packages don't ship usable ones), the rest from the grammar package at
+  // `ver`. A language whose queries all come from nvim-treesitter (`queriesFrom`, markdown)
+  // takes every kind from there. Best-effort per kind: one a grammar doesn't ship is
+  // skipped, not an error. Returns `{ kind: text, … }` for whatever was found.
+  async function fetchQuerySet(name, cfg, ver) {
+    const fromNvimTs = queriesFromNvimTs(name);
+    // One kind's fetch; `null` when neither source has it. The kinds are independent, so
+    // they're fetched in parallel (each can take several round trips through `; inherits:`).
+    async function one(kind) {
+      if (fromNvimTs || kind === 'indents' || kind === 'folds' || kind === 'textobjects') {
+        const merged = await fetchQueryMerged(name, kind, fetchText, GH_BASE);
+        if (merged.trim()) return merged;
+        if (fromNvimTs || kind === 'textobjects') return null;
+        // Indents / folds: fall back to the grammar package's own.
       }
-      // Folds, like indents, come (inherit-merged) from nvim-treesitter so the browser
-      // matches native (the grammar package's own folds.scm, if any, can differ); fall back.
-      if (kind === 'folds') {
-        const merged = await fetchQueryMerged(name, 'folds', fetchText, GH_BASE);
-        if (merged.trim()) { extras.folds = merged; continue; }
-        try { extras.folds = await fetchText(`${CDN_BASE}/${cfg.pkg}@${ver}/queries/folds.scm`); }
-        catch { /* no folds from either source */ }
-        continue;
-      }
-      // Text objects come from the SEPARATE nvim-treesitter-textobjects repo (neither
-      // nvim-treesitter core nor the grammar package ships them), also inherit-merged; the
-      // worker's text-object runner (web/ts-textobjects.js) consumes them. Best-effort.
-      if (kind === 'textobjects') {
-        const merged = await fetchQueryMerged(name, 'textobjects', fetchText, GH_BASE);
-        if (merged.trim()) extras.textobjects = merged;
-        continue;
-      }
-      try { extras[kind] = await fetchText(`${CDN_BASE}/${cfg.pkg}@${ver}/queries/${kind}.scm`); }
-      catch { /* not shipped by this grammar */ }
+      try { return await fetchText(`${CDN_BASE}/${cfg.pkg}@${ver}/queries/${kind}.scm`); }
+      catch { return null; /* not shipped by this grammar */ }
     }
+    const kinds = QUERY_KINDS.filter((k) => k !== 'highlights');
+    const texts = await Promise.all(kinds.map(one));
+    const extras = {};
+    kinds.forEach((kind, i) => { if (texts[i] !== null) extras[kind] = texts[i]; });
     return extras;
   }
 
-  // `:TSInstall <name>` — make a grammar available. If it's already bundled/installed *with
-  // its indents.scm*, (re)register it (no network). If it's available but MISSING its
-  // indents (the offline bundle ships grammars without indents), fetch just the standard
-  // query set and cache it to OPFS next to the existing grammar — no parser.wasm refetch.
-  // Otherwise fetch the prebuilt `.wasm` + the standard query set from the CDN, sanitize
-  // highlights against the grammar, cache everything in OPFS (so it survives reload), and
-  // register it. Returns `{ ok, msg }` for the status line. highlights.scm feeds this UI
-  // highlighter; indents.scm is consumed by the worker's tree-sitter indenter
-  // (web/ts-indent.js); injections/folds/locals are cached for forward-compat.
-  async function install(rawName) {
-    await ready;
-    // Canonicalize first (`c#`/`csharp`/`cs` → `c_sharp`, …); `name` is what we cache,
-    // register, and report back, so OPFS / the installed manifest / `:TSInstallInfo` all
-    // use the one canonical spelling regardless of which alias the user typed.
-    const name = resolveName(rawName);
-    const cfg = REGISTRY[name];
-    if (!cfg) return { ok: false, name, msg: `unknown language '${rawName}'` };
+  // Which grammars were installed at a chosen npm version (`:TSInstall lua@latest`), so a
+  // `:TSUpdate` fetches that version again: `{ name: ref }`, kept in OPFS beside the
+  // install manifest (whose plain list of names the worker reads too, so it stays as is).
+  async function readFollows() {
+    try { return JSON.parse(await opfsReadText([...TS_DIR, 'follows.json'])) || {}; }
+    catch { return {}; }
+  }
+  async function writeFollows(follows) {
+    await opfsWriteBytes([...TS_DIR, 'follows.json'], new TextEncoder().encode(JSON.stringify(follows)));
+  }
+
+  // The npm version a `@ref` names. The browser installs published packages, not git
+  // refs, so a ref is an npm version or dist-tag; `HEAD` (native's "follow upstream") is
+  // taken as `latest`, the nearest thing npm has. A git sha is refused with that reason.
+  function npmVersion(ref) {
+    if (ref === 'HEAD') return { v: 'latest' };
+    if (/^[0-9a-f]{7,40}$/.test(ref) && /[a-f]/.test(ref)) {
+      return { error: `'${ref}' looks like a git commit; the browser installs published npm packages, so name an npm version or dist-tag (e.g. @latest)` };
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9.+_-]*$/.test(ref)) {
+      return { error: `invalid version '${ref}' (expected an npm version or dist-tag, e.g. @latest or @0.4.0)` };
+    }
+    return { v: ref };
+  }
+
+  // Where a `prebuilt` parser (markdown's two, which no npm package publishes) is fetched
+  // from: the committed file in bemtvi's own repository, through jsDelivr's GitHub mirror,
+  // at the commit build.sh stamped (the last one that changed treesitter/prebuilt/).
+  function prebuiltUrl(cfg) {
+    return `${GH_BASE}/bemtvi/bemtvi@${PREBUILT_COMMIT}/crates/bemtvi-edithost/treesitter/prebuilt/${cfg.prebuilt}`;
+  }
+
+  // Fetch a grammar's `.wasm` (from `wasmUrl`, else the npm package at `ver`) and its query
+  // set, check the highlights against it, cache everything in OPFS (so it survives a reload
+  // and wins over a bundled copy) and register it. Returns `{ ok, name, msg }`.
+  async function fetchAndCache(name, cfg, { ver, wasmUrl, source }) {
     const enc = (s) => new TextEncoder().encode(s);
-
-    // A bundle-only language: its npm package ships no `.wasm`, so ours is compiled from
-    // source and committed (`prebuilt` — markdown's two parsers), which also means jsDelivr
-    // has no wasm to fetch. There is genuinely nothing to install, so say so instead of
-    // 404ing on a URL that cannot exist — and if the vendored copy is missing, fail loud
-    // rather than pretending an install could fix it.
-    if (cfg.prebuilt) {
-      if (!isAvail(name)) {
-        return { ok: false, name, msg: `no upstream wasm for '${name}' — it ships in the offline bundle (rebuild web/vendor)` };
-      }
-      langs.delete(name);
-      await load(name);
-      return langs.get(name)
-        ? { ok: true, name, msg: 'bundled (offline only — upstream ships no wasm)' }
-        : { ok: false, name, msg: 'bundled grammar failed to load' };
-    }
-
-    // Already available WITH indents — re-register from cache, no network (also the
-    // `:TSUpdate` of a complete bundled lang).
-    if (isAvail(name) && await hasIndents(name)) {
-      langs.delete(name);
-      await load(name);
-      return langs.get(name)
-        ? { ok: true, name, msg: installed.has(name) ? 'already installed' : 'bundled' }
-        : { ok: false, name, msg: 'cached grammar failed to load' };
-    }
-
-    // Available but missing its indents.scm (a bundled grammar gen-treesitter couldn't
-    // fetch indents for, or an older install). The grammar itself is fine — fetch only the
-    // standard query set and cache it to OPFS beside the existing (bundled or installed)
-    // grammar. The worker indenter prefers an OPFS-cached indents.scm over the absent
-    // vendored one (see ts-indent.js), so it picks these up on the post-install reload.
-    if (isAvail(name)) {
-      try {
-        const extras = await fetchQuerySet(name, cfg);
-        if (!extras.indents) return { ok: false, name, msg: 'no indents.scm available for this language' };
-        for (const [kind, text] of Object.entries(extras)) {
-          await opfsWriteBytes([...TS_DIR, name, kind + '.scm'], enc(text));
-        }
-        // Keep the in-memory highlighter as-is (highlights are unchanged); the indenter
-        // reloads off OPFS. memo is cleared so any pending repaint re-runs cleanly.
-        memo = { lang: null, text: null, from: 0, to: 0, spans: null };
-        notify();
-        return { ok: true, name, msg: `queries: ${Object.keys(extras).join('+')}` };
-      } catch (e) {
-        return { ok: false, name, msg: String(e && e.message ? e.message : e) };
-      }
-    }
-
     try {
-      const ver = versionOf(cfg.pkg);
-      const wasmBytes = await fetchBytes(`${CDN_BASE}/${cfg.pkg}@${ver}/${cfg.wasm}`);
+      const wasmBytes = await fetchBytes(wasmUrl || `${CDN_BASE}/${cfg.pkg}@${ver}/${cfg.wasm}`);
       const language = await Language.load(wasmBytes);
 
-      // highlights.scm — concatenate the registry's source list (ts builds on js, …),
-      // then sanitize against the grammar (drop predicates / patterns it can't run).
-      const rawHl = (
-        await Promise.all(highlightSources(name).map(([pkg, file]) =>
-          fetchText(`${CDN_BASE}/${pkg}@${versionOf(pkg)}/${file}`)))
-      ).join('\n');
+      // highlights.scm — from nvim-treesitter for a `queriesFrom` language, else the
+      // registry's source list (ts builds on js, …) with this package at `ver`; then
+      // sanitized against the grammar (drop predicates / patterns it can't run).
+      const rawHl = queriesFromNvimTs(name)
+        ? await fetchQueryMerged(name, 'highlights', fetchText, GH_BASE)
+        : (await Promise.all(highlightSources(name).map(([pkg, file]) =>
+          fetchText(`${CDN_BASE}/${pkg}@${pkg === cfg.pkg ? ver : versionOf(pkg)}/${file}`)))
+        ).join('\n');
       const parser = new Parser();
       parser.setLanguage(language);
       const tree = parser.parse(cfg.sample);
@@ -436,7 +397,7 @@ export function createHighlighter({ onReady } = {}) {
       // The rest of the standard query set (indents/injections/folds/locals). Fetched
       // BEFORE the sample tree is released: injections.scm is sanitized against it, the
       // same way highlights just were.
-      const extras = await fetchQuerySet(name, cfg);
+      const extras = await fetchQuerySet(name, cfg, ver);
 
       // Register with the injections query too (compiled from what we just fetched), so a
       // freshly installed grammar reaches its embedded languages immediately rather than
@@ -464,10 +425,137 @@ export function createHighlighter({ onReady } = {}) {
       memo = { lang: null, text: null, from: 0, to: 0, spans: null }; // a now-installed buffer must re-highlight
       notify();
       const kinds = ['highlights', ...Object.keys(extras)].join('+');
-      return { ok: true, name, msg: `${cfg.pkg}@${ver}, queries: ${kinds}` };
+      return { ok: true, name, msg: `${source || `${cfg.pkg}@${ver}`}, queries: ${kinds}` };
     } catch (e) {
       return { ok: false, name, msg: String(e && e.message ? e.message : e) };
     }
+  }
+
+  // `:TSInstall <name>[@version]` / `:TSUpdate <name>` — make a grammar available.
+  //
+  // - `name@version` fetches the npm package at that version or dist-tag (`@latest`;
+  //   `@HEAD` means `latest`) and remembers it, so `:TSUpdate name` fetches it again.
+  // - A plain `name` goes back to the pinned version and forgets one remembered. If the
+  //   grammar is already bundled/installed *with its indents.scm*, it's (re)registered with
+  //   no network; if it's available but MISSING its indents (the offline bundle ships some
+  //   without), just the query set is fetched; otherwise the `.wasm` + query set.
+  // - markdown (a `prebuilt` language: no npm package publishes its wasm) is fetched from
+  //   bemtvi's own repository, both halves: `markdown_inline` is what it injects.
+  //
+  // Returns `{ ok, name, msg }` for the status line. highlights.scm feeds this UI
+  // highlighter; indents.scm is consumed by the worker's tree-sitter indenter
+  // (web/ts-indent.js); injections/folds/locals/textobjects by the worker's other runners.
+  async function install(rawSpec, { update = false } = {}) {
+    await ready;
+    const spec = String(rawSpec);
+    const at = spec.indexOf('@');
+    const rawName = at < 0 ? spec : spec.slice(0, at);
+    let ref = at < 0 ? null : spec.slice(at + 1);
+    // Canonicalize first (`c#`/`csharp`/`cs` → `c_sharp`, …); `name` is what we cache,
+    // register, and report back, so OPFS / the installed manifest / `:TSInstallInfo` all
+    // use the one canonical spelling regardless of which alias the user typed.
+    const name = resolveName(rawName);
+    const cfg = REGISTRY[name];
+    if (!cfg) return { ok: false, name, msg: `unknown language '${rawName}'` };
+
+    const follows = await readFollows();
+    if (ref === null && update && follows[name]) ref = follows[name];
+
+    if (ref !== null) {
+      if (cfg.prebuilt) {
+        return { ok: false, name, msg: `${name}'s browser parser is bemtvi's own build (no npm package publishes one), so it has no versions to pick from — use :TSInstall ${name}` };
+      }
+      const v = npmVersion(ref);
+      if (v.error) return { ok: false, name, msg: v.error };
+      const res = await fetchAndCache(name, cfg, { ver: v.v });
+      if (res.ok) {
+        follows[name] = ref;
+        await writeFollows(follows);
+        res.msg += ` (following ${ref}; :TSUpdate fetches it again)`;
+        res.follows = ref;
+      }
+      return res;
+    }
+
+    // A plain install: the pinned version, forgetting one a `name@version` remembered —
+    // but only once the pinned grammar has replaced it, so a failed fetch leaves the
+    // followed version (still what OPFS holds) on record.
+    const wasFollowing = Object.prototype.hasOwnProperty.call(follows, name);
+
+    if (cfg.prebuilt) {
+      if (!PREBUILT_COMMIT) {
+        // No commit to fetch from, but the offline bundle has it: re-register that.
+        if (isAvail(name)) {
+          langs.delete(name);
+          await load(name);
+          return langs.get(name)
+            ? { ok: true, name, msg: 'bundled (this build has no prebuilt-parser commit to fetch a newer copy from)' }
+            : { ok: false, name, msg: 'bundled grammar failed to load' };
+        }
+        return { ok: false, name, msg: `this build has no prebuilt-parser commit to fetch ${name} from (build.sh stamps it from git) — rebuild from a git checkout` };
+      }
+      const names = name === 'markdown' ? ['markdown', 'markdown_inline'] : [name];
+      const source = `bemtvi@${PREBUILT_COMMIT.slice(0, 9)}`;
+      let last;
+      for (const n of names) {
+        const c = REGISTRY[n];
+        last = await fetchAndCache(n, c, { ver: versionOf(c.pkg), wasmUrl: prebuiltUrl(c), source });
+        if (!last.ok) return { ok: false, name, msg: `${n}: ${last.msg}` };
+      }
+      return { ok: true, name, msg: names.length > 1 ? `${last.msg} (+${names.slice(1).join(', ')})` : last.msg };
+    }
+
+    if (!wasFollowing) {
+      // Already available WITH indents — re-register from cache, no network (also the
+      // `:TSUpdate` of a complete bundled lang).
+      if (isAvail(name) && await hasIndents(name)) {
+        langs.delete(name);
+        await load(name);
+        return langs.get(name)
+          ? { ok: true, name, msg: installed.has(name) ? 'already installed' : 'bundled' }
+          : { ok: false, name, msg: 'cached grammar failed to load' };
+      }
+
+      // Available but missing its indents.scm (a bundled grammar gen-treesitter couldn't
+      // fetch indents for, or an older install). The grammar itself is fine — fetch only the
+      // standard query set and cache it to OPFS beside the existing (bundled or installed)
+      // grammar. The worker indenter prefers an OPFS-cached indents.scm over the absent
+      // vendored one (see ts-indent.js), so it picks these up on the post-install reload.
+      if (isAvail(name)) {
+        try {
+          const extras = await fetchQuerySet(name, cfg, versionOf(cfg.pkg));
+          if (!extras.indents) return { ok: false, name, msg: 'no indents.scm available for this language' };
+          const enc = (s) => new TextEncoder().encode(s);
+          for (const [kind, text] of Object.entries(extras)) {
+            await opfsWriteBytes([...TS_DIR, name, kind + '.scm'], enc(text));
+          }
+          // Keep the in-memory highlighter as-is (highlights are unchanged); the indenter
+          // reloads off OPFS. memo is cleared so any pending repaint re-runs cleanly.
+          memo = { lang: null, text: null, from: 0, to: 0, spans: null };
+          notify();
+          return { ok: true, name, msg: `queries: ${Object.keys(extras).join('+')}` };
+        } catch (e) {
+          return { ok: false, name, msg: String(e && e.message ? e.message : e) };
+        }
+      }
+    }
+
+    const res = await fetchAndCache(name, cfg, { ver: versionOf(cfg.pkg) });
+    if (res.ok && wasFollowing) {
+      delete follows[name];
+      await writeFollows(follows);
+    }
+    return res;
+  }
+
+  // Installs run one at a time. Each reads, then rewrites, the OPFS manifest and
+  // `follows.json`; `:TSInstall a@latest b@latest` sends both at once, and two installs
+  // interleaving would each write back a record missing the other's entry.
+  let installQueue = Promise.resolve();
+  function queuedInstall(spec, opts) {
+    const run = installQueue.then(() => install(spec, opts));
+    installQueue = run.catch(() => {});
+    return run;
   }
 
   // The grammar for a file name, or null if unsupported / not yet available. A known
@@ -922,6 +1010,6 @@ export function createHighlighter({ onReady } = {}) {
     spansForFencedMarkdown,
     spansForCodeBlocks,
     colorsForLine,
-    install,
+    install: queuedInstall,
   };
 }

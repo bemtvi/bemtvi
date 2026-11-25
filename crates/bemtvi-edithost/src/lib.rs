@@ -374,8 +374,9 @@ struct Sink {
     /// Drained by [`eh_take_ts_requests`] for the Worker to forward to the UI thread,
     /// which fetches the prebuilt `.wasm` + queries (offline bundle / OPFS / jsDelivr),
     /// caches + registers them with the JS highlighter, and lands the outcome back via
-    /// [`eh_ts_install_complete`]. Browser-side fetch, not a native compile.
-    ts_requests: Vec<String>,
+    /// [`eh_ts_install_complete`]. Browser-side fetch, not a native compile. The flag
+    /// is `:TSUpdate` (follow the version a grammar was installed at) vs `:TSInstall`.
+    ts_requests: Vec<(String, bool)>,
     /// The browser clipboard mirror backing the `"+` / `"*` registers: the text and whether
     /// it is linewise. It is the value the UI last pushed in from `navigator.clipboard`
     /// ([`eh_clipboard_push`], refreshed on focus / paste), the last in-editor `"+` / `"*`
@@ -1169,13 +1170,13 @@ impl HostEffects for WasmEffects {
         );
     }
 
-    fn ts_install(&mut self, lang: String) {
+    fn ts_install(&mut self, lang: String, update: bool) {
         // `:TSInstall <lang>` on the browser build: record the request for the Worker to
         // forward to the UI thread (`eh_take_ts_requests` → `ts_install` postMessage),
         // where web-tree-sitter lives. The UI fetches the prebuilt grammar (offline
         // bundle / OPFS cache / jsDelivr), registers it, and lands the outcome back via
         // `eh_ts_install_complete`. Fire-and-forget — the editor tick doesn't block on it.
-        self.sink.borrow_mut().ts_requests.push(lang);
+        self.sink.borrow_mut().ts_requests.push((lang, update));
     }
 
     fn lsp_ensure(&mut self, key: ServerKey, spawn: ServerSpawn) {
@@ -1755,7 +1756,8 @@ fn stat_to_wire_json(stat: bemtvi_core::FileStat) -> serde_json::Value {
 }
 
 /// Drain the treesitter grammars the editor asked to install this convergence (one per
-/// `:TSInstall <lang>`) as a JSON `["lang", …]` array, emptying the queue so each is
+/// `:TSInstall <lang>` / `:TSUpdate <lang>`) as a JSON `[{"lang", "update"}, …]` array,
+/// emptying the queue so each is
 /// forwarded to the UI thread exactly once. The Worker posts a `ts_install` message per
 /// language; the UI fetches/caches/registers the grammar (web-tree-sitter is UI-side) and
 /// lands the outcome via [`eh_ts_install_complete`]. Caller frees with [`eh_free_string`].
@@ -1773,7 +1775,10 @@ pub unsafe extern "C" fn eh_take_ts_requests(h: *mut WasmEditHost) -> *mut c_cha
             return into_owned_cstr("[]".into());
         }
     }
-    let reqs: Vec<String> = std::mem::take(&mut handle.sink.borrow_mut().ts_requests);
+    let reqs: Vec<serde_json::Value> = std::mem::take(&mut handle.sink.borrow_mut().ts_requests)
+        .into_iter()
+        .map(|(lang, update)| serde_json::json!({ "lang": lang, "update": update }))
+        .collect();
     into_owned_cstr(serde_json::to_string(&reqs).unwrap_or_else(|_| "[]".into()))
 }
 
@@ -1896,11 +1901,16 @@ pub unsafe extern "C" fn eh_ts_install_complete(
     lang: *const c_char,
     ok: i32,
     msg: *const c_char,
+    follows: *const c_char,
 ) {
     let handle = host_or!(h);
-    handle
-        .host
-        .complete_ts_install(as_str(lang).to_string(), ok != 0, as_str(msg).to_string());
+    let follows = as_str(follows);
+    handle.host.complete_ts_install(
+        as_str(lang).to_string(),
+        ok != 0,
+        as_str(msg).to_string(),
+        (!follows.is_empty()).then(|| follows.to_string()),
+    );
 }
 
 /// The worker's query runner finished loading a grammar a `btv.treesitter.query` or a
@@ -1915,17 +1925,31 @@ pub unsafe extern "C" fn eh_ts_grammar_ready(h: *mut WasmEditHost) {
     handle.host.ts_grammar_ready();
 }
 
-/// Seed the grammars available to the JS highlighter at boot, from a JSON `["lang", …]`
-/// array the Worker assembles by reading the offline bundle's manifest and the OPFS
-/// install cache. Backs `:TSInstallInfo`. See [`EditHost::seed_ts_installed`].
+/// Seed the grammars available to the JS highlighter at boot, from a JSON
+/// `{"langs": ["lang", …], "follows": {"lang": "version", …}}` the Worker assembles by
+/// reading the offline bundle's manifest and the OPFS install cache (and its record of
+/// grammars installed at a chosen version). Backs `:TSInstallInfo`. See
+/// [`EditHost::seed_ts_installed`].
 ///
 /// # Safety
 /// `h` must come from [`eh_new`] and not yet be freed; `json` is a valid C string.
 #[no_mangle]
 pub unsafe extern "C" fn eh_ts_seed_installed(h: *mut WasmEditHost, json: *const c_char) {
     let handle = host_or!(h);
-    let langs: Vec<String> = serde_json::from_str(as_str(json)).unwrap_or_default();
-    handle.host.seed_ts_installed(langs);
+    let seed: serde_json::Value = serde_json::from_str(as_str(json)).unwrap_or_default();
+    let langs = seed["langs"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let follows = seed["follows"]
+        .as_object()
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    handle.host.seed_ts_installed(langs, follows);
 }
 
 /// Pointer to the snapshotted bytes of the in-flight off-tick write `seq` (a `double` so

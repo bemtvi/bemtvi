@@ -15,7 +15,7 @@
 // algorithm (web/ts-indent.js) expects. The grammar npm packages don't ship a usable
 // `indents.scm` — only `highlights.scm` lives there — so indents come from
 // nvim-treesitter's `runtime/queries/<lang>/indents.scm`, exactly like native.
-export const NVIM_TS_REF = '4916d6592ede8c07973490d9322f187e07dfefac';
+export const NVIM_TS_REF = '52773f0d13a0c11d0c3ef33c14ab6ecc1c17148b';
 
 // The jsDelivr URL for `lang`'s nvim-treesitter `indents.scm` at the pinned ref, or
 // null for a language not in the registry. `base` overrides the CDN host (a test
@@ -39,7 +39,7 @@ export function foldSource(name, base) {
 // textobjects.scm is the same revision the ported range logic (web/ts-textobjects.js)
 // expects. These queries live in a SEPARATE repo from nvim-treesitter core (which ships
 // none), under `queries/<lang>/textobjects.scm` — a different repo AND path than folds.
-export const NVIM_TS_TEXTOBJECTS_REF = '898ee307df58f854d11cd7edd06472574d48014e';
+export const NVIM_TS_TEXTOBJECTS_REF = '5c7b0263797dfd1bd6202f2b219f3b53a80b2187';
 
 // The jsDelivr URL for `lang`'s nvim-treesitter-textobjects `textobjects.scm` at the
 // pinned ref, or null for a language not in the registry. `base` overrides the CDN host.
@@ -140,8 +140,9 @@ export const VERSIONS = {
 // Plus, for the languages whose npm package ships no usable wasm or queries:
 //   prebuilt    file under `treesitter/prebuilt/` holding a *committed* parser wasm,
 //               compiled from the package's C sources (see prebuilt/README.md), used
-//               INSTEAD of `wasm`. Such a language is bundle-only: there is no
-//               prebuilt wasm on the CDN, so `:TSInstall` can't fetch it either.
+//               INSTEAD of `wasm`. No npm package publishes it, so `:TSInstall` fetches
+//               the committed file from bemtvi's own repository (through jsDelivr's
+//               GitHub mirror, at the commit build.sh stamps in vendor/build-info.js).
 //   grammarDir  subdirectory of a multi-grammar package holding this parser's sources
 //               (markdown ships two: block + inline). Only used to rebuild `prebuilt`.
 //   queriesFrom `'nvim-treesitter'` when the queries come from nvim-treesitter at the
@@ -321,7 +322,8 @@ export const REGISTRY = {
 // The languages bundled into web/vendor/ for offline use. Kept small: rust (the repo's
 // own language; verify-ui.mjs asserts it), lua (bemtvi config), the common
 // json/javascript/typescript/python, and markdown + its inline half (docs, READMEs and
-// every hover float are markdown, and it CAN'T be `:TSInstall`ed — no wasm upstream).
+// every hover float are markdown, and no npm package publishes its wasm: `:TSInstall`
+// fetches bemtvi's own committed copy).
 // Everything else is fetched on demand via `:TSInstall` and cached in OPFS.
 export const BUNDLED = ['rust', 'lua', 'json', 'javascript', 'typescript', 'python', 'markdown', 'markdown_inline'];
 

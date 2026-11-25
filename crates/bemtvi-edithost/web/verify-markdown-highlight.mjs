@@ -8,7 +8,8 @@
 //      i.e. the fence's info string routed that region to the rust grammar;
 //   4. plain prose stays uncoloured (the paint follows captures, it isn't blanket-tinted);
 //   5. all of it offline — zero CDN traffic, since both markdown parsers ship in the bundle
-//      (they have to: upstream publishes no markdown `.wasm`, so `:TSInstall` can't get one).
+//      (upstream publishes no markdown `.wasm`; `:TSInstall markdown` fetches bemtvi's own
+//      committed copy, see verify-tsinstall-versions.mjs).
 //
 // Plus a direct probe of the highlighter module for the capture NAMES behind those colours,
 // which pins the semantics a colour comparison can only imply — including that

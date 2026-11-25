@@ -2222,6 +2222,11 @@ pub struct EditHost {
     /// like native's [`bemtvi_ts::installed_parsers`] — this set is that listing. Wasm only.
     #[cfg(not(feature = "native"))]
     ts_installed: std::collections::BTreeSet<String>,
+    /// The browser grammars installed at a chosen npm version (`:TSInstall lua@latest`),
+    /// language → the version or dist-tag they follow, for `:TSInstallInfo`. Seeded at
+    /// boot from the JS host's record and updated by each completed install. Wasm only.
+    #[cfg(not(feature = "native"))]
+    ts_follows: std::collections::BTreeMap<String, String>,
     /// The browser client's chord substitutions (`<C-w>` → `<A-w>`), mirrored into
     /// `btv.ui.caps().key_labels` so a which-key popup names the chord the visitor can
     /// actually press. The page computes them — only it knows the platform and which
@@ -2540,6 +2545,8 @@ impl EditHost {
             held_input: std::collections::VecDeque::new(),
             #[cfg(not(feature = "native"))]
             ts_installed: std::collections::BTreeSet::new(),
+            #[cfg(not(feature = "native"))]
+            ts_follows: std::collections::BTreeMap::new(),
             #[cfg(not(feature = "native"))]
             key_labels: Vec::new(),
             #[cfg(not(feature = "native"))]
@@ -3885,8 +3892,13 @@ impl EditHost {
     /// plus whatever the previous session installed into OPFS, both discovered by the
     /// Worker (it owns the manifests). Backs `:TSInstallInfo`; idempotent. No echo /
     /// repaint — this runs before the first frame.
-    pub fn seed_ts_installed(&mut self, langs: Vec<String>) {
+    pub fn seed_ts_installed(
+        &mut self,
+        langs: Vec<String>,
+        follows: std::collections::BTreeMap<String, String>,
+    ) {
         self.ts_installed.extend(langs);
+        self.ts_follows.extend(follows);
     }
 
     /// Apply a finished browser `:TSInstall`: the JS host fetched + cached the grammar
@@ -3901,10 +3913,23 @@ impl EditHost {
     /// through `WasmSyntax::reload_grammar`, so they pick the new grammar up instead of
     /// keeping a cached "no grammar", and it re-runs the decoration providers of that
     /// language's buffers.
-    pub fn complete_ts_install(&mut self, lang: String, ok: bool, msg: String) {
+    ///
+    /// `follows` is the npm version or dist-tag the grammar was installed at
+    /// (`lua@latest`), `None` for its pinned version; it is only read on success.
+    pub fn complete_ts_install(
+        &mut self,
+        lang: String,
+        ok: bool,
+        msg: String,
+        follows: Option<String>,
+    ) {
         if ok {
             self.editor.reload_ts_language(&lang);
             self.ts_installed.insert(lang.clone());
+            match follows {
+                Some(v) => self.ts_follows.insert(lang.clone(), v),
+                None => self.ts_follows.remove(&lang),
+            };
             let detail = if msg.is_empty() {
                 String::new()
             } else {
@@ -3936,6 +3961,12 @@ impl EditHost {
     /// answer to native's on-disk parser scan ([`bemtvi_ts::installed_parsers`]).
     pub fn ts_installed_list(&self) -> Vec<String> {
         self.ts_installed.iter().cloned().collect()
+    }
+
+    /// The npm version or dist-tag `lang` follows (`:TSInstall lua@latest`), for
+    /// `:TSInstallInfo`; `None` at its pinned version.
+    pub fn ts_followed(&self, lang: &str) -> Option<&str> {
+        self.ts_follows.get(lang).map(String::as_str)
     }
 }
 

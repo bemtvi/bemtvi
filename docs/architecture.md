@@ -1178,7 +1178,9 @@ fs/process half is OPFS or a remote daemon over WebTransport.
   markdown buffer reaches the `markdown_inline` grammar and its fences' languages), and
   `:TSInstall` fetches a prebuilt `.wasm` grammar. The one exception to "generated": no
   markdown `.wasm` is published anywhere, so its two parsers are compiled from the pinned
-  npm sources and **committed** under `treesitter/prebuilt/`.
+  npm sources and **committed** under `treesitter/prebuilt/`; `:TSInstall markdown`
+  fetches that committed copy through jsDelivr's GitHub mirror, at the commit `build.sh`
+  stamps into `web/vendor/build-info.js`.
 - **Excluded from the workspace.** It targets `wasm32-unknown-emscripten` and links C
   via `emcc`, so it is in the root Cargo.toml's `[workspace] exclude` (the host
   `cargo build/test/clippy --workspace` never touches it) and pins its own
@@ -1300,10 +1302,13 @@ screen," and that is exactly the shape of these tests.
   **landed**: the native arm fetches + compiles each grammar into the data dir
   off the editor thread (`bemtvi_ts::install`, with a pinned checksum-verified Zig
   fetched on demand — never a compiler from PATH — unless `$BEMTVI_CC` is set),
-  and the browser arm fetches a *prebuilt* `.wasm` grammar instead. The
-  `:set`-driven highlight toggle has landed too. (Residual `:TSInstall` edges —
-  grammars needing `tree-sitter generate`, no install-from-`HEAD` — are tracked in
-  [*Known approximations*](known-approximations.md).) Treesitter **injections**
+  and the browser arm fetches a *prebuilt* `.wasm` grammar instead. A repo that
+  commits only `grammar.js` is generated in-process (an embedded QuickJS evaluates
+  it and `tree-sitter-generate` writes the parser; `bemtvi_ts::generate`), and
+  `:TSInstall lang@ref` builds a catalog grammar at a ref that `:TSUpdate` follows
+  (see [Installing treesitter grammars](features/treesitter-install.md)). The
+  `:set`-driven highlight toggle has landed too. (The remaining `:TSInstall` edges
+  are tracked in [*Known approximations*](known-approximations.md).) Treesitter **injections**
   have landed (engine-native, see
   [*Syntax highlighting*](#syntax-highlighting-treesitter)). Treesitter is the
   **native engine**; control is declarative buffer state (see

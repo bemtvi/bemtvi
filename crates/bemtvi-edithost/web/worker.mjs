@@ -148,7 +148,7 @@ const eh_sock_closed = M.cwrap("eh_sock_closed", null, ["number", "number", "str
 // the grammar and lands the outcome back via `eh_ts_install_complete`. `eh_ts_seed_installed`
 // tells the core, at boot, which grammars are already available (bundle + OPFS cache).
 const eh_take_ts_requests = M.cwrap("eh_take_ts_requests", "number", ["number"]);
-const eh_ts_install_complete = M.cwrap("eh_ts_install_complete", null, ["number", "string", "number", "string"]);
+const eh_ts_install_complete = M.cwrap("eh_ts_install_complete", null, ["number", "string", "number", "string", "string"]);
 const eh_ts_grammar_ready = M.cwrap("eh_ts_grammar_ready", null, ["number"]);
 const eh_ts_seed_installed = M.cwrap("eh_ts_seed_installed", null, ["number", "string"]);
 // The page's chord substitutions (`{"<C-w>": "<A-w>"}`), for `btv.ui.caps().key_labels`.
@@ -463,7 +463,14 @@ async function bootWithConfig() {
     const cache = await opfsRead("/.bemtvi/treesitter/manifest.json"); // kind 0 = present (raw `bytes`)
     const cacheText = cache.kind === 0 && cache.bytes ? utf8(cache.bytes) : ""; // UTF-8 JSON; decode raw bytes
     if (cacheText.length) for (const l of JSON.parse(cacheText)) avail.add(l);
-    eh_ts_seed_installed(h, JSON.stringify([...avail]));
+    // Grammars installed at a chosen npm version (`:TSInstall lua@latest`), for the listing.
+    // A damaged record loses only the versions, not the whole listing.
+    let follows = {};
+    try {
+      const fol = await opfsRead("/.bemtvi/treesitter/follows.json");
+      if (fol.kind === 0 && fol.bytes) follows = JSON.parse(utf8(fol.bytes) || "{}") || {};
+    } catch { follows = {}; }
+    eh_ts_seed_installed(h, JSON.stringify({ langs: [...avail], follows }));
   } catch (e) {
     postMessage({ type: "config_error", error: "treesitter seed: " + e });
   }
@@ -2156,7 +2163,7 @@ async function drainWatchRequests() {
 // keystroke, so no extra repaint is needed here. Returns whether any were sent.
 function drainTsRequests() {
   const reqs = JSON.parse(readStr(eh_take_ts_requests(h)));
-  for (const lang of reqs) postMessage({ type: "ts_install", lang });
+  for (const { lang, update } of reqs) postMessage({ type: "ts_install", lang, update });
   return reqs.length > 0;
 }
 
@@ -2404,7 +2411,7 @@ async function runLoopSAB(ctrl, data) {
         // outcome (echo + record installed). Not a user request, so it earns a repaint but
         // no ack / shada churn — skip the `acks.push` below.
         const r = JSON.parse(utf8(payload));
-        eh_ts_install_complete(h, String(r.lang), r.ok ? 1 : 0, String(r.msg || ""));
+        eh_ts_install_complete(h, String(r.lang), r.ok ? 1 : 0, String(r.msg || ""), String(r.follows || ""));
         tsLanded = true;
         continue;
       } else if (type === 7) {
@@ -2677,7 +2684,7 @@ onmessage = async (ev) => {
   // `:TSInstall` outcome from the UI (SAB sends it as a ring type-6 frame instead). Land
   // the echo + record, then repaint so the status line shows it.
   if (msg.type === "ts_install_result") {
-    eh_ts_install_complete(h, String(msg.lang), msg.ok ? 1 : 0, String(msg.msg ?? ""));
+    eh_ts_install_complete(h, String(msg.lang), msg.ok ? 1 : 0, String(msg.msg ?? ""), String(msg.follows ?? ""));
     postMessage(redrawMsg());
     return;
   }

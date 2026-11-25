@@ -1,0 +1,47 @@
+-- ~~~ bemtvi :TSInstall playground: a grammar generated from grammar.js ~~~
+--
+-- The LaTeX grammar's repository commits only `grammar.js`, not a generated
+-- parser. bemtvi generates one itself (an embedded JavaScript engine evaluates
+-- grammar.js; tree-sitter's generator writes the parser), then compiles it. No
+-- `tree-sitter` CLI, no `node`, no C toolchain needed.
+--
+-- This config is empty on purpose: everything here is a command you type.
+--
+-- Run it (from the repo root) against the sample document:
+--
+--     BEMTVI_CONFIG=examples/treesitter-install \
+--       cargo run -p bemtvi -- examples/treesitter-install/sample.tex
+--
+--------------------------------------------------------------------------------
+-- 1. Install the grammar.
+--
+--    TYPE THIS: `:TSInstall latex`. SEE THAT: the message line says
+--    `TSInstall: installing latex…`, and after several seconds (the first install
+--    also fetches a pinned Zig) `TSInstall: installed latex @ …`. The document
+--    lights up as soon as it lands: commands, sections, math and comments in their
+--    own colours. Nothing to reopen.
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+-- 2. See what's installed.
+--
+--    TYPE THIS: `:TSInstallInfo`. SEE THAT: a `latex` row listing its queries
+--    (highlights, injections, folds, textobjects) and the directory it lives in.
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+-- 3. Follow upstream instead of the pinned revision.
+--
+--    TYPE THIS: `:TSInstall latex@HEAD`. SEE THAT: `installed latex @ <commit>
+--    following HEAD …`, and `:TSInstallInfo` now says `following HEAD @ <commit>`.
+--    `:TSUpdate latex` builds HEAD again; a plain `:TSInstall latex` goes back to
+--    the pinned revision.
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+-- 4. Folds from the grammar.
+--
+--    TYPE THIS: `:set foldmethod=expr foldexpr=v:lua.btv.treesitter.foldexpr()`,
+--    then `zM`. SEE THAT: each section and environment folds to one line. `zR`
+--    opens them all again.
+--------------------------------------------------------------------------------

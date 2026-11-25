@@ -172,16 +172,17 @@ fetch/compile — aren't listed; only the edges that still diverge are.)
   principle 2). `vim.fn.*` is a hand-written set of helper aliases, not an
   interpreter — unimplemented `vim.fn.*` entries are loud gaps, not a TODO to
   build an evaluator.
-- **`:TSInstall` approximations.** The command fetches/compiles grammars
-  (`bemtvi_ts::install`), with a pinned, checksum-verified Zig fetched on demand
-  (never a compiler from PATH; `$BEMTVI_CC` overrides) — on macOS, Linux, and
-  Windows alike. Remaining: (1) grammars needing `tree-sitter
-  generate` (no committed `src/parser.c`) fail loud rather than generating;
-  (2) the nvim-treesitter ref is pinned in source — no `:TSInstall`-from-`HEAD`;
-  (3) in the **browser**, markdown can't be installed at all — no npm package publishes a
-  markdown `.wasm` — so its two parsers (block + inline) ship as committed wasm in the
-  offline bundle (`crates/bemtvi-edithost/treesitter/prebuilt/`) and `:TSInstall markdown`
-  reports that instead of fetching.
+- **`:TSInstall` edges.** The command fetches and compiles grammars
+  (`bemtvi_ts::install`) with a pinned, checksum-verified Zig fetched on demand (never a
+  compiler from PATH; `$BEMTVI_CC` overrides), generates a parser in-process when a repo
+  commits only `grammar.js`, and builds a catalog grammar at a ref with `lang@ref`; see
+  [Installing treesitter grammars](features/treesitter-install.md). What it doesn't do:
+  (1) a `grammar.js` that imports an npm package or a node built-in can't be generated
+  from the repository alone, and fails naming the module; (2) `lang@ref` builds the
+  grammar at the ref but keeps nvim-treesitter's pinned queries, which can name nodes a
+  newer grammar renamed; (3) in the **browser**, grammars are published npm packages, so
+  `@ref` is an npm version or dist-tag (`@HEAD` means `latest`), and `owner/repo`
+  installs are refused (they need a C compiler).
 - **Tree-sitter query-directive approximations.** `(#trim! @fold)` is ignored by **both**
   engines, so markdown's `(section)` fold runs to the blank line before the next section.
   The browser's injection runner (`web/highlight.js`) additionally parses each

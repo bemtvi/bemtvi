@@ -998,9 +998,9 @@
     }
     // Report a `:TSInstall` outcome back to the Worker (so the core echoes + records it) — a
     // ring type-6 frame under SAB, a message under 5c, matching `bind`/`shada_flush`.
-    function tsInstallResultOp(lang, ok, msg) {
-      if (useSAB) pushFrame(6, enc(JSON.stringify({ lang, ok, msg })));
-      else worker.postMessage({ type: "ts_install_result", lang, ok, msg });
+    function tsInstallResultOp(lang, ok, msg, follows) {
+      if (useSAB) pushFrame(6, enc(JSON.stringify({ lang, ok, msg, follows })));
+      else worker.postMessage({ type: "ts_install_result", lang, ok, msg, follows });
     }
     // Push the OS clipboard's text into the Worker's `"+`/`"*` read mirror — a ring type-8
     // frame under SAB (ordered with the feeds, so it lands before a following `"+p`), a
@@ -1237,11 +1237,11 @@
       if (msg.type === "ts_install") {
         const lang = String(msg.lang);
         const res = (ts && ts.install)
-          ? await ts.install(lang)
+          ? await ts.install(lang, { update: !!msg.update })
           : { ok: false, msg: "syntax highlighter unavailable (tree-sitter vendor not built)" };
         // Report the canonical name the highlighter resolved (e.g. `c#` → `c_sharp`) so the
         // core's echo + `:TSInstallInfo` record match what's cached in OPFS.
-        tsInstallResultOp(res.name || lang, res.ok, res.msg || "");
+        tsInstallResultOp(res.name || lang, res.ok, res.msg || "", res.follows || "");
         return;
       }
       // A `"+`/`"*` yank/delete — write the text to the real clipboard (only the UI thread can

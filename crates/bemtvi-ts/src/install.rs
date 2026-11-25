@@ -10,7 +10,9 @@
 //!   1. fetch `parsers.lua`, extract the `<lang>` `install_info` (url + revision),
 //!   2. download the grammar repo tarball at that revision and unpack it,
 //!   3. compile `src/parser.c` (+ a `scanner.{c,cc}` if present) into
-//!      `<data>/parser/<lang>.so`, using a resolved C compiler,
+//!      `<data>/parser/<lang>.so`, using a resolved C compiler — generating
+//!      `parser.c` first, in-process, when the repo commits only `grammar.js`
+//!      ([`crate::generate`]),
 //!   4. copy the standard queries into `<data>/queries/<lang>/`.
 //!
 //! The compiler is resolved in [`resolve_compiler`]: an explicit `$BEMTVI_CC`
@@ -31,13 +33,13 @@ use anyhow::{anyhow, bail, Context, Result};
 /// nvim-treesitter commit the install reads from — `parsers.lua` (grammar repos +
 /// pinned revisions) and `runtime/queries/`. Pinning the ref pins every grammar
 /// transitively. Override with `$BEMTVI_TS_REF` (a branch, tag, or sha).
-const NVIM_TS_REF: &str = "4916d6592ede8c07973490d9322f187e07dfefac";
+const NVIM_TS_REF: &str = "52773f0d13a0c11d0c3ef33c14ab6ecc1c17148b";
 
 /// nvim-treesitter-textobjects commit the install reads `textobjects.scm` from.
 /// The textobjects queries live in this **separate** repo (nvim-treesitter core
 /// ships none), under `queries/<lang>/textobjects.scm` — a different path than the
 /// core repo's `runtime/queries/`. Pinned; override with `$BEMTVI_TS_TEXTOBJECTS_REF`.
-const NVIM_TS_TEXTOBJECTS_REF: &str = "898ee307df58f854d11cd7edd06472574d48014e";
+const NVIM_TS_TEXTOBJECTS_REF: &str = "5c7b0263797dfd1bd6202f2b219f3b53a80b2187";
 
 /// Zig version fetched to build every grammar (unless `$BEMTVI_CC` is set). The per-target archive
 /// + SHA-256 are pinned in [`zig_target`]; bump all three together.
@@ -51,8 +53,14 @@ const QUERY_FILES: &[&str] = &["highlights", "indents", "injections", "folds", "
 #[derive(Debug, Clone)]
 pub struct InstallReport {
     pub lang: String,
-    /// The grammar revision (from nvim-treesitter's `parsers.lua`) that was built.
+    /// The grammar revision that was built: nvim-treesitter's pinned one, or for a
+    /// `lang@ref` install the commit `ref` resolved to (the ref itself when the
+    /// archive doesn't say).
     pub revision: String,
+    /// For a `lang@ref` install, the ref it follows (`HEAD`, a branch, tag or sha):
+    /// recorded so `:TSUpdate` builds it again. `None` for the pinned revision and
+    /// for a repo install.
+    pub follows: Option<String>,
     /// The compiled parser written under `<data>/parser/`.
     pub parser: PathBuf,
     /// Query file basenames copied into `<data>/queries/<lang>/` (e.g. `indents`).
@@ -78,20 +86,191 @@ struct ParserEntry {
     location: Option<String>,
 }
 
-/// Install grammar `spec` into `data_dir`. `spec` is either a catalog **language
-/// name** (`rust`) resolved through nvim-treesitter's `parsers.lua`, or a GitHub
-/// **repo spec** (`owner/repo` or `owner/repo@ref`) built straight from the repo.
-/// A spec containing `/` is treated as a repo. See the module docs for the flow.
+/// Install grammar `spec` into `data_dir` (`:TSInstall`). `spec` is one of:
+///
+/// - a catalog **language name** (`rust`), resolved through nvim-treesitter's
+///   `parsers.lua` and built at its pinned revision;
+/// - a catalog language **at a ref** (`rust@HEAD`, or a branch, tag or sha): the same
+///   grammar repo built at `ref`, with the queries still from the pinned
+///   nvim-treesitter. The ref is recorded, so [`update`] follows it;
+/// - a GitHub **repo spec** (`owner/repo` or `owner/repo@ref`), built straight from
+///   the repo. A spec containing `/` is treated as a repo.
+///
+/// A plain language name forgets a ref recorded by an earlier `lang@ref` install.
+/// See the module docs for the flow.
 pub fn install(data_dir: &Path, spec: &str) -> Result<InstallReport> {
     if let Some(repo) = parse_repo_spec(spec) {
+        let turn = install_turn(&format!("{}/{}", repo.owner, repo.repo));
+        let _held = turn.lock().unwrap_or_else(|e| e.into_inner());
         return install_from_repo(data_dir, &repo);
     }
-    install_from_catalog(data_dir, spec)
+    let (lang, git_ref) = parse_catalog_spec(spec)?;
+    let turn = install_turn(lang);
+    let _held = turn.lock().unwrap_or_else(|e| e.into_inner());
+    install_from_catalog(data_dir, lang, git_ref)
 }
 
-/// Install a catalog language (the original flow): resolve `parsers.lua`, build the
-/// grammar at the pinned revision, copy nvim-treesitter's matched query sets.
-fn install_from_catalog(data_dir: &Path, lang: &str) -> Result<InstallReport> {
+/// The lock an install of `key` (a language, or `owner/repo`) holds while it runs.
+/// `:TSInstall rust rust@HEAD` runs both installs on parallel workers, and two installs
+/// of one grammar share its build dir, its parser and its record: each would delete the
+/// other's unpacked source. Different grammars still install in parallel. A poisoned
+/// lock (an install panicked) guards no state, so callers take it anyway.
+fn install_turn(key: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static TURNS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    TURNS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key.to_string())
+        .or_default()
+        .clone()
+}
+
+/// Reinstall grammar `spec` (`:TSUpdate`). Like [`install`], except that a plain
+/// language name installed earlier as `lang@ref` is built at that ref again rather
+/// than going back to the pinned revision.
+pub fn update(data_dir: &Path, spec: &str) -> Result<InstallReport> {
+    if parse_repo_spec(spec).is_none() && !spec.contains('@') {
+        let turn = install_turn(spec);
+        let held = turn.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(record) = read_follow_record(data_dir, spec)? {
+            return install_from_catalog(data_dir, spec, Some(&record.git_ref));
+        }
+        // No record: a plain install, which takes the turn itself.
+        drop(held);
+    }
+    install(data_dir, spec)
+}
+
+/// Split a catalog spec into the language and an optional ref: `lua` or `lua@HEAD`.
+fn parse_catalog_spec(spec: &str) -> Result<(&str, Option<&str>)> {
+    match spec.split_once('@') {
+        None => Ok((spec, None)),
+        Some((lang, git_ref)) => {
+            if !valid_ref(git_ref) {
+                bail!("invalid ref '{git_ref}' in '{spec}' (expected a branch, tag or sha)");
+            }
+            Ok((lang, Some(git_ref)))
+        }
+    }
+}
+
+/// Whether `git_ref` can name a branch, tag or sha. It goes into a URL path
+/// (`archive/<ref>.tar.gz`), so it is limited to letters, digits and `-_.+/` — what
+/// branch, tag and sha names use in practice — which keeps `?`, `#`, `%` and the like
+/// from turning it into a query, a fragment or an escape. No `..`, no leading `/` or
+/// `-`, no trailing `/` or `.`.
+fn valid_ref(git_ref: &str) -> bool {
+    !git_ref.is_empty()
+        && git_ref
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/'))
+        && !git_ref.contains("..")
+        && !git_ref.contains("//")
+        && !git_ref.starts_with(['/', '-'])
+        && !git_ref.ends_with(['/', '.'])
+}
+
+/// What a `lang@ref` install records in `<data>/parser-info/<lang>.json`.
+struct FollowRecord {
+    git_ref: String,
+}
+
+fn follow_record_path(data_dir: &Path, lang: &str) -> PathBuf {
+    data_dir.join("parser-info").join(format!("{lang}.json"))
+}
+
+/// The ref `lang` follows, from its record; `None` when it was installed at the
+/// pinned revision (no record). A record that can't be read fails loud rather than
+/// quietly falling back to the pinned revision.
+fn read_follow_record(data_dir: &Path, lang: &str) -> Result<Option<FollowRecord>> {
+    if !crate::loader::is_valid_language(lang) {
+        return Ok(None);
+    }
+    let path = follow_record_path(data_dir, lang);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let json: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    let git_ref = json
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .filter(|r| valid_ref(r))
+        .with_context(|| format!("{} has no valid \"ref\"", path.display()))?;
+    Ok(Some(FollowRecord {
+        git_ref: git_ref.to_string(),
+    }))
+}
+
+/// The ref `lang` follows, for `:TSInstallInfo`: `(ref, commit)` from its record, or
+/// `None` at the pinned revision (or with no readable record).
+pub fn followed_ref(data_dir: &Path, lang: &str) -> Option<(String, Option<String>)> {
+    let text = std::fs::read_to_string(follow_record_path(data_dir, lang)).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let git_ref = json.get("ref")?.as_str()?.to_string();
+    let commit = json
+        .get("commit")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Some((git_ref, commit))
+}
+
+/// Record (`Some`) or forget (`None`) the ref `lang` follows.
+fn write_follow_record(
+    data_dir: &Path,
+    lang: &str,
+    follow: Option<(&str, Option<&str>)>,
+) -> Result<()> {
+    let path = follow_record_path(data_dir, lang);
+    match follow {
+        None => match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
+        },
+        Some((git_ref, commit)) => {
+            let dir = path.parent().expect("record path has a parent");
+            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+            let json = serde_json::json!({ "ref": git_ref, "commit": commit });
+            std::fs::write(&path, serde_json::to_string_pretty(&json)? + "\n")
+                .with_context(|| format!("write {}", path.display()))
+        }
+    }
+}
+
+/// The commit a GitHub archive was made from. GitHub builds archives with
+/// `git archive`, which writes the commit id into a pax global header (`comment`)
+/// at the start of the tarball. `None` if there isn't one.
+fn archive_commit(tarball: &[u8]) -> Option<String> {
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tarball));
+    let mut entries = archive.entries().ok()?;
+    let mut first = entries.next()?.ok()?;
+    if !first.header().entry_type().is_pax_global_extensions() {
+        return None;
+    }
+    for ext in first.pax_extensions().ok()??.flatten() {
+        if ext.key().ok()? == "comment" {
+            let value = ext.value().ok()?.trim();
+            if value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Install a catalog language: resolve `parsers.lua`, build the grammar at the
+/// pinned revision (or at `git_ref`), copy nvim-treesitter's matched query sets.
+fn install_from_catalog(
+    data_dir: &Path,
+    lang: &str,
+    git_ref: Option<&str>,
+) -> Result<InstallReport> {
     if !crate::loader::is_valid_language(lang) {
         bail!("invalid language name '{lang}' (letters, digits, '_' and '-' only)");
     }
@@ -100,32 +279,41 @@ fn install_from_catalog(data_dir: &Path, lang: &str) -> Result<InstallReport> {
     let (owner, repo) = github_owner_repo(&entry.url)
         .with_context(|| format!("grammar url is not a GitHub repo: {}", entry.url))?;
 
-    // 1. Download + unpack the grammar source at the pinned revision.
+    // 1. Download + unpack the grammar source at the pinned revision (or the ref).
     let build_dir = data_dir.join(".ts-build").join(lang);
     let _ = std::fs::remove_dir_all(&build_dir);
     std::fs::create_dir_all(&build_dir)
         .with_context(|| format!("create build dir {}", build_dir.display()))?;
+    let wanted = git_ref.unwrap_or(&entry.revision);
     let tarball = fetch(&format!(
-        "https://github.com/{owner}/{repo}/archive/{}.tar.gz",
-        entry.revision
-    ))?;
+        "https://github.com/{owner}/{repo}/archive/{wanted}.tar.gz"
+    ))
+    .with_context(|| match git_ref {
+        Some(r) => format!("download {owner}/{repo} at '{r}' — is the ref spelled right?"),
+        None => format!("download {owner}/{repo} at {wanted}"),
+    })?;
+    let revision = match git_ref {
+        Some(r) => archive_commit(&tarball).unwrap_or_else(|| r.to_string()),
+        None => entry.revision.clone(),
+    };
     unpack_tar_gz(&tarball, &build_dir).with_context(|| format!("unpack {repo} source tarball"))?;
     // The archive's single top-level directory — *discovered*, not computed.
     // GitHub names it `<repo>-<ref>` but mangles `<ref>`: a version-like tag
     // `v0.25.0` becomes `…-0.25.0` (leading `v` stripped), so `{repo}-{revision}`
     // would miss it. Reading the one extracted dir is robust to tag vs sha.
-    let mut src_root = single_subdir(&build_dir).with_context(|| {
+    let unpacked = single_subdir(&build_dir).with_context(|| {
         format!(
             "locating unpacked {repo} source under {}",
             build_dir.display()
         )
     })?;
-    if let Some(loc) = &entry.location {
-        src_root = src_root.join(loc);
-    }
-    // A repo that commits only `grammar.js` is generated with the `tree-sitter` CLI
-    // if the user has it (else this fails loud naming what's missing).
-    ensure_parser_c(&src_root, &format!("grammar '{lang}'"))?;
+    let src_root = match &entry.location {
+        Some(loc) => unpacked.join(loc),
+        None => unpacked.clone(),
+    };
+    // A repo that commits only `grammar.js` (nvim-treesitter's `generate = true`) is
+    // generated here first.
+    ensure_parser_c(&src_root, &unpacked, &format!("grammar '{lang}'"))?;
     let src_dir = src_root.join("src");
     let parser_c = src_dir.join("parser.c");
 
@@ -140,12 +328,17 @@ fn install_from_catalog(data_dir: &Path, lang: &str) -> Result<InstallReport> {
     // 3. Copy queries matched to this revision (plus inherited query sets).
     let (queries, inherited) = install_queries(data_dir, lang)?;
 
+    // 4. Remember the ref (or forget an old one), so `:TSUpdate` builds the same.
+    let commit = (git_ref.is_some() && revision.len() == 40).then_some(revision.as_str());
+    write_follow_record(data_dir, lang, git_ref.map(|r| (r, commit)))?;
+
     // Best-effort cleanup of the unpacked source; the parser is self-contained.
     let _ = std::fs::remove_dir_all(&build_dir);
 
     Ok(InstallReport {
         lang: lang.to_string(),
-        revision: entry.revision,
+        revision,
+        follows: git_ref.map(str::to_string),
         parser: out,
         queries,
         inherited,
@@ -185,9 +378,7 @@ fn parse_repo_spec(spec: &str) -> Option<RepoSpec> {
     if !name_ok(owner) || !name_ok(repo) {
         return None;
     }
-    // A ref must be a single non-empty token (branches/tags/shas never contain
-    // whitespace); slashes are allowed, but a `..` or leading `/` is not a ref.
-    if git_ref.is_empty() || git_ref.split_whitespace().count() != 1 || git_ref.contains("..") {
+    if !valid_ref(git_ref) {
         return None;
     }
     Some(RepoSpec {
@@ -245,7 +436,7 @@ fn install_from_repo(data_dir: &Path, spec: &RepoSpec) -> Result<InstallReport> 
     }
 
     // The declared `path` is a subdir of the repo: an absolute or `..` one would build
-    // (and `tree-sitter generate` would write) outside the unpacked source.
+    // (and generating would write) outside the unpacked source.
     if !Path::new(&meta.path).components().all(|c| {
         matches!(
             c,
@@ -264,7 +455,7 @@ fn install_from_repo(data_dir: &Path, spec: &RepoSpec) -> Result<InstallReport> 
     } else {
         root.join(&meta.path)
     };
-    ensure_parser_c(&grammar_root, &format!("repo {owner}/{repo}"))?;
+    ensure_parser_c(&grammar_root, &root, &format!("repo {owner}/{repo}"))?;
     let src_dir = grammar_root.join("src");
     let parser_c = src_dir.join("parser.c");
     let (cc, compiler_desc) = resolve_compiler(data_dir)?;
@@ -277,11 +468,17 @@ fn install_from_repo(data_dir: &Path, spec: &RepoSpec) -> Result<InstallReport> 
     // 4. Copy the repo's own queries (custom grammars aren't in nvim-treesitter).
     let queries = copy_repo_queries(data_dir, &meta.lang, &grammar_root)?;
 
+    // This build replaces any catalog `lang@ref` one, so forget the ref it followed:
+    // otherwise `:TSInstallInfo` keeps naming it and `:TSUpdate <lang>` rebuilds the
+    // catalog grammar over this one.
+    write_follow_record(data_dir, &meta.lang, None)?;
+
     let _ = std::fs::remove_dir_all(&build_dir);
 
     Ok(InstallReport {
         lang: meta.lang,
         revision: git_ref.clone(),
+        follows: None,
         parser: out,
         queries,
         inherited: Vec::new(),
@@ -578,10 +775,20 @@ fn compile(cc: &[String], src_dir: &Path, parser_c: &Path, out: &Path) -> Result
     let mut cmd = Command::new(prog);
     bemtvi_core::process::no_console_window(&mut cmd)
         .args(prefix)
-        .args(["-shared", "-fPIC", "-O2"])
-        .arg("-I")
-        .arg(src_dir)
-        .arg(parser_c);
+        .args(["-shared", "-fPIC", "-O2"]);
+    // On macOS, Zig names the target itself instead of detecting the host: Zig 0.15's
+    // detection doesn't know macOS 26, and with it a `-shared` build links no libc, so
+    // every grammar whose scanner calls `calloc`/`free` fails with undefined symbols.
+    // An explicit target links Zig's bundled libSystem stubs, whatever the SDK.
+    if is_zig && cfg!(target_os = "macos") {
+        let arch = if cfg!(target_arch = "aarch64") {
+            "aarch64"
+        } else {
+            "x86_64"
+        };
+        cmd.args(["-target", &format!("{arch}-macos")]);
+    }
+    cmd.arg("-I").arg(src_dir).arg(parser_c);
     if let Some(s) = &scanner {
         cmd.arg(s);
     }
@@ -631,39 +838,43 @@ fn resolve_compiler(data_dir: &Path) -> Result<(Vec<String>, String)> {
     ))
 }
 
-/// Ensure `<grammar_root>/src/parser.c` exists, generating it from `grammar.js`
-/// when the repo committed only the grammar definition. bemtvi can't generate a
-/// parser itself — that needs the **`tree-sitter` CLI** and its JS toolchain — so if
-/// `grammar.js` is present we shell out to a `tree-sitter` on PATH (override with
-/// `$BEMTVI_TREE_SITTER_CLI`). Every branch fails *loud* naming what's missing: no
-/// sources to build, the CLI absent, or `generate` itself erroring.
-fn ensure_parser_c(grammar_root: &Path, what: &str) -> Result<()> {
+/// Make sure `grammar_root/src/parser.c` exists. A committed one is used as is.
+/// Otherwise it is generated: by the `tree-sitter` CLI named in
+/// `$BEMTVI_TREE_SITTER_CLI` when that is set, else in-process
+/// ([`crate::generate`]: `src/grammar.json` if committed, else `grammar.js`
+/// evaluated in an embedded QuickJS). `root` is the unpacked source tree, which
+/// bounds what `grammar.js` may `require`.
+fn ensure_parser_c(grammar_root: &Path, root: &Path, what: &str) -> Result<()> {
     let src_dir = grammar_root.join("src");
     if src_dir.join("parser.c").exists() {
         return Ok(());
     }
-    if !grammar_root.join("grammar.js").exists() {
+    if !grammar_root.join("grammar.js").exists() && !src_dir.join("grammar.json").exists() {
         bail!(
-            "{what} ships neither src/parser.c nor grammar.js at {} — nothing to build",
+            "{what} ships neither src/parser.c, src/grammar.json nor grammar.js at {} — \
+             nothing to build",
             grammar_root.display()
         );
     }
     let Some(cli) = tree_sitter_cli() else {
-        bail!(
-            "{what} ships grammar.js but no generated src/parser.c. Generating one \
-             needs the `tree-sitter` CLI (https://tree-sitter.github.io) — install it \
-             and re-run, or install a repo that commits the generated parser"
-        );
+        return crate::generate::generate(grammar_root, root).with_context(|| {
+            format!("{what} ships no generated src/parser.c; generating it failed")
+        });
     };
-    let output = bemtvi_core::process::no_console_window(&mut Command::new(&cli))
-        .arg("generate")
+    let mut cmd = Command::new(&cli);
+    cmd.arg("generate");
+    // Without an argument the CLI reads `grammar.js`; a repo that commits only
+    // `src/grammar.json` has to be named.
+    if !grammar_root.join("grammar.js").exists() {
+        cmd.arg(src_dir.join("grammar.json"));
+    }
+    let output = bemtvi_core::process::no_console_window(&mut cmd)
         .current_dir(grammar_root)
         .output()
         .with_context(|| format!("run `{cli} generate` in {}", grammar_root.display()))?;
     if !output.status.success() {
         bail!(
-            "`{cli} generate` failed in {} — {what} may need a newer CLI or a JS \
-             runtime for its grammar.js:\n{}",
+            "`{cli} generate` ($BEMTVI_TREE_SITTER_CLI) failed in {}:\n{}",
             grammar_root.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -677,26 +888,14 @@ fn ensure_parser_c(grammar_root: &Path, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// The `tree-sitter` CLI to invoke, or `None` if unavailable. `$BEMTVI_TREE_SITTER_CLI`
-/// (a path or program name) wins; otherwise a `tree-sitter` on PATH.
+/// The `tree-sitter` CLI `$BEMTVI_TREE_SITTER_CLI` names (a path or program name), or
+/// `None` to generate in-process. A CLI on `PATH` is not picked up on its own: the
+/// in-process generator is the default everywhere, so an install doesn't depend on
+/// what happens to be installed.
 fn tree_sitter_cli() -> Option<String> {
-    if let Ok(p) = std::env::var("BEMTVI_TREE_SITTER_CLI") {
-        if !p.trim().is_empty() {
-            return Some(p);
-        }
-    }
-    program_exists("tree-sitter", &["--version"]).then(|| "tree-sitter".to_string())
-}
-
-/// Whether running `name <args…>` succeeds (the tool is present on PATH).
-fn program_exists(name: &str, args: &[&str]) -> bool {
-    bemtvi_core::process::no_console_window(&mut Command::new(name))
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    std::env::var("BEMTVI_TREE_SITTER_CLI")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -911,10 +1110,94 @@ fn single_subdir(dir: &Path) -> Result<PathBuf> {
 /// Unpack a gzip-compressed tarball into `dest`.
 fn unpack_tar_gz(bytes: &[u8], dest: &Path) -> Result<()> {
     let gz = flate2::read::GzDecoder::new(bytes);
-    tar::Archive::new(gz)
-        .unpack(dest)
-        .with_context(|| format!("unpack tar.gz into {}", dest.display()))?;
+    let mut archive = tar::Archive::new(gz);
+    let entries = archive
+        .entries()
+        .with_context(|| format!("read tar.gz for {}", dest.display()))?;
+    for entry in entries {
+        let mut entry = entry.context("read a tar entry")?;
+        // `tar` keeps hardlinks and entry paths inside `dest`, but creates a symlink to
+        // any target. A grammar's source is untrusted, and the build writes into it
+        // (a generated `src/parser.c`) and reads from it: a `src` symlink to a directory
+        // elsewhere would have both happen there. So a symlink must resolve inside the
+        // archive.
+        if entry.header().entry_type().is_symlink() {
+            let path = entry
+                .path()
+                .context("read a tar entry's path")?
+                .into_owned();
+            let target = entry
+                .link_name()
+                .context("read a symlink's target")?
+                .with_context(|| format!("symlink {} has no target", path.display()))?
+                .into_owned();
+            if !symlink_stays_inside(&path, &target) {
+                bail!(
+                    "the archive's symlink {} -> {} points outside it; refusing to unpack",
+                    path.display(),
+                    target.display()
+                );
+            }
+        }
+        entry
+            .unpack_in(dest)
+            .with_context(|| format!("unpack into {}", dest.display()))?;
+    }
+    // The check above reads each link's target as text, which can't see through
+    // another link: `a/l -> ..` is fine alone, but `src -> a/l/../x` climbs one
+    // level further on disk than it does lexically. So once everything is on disk,
+    // resolve every symlink for real and refuse one that lands outside `dest`.
+    let root =
+        std::fs::canonicalize(dest).with_context(|| format!("resolve {}", dest.display()))?;
+    check_symlinks_inside(dest, &root)
+}
+
+/// Walk `dir` (not following symlinks) and fail on any symlink that resolves outside
+/// `root`. A dangling one is removed: it can't be read, and writing through it (a
+/// generated `src/parser.c`) would create its target, wherever that is.
+fn check_symlinks_inside(dir: &Path, root: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let path = entry?.path();
+        let meta =
+            std::fs::symlink_metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+        if meta.file_type().is_symlink() {
+            match std::fs::canonicalize(&path) {
+                Ok(real) if real.starts_with(root) => {}
+                Ok(real) => bail!(
+                    "the archive's symlink {} resolves to {}, outside it; refusing to unpack",
+                    path.display(),
+                    real.display()
+                ),
+                Err(_) => std::fs::remove_file(&path)
+                    .with_context(|| format!("remove dangling symlink {}", path.display()))?,
+            }
+        } else if meta.is_dir() {
+            check_symlinks_inside(&path, root)?;
+        }
+    }
     Ok(())
+}
+
+/// Whether a symlink at archive path `path` pointing at `target` resolves inside the
+/// archive: `target` is relative, and walking it from `path`'s directory never climbs
+/// above the archive root.
+fn symlink_stays_inside(path: &Path, target: &Path) -> bool {
+    use std::path::Component;
+    let mut depth: Vec<&std::ffi::OsStr> = Vec::new();
+    let parent = path.parent().unwrap_or(Path::new(""));
+    for c in parent.components().chain(target.components()) {
+        match c {
+            Component::Normal(name) => depth.push(name),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if depth.pop().is_none() {
+                    return false;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
 }
 
 /// Split `https://github.com/<owner>/<repo>` into `(owner, repo)`, tolerating a

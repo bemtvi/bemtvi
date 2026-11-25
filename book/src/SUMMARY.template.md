@@ -33,6 +33,7 @@
   - [Expressions](features/expressions.md)
   - [Smooth scrolling](features/smooth-scrolling.md)
   - [Indent detection](features/indent-detection.md)
+  - [Installing treesitter grammars](features/treesitter-install.md)
   - [Image previews](features/image-previews.md)
   - [UI primitives](features/ui-primitives.md)
   - [Permanent docks](features/docks.md)

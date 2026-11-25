@@ -24,7 +24,9 @@ daemon.
   surviving a reload.
 - **Syntax highlighting** — done JS-side via web-tree-sitter. A small set of grammars is
   bundled for offline use (rust, lua, json, javascript, typescript, python, markdown);
-  `:TSInstall <lang>` fetches any other prebuilt grammar on demand and caches it.
+  `:TSInstall <lang>` fetches any other prebuilt grammar on demand and caches it
+  (`<lang>@<version>` picks an npm version or dist-tag; see
+  [Installing treesitter grammars](features/treesitter-install.md)).
   Embedded content highlights too, through each grammar's `injections.scm`: markdown's
   prose is parsed by the `markdown_inline` grammar the block grammar injects, and the code
   inside a ` ```lang ` fence by that language's own.

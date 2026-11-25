@@ -36,21 +36,58 @@ command -v em++ >/dev/null 2>&1 || {
 #    `native` feature and its non-emscripten deps drop out; the Lua backend (PUC
 #    lua54, the only backend) comes from the shared mlua dep. -fwasm-exceptions
 #    aligns Rust's wasm EH with the vendored C's (puc-lua-compiles-to-wasm-emscripten).
+#
+#    A Rust `staticlib` bundles Rust code but NOT the native C libraries its build scripts
+#    compiled (the vendored Lua, and bemtvi-regex's C) — cargo records those as link
+#    directives we bypass by invoking em++ by hand, so they are passed explicitly. Where
+#    they are is cargo's to say, not ours to guess: a build script's output goes under the
+#    build directory, which `build.build-dir` (a user's ~/.cargo/config.toml) can put
+#    outside `target/` entirely, and a search of `target/` then finds nothing — or worse,
+#    a stale copy from before the setting, linked without a word. So the build reports
+#    its messages as JSON (`build-script-executed` names each script's `out_dir`,
+#    `compiler-artifact` the staticlib's path), for cached units too, and the paths come
+#    from there.
+MSGS="$(mktemp)"
+trap 'rm -f "$MSGS"' EXIT
 EMCC_CFLAGS="-fwasm-exceptions" \
-  cargo build --locked --release --target wasm32-unknown-emscripten
+  cargo build --locked --release --target wasm32-unknown-emscripten \
+    --message-format=json-render-diagnostics >"$MSGS"
 
-LIB=target/wasm32-unknown-emscripten/release/libbemtvi_edithost.a
-
-# A Rust `staticlib` bundles Rust code but NOT the native C libraries its build scripts
-# compiled (the vendored Lua, and bemtvi-regex's C) — cargo records those as link
-# directives we bypass by invoking emcc by hand. Locate and pass them explicitly; paths
-# carry a build-hash, so find the newest match rather than pin it.
-newest() { find target/wasm32-unknown-emscripten/release/build -path "$1" -print0 2>/dev/null \
-  | xargs -0 ls -t 2>/dev/null | head -1; }
-LUA_A=$(newest '*/out/lib/liblua5.*.a')
-REGEX_A=$(newest '*/out/libbemtvi_regex_c.a')
-[ -n "$LUA_A" ]   || { echo "error: liblua5.*.a not found (did the cargo build run?)" >&2; exit 1; }
-[ -n "$REGEX_A" ] || { echo "error: libbemtvi_regex_c.a not found" >&2; exit 1; }
+# Print the path one cargo message names: `lib` (the edit host's staticlib), `lua`
+# (mlua-sys's vendored liblua5.*.a) or `regex` (bemtvi-regex's C archive). Fails loud,
+# naming what is missing, rather than print an empty path.
+cargo_path() {
+  node --input-type=module -e '
+    import { readFileSync, readdirSync, existsSync } from "node:fs";
+    import { join } from "node:path";
+    const want = process.argv[1];
+    const msgs = readFileSync(process.argv[2], "utf8").split("\n").filter(Boolean)
+      .map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const outDir = (pkg) => msgs.filter((m) => m.reason === "build-script-executed"
+      && new RegExp(`[/#]${pkg}[@#]`).test(m.package_id)).map((m) => m.out_dir).pop();
+    let path;
+    if (want === "lib") {
+      path = msgs.filter((m) => m.reason === "compiler-artifact" && m.target.name === "bemtvi_edithost")
+        .flatMap((m) => m.filenames).find((f) => f.endsWith(".a"));
+    } else if (want === "lua") {
+      const dir = outDir("mlua-sys");
+      const lib = dir && join(dir, "lib");
+      const name = lib && existsSync(lib) && readdirSync(lib).find((f) => /^liblua5\..*\.a$/.test(f));
+      path = name && join(lib, name);
+    } else if (want === "regex") {
+      const dir = outDir("bemtvi-regex");
+      path = dir && join(dir, "libbemtvi_regex_c.a");
+    }
+    if (!path || !existsSync(path)) {
+      console.error(`error: cargo reported no ${want} archive (did the build run?)`);
+      process.exit(1);
+    }
+    console.log(path);
+  ' "$1" "$MSGS"
+}
+LIB=$(cargo_path lib)
+LUA_A=$(cargo_path lua)
+REGEX_A=$(cargo_path regex)
 
 # 2. Final link → an importable ES module. Archive order: the edit-host lib first, then
 #    the C libs it depends on (wasm-ld pulls members to satisfy earlier undefineds).

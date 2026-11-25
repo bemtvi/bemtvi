@@ -3249,6 +3249,13 @@ impl EditHost {
                 fired_any = true;
                 continue;
             }
+            // And the scheduled-callback carry-over (the browser twin of the native run
+            // loop's arm): nothing to run here; the trailing `run_pending` drains the
+            // callbacks the last convergence kept.
+            if timer.id == MICROTASK_RESUME_TIMER_ID {
+                fired_any = true;
+                continue;
+            }
             if let Err(e) = self
                 .lua
                 .run_callback(timer.id, keep, bemtvi_lua::CallbackArgs::None)
@@ -4157,6 +4164,20 @@ pub(crate) const PREVIEW_HL_TIMER_ID: u64 = 1 << 55;
 /// asks so one whose wait would otherwise never end (a grammar load that never reports)
 /// is rejected on time instead of only on a retry that may never come.
 pub(crate) const TS_QUERY_LIMIT_TIMER_ID: u64 = 1 << 57;
+
+/// The wake that carries scheduled callbacks over to the next loop turn when the
+/// `run_pending` fixpoint reaches its round cap with only those left (a long chain of
+/// same-tick awaits). Firing it runs no callback of its own: the settle after it drains
+/// the kept queue. Armed through [`LoopOp`](bemtvi_lua::LoopOp), so the browser's timer
+/// wheel drives it too.
+pub(crate) const MICROTASK_RESUME_TIMER_ID: u64 = 1 << 58;
+
+/// Whether `event` is the scheduled-callback carry-over wake
+/// ([`MICROTASK_RESUME_TIMER_ID`]).
+#[cfg(feature = "native")]
+pub(crate) fn is_microtask_resume_timer(event: &LoopEvent) -> bool {
+    matches!(event, LoopEvent::Timer { id, .. } if *id == MICROTASK_RESUME_TIMER_ID)
+}
 
 /// Whether `event` is the parked-query give-up wake ([`TS_QUERY_LIMIT_TIMER_ID`]).
 #[cfg(feature = "native")]

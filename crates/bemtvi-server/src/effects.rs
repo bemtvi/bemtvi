@@ -3514,6 +3514,28 @@ impl EditHost {
         });
     }
 
+    /// Whether the only work the `run_pending` fixpoint still owes is scheduled callbacks
+    /// (promise reactions and `btv.schedule`): what a long chain of same-tick awaits
+    /// leaves at the round cap, as opposed to a command or callback re-queuing itself.
+    fn only_microtasks_pending(&self) -> bool {
+        !self.scheduled.is_empty()
+            && self.editor.lua_queue.is_empty()
+            && self.editor.deferred_commands.is_empty()
+            && self.editor.view_selects.is_empty()
+            && self.editor.view_closes.is_empty()
+            && self.editor.prompt_results.is_empty()
+            && self.editor.menu_results.is_empty()
+            && self.editor.picker_sends.is_empty()
+            && self.editor.picker_query_changes.is_empty()
+            && self.editor.complete_query_changes.is_empty()
+            && !self.editor.has_pending_checktime()
+            && !self.editor.has_pending_pre_writes()
+            && self.au_gate_done.is_empty()
+            && !self.editor.has_write_events()
+            && !self.editor.has_exit_requested()
+            && !self.editor.decor_invalidation_pending()
+    }
+
     /// Route one [`LoopOp`]: enqueue a `Schedule` for the `run_pending` drain, or
     /// forward a timer / process op to the event-loop actor (a fire-and-forget
     /// [`LoopCommand`], never awaited).
@@ -5215,6 +5237,21 @@ impl EditHost {
                 break;
             }
             rounds += 1;
+            if rounds >= MAX_ROUNDS && self.only_microtasks_pending() {
+                // Only promise reactions / `btv.schedule` callbacks are left, a chain of
+                // them each queuing the next: an async function whose awaits keep
+                // settling within this convergence (already-resolved promises, a query
+                // answered at once). That is not runaway recursion, and dropping them
+                // would silently strand the coroutine waiting on them. Yield instead:
+                // the queue is kept as is, and a wake on the next loop turn drains it
+                // there, after whatever input arrived in between.
+                self.apply_loop_op(bemtvi_lua::LoopOp::TimerStart {
+                    id: crate::MICROTASK_RESUME_TIMER_ID,
+                    delay_ms: 0,
+                    repeat_ms: 0,
+                });
+                break;
+            }
             if rounds >= MAX_ROUNDS {
                 // Drop the still-growing work and report it, rather than loop
                 // forever. The editor stays responsive to the next message.

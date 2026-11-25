@@ -170,6 +170,11 @@ impl EditHost {
                 diag_due = true;
             } else if crate::is_parse_resume_timer(&event) {
                 resume_due = true;
+            } else if crate::is_microtask_resume_timer(&event) {
+                // The last convergence stopped at its round cap with scheduled callbacks
+                // still queued (a long chain of same-tick awaits): the settle below
+                // drains them. No Lua callback sits behind this id.
+                had_real = true;
             } else if crate::is_preview_hl_timer(&event) {
                 // The picker selection has sat still: let this frame's projection
                 // extract the preview's spans. Handled here like the wakes above — it

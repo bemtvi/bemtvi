@@ -874,3 +874,62 @@ async fn the_editor_stays_live_while_a_burst_drains() {
         "input must be served while the event burst drains, not after it"
     );
 }
+
+/// An async function whose awaits keep settling within the same convergence (here,
+/// already-resolved promises; in practice a `btv.treesitter.query` answered at once, or
+/// `btv.buf.set_lines` followed by a read) runs as a chain of promise reactions, each a
+/// microtask the effects drain picks up on its next round. Past the drain's round cap
+/// those reactions were dropped with an `E132`, so the coroutine never resumed again:
+/// a spec looping over edits hung its whole run at step 50. The chain must run to the
+/// end, its tail carried to the next loop turn rather than dropped.
+#[tokio::test]
+async fn a_long_chain_of_same_tick_awaits_runs_to_the_end() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.done, _G.reached = false, 0
+        btv.async(function()
+          for i = 1, 300 do
+            _G.reached = btv.await(btv.promise.resolve(i))
+          end
+          _G.done = true
+        end)()
+        "#,
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.done").await,
+        "the chain stopped at await {}",
+        lua_u64(&rpc, "return _G.reached").await.unwrap_or(0)
+    );
+}
+
+/// The other side of carrying scheduled callbacks over: a callback that schedules
+/// itself forever no longer stops at the round cap, but it yields at it, so input
+/// still gets through between its rounds and it can be told to stop.
+#[tokio::test]
+async fn a_self_rescheduling_callback_leaves_the_editor_responsive() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.spins, _G.stop = 0, false
+        local function spin()
+          _G.spins = _G.spins + 1
+          if not _G.stop then
+            btv.schedule(spin)
+          end
+        end
+        spin()
+        "#,
+    )
+    .await;
+    feed(&rpc, "ityped<Esc>");
+    let got = tokio::time::timeout(std::time::Duration::from_secs(5), lines(&rpc))
+        .await
+        .expect("the spinning callback wedged the server");
+    assert_eq!(got, vec!["typed"]);
+    assert!(lua_u64(&rpc, "return _G.spins").await.unwrap_or(0) > 100);
+    exec_lua(&rpc, "_G.stop = true").await;
+}

@@ -1697,6 +1697,12 @@ pub struct EditHost {
     /// scheduled fn runs at the end of the current convergence (not nested in its
     /// caller). A scheduled fn may schedule more, so this feeds the fixpoint loop.
     scheduled: VecDeque<u64>,
+    /// How many `run_pending` drains in a row have reached their round cap with scheduled
+    /// callbacks still queued and carried the work to the next loop turn. A chain of
+    /// same-tick awaits ends within a few; a callback that reschedules itself forever
+    /// doesn't, and past [`MAX_MICROTASK_CARRIES`] it is dropped with `E132`. Reset by a
+    /// drain that converges.
+    microtask_carries: u32,
     /// Per-buffer `changedtick` last copied into the `btv._bufs` Lua mirror
     /// ([`EditHost::push_buf_mirror`]), so an unchanged buffer's line array isn't
     /// re-serialized on every Lua entry — only the cheap cursor/window fields
@@ -2448,6 +2454,7 @@ impl EditHost {
             keymaps: Keymaps::default(),
             last_key_pending: None,
             scheduled: VecDeque::new(),
+            microtask_carries: 0,
             buf_mirror_ticks: HashMap::new(),
             buf_mirror_lines: HashMap::new(),
             bo_mirror_gen: u64::MAX,
@@ -4171,6 +4178,13 @@ pub(crate) const TS_QUERY_LIMIT_TIMER_ID: u64 = 1 << 57;
 /// the kept queue. Armed through [`LoopOp`](bemtvi_lua::LoopOp), so the browser's timer
 /// wheel drives it too.
 pub(crate) const MICROTASK_RESUME_TIMER_ID: u64 = 1 << 58;
+
+/// How many consecutive loop turns a `run_pending` drain may carry its scheduled
+/// callbacks over (each after a full round cap) before the work is treated as runaway
+/// and dropped with `E132`: 100 turns of 100 rounds, far past any chain of awaits that
+/// ends, while a loop that never does stops within a second or so instead of pinning a
+/// core and repainting forever.
+pub(crate) const MAX_MICROTASK_CARRIES: u32 = 100;
 
 /// Whether `event` is the scheduled-callback carry-over wake
 /// ([`MICROTASK_RESUME_TIMER_ID`]).

@@ -110,6 +110,13 @@ end
 -- stack frame (the strict improvement over the old inline `fn()`), but still
 -- within the same input tick (not a later wall-clock turn; that is `defer_fn`).
 -- This is exactly what the colorscheme's "defer to avoid reentrancy" wants.
+--
+-- A chain of scheduled callbacks (each scheduling the next, as a long run of
+-- promise reactions does) that outgrows one convergence's round cap carries over to
+-- the next loop turn rather than being dropped, so input still gets through; one
+-- that never ends is dropped with `E132` after a bounded number of such turns. It is
+-- not a way to poll for state that changes between ticks: use `btv.on_next_tick` or
+-- `btv.wait_for`.
 function btv.schedule(fn)
   local id = btv._next_cb_id()
   btv._cb_fns[id] = fn

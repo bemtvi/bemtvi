@@ -3514,28 +3514,6 @@ impl EditHost {
         });
     }
 
-    /// Whether the only work the `run_pending` fixpoint still owes is scheduled callbacks
-    /// (promise reactions and `btv.schedule`): what a long chain of same-tick awaits
-    /// leaves at the round cap, as opposed to a command or callback re-queuing itself.
-    fn only_microtasks_pending(&self) -> bool {
-        !self.scheduled.is_empty()
-            && self.editor.lua_queue.is_empty()
-            && self.editor.deferred_commands.is_empty()
-            && self.editor.view_selects.is_empty()
-            && self.editor.view_closes.is_empty()
-            && self.editor.prompt_results.is_empty()
-            && self.editor.menu_results.is_empty()
-            && self.editor.picker_sends.is_empty()
-            && self.editor.picker_query_changes.is_empty()
-            && self.editor.complete_query_changes.is_empty()
-            && !self.editor.has_pending_checktime()
-            && !self.editor.has_pending_pre_writes()
-            && self.au_gate_done.is_empty()
-            && !self.editor.has_write_events()
-            && !self.editor.has_exit_requested()
-            && !self.editor.decor_invalidation_pending()
-    }
-
     /// Route one [`LoopOp`]: enqueue a `Schedule` for the `run_pending` drain, or
     /// forward a timer / process op to the event-loop actor (a fire-and-forget
     /// [`LoopCommand`], never awaited).
@@ -5234,17 +5212,25 @@ impl EditHost {
                 // hold the loop for one extra round per invalidation.
                 && !self.editor.decor_invalidation_pending()
             {
+                // Converged: whatever chain was being carried over has ended.
+                self.microtask_carries = 0;
                 break;
             }
             rounds += 1;
-            if rounds >= MAX_ROUNDS && self.only_microtasks_pending() {
-                // Only promise reactions / `btv.schedule` callbacks are left, a chain of
-                // them each queuing the next: an async function whose awaits keep
-                // settling within this convergence (already-resolved promises, a query
-                // answered at once). That is not runaway recursion, and dropping them
-                // would silently strand the coroutine waiting on them. Yield instead:
-                // the queue is kept as is, and a wake on the next loop turn drains it
-                // there, after whatever input arrived in between.
+            if rounds >= MAX_ROUNDS
+                && !self.scheduled.is_empty()
+                && self.microtask_carries < crate::MAX_MICROTASK_CARRIES
+            {
+                // Promise reactions / `btv.schedule` callbacks are still queued (with or
+                // without other work beside them): a chain of them each queuing the next,
+                // which is what an async function whose awaits keep settling within this
+                // convergence is (already-resolved promises, a query answered at once, a
+                // command run between awaits). Dropping them would silently strand the
+                // coroutine waiting on them. Yield instead: everything queued is kept,
+                // and a wake on the next loop turn drains it there, after whatever input
+                // arrived in between. A chain that never ends is bounded by the count of
+                // turns carried in a row (`MAX_MICROTASK_CARRIES`), then dropped below.
+                self.microtask_carries += 1;
                 self.apply_loop_op(bemtvi_lua::LoopOp::TimerStart {
                     id: crate::MICROTASK_RESUME_TIMER_ID,
                     delay_ms: 0,
@@ -5275,8 +5261,14 @@ impl EditHost {
                 self.editor.take_exit_requested();
                 self.editor.take_write_events();
                 self.scheduled.clear();
-                self.editor
-                    .echo("E132: command recursion limit exceeded".to_string());
+                // Past the carry bound, what ran away was a callback chain, not a command.
+                let msg = if self.microtask_carries >= crate::MAX_MICROTASK_CARRIES {
+                    "E132: scheduled callbacks kept queuing more for too long (a btv.schedule or promise loop that never ends?)"
+                } else {
+                    "E132: command recursion limit exceeded"
+                };
+                self.microtask_carries = 0;
+                self.editor.echo(msg.to_string());
                 break;
             }
         }

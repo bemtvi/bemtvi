@@ -906,20 +906,19 @@ async fn a_long_chain_of_same_tick_awaits_runs_to_the_end() {
 }
 
 /// The other side of carrying scheduled callbacks over: a callback that schedules
-/// itself forever no longer stops at the round cap, but it yields at it, so input
-/// still gets through between its rounds and it can be told to stop.
+/// itself forever yields at the round cap, so input still gets through between its
+/// rounds, and it doesn't spin forever either: after a bounded number of carried
+/// turns it is dropped with `E132`, like any other runaway.
 #[tokio::test]
-async fn a_self_rescheduling_callback_leaves_the_editor_responsive() {
-    let (rpc, _incoming) = start().await;
+async fn a_self_rescheduling_callback_yields_then_stops_with_e132() {
+    let (rpc, mut incoming) = start().await;
     exec_lua(
         &rpc,
         r#"
-        _G.spins, _G.stop = 0, false
+        _G.spins = 0
         local function spin()
           _G.spins = _G.spins + 1
-          if not _G.stop then
-            btv.schedule(spin)
-          end
+          btv.schedule(spin)
         end
         spin()
         "#,
@@ -930,6 +929,48 @@ async fn a_self_rescheduling_callback_leaves_the_editor_responsive() {
         .await
         .expect("the spinning callback wedged the server");
     assert_eq!(got, vec!["typed"]);
-    assert!(lua_u64(&rpc, "return _G.spins").await.unwrap_or(0) > 100);
-    exec_lua(&rpc, "_G.stop = true").await;
+    // It stops: the count settles, and the message says why.
+    let mut last = 0;
+    let mut settled = false;
+    for _ in 0..200 {
+        let now = lua_u64(&rpc, "return _G.spins").await.unwrap_or(0);
+        if now == last && now > 100 {
+            settled = true;
+            break;
+        }
+        last = now;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(settled, "the runaway callback never stopped ({last} runs)");
+    let msg = bemtvi_test_harness::message_after(&rpc, &mut incoming, "").await;
+    assert!(msg.starts_with("E132"), "{msg}");
+}
+
+/// A chain whose links do more than await — each runs a user command, then awaits —
+/// leaves commands queued beside the reactions at the round cap. It is still a chain
+/// that ends, carried over like a pure one rather than dropped.
+#[tokio::test]
+async fn a_chain_mixing_commands_and_awaits_runs_to_the_end() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.done, _G.ran = false, 0
+        btv.command("Tick", function() _G.ran = _G.ran + 1 end)
+        btv.async(function()
+          for i = 1, 200 do
+            btv.cmd("Tick")
+            btv.await(btv.promise.resolve(i))
+          end
+          _G.done = true
+        end)()
+        "#,
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.done").await,
+        "the chain stopped after {} commands",
+        lua_u64(&rpc, "return _G.ran").await.unwrap_or(0)
+    );
+    assert_eq!(lua_u64(&rpc, "return _G.ran").await, Some(200));
 }

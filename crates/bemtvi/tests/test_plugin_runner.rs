@@ -522,3 +522,66 @@ fn plugin_scripts_loaded_by_the_spec_join_the_baseline() {
     );
     assert!(stdout.contains("2 passed, 0 failed"), "stdout:\n{stdout}");
 }
+
+/// The plugin manager is hermetic under `--test-plugin`: its install root and its
+/// config dir (where the lockfile lives) are the run's own temp dirs, never the
+/// user's. A spec that ran `:PluginClean` used to delete every real checkout in
+/// `stdpath("data")/plugins` that it didn't itself declare, because the runner left
+/// the manager on the user's real data dir: the bundled `examples/plugins` spec did
+/// exactly that to a user's `friendly-snippets`.
+///
+/// The fixture's data and config dirs stand in for the user's (through the XDG
+/// variables), so a regression deletes the planted checkout, not a real one.
+#[test]
+fn the_plugin_manager_never_touches_the_users_dirs() {
+    let dir = fixture_dir("pm_hermetic");
+    let data = dir.join("xdg-data");
+    let config = dir.join("xdg-config");
+    let checkout = data.join("bemtvi/plugins/precious");
+    std::fs::create_dir_all(checkout.join("lua")).unwrap();
+    std::fs::write(checkout.join("lua/precious.lua"), "return {}\n").unwrap();
+    let lockfile = config.join("bemtvi/bemtvi-lock.json");
+    std::fs::create_dir_all(lockfile.parent().unwrap()).unwrap();
+    let lock_body = r#"{ "precious": { "branch": "main", "commit": "0123456789abcdef0123456789abcdef01234567" } }"#;
+    std::fs::write(&lockfile, lock_body).unwrap();
+    std::fs::write(
+        dir.join("test/pm_spec.lua"),
+        r#"
+        btv.test.describe("plugin manager", function()
+          btv.test.it("cleans and locks only the run's own dirs", function(t)
+            -- Nothing is declared: against the user's dirs, clean deletes every
+            -- checkout there and lock hands back the user's lockfile.
+            local removed = t:exec(function()
+              return btv.await(btv.plugins.clean())
+            end)
+            btv.test.expect(removed).to_equal({})
+            local locked = t:exec(function()
+              return btv.await(btv.plugins.lock())
+            end)
+            btv.test.expect(locked.precious).to_be_nil()
+          end)
+        end)
+        "#,
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bemtvi"))
+        .arg("--test-plugin")
+        .arg(&dir)
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .output()
+        .expect("spawn bemtvi --test-plugin");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        checkout.join("lua/precious.lua").exists(),
+        "a spec's clean deleted a checkout in the user's data dir; stdout:\n{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&lockfile).unwrap(),
+        lock_body,
+        "the user's lockfile changed"
+    );
+    assert!(out.status.success(), "stdout:\n{stdout}");
+    assert!(stdout.contains("1 passed, 0 failed"), "stdout:\n{stdout}");
+}

@@ -3901,12 +3901,12 @@ impl LuaRuntime {
     /// nil in a normal session; the server calls this when the `--test-plugin` runner
     /// enables test mode, so the API exists only there.
     pub fn install_test_api(&self) -> mlua::Result<()> {
-        let install: mlua::Function = self.btv()?.get("_install_test")?;
-        install.call::<()>(())?;
-        // …and unlock the `btv._test_*` primitives the framework drives — see
-        // [`Shared::test_api_installed`]. Outside a spec they raise.
+        // Unlock the `btv._test_*` primitives the framework drives (see
+        // [`Shared::test_api_installed`]; outside a spec they raise) first, since the
+        // install itself takes a `btv._test_tempdir()` for the plugin manager.
         self.shared.borrow_mut().test_api_installed = true;
-        Ok(())
+        let install: mlua::Function = self.btv()?.get("_install_test")?;
+        install.call::<()>(())
     }
 
     /// Refresh the `btv._ui` mirror from a [`UiMirror`] snapshot — what the plugin

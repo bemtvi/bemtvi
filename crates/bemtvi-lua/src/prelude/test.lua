@@ -33,8 +33,24 @@ local M = {}
 -- turns on test mode (the `btv_enable_test_mode` RPC). In a normal editor session
 -- `btv.test` stays nil, so a config or plugin can't depend on the test API — and the
 -- UI mirror it reads (`btv._ui`) is likewise only populated under `--test-plugin`.
+--
+-- It also points the plugin manager at the run's own temp dirs: its install root
+-- (`stdpath("data")/plugins` otherwise) and its config dir, where the lockfile and the
+-- first-run `lua/plugins.lua` go. The runner leaves `stdpath()` on the user's real
+-- directories (a spec still finds the installed tree-sitter grammars there), so without
+-- this a spec's `:PluginClean` deleted every real checkout it didn't itself declare, and
+-- a `:PluginLock` rewrote the user's lockfile. A spec that wants a root of its own still
+-- sets one with `btv.plugins.setup_manager`.
 function btv._install_test()
   btv.test = M
+  -- (A disabled manager installs nothing and deletes nothing, so it has no dirs to move.)
+  if not btv.plugins.disabled() then
+    local tmp = btv._test_tempdir()
+    btv.plugins.setup_manager({
+      root = btv.utils.local_path_join(tmp, "plugins"),
+      config = btv.utils.local_path_join(tmp, "config"),
+    })
+  end
 end
 
 -- ----- the suite tree -------------------------------------------------------

@@ -408,3 +408,113 @@ async fn json_encode_sorts_object_keys() {
         "{nested}"
     );
 }
+
+// `btv.str.grapheme_floor` / `grapheme_next` expose the core's grapheme-cluster
+// boundaries (the ones the cursor and selections move by), so a plugin that cuts a
+// string, such as one measuring a huge cell a piece at a time, never splits a ZWJ emoji,
+// a flag or a letter from its combining accent. Offsets are 0-based bytes.
+#[tokio::test]
+async fn grapheme_boundaries_follow_the_core() {
+    let (rpc, _incoming) = start().await;
+    // A family emoji: three 4-byte emoji joined by two 3-byte ZWJs, 18 bytes, one
+    // grapheme. Any offset inside it floors to 1 and steps on to 19.
+    let fam = r#""a\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}b""#;
+    for at in [1, 5, 8, 12, 18] {
+        assert_eq!(
+            eval_str(&rpc, &format!("btv.str.grapheme_floor({fam}, {at})")).await,
+            "1",
+            "floor of {at}"
+        );
+    }
+    assert_eq!(
+        eval_str(&rpc, &format!("btv.str.grapheme_next({fam}, 5)")).await,
+        "19"
+    );
+    assert_eq!(
+        eval_str(&rpc, &format!("btv.str.grapheme_next({fam}, 0)")).await,
+        "1"
+    );
+    assert_eq!(
+        eval_str(&rpc, &format!("btv.str.grapheme_floor({fam}, 19)")).await,
+        "19"
+    );
+    // A flag is two regional indicators (4 bytes each); `e` + U+0301 is one letter.
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.grapheme_floor("\u{1F1E7}\u{1F1F7}", 4)"#).await,
+        "0"
+    );
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.grapheme_next("e\u{301}x", 0)"#).await,
+        "3"
+    );
+    // Offsets clamp into the string; the end is a boundary with nothing after it.
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.grapheme_floor("abc", -2)"#).await,
+        "0"
+    );
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.grapheme_floor("abc", 9)"#).await,
+        "3"
+    );
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.grapheme_next("abc", 3)"#).await,
+        "3"
+    );
+    assert_eq!(eval_str(&rpc, r#"btv.str.grapheme_next("", 0)"#).await, "0");
+    // A malformed byte is one character of its own, as in the other `btv.str`
+    // helpers, and the offsets around it stay the string's own bytes.
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.grapheme_next("\xe9e\u{301}", 0)"#).await,
+        "1"
+    );
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.grapheme_floor("\xe9e\u{301}", 3)"#).await,
+        "1"
+    );
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.grapheme_next("\xe9e\u{301}", 1)"#).await,
+        "4"
+    );
+    // A truncated 4-byte character (3 bytes, one U+FFFD on screen) is one character.
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.grapheme_floor("\xf0\x9f\x98x", 2)"#).await,
+        "0"
+    );
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.grapheme_next("\xf0\x9f\x98x", 1)"#).await,
+        "3"
+    );
+}
+
+// `btv.str.chars(s, skipcc)` (vim's `strchars`) leaves composing characters out of the
+// count. It used to ignore `skipcc` and count every codepoint. Here a character is a
+// grapheme cluster, the unit the cursor moves by, so a ZWJ emoji or a flag counts once
+// too. A `skipcc` of `0` or `false` is vim's "count them", as is leaving it out.
+#[tokio::test]
+async fn chars_skipcc_counts_graphemes() {
+    let (rpc, _incoming) = start().await;
+    let s = r#""e\u{301}\u{1F468}\u{200D}\u{1F469}\u{1F1E7}\u{1F1F7}x""#;
+    assert_eq!(eval_str(&rpc, &format!("btv.str.chars({s})")).await, "8");
+    assert_eq!(eval_str(&rpc, &format!("btv.str.chars({s}, 0)")).await, "8");
+    assert_eq!(
+        eval_str(&rpc, &format!("btv.str.chars({s}, false)")).await,
+        "8"
+    );
+    assert_eq!(
+        eval_str(&rpc, &format!("btv.str.chars({s}, true)")).await,
+        "4"
+    );
+    assert_eq!(
+        eval_str(&rpc, &format!("vim.fn.strchars({s}, 1)")).await,
+        "4"
+    );
+    // A malformed byte still counts as one.
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.chars("\xe9e\u{301}", true)"#).await,
+        "2"
+    );
+    assert_eq!(
+        eval_str(&rpc, r#"btv.str.chars("\xf0\x9f\x98x", true)"#).await,
+        "2"
+    );
+}

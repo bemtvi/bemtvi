@@ -898,10 +898,16 @@ end
 vim.fn.nr2char = btv.str.from_char
 
 -- `btv.str.chars(s[, skipcc])` [alias `vim.fn.strchars`]: number of characters
--- (codepoints) in `s`. INCOMPLETE: `skipcc` (skip composing characters) is ignored —
--- every codepoint counts, since bemtvi doesn't classify combining marks.
-function btv.str.chars(s, _skipcc)
+-- (codepoints) in `s`. With `skipcc` (any value but `nil`, `false` or `0`, as in vim),
+-- composing characters aren't counted: the count is of grapheme clusters, the unit the
+-- cursor moves by, so a letter with its combining accents, a ZWJ emoji sequence or a
+-- flag counts once. (A `"\r\n"` pair is one cluster too.) A malformed UTF-8 sequence
+-- counts as one character either way.
+function btv.str.chars(s, skipcc)
   s = tostring(s or "")
+  if skipcc and skipcc ~= 0 then
+    return btv._grapheme_count(s)
+  end
   local i, n = 1, 0
   while i <= #s do
     local _, len = utf8_decode(s, i)
@@ -1019,6 +1025,40 @@ function btv.str.byteindex(s, a, b)
   return byteindex_for(s, a, false)
 end
 vim.str_byteindex = btv.str.byteindex
+
+-- A 0-based byte offset into `s`, floored and clamped into `0`..`#s`.
+local function clamp_byte(s, byte, fname)
+  if type(byte) ~= "number" then
+    error("btv.str." .. fname .. ": byte must be a number, got " .. type(byte), 3)
+  end
+  return math.min(#s, math.max(0, math.floor(byte)))
+end
+
+-- `btv.str.grapheme_floor(s, byte)`: the 0-based byte offset of the grapheme-cluster
+-- boundary at or before offset `byte` in `s`, so cutting `s` there never splits a
+-- character: a letter from its combining accent, a ZWJ emoji sequence, a flag. These are
+-- the boundaries the cursor moves by. `byte` is clamped into `0`..`#s` (and floored), and
+-- `#s` is itself a boundary. A malformed UTF-8 sequence is a character of its own.
+--
+-- ```lua
+-- local s = "e\u{301}x"            -- "é" as e + combining acute, then x
+-- btv.str.grapheme_floor(s, 2)     --> 0  (inside "é")
+-- btv.str.grapheme_floor(s, 3)     --> 3  (between "é" and "x")
+-- ```
+function btv.str.grapheme_floor(s, byte)
+  s = tostring(s or "")
+  return btv._grapheme_floor(s, clamp_byte(s, byte, "grapheme_floor"))
+end
+
+-- `btv.str.grapheme_next(s, byte)`: the 0-based byte offset of the first grapheme-cluster
+-- boundary after offset `byte` in `s`, which is the end of the character `byte` falls in.
+-- Returns `#s` when there is no following character, so stepping from `0` until the
+-- result is `#s` visits each character once. `byte` is clamped as in
+-- `btv.str.grapheme_floor`.
+function btv.str.grapheme_next(s, byte)
+  s = tostring(s or "")
+  return btv._grapheme_next(s, clamp_byte(s, byte, "grapheme_next"))
+end
 
 -- `btv.str.charpart(s, start[, len])` [alias `vim.fn.strcharpart`]: the substring of `s`
 -- starting at character index `start` (0-based), spanning `len` characters (default:

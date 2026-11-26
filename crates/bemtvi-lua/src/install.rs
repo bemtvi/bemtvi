@@ -693,6 +693,37 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
             ))
         })?,
     )?;
+    // `btv._grapheme_floor(s, byte)` / `btv._grapheme_next(s, byte)` (behind
+    // `btv.str.grapheme_floor` / `grapheme_next`): the core's grapheme-cluster
+    // boundaries, the ones the cursor moves by, on 0-based byte offsets the prelude has
+    // already clamped into `0..=#s`. A malformed sequence is a character of its own, so
+    // the offsets stay `s`'s own bytes (a lossy conversion would shift them).
+    btv.set(
+        "_grapheme_floor",
+        lua.create_function(|_, (s, byte): (mlua::LuaString, usize)| {
+            Ok(bemtvi_core::unicode::floor_grapheme_bytes(
+                &s.as_bytes(),
+                byte,
+            ))
+        })?,
+    )?;
+    btv.set(
+        "_grapheme_next",
+        lua.create_function(|_, (s, byte): (mlua::LuaString, usize)| {
+            Ok(bemtvi_core::unicode::next_grapheme_bytes(
+                &s.as_bytes(),
+                byte,
+            ))
+        })?,
+    )?;
+    // `btv._grapheme_count(s)` (behind `btv.str.chars(s, skipcc)`): the grapheme
+    // clusters in `s`, a malformed sequence counting as one.
+    btv.set(
+        "_grapheme_count",
+        lua.create_function(|_, s: mlua::LuaString| {
+            Ok(bemtvi_core::unicode::grapheme_count_bytes(&s.as_bytes()))
+        })?,
+    )?;
     // `btv._replace_termcodes(s)` (exposed by the prelude as `btv.replace_termcodes` /
     // `vim.api.nvim_replace_termcodes`): translate vim key-notation into the
     // terminal-byte encoding neovim emits — Ctrl-chords (`<C-o>` → `\x0f`), the

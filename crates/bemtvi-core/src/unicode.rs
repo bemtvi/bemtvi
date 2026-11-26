@@ -79,6 +79,56 @@ pub fn floor_grapheme(line: &str, byte: usize) -> usize {
     cursor.prev_boundary(line, 0).ok().flatten().unwrap_or(0)
 }
 
+/// [`floor_grapheme`] over bytes that may not be UTF-8. A malformed sequence (what
+/// `String::from_utf8_lossy` turns into one U+FFFD) is a character of its own, so an
+/// offset inside one snaps to its start. Offsets are `bytes`' own, never shifted by a
+/// lossy conversion. Returns `bytes.len()` for `byte >= bytes.len()`.
+pub fn floor_grapheme_bytes(bytes: &[u8], byte: usize) -> usize {
+    let mut start = 0;
+    for chunk in bytes.utf8_chunks() {
+        let valid_end = start + chunk.valid().len();
+        if byte < valid_end {
+            return start + floor_grapheme(chunk.valid(), byte - start);
+        }
+        let end = valid_end + chunk.invalid().len();
+        if byte < end {
+            return valid_end;
+        }
+        start = end;
+    }
+    bytes.len()
+}
+
+/// [`next_grapheme`] over bytes that may not be UTF-8, a malformed sequence being one
+/// character (see [`floor_grapheme_bytes`]). Returns `bytes.len()` when there is no
+/// following grapheme.
+pub fn next_grapheme_bytes(bytes: &[u8], byte: usize) -> usize {
+    let mut start = 0;
+    for chunk in bytes.utf8_chunks() {
+        let valid_end = start + chunk.valid().len();
+        if byte < valid_end {
+            // The end of a valid run is a boundary: a malformed sequence or the end
+            // of `bytes` follows it.
+            return start + next_grapheme(chunk.valid(), byte - start);
+        }
+        let end = valid_end + chunk.invalid().len();
+        if byte < end {
+            return end;
+        }
+        start = end;
+    }
+    bytes.len()
+}
+
+/// The grapheme clusters in `bytes`, a malformed sequence counting as one (see
+/// [`floor_grapheme_bytes`]).
+pub fn grapheme_count_bytes(bytes: &[u8]) -> usize {
+    bytes
+        .utf8_chunks()
+        .map(|c| c.valid().graphemes(true).count() + usize::from(!c.invalid().is_empty()))
+        .sum()
+}
+
 /// Display width of `s` in screen cells — wide characters count as two (via
 /// `unicode-width`), with no tab handling (callers use it for short tab-free
 /// strings like tabline cells, where there are no tabs to expand).

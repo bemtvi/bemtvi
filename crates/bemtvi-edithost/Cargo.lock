@@ -111,6 +111,7 @@ dependencies = [
  "sha1",
  "sha2",
  "unicode-width",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

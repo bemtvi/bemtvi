@@ -61,3 +61,8 @@ unicode-width.workspace = true
 # anyway — so it is compiled out there (edit-host plan, Phase 4).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bemtvi-ts = { workspace = true }
+
+# The registry and shell calls behind `btv.file_associations` (src/fileassoc.rs): the
+# per-user file-type keys, and the notice that makes Explorer redraw file icons.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Registry", "Win32_UI_Shell"] }

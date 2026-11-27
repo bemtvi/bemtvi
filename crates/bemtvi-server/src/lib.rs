@@ -672,6 +672,13 @@ pub struct ServerInit {
     /// runs (a config's own `btv.plugins.recommend{...}` still overrides it). Mirrors
     /// how `shada` / `clipboard` keep tests hermetic while the binary opts in.
     pub offer_default_recommended: bool,
+    /// Whether this session runs in `bemtvi-gui`, the program Windows file associations
+    /// name (`btv.file_associations`: Explorer's "Open with" and bemtvi's document icon).
+    /// It enables registering, and arms a one-time offer to register before `init.lua`,
+    /// shown at the first client attach. `false` (the default) for the TUI, apps
+    /// embedding the editor and the test suites, which can't register: their exe has no
+    /// document icon. The offer does nothing off Windows.
+    pub offer_file_associations: bool,
     /// The **system-plugin tier** — local plugins the *client* loads into this session
     /// before `init.lua`, un-shadowable-from-config in load order but never able to
     /// hijack a user module name (they sit AHEAD of managed plugins but BEHIND the
@@ -5314,6 +5321,14 @@ where
     // wins. The interactive binary opts in; tests leave this off and stay hermetic.
     if init.offer_default_recommended {
         let _ = host.lua.exec("btv.plugins._use_default_recommended()");
+    }
+    // Arm the GUI's one-time offer to register for file types (Windows). It shows at the
+    // first client attach, once the plugin welcome (if any) is answered.
+    if init.offer_file_associations {
+        if let Err(e) = host.lua.exec("btv.file_associations._arm()") {
+            host.editor
+                .echo(format!("bemtvi: file-association offer failed: {e}"));
+        }
     }
     // Turn on command-line completion (`:`+<Tab>) by default for the interactive
     // binary — BEFORE init.lua, so a config's own `btv.cmdline_complete.setup{ ... }`

@@ -24,6 +24,7 @@
 //! - [`luafs`] — the project-facing Lua filesystem seam ([`LuaFs`]).
 
 mod convert;
+mod fileassoc;
 mod fswire;
 mod gitignore;
 mod gitwire;

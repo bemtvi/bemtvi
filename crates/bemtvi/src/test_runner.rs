@@ -131,6 +131,8 @@ fn spawn_server(plugin_dir: PathBuf) -> (Rpc, UnboundedReceiver<Incoming>) {
             // Hermetic: never offer the built-in recommended set / first-run welcome,
             // and leave command-line completion off (a plugin's own setup{} can opt in).
             offer_default_recommended: false,
+            // The file-type offer is the GUI's (`bemtvi-gui` is the program Explorer opens).
+            offer_file_associations: false,
             cmdline_complete_default: false,
             show_intro: false,
             // The plugin-test runner reads `print` through the message mirror, not stdout.

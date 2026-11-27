@@ -95,6 +95,10 @@ pub struct Launch {
     pub disable_lsp: bool,
     /// Pickers taken away, by source name (see `ServerInit::disabled_pickers`).
     pub disabled_pickers: Vec<String>,
+    /// Offer, once, to register this program for file types on Windows (see
+    /// `ServerInit::offer_file_associations`). `bemtvi-gui`'s alone: an app embedding the
+    /// editor is a different program, and not a file opener.
+    pub offer_file_associations: bool,
 }
 
 impl Launch {
@@ -112,6 +116,7 @@ impl Launch {
             disable_plugin_manager: false,
             disable_lsp: false,
             disabled_pickers: Vec::new(),
+            offer_file_associations: true,
         }
     }
 }
@@ -612,6 +617,7 @@ async fn server_init(
         disable_plugin_manager: launch.disable_plugin_manager,
         disable_lsp: launch.disable_lsp,
         disabled_pickers: launch.disabled_pickers.clone(),
+        offer_file_associations: launch.offer_file_associations,
     })
 }
 

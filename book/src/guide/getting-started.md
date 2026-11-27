@@ -18,6 +18,15 @@ bemtvi file.txt        # terminal editor
 bemtvi-gui file.txt    # native GUI (mitsuami + wgpu)
 ```
 
+On Windows, the GUI's first start offers to add bemtvi to Explorer's "Open with"
+list for the file types it recognizes, and to give the files you open with it
+bemtvi's document icon. `:RegisterFileTypes` does the same later, and
+`:UnregisterFileTypes` undoes it. Windows doesn't let a program make itself the
+default, so to make bemtvi a type's default, pick it once in "Open with" (Choose
+another app, then Always). The keys are per-user (`HKEY_CURRENT_USER`), so no
+administrator rights are needed. If you move `bemtvi-gui.exe`, the next start
+updates them to the new location.
+
 Downloads ship with checksums and SLSA build provenance — see
 [Verifying downloads](../appendix/verifying-downloads.md).
 

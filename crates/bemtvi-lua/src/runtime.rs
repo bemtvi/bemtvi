@@ -936,6 +936,14 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
         include_str!("prelude/intro_logo.lua"),
     ),
     ("bemtvi:prelude/intro", include_str!("prelude/intro.lua")),
+    // Windows file associations (`btv.file_associations`, `:RegisterFileTypes`) and the
+    // GUI's one-time offer to register. Loads after plugins.lua (the offer waits for the
+    // plugin welcome, `btv.plugins._bootstrapping`) and view.lua / component.lua (its
+    // float). Inert until the GUI's launch arms it (`ServerInit.offer_file_associations`).
+    (
+        "bemtvi:prelude/fileassoc",
+        include_str!("prelude/fileassoc.lua"),
+    ),
 ];
 
 /// A generated stub declaring the two root globals bemtvi injects from **Rust**

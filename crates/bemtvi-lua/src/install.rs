@@ -1911,6 +1911,86 @@ pub(crate) fn install_runtime_api(
         )?;
     }
 
+    // `btv._file_assoc(action, arg?)`: the registry half of `btv.file_associations`
+    // (`prelude/fileassoc.lua`). `"register"` / `"unregister"` start a pass writing /
+    // removing the keys under `HKCU\<arg>` (default `Software\Classes`) on a thread of
+    // its own, and return its job id at once; `"poll"` with that id returns `nil` while
+    // the pass runs, then (once) `{ exe, extensions, failed = { … } }`, or `{ error }`
+    // when it couldn't run at all — off Windows, naming why. `"exe"` returns the running
+    // program's path.
+    {
+        let jobs: std::sync::Arc<
+            std::sync::Mutex<(u64, std::collections::HashMap<u64, crate::fileassoc::Job>)>,
+        > = Default::default();
+        btv.set(
+            "_file_assoc",
+            lua.create_function(move |lua, (action, arg): (String, mlua::Value)| {
+                let mut jobs = jobs.lock().unwrap_or_else(|e| e.into_inner());
+                match action.as_str() {
+                    "register" | "unregister" => {
+                        let classes = match arg {
+                            mlua::Value::Nil => crate::fileassoc::DEFAULT_CLASSES.to_string(),
+                            mlua::Value::String(s) => s.to_str()?.to_string(),
+                            other => {
+                                return Err(mlua::Error::RuntimeError(format!(
+                                    "btv._file_assoc: classes must be a string, got {}",
+                                    other.type_name()
+                                )))
+                            }
+                        };
+                        let job = crate::fileassoc::start(action == "register", classes);
+                        jobs.0 += 1;
+                        let id = jobs.0;
+                        jobs.1.insert(id, job);
+                        Ok(mlua::Value::Integer(id as i64))
+                    }
+                    "poll" => {
+                        let id = match arg {
+                            mlua::Value::Integer(n) if n > 0 => n as u64,
+                            other => {
+                                return Err(mlua::Error::RuntimeError(format!(
+                                    "btv._file_assoc: poll wants a job id, got {other:?}"
+                                )))
+                            }
+                        };
+                        let outcome = match jobs.1.get(&id) {
+                            Some(job) => job.poll(),
+                            None => {
+                                return Err(mlua::Error::RuntimeError(format!(
+                                    "btv._file_assoc: no file-association job {id}"
+                                )))
+                            }
+                        };
+                        let Some(outcome) = outcome else {
+                            return Ok(mlua::Value::Nil);
+                        };
+                        jobs.1.remove(&id);
+                        let t = lua.create_table()?;
+                        match outcome {
+                            Ok(report) => {
+                                t.set("exe", report.exe)?;
+                                t.set("extensions", report.extensions)?;
+                                t.set("failed", lua.create_sequence_from(report.failed)?)?;
+                            }
+                            Err(e) => t.set("error", e)?,
+                        }
+                        Ok(mlua::Value::Table(t))
+                    }
+                    "exe" => {
+                        let exe =
+                            crate::fileassoc::current_exe().map_err(mlua::Error::RuntimeError)?;
+                        Ok(mlua::Value::String(
+                            lua.create_string(exe.to_string_lossy().as_bytes())?,
+                        ))
+                    }
+                    other => Err(mlua::Error::RuntimeError(format!(
+                        "btv._file_assoc: unknown action {other:?}"
+                    ))),
+                }
+            })?,
+        )?;
+    }
+
     // `btv._uuid()` -> a random v4 UUID in canonical `8-4-4-4-12` hex. The private
     // bridge; the documented public `btv.uuid` is its one-line wrapper in
     // `prelude/btv.lua` (so the book's generator, which only scans the prelude, picks

@@ -2712,7 +2712,16 @@ btv.on("VimEnter", {}, function()
   M._vim_entered = true
   maybe_fire_plugins_loaded()
   if not plugins_disabled then
-    M.bootstrap()
+    -- Kept so a later first-run offer (the GUI's file associations) can wait for this
+    -- one to be answered rather than stack its float on top. Its failure is reported
+    -- here: a waiter subscribing would otherwise mark the rejection handled, and the
+    -- unhandled-rejection notice would never show.
+    M._bootstrapping = M.bootstrap():catch(function(err)
+      btv.notify(
+        "btv.plugins: first-run welcome failed: " .. tostring(err and err.message or err),
+        4
+      )
+    end)
   end
 end)
 

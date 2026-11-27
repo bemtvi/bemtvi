@@ -236,3 +236,35 @@ async fn a_missing_extension_row_is_filled_and_unknown_files_stay_untyped() {
         ""
     );
 }
+
+// An extension spelled in another case (`MAIN.RS`, `README.MD`, a Windows file named
+// in capitals) is the same type: Explorer and the filesystem treat it so, and a file
+// opened from there must highlight. The exact spelling still wins where the table
+// tells cases apart (`.C` is C++, `.c` is C).
+#[tokio::test]
+async fn an_extension_in_another_case_is_the_same_type() {
+    let (rpc, mut incoming) = start().await;
+    assert_eq!(
+        detect(&rpc, &mut incoming, "MAIN.RS", "fn main() {}\n").await,
+        "rust"
+    );
+    assert_eq!(
+        detect(&rpc, &mut incoming, "README.MD", "# hi\n").await,
+        "markdown"
+    );
+    assert_eq!(
+        detect(&rpc, &mut incoming, "Script.Py", "print(1)\n").await,
+        "python"
+    );
+    assert_eq!(
+        detect(&rpc, &mut incoming, "lower.c", "int x;\n").await,
+        "c"
+    );
+    assert_eq!(
+        detect(&rpc, &mut incoming, "upper.C", "int x;\n").await,
+        "cpp"
+    );
+    // A name no buffer has goes through the same tables.
+    let ft = exec_lua(&rpc, "return btv.filetype.match('NOTES.TOML')").await;
+    assert_eq!(ft.as_str(), Some("toml"));
+}

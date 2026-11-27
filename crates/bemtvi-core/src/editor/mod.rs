@@ -4318,9 +4318,17 @@ pub fn language_of_path(path: Option<&Path>) -> Option<&'static str> {
         return Some(ft);
     }
     let ext = path.extension()?.to_str()?;
+    // The exact spelling first, where the table tells cases apart (`.C` is C++, `.c`
+    // is C); then any case, since `MAIN.RS` is the same type on every filesystem that
+    // ignores case, and Explorer opens it as one.
     EXT_FILETYPE
         .iter()
         .find(|(e, _)| *e == ext)
+        .or_else(|| {
+            EXT_FILETYPE
+                .iter()
+                .find(|(e, _)| e.eq_ignore_ascii_case(ext))
+        })
         .map(|(_, ft)| *ft)
 }
 
@@ -4448,6 +4456,15 @@ pub fn known_filetypes() -> Vec<&'static str> {
     fts.sort_unstable();
     fts.dedup();
     fts
+}
+
+/// Every extension [`language_of_path`] recognizes, each with the filetype it means, in
+/// table order (no leading dot; a few differ only in case, like `C` / `c`, where the
+/// exact spelling wins — any other casing matches case-insensitively). What the
+/// Windows file associations register bemtvi for: the same table that types a buffer,
+/// so a file Explorer offers to open in bemtvi is one bemtvi then highlights.
+pub fn known_extensions() -> &'static [(&'static str, &'static str)] {
+    EXT_FILETYPE
 }
 
 /// The treesitter grammar for a vim **help** file, or `None` when `path` isn't one.

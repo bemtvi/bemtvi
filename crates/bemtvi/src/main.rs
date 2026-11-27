@@ -283,6 +283,8 @@ fn run_lua_oneshot(code: String, shada: &ShadaOpts, workspace_cwd: bool) -> Resu
             runtimepath,
             clipboard: bemtvi_server::ClipboardProvider::Disabled,
             offer_default_recommended: false,
+            // The file-type offer is the GUI's (`bemtvi-gui` is the program Explorer opens).
+            offer_file_associations: false,
             cmdline_complete_default: false,
             show_intro: false,
             // Headless: no UI is attached, so route `print` / echo / error output to the
@@ -797,6 +799,8 @@ fn main() -> Result<()> {
         // The interactive binary offers bemtvi's built-in default recommended set on a
         // fresh setup (the first-run welcome); a config's own recommend{} overrides it.
         offer_default_recommended: true,
+        // The file-type offer is the GUI's (`bemtvi-gui` is the program Explorer opens).
+        offer_file_associations: false,
         // Seed the client-owned system-plugin tier (`stdpath("data")/system/*`) into every
         // session — loaded before init.lua, guaranteed present before any connect. Empty on
         // a fresh install (no system dir), so nothing changes until a connector is installed.
@@ -1246,6 +1250,8 @@ where
         // built-in default recommended set on first run, and enable
         // command-line completion by default (a config's setup{} still wins).
         offer_default_recommended: true,
+        // The file-type offer is the GUI's (`bemtvi-gui` is the program Explorer opens).
+        offer_file_associations: false,
         // Seed the client-owned system-plugin tier into the daemon session too:
         // system plugins load into the LOCAL VM via the local runtimepath (like the
         // remote-aware plugin manager), so a connector persists across the reload.

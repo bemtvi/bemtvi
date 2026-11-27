@@ -1415,6 +1415,7 @@ async fn ts_install_refuses_a_tarball_symlink_that_leaves_the_archive() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn ts_install_refuses_a_symlink_that_escapes_through_another_symlink() {
     let _guard = test_lock().lock().await;
